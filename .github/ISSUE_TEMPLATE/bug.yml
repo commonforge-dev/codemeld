@@ -1,0 +1,112 @@
+name: Bug report
+description: Report a reproducible problem in codemeld
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve codemeld.
+
+        Do not file security issues here. Email francisco@natserv.com instead.
+        Before attaching logs or config, redact API keys, session tokens, provider
+        credentials, and local paths you do not want public.
+
+  - type: input
+    id: version
+    attributes:
+      label: codemeld version
+      description: The version `/status` shows in an interactive session.
+      placeholder: "Alpha 0.4.5"
+    validations:
+      required: true
+
+  - type: input
+    id: os-terminal
+    attributes:
+      label: OS and terminal emulator
+      placeholder: "Linux + foot, macOS + Terminal.app, FreeBSD + xterm"
+    validations:
+      required: true
+
+  - type: input
+    id: provider-model
+    attributes:
+      label: Provider and model
+      description: Provider/model behavior can differ, so include both.
+      placeholder: "OpenAI / gpt-5.5"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: vcs
+    attributes:
+      label: VCS in use
+      options:
+        - Mercurial
+        - Git
+        - other
+        - none
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened?
+      description: Describe the user-visible behavior and any error text.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest sequence that shows the problem.
+      placeholder: |
+        1. Run ...
+        2. Press ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect codemeld to do instead?
+
+  - type: textarea
+    id: logs-config
+    attributes:
+      label: Logs and config
+      description: Redact API keys, session tokens, settings files, and session dumps before posting.
+      render: text
+
+  - type: dropdown
+    id: llm-used
+    attributes:
+      label: Was an LLM used to write this report?
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: true
+
+  - type: input
+    id: llm-verified
+    attributes:
+      label: If yes, did you confirm it yourself?
+      description: Say how you reproduced it or how a different model verified it. Use N/A if no LLM was used.
+      placeholder: "N/A"
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues before filing this.
+          required: true
+        - label: I redacted secrets, tokens, local settings, and session dumps.
+          required: true

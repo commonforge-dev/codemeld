@@ -1,0 +1,402 @@
+# deadcode allowlist — documented exceptions that `mise run deadcode` reports as
+# unreachable from main(). Format: "<file> <FuncName>", one per line; blank
+# lines and lines starting with '#' are ignored.
+#
+# Each entry is an intentional test-only seam with no production caller by design.
+# The per-function justification lives at the source: the "// intentional: test-only
+# seam (no production caller by design)." comments. See also
+# docs/deadcode-process.md (bucket 3: intentional deadcode).
+#
+# Keep this list tiny — a growing allowlist is a smell, not a convenience.
+internal/fsutil/atomic.go SetSyncFileForTest
+internal/fsutil/atomic.go SetSyncDirForTest
+internal/fsutil/atomic.go SetBeforePublishRenameForTest
+internal/fsutil/atomic.go SetRecoveryNameForTest
+internal/fsutil/atomic.go SetBeforeCleanupForTest
+internal/fsutil/move.go SetRenameNoReplaceAtForTest
+internal/fsutil/move.go SetBeforeMoveRenameForTest
+
+# --prompt-for-approval wiring observability: the run test asserts the flag bound
+# interactive terminal escalation onto the real HeadlessDriver. Production reads the field
+# directly in HeadlessDriver.Run, so this accessor has no production caller by design.
+internal/bootstrap/headless.go HeadlessDriver.PromptForApprovalEnabled
+
+# --dev-debug wiring observability: the run test asserts the flag bound the
+# suggest_followup development trace onto the real HeadlessDriver. Production reads the field
+# directly in HeadlessDriver.Run, so this accessor has no production caller by design.
+internal/bootstrap/headless.go HeadlessDriver.DevDebugRequested
+
+# E2 experiment binding: the only caller is a local, non-shipped harness in a separate
+# main package outside this reachability root. `codemeld run` must never call it — the product
+# surface stays the shipped advertised set — so it has no production caller by design.
+internal/bootstrap/headless.go HeadlessDriver.EnableExperiment
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the shared
+# read-target resolver and symlink-policy predicates. Complete and tested, but
+# no production caller exists until the read-only navigation tools are wired:
+# the read tool calls ResolveReadTarget + ResolveReadFile; the list tool calls
+# ClassifyEntry; the grep and tree tools and glob recursion call IsDirectorySymlink.
+# Remove each line once its consuming tool task lands a production caller.
+internal/filetools/readresolve.go ResolveReadTarget
+internal/filetools/readresolve.go IsDirectorySymlink
+internal/filetools/readresolve.go ClassifyEntry
+internal/filetools/readresolve.go ResolveReadFile
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the shared
+# output-bounding helpers — numeric-argument validation and the byte-cap-safe
+# success-result builder. Complete and tested, but no production caller exists
+# until the read-only navigation tools are wired: the read tool calls
+# ValidateNumericArgs + BoundedResult; the grep, list and tree tools and glob
+# call them too. Remove each line once its consuming tool task lands a caller.
+internal/filetools/limits.go ValidateNumericArgs
+internal/filetools/limits.go BoundedResult
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the OpenAI
+# Platform key-resolution helper. Complete and tested, but no production caller
+# exists until provider-scoped auth is wired into turn dispatch: the wired
+# turnController.dispatch resolves the Platform key with OPENAI_API_KEY precedence
+# over the configured global-settings key through ResolvePlatformAPIKey. Remove this
+# line once that caller lands.
+internal/provider/openai_adapter.go ResolvePlatformAPIKey
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the ChatGPT
+# session deleter. Complete and tested, but no production caller exists until the
+# logout flow is wired: logout calls Delete. The landed login flow wires
+# authstate.Write through the CLI storage seam (internal/cli/
+# auth.go), so Write — and sessionYAML, which Write calls — are now reachable from
+# main() and are no longer allowlisted. Remove this line once the logout flow lands
+# its production caller.
+internal/authstate/chatgpt.go Delete
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the shared
+# directory walker (ordered, hidden-filtered, symlink-no-follow traversal plus
+# the empty-by-default ignore-filter seam). Complete and tested, but no production
+# caller exists until the recursive read-only navigation tools are wired: the glob,
+# grep, list, and tree tools call Walk; .gitignore and .hgignore support
+# register matchers into its WalkOptions.Ignore set. Remove each
+# line once its consuming tool task lands a production caller.
+internal/filetools/walk.go Walk
+internal/filetools/walk.go classifyDirEntry
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the OpenAI
+# ChatGPT token-refresh policy — the proactive (EnsureFreshSession) and one-shot
+# reactive (RefreshNow + ShouldRefreshAfterStatus) refresh entrypoints, their
+# shared refresh/persist helpers, the credential-free RefreshFailure error, and
+# authstate.Session.ApplyRefresh (the refresh merge that preserves account_id and
+# an un-rotated refresh token). Complete and tested, but no production caller
+# exists until provider-scoped auth is wired into turn dispatch: the wired turn
+# setup calls EnsureFreshSession and its Responses-adapter retry path pairs
+# ShouldRefreshAfterStatus with RefreshNow. Remove each line once those callers
+# land.
+internal/authstate/chatgpt.go Session.ApplyRefresh
+internal/openaiauth/refresh.go Flow.EnsureFreshSession
+internal/openaiauth/refresh.go Flow.RefreshNow
+internal/openaiauth/refresh.go Flow.refreshAndPersist
+internal/openaiauth/refresh.go Flow.refreshTokens
+internal/openaiauth/refresh.go ShouldRefreshAfterStatus
+internal/openaiauth/refresh.go RefreshFailure.Error
+internal/openaiauth/refresh.go RefreshFailure.Unwrap
+internal/openaiauth/refresh.go nearExpiry
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the OpenAI
+# ChatGPT (Codex) Responses API adapter — the NewChatGPTClient constructor and the
+# whole request-mapping / SSE-bridge / safe-error cluster it reaches, plus the
+# shared redactCredentials helper (only the adapter scrubs credentials today).
+# Complete and tested, but no production caller exists until provider-scoped auth
+# is wired into turn dispatch: the selected-provider dispatch builds
+# the adapter with NewChatGPTClient from the loaded/refreshed session, and its
+# terminal test drives a fake auth.openai-chatgpt session through that real
+# construction path. Remove each line once the production caller lands.
+internal/provider/http_errors.go redactCredentials
+internal/provider/openai_chatgpt_client.go NewChatGPTClient
+internal/provider/openai_chatgpt_client.go pinRedirects
+internal/provider/openai_chatgpt_client.go chatGPTClient.ChatCompletion
+internal/provider/openai_chatgpt_client.go chatGPTClient.redact
+internal/provider/openai_chatgpt_client.go chatGPTClient.surfaceHTTPError
+internal/provider/openai_chatgpt_client.go buildResponsesRequest
+internal/provider/openai_chatgpt_client.go responsesToolsFromDefs
+internal/provider/openai_chatgpt_client.go responsesInputFromMessages
+internal/provider/openai_chatgpt_client.go roleMessage
+internal/provider/openai_chatgpt_client.go newResponsesBridge
+internal/provider/openai_chatgpt_client.go responsesBridge.Next
+internal/provider/openai_chatgpt_client.go responsesBridge.Event
+internal/provider/openai_chatgpt_client.go responsesBridge.Close
+internal/provider/openai_chatgpt_client.go responsesBridge.Err
+internal/provider/openai_chatgpt_client.go responsesBridge.translate
+internal/provider/openai_chatgpt_client.go responsesBridge.enqueueContent
+internal/provider/openai_chatgpt_client.go responsesBridge.seedFunctionCall
+internal/provider/openai_chatgpt_client.go responsesBridge.enqueueFunctionArgs
+internal/provider/openai_chatgpt_client.go responsesBridge.completeFunctionArgs
+internal/provider/openai_chatgpt_client.go responsesBridge.enqueueCompletion
+internal/provider/openai_chatgpt_client.go responsesBridge.responseError
+internal/provider/openai_chatgpt_client.go toolCallChunk
+internal/provider/openai_chatgpt_client.go marshalChunk
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the run-scoped
+# catalog effort source. Complete and tested, but no production caller exists until
+# discovered ChatGPT efforts are wired: into turn sending plus the bootstrap
+# picker/effort lookups, and into title generation. Remove this line once that
+# wiring lands a production caller.
+internal/provider/catalog.go Catalog.SupportedEffort
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the exported
+# capability member table. The matcher's read side (capabilityContains) and the
+# entry parser's reservation check (IsCapabilitySubject) are already reachable from
+# main(); this accessor exposes the same source-of-truth table to other packages.
+# No production caller exists until dispatch's write side is wired: the wired
+# dispatch/orchestrate reuses CapabilityMembers (with CapabilityWrite/CapabilityRead)
+# to map an approved concrete tool onto its capability subject when storing a tool
+# grant. Remove this line once that production caller lands.
+internal/permissions/capability.go CapabilityMembers
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the exported
+# compound-subject encoder. RecognizeSimpleCompound, the decoder,
+# and the generalized matcher are already reachable from main() through the literal
+# branch of subjectMatches; this encoder builds the stored generalized subject. No
+# production caller exists until the per-stage scope chooser is wired: the chooser calls
+# EncodeCompoundSubject with the wrapper flag and the per-stage Exact/Subcommand/
+# Program scope subjects the user chose, and passes the result as the prompt outcome's
+# stored subject. Remove this line once that production caller lands.
+internal/permissions/compound.go EncodeCompoundSubject
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the simple-compound
+# per-stage scope option builder. buildCompoundStageScopeOptions derives the
+# per-stage Exact/Subcommand/Program rows (Exact-only/no-widen for a destructive stage)
+# from a recognized permissions.SimpleCompound; the compoundStageScope shape it returns
+# keeps display labels separate from canonical stored subjects. Complete and tested, but
+# no production caller exists until the compound prompt chooser is wired: the chooser's prompt
+# flow calls buildCompoundStageScopeOptions to build the per-stage rows it shows the user.
+# Remove this line once that production caller lands.
+internal/tui/prompt_scope.go buildCompoundStageScopeOptions
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the permission
+# delete primitive — the KeyPermissions delete sentinel/payload
+# (PermissionDelete) and the grant-kind→file routing adapter (DeleteGrant).
+# Complete and tested, but no production caller exists until the revoke surface is
+# wired: the RevokeGrant seam calls DeleteGrant for a persisted grant (and
+# Cache.RemovePermission for the in-memory drop), and the /settings overlay
+# revoke control drives that seam from internal/tui/picker_settings.go. DeleteGrant
+# is the only caller of config.PermissionDelete, so both are unreachable until then.
+# Remove each line once the RevokeGrant seam and the /settings revoke control land
+# their production callers.
+internal/config/rewrite.go PermissionDelete
+internal/permissionpersist/persist.go DeleteGrant
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the auto-title
+# helper — GenerateTitle and the private sanitizers it reaches (exchangeText,
+# sanitizeTitle, stripWrappingQuotes). Complete and tested, but no production
+# caller exists until it is wired into bootstrap turn completion: the
+# first-turn production hook calls GenerateTitle and reads the title from disk.
+# Remove each line once that production caller lands.
+internal/turn/titlegen.go GenerateTitle
+internal/turn/titlegen.go exchangeText
+internal/turn/titlegen.go sanitizeTitle
+internal/turn/titlegen.go stripWrappingQuotes
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the fd-relative
+# no-overwrite rename helper — MoveNoReplace and the endpoint validator / parent-identity
+# check it reaches (splitMoveEndpoint, sameDir). Complete and tested, but no production
+# caller exists until the structured move tool is wired: the unregistered MoveTool
+# resolver/invoke calls MoveNoReplace with the resolved, authorized endpoints, and the
+# registration step registers that tool in the production registry. The MoveTool caller is
+# itself unregistered (not reachable from main), so these stay dead until the registration
+# step registers the tool; remove each line once that production registration lands.
+internal/fsutil/move.go MoveNoReplace
+internal/fsutil/move.go splitMoveEndpoint
+internal/fsutil/move.go sameDir
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the structured
+# move tool — the MoveTool type (constructor, the tools.Tool methods, and the move-specific
+# two-endpoint ResolveEndpoints/OutOfRootScope/InvokeWithResolvedMove handoff) plus the
+# private endpoint-resolution/precondition/mutation helpers it reaches. Complete and tested,
+# but the tool stays unregistered (no caller reachable from main) until it is wired: one step
+# adds the multi-scope dispatch prompt/action seam and the registration step registers
+# NewMoveTool in the production tool registry. Remove each line once that production
+# registration lands (which also clears the MoveNoReplace/splitMoveEndpoint/sameDir entries
+# above).
+internal/filetools/move.go NewMoveTool
+internal/filetools/move.go MoveTool.Name
+internal/filetools/move.go MoveTool.SubjectKind
+internal/filetools/move.go MoveTool.Advertise
+internal/filetools/move.go MoveTool.ResolveEndpoints
+internal/filetools/move.go MoveTool.anchorEndpoint
+internal/filetools/move.go MoveTool.OutOfRootScope
+internal/filetools/move.go moveSourcePrecondition
+internal/filetools/move.go moveDestinationPrecondition
+internal/filetools/move.go MoveTool.InvokeWithResolvedMove
+internal/filetools/move.go MoveTool.Invoke
+internal/filetools/move.go MoveTool.move
+internal/filetools/move.go rejectUnknownMoveArgs
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the read-only
+# file_count filetool — the FileCountTool type (constructor, the tools.Tool methods,
+# and the target-scoped ResolveTarget/ExternalReadScope/InvokeWithResolvedTarget
+# dispatch seam) plus the private aggregation/filtering helpers it reaches. Complete
+# and tested, but no production caller exists until the tool is wired: the registration
+# step registers NewFileCountTool in the production tool registry and folds it into
+# advertised-tools, and a separate step folds file_count into the external-read
+# read-capability grants. Remove each line once the registration step lands that
+# production caller.
+internal/filetools/filecount.go NewFileCountTool
+internal/filetools/filecount.go FileCountTool.Name
+internal/filetools/filecount.go FileCountTool.SubjectKind
+internal/filetools/filecount.go FileCountTool.Advertise
+internal/filetools/filecount.go FileCountTool.ResolveTarget
+internal/filetools/filecount.go FileCountTool.ExternalReadScope
+internal/filetools/filecount.go FileCountTool.InvokeWithResolvedTarget
+internal/filetools/filecount.go FileCountTool.Invoke
+internal/filetools/filecount.go FileCountTool.count
+internal/filetools/filecount.go aggregateFileCount
+internal/filetools/filecount.go fileCountGroupKey
+internal/filetools/filecount.go renderFileCount
+internal/filetools/filecount.go resolveFileCountKinds
+internal/filetools/filecount.go optionalStringSliceArg
+internal/filetools/filecount.go validateGlobPatterns
+internal/filetools/filecount.go globsAllow
+internal/filetools/filecount.go validGroupBy
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the /connect
+# handler and its private rejection helper. Complete and unit-tested against a fake
+# ConnectDeps, but no production caller exists until a production ConnectDeps is bound
+# and NewConnectHandler is passed into BuildRegistry's replacements. Until
+# then the shipping /connect uses the connectPlaceholderHandler placeholder. Remove both lines
+# once the production registration lands.
+internal/tui/cmd_connect.go NewConnectHandler
+internal/tui/cmd_connect.go rejectConnect
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the OpenAI-
+# compatible API-key GET /models discovery. Complete and tested, but no production
+# caller exists until it is wired into the production /connect flow: that flow calls
+# DiscoverAPIKeyModels from connectDeps.Connect after the TUI collects the key and
+# persists the sanitized ids via UpdateDiscoveredModelsProvider. Remove this line
+# once that production caller lands.
+internal/provider/apikey_model_discovery.go DiscoverAPIKeyModels
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the durable
+# provider_request_retry_skipped emitter. The event kind, payload, and validator are
+# reachable through the load-time decode/ValidatePayload path; this append-and-flush
+# helper has no production caller until the retry loop is wired to record a skipped
+# retry before a terminal provider_request_failed. Remove this line once that
+# production caller lands.
+internal/events/providerrequestretryskipped.go EmitProviderRequestRetrySkipped
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the durable
+# provider_stream_idle emitter. The event kind, payload, and validator are reachable
+# through the load-time decode/ValidatePayload path; this append-and-flush helper has
+# no production caller until the turn-loop idle detector is wired to record a stalled
+# provider stream. Remove this line once that production caller lands.
+internal/events/providerstreamidle.go EmitProviderStreamIdle
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the picker-triggered
+# configured-provider catalog refresh service — the ProviderCatalogRefresher constructor,
+# its Refresh entrypoint, the schedule/run/discoverAndStore background worker it reaches,
+# the freshness predicate, and the RefreshOutcome label. Complete and tested against a fake
+# discovery function and a real Cache, but no production caller exists until it is wired
+# into the model picker: that wiring installs Refresh as the picker's refresh callback in
+# internal/bootstrap/starttui.go and internal/tui/picker_model.go. Remove each line once
+# that production caller lands.
+internal/bootstrap/provider_refresh.go NewProviderCatalogRefresher
+internal/bootstrap/provider_refresh.go ProviderCatalogRefresher.Refresh
+internal/bootstrap/provider_refresh.go ProviderCatalogRefresher.schedule
+internal/bootstrap/provider_refresh.go ProviderCatalogRefresher.run
+internal/bootstrap/provider_refresh.go ProviderCatalogRefresher.discoverAndStore
+internal/bootstrap/provider_refresh.go providerCacheStale
+internal/bootstrap/provider_refresh.go RefreshOutcome.String
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the durable
+# structured_read_start/structured_read_end emitters. The event kinds,
+# payloads, and validators are reachable through the load-time decode/ValidatePayload
+# path; these append helpers have no production caller until the
+# concurrent structured-read execution closure in productionToolDispatcher
+# (internal/bootstrap/tooldispatch.go) is wired to record each prepared, positively
+# classified in-project read. Remove each line once that production caller lands.
+internal/events/structuredread.go EmitStructuredReadStart
+internal/events/structuredread.go EmitStructuredReadEnd
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the cancelled-turn
+# drain wait. The signal it waits on is closed by turnController.run, which is reachable
+# from main(), but no production caller waits on it until the session switch is wired:
+# the /clear and equal-schema /resume handlers call it through an optional drain
+# capability on the already-installed tui.StreamCanceller, before their prior-store flush
+# and seal. Remove this line once that production caller lands.
+internal/bootstrap/turndeps.go turnController.WaitTurnDrained
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the lock-held
+# model.favorites writer. Complete and tested (it reaches applyFavorite through
+# Persist), but no production caller exists until the cached global toggle that calls it
+# is exposed. Remove this line once that production caller lands.
+internal/config/favorites.go persistFavorite
+
+# Not-yet-integrated foundation (deadcode-process.md bucket 2): the stored-grant
+# permission_decision emitter, which records the effective stored subject a grant covers.
+# The permission_decision kind, payload, and validator are already reachable through
+# EmitDecision and the load-time decode/ValidatePayload path; this sibling emitter has no
+# production caller until the stored-grant branch of grant() in
+# internal/permissions/orchestrate.go is wired to it. Remove this line once that
+# production caller lands.
+internal/events/permissions.go EmitDecisionGrant
+
+# Intentional deferred behavior (deadcode-process.md bucket 3): the session schema
+# contract retains the older-schema migration fork, but ReaderSupportedVersion == 1
+# means no loadable session can reach it. The path gets wired when a schema transition
+# first makes older sessions reachable, and these entries are removed then.
+internal/sessionfork/fork.go ForkSession
+internal/sessionfork/fork.go CreateChild
+internal/sessionfork/fork.go filterTextRecords
+internal/sessionfork/fork.go filterTextContent
+
+# Security-state monitor: complete and tested, but no production caller exists until the
+# runtime-startup monitoring step constructs a monitor from the bootstrap settings handoff
+# and wires it into the runtime dependencies. Every entry below is reachable from
+# NewMonitor/Checkpoint/AdvanceBaseline; that step removes the whole block once that
+# construction lands.
+internal/securitystate/monitor.go NewMonitor
+internal/securitystate/monitor.go Monitor.Checkpoint
+internal/securitystate/monitor.go Monitor.check
+internal/securitystate/monitor.go Monitor.AdvanceBaseline
+internal/securitystate/monitor.go Project
+internal/securitystate/monitor.go stringFields
+internal/securitystate/monitor.go stringAt
+internal/securitystate/monitor.go validate
+internal/securitystate/monitor.go compare
+internal/securitystate/monitor.go fixedOrder
+internal/securitystate/monitor.go comparePermissions
+internal/securitystate/monitor.go compareStringEntries
+internal/securitystate/monitor.go counts
+internal/securitystate/monitor.go takeCommon
+internal/securitystate/monitor.go compareAuth
+internal/securitystate/monitor.go compareProviders
+internal/securitystate/monitor.go markProviderSections
+internal/securitystate/monitor.go compareWebKey
+
+
+# Intentional platform-specific code (deadcode-process.md bucket 3): the FreeBSD
+# kern.proc.pid record decoder and the shared BSD timeval encoder. Both live in the
+# portable owner.go — not owner_freebsd.go — so the fixture-driven layout-guard tests can
+# run on the development and CI host. Only owner_freebsd.go and owner_darwin.go call them,
+# and neither file is part of a linux build, so they stay unreachable in this analysis even
+# after the child-agent write rollback wires a production caller. Do not remove these with
+# the undo-log process-owner block above.
+internal/procowner/owner.go decodeFreeBSDStartTime
+internal/procowner/owner.go formatTimeval
+
+# Security-halt record seam: complete and tested, but no production caller exists until
+# the turn checkpoint calls it (records, then the security_halted terminal, in one
+# store commit) and until the startup checkpoint calls it. The turn-checkpoint step removes
+# these lines once its checkpoint lands; the startup call needs no separate entry.
+# Store.CommitRecords is the batch append-and-flush that commit uses; it becomes reachable with
+# the same wiring.
+internal/events/payloads.go EmitSecurityStateHalt
+internal/events/payloads.go checkSecurityHaltRecords
+internal/sessions/store.go Store.CommitRecords
+
+# Persistent-halt presentation seam: complete and tested, but no production caller exists
+# until the runtime-startup monitoring step binds the interactive presentation path (the
+# production interface call that seals the partial reply and pins the persistent
+# protected-settings element). That step removes this line once that binding lands; keep it
+# separate from the turn-checkpoint record-emitter block above.
+internal/tui/app.go App.SecurityHalt
+
+# Pathname entrypoint kept for the rewrite tests: config.Persist publishes through the
+# held-parent route (rewriteKeyAt), so RewriteKey has no production caller by design.
+internal/config/rewrite.go RewriteKey

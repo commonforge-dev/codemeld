@@ -1,0 +1,138 @@
+{
+  "session": "<session>",
+  "folder": "/some/folder",
+  "prompts": [
+    {
+      "subject_kind": "direct",
+      "subject": "git commit -m First task",
+      "scope": "/proj/sub",
+      "outcome": "granted",
+      "grant": {
+        "stored": true,
+        "kind": "folder",
+        "path_scope": "/proj/sub",
+        "subject": "git commit -m \"First task\""
+      }
+    },
+    {
+      "subject_kind": "direct",
+      "subject": "git commit -m First task",
+      "scope": "/proj",
+      "outcome": "granted",
+      "grant": {
+        "stored": false
+      },
+      "scope_escalation": {
+        "grant_path_scope": "/proj/sub",
+        "grant_subject": "git commit -m \"First task\""
+      }
+    },
+    {
+      "subject_kind": "tool",
+      "subject": "edit",
+      "scope": "/proj/sub",
+      "outcome": "granted",
+      "grant": {
+        "stored": true,
+        "kind": "folder",
+        "path_scope": "/proj/sub",
+        "subject": "write"
+      }
+    },
+    {
+      "subject_kind": "tool",
+      "subject": "create",
+      "scope": "/proj",
+      "outcome": "granted",
+      "grant": {
+        "stored": true,
+        "kind": "global",
+        "subject": "write"
+      },
+      "scope_escalation": {
+        "grant_path_scope": "/proj/sub",
+        "grant_subject": "write"
+      }
+    },
+    {
+      "subject_kind": "host",
+      "subject": "web_search",
+      "scope": "example.com",
+      "outcome": "granted",
+      "grant": {
+        "stored": true,
+        "kind": "project",
+        "host_scope": "example.com",
+        "subject": "web_search"
+      }
+    },
+    {
+      "subject_kind": "tool",
+      "subject": "Bash",
+      "scope": "/proj",
+      "outcome": "denied"
+    },
+    {
+      "subject_kind": "literal",
+      "subject": "sh -c \"echo hi\"",
+      "scope": "/proj",
+      "outcome": "pending"
+    },
+    {
+      "subject_kind": "tool",
+      "subject": "read",
+      "scope": "/other",
+      "outcome": "granted",
+      "grant": {
+        "stored": true,
+        "kind": "session",
+        "path_scope": "/other",
+        "subject": "read*"
+      }
+    },
+    {
+      "subject_kind": "host",
+      "subject": "web_fetch",
+      "scope": "docs.example.com",
+      "outcome": "granted",
+      "grant": {
+        "stored": true,
+        "kind": "session",
+        "host_scope": "docs.example.com",
+        "subject": "web_fetch"
+      }
+    }
+  ],
+  "granted": 7,
+  "denied": 1,
+  "pending": 1,
+  "non_prompted": {
+    "grant": 1,
+    "cache": 1,
+    "mode_auto": 1,
+    "declared_scope": 0,
+    "declared_command": 0,
+    "open_read": 0,
+    "confined": 0
+  },
+  "refused": {
+    "blocked_path": 0,
+    "protected_state": 0
+  },
+  "revocation_requests": [
+    {
+      "kind": "tool",
+      "subject": "edit",
+      "scope": "/proj/sub",
+      "grant_kind": "folder",
+      "source": "permissions_ui"
+    },
+    {
+      "kind": "tool",
+      "subject": "web_fetch",
+      "scope": "docs.example.com",
+      "grant_kind": "session",
+      "source": "permissions_ui"
+    }
+  ]
+}

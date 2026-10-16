@@ -1,0 +1,108 @@
+# OSS reference-check allowlist — audited carve-out for scripts/oss-reference-check.sh.
+#
+# Each entry is a  <repo-relative-path><TAB><matched-token>  pair. The path is matched
+# exactly and case-sensitively; the token is matched case-insensitively, so one entry
+# covers every capitalization of that token in that one file, a public doc included. It
+# permits the token in that file only: the same token in another file, or in a file
+# whose path differs only in letter case, still fails, as does a different token in the
+# same file. Test diagnostics are not allowed by filename; intentional ones need entries
+# here too. Entries apply to requirement references (category 1) and task/ADR-id-shaped
+# tokens (category 3); a withheld-path reference (category 2) can never be allowed.
+#
+# Category 1 entries are the req-named identifiers, validation strings, and test
+# diagnostics the OSS scrub intentionally left in place: renaming an exported-style
+# identifier, error-category string, or behavior-locking diagnostic would change the
+# audited behavior, so the worded reason stays in code while the unresolvable tag is
+# recorded only in the withheld traceability map.
+#
+# Category 3 entries are audited false positives: an id-shaped token that is not a task
+# or ADR id, such as a CPU architecture name.
+# Lines starting with # and blank lines are ignored.
+docs/architecture.md	i386
+internal/agentinstr/assemble_test.go	req 30
+internal/bootstrap/cleardeps_test.go	req 400
+internal/bootstrap/exitdeps_test.go	req 400
+internal/bootstrap/firstrun_settings_test.go	PRD
+internal/bootstrap/firstrun_settings_test.go	Req135
+internal/bootstrap/firstrun_settings_test.go	Req515
+internal/bootstrap/firstrun_settings_test.go	req 105
+internal/bootstrap/firstrun_settings_test.go	req 135
+internal/bootstrap/firstrun_settings_test.go	req 150
+internal/bootstrap/firstrun_settings_test.go	req 515
+internal/bootstrap/firstrun_settings_test.go	req-135
+internal/bootstrap/firstrun_settings_test.go	req-220
+internal/bootstrap/firstrun_settings_test.go	req-45
+internal/bootstrap/firstrun_settings_test.go	req-50
+internal/bootstrap/firstrun_settings_test.go	req-515
+internal/bootstrap/firstrun_snapshot_test.go	PRD
+internal/bootstrap/firstrun_snapshot_test.go	req-135
+internal/bootstrap/firstrun_snapshot_test.go	req-45
+internal/bootstrap/firstrun_snapshot_test.go	req-50
+internal/bootstrap/firstrun_snapshot_test.go	req-515
+internal/bootstrap/firstrun_vcs_test.go	req 60
+internal/bootstrap/headless_test.go	req-400
+internal/bootstrap/modeldeps_test.go	req-105
+internal/bootstrap/modeldetermine_test.go	req-540
+internal/bootstrap/prunedeps_test.go	req 400
+internal/bootstrap/prunedeps_test.go	req 450
+internal/bootstrap/resume_test.go	req 450
+internal/bootstrap/starttui_test.go	req 400
+internal/bootstrap/status_overlay_test.go	req 580
+internal/bootstrap/status_overlay_test.go	req 585
+internal/bootstrap/status_overlay_test.go	req-585
+internal/bootstrap/streaming_interrupt_test.go	req 445
+internal/bootstrap/streaming_interrupt_test.go	req 630
+internal/bootstrap/streaming_interrupt_test.go	req-400
+internal/bootstrap/tooldispatch_test.go	req 20
+internal/bootstrap/tui_commands_test.go	req 445
+internal/bootstrap/tui_commands_test.go	req-575
+internal/bootstrap/turndeps_test.go	req-400
+internal/config/compose_test.go	req 90
+internal/config/compose_test.go	req 95
+internal/config/rewrite_test.go	req 515
+internal/events/payloads.go	req-200
+internal/events/payloads.go	req-40
+internal/filetools/glob_test.go	req 20
+internal/filetools/grep_test.go	req 20
+internal/filetools/list_test.go	req 20
+internal/filetools/read_test.go	req 20
+internal/filetools/readresolve_test.go	req 35
+internal/filetools/tree_test.go	req 20
+internal/filetools/walk_test.go	req 35
+internal/integration/schema_fork_test.go	req 420
+internal/model/selection.go	req 510
+internal/model/selection_test.go	req 510
+internal/model/selection_test.go	req 525
+internal/model/selection_test.go	req 530
+internal/model/persist_test.go	req-520
+internal/permissions/orchestrate_test.go	req 150
+internal/turn/failure_test.go	req 564
+internal/turn/request_test.go	req2
+internal/turn/tools_test.go	req-425
+internal/tui/cmd_context_test.go	req 400
+internal/tui/cmd_effort.go	req510
+internal/tui/cmd_effort_test.go	req 565
+internal/tui/cmd_effort_test.go	req 570
+internal/tui/cmd_effort_test.go	req 575
+internal/tui/cmd_effort_test.go	req510
+internal/tui/cmd_exit_test.go	req 400
+internal/tui/cmd_model.go	req510
+internal/tui/cmd_model_test.go	req 565
+internal/tui/cmd_model_test.go	req 570
+internal/tui/cmd_model_test.go	req 575
+internal/tui/cmd_model_test.go	req-510
+internal/tui/cmd_status_test.go	req 580
+internal/tui/cmd_status_test.go	req 585
+internal/tui/key_ctrld_test.go	req 400
+internal/tui/overlay_keys_test.go	req 590
+internal/tui/overlay_keys_test.go	req 600
+internal/tui/overlay_keys_test.go	req600
+internal/tui/prompt_test.go	req 275
+internal/tui/registry_test.go	req 560
+internal/tui/registry_test.go	req 565
+internal/tui/registry_test.go	req 570
+internal/tui/registry_test.go	req 595
+internal/tui/reverse_search_test.go	req 600
+internal/tui/reverse_search_test.go	req 650
+internal/vcs/tool_test.go	req 220
+internal/vcs/tool_test.go	req 225

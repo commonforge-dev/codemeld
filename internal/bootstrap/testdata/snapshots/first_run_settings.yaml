@@ -1,0 +1,200 @@
+# codemeld: default global settings.
+#
+# This file is generated on first run at ~/.codemeld/global/settings.yaml.
+# Every documented key with a hard-coded default is materialized below so you
+# can see and edit it; keys you omit fall back to the same default at load
+# time. Per-project overrides live in .codemeld/settings.yaml inside a
+# project; see `discovery.boundary` below for how they are located.
+
+discovery:
+  # boundary mode: how codemeld locates per-project settings files.
+  #   launch-dir-only - only the current directory's .codemeld/settings.yaml
+  #                     is consulted (in addition to this global file).
+  #   project-root    - walk upward and stop at the innermost ancestor
+  #                     containing a .codemeld/settings.yaml file.
+  boundary: launch-dir-only
+
+vcs:
+  # tie-breaker order when a folder contains markers for more than one VCS.
+  # Reorder this list to prefer one when both are present (e.g. [hg, git, jj]
+  # to prefer Mercurial). It does not force a VCS that is not detected; for
+  # that, set 'preferred' below.
+  priority: [git, hg, jj]
+  # preferred (optional): a VCS template name used unconditionally, bypassing
+  # detection. Allowed values are any built-in name (git, hg, jj) or a
+  # user-defined template name under ~/.codemeld/global/vcs/ or
+  # <project_root>/.codemeld/vcs/. Empty string means auto-detect (default).
+  preferred: ""
+
+sessions:
+  # number of days session JSON files in ~/.codemeld/sessions/ are kept before
+  # automatic pruning. Set higher to retain longer.
+  retention_days: 30
+  # per-stream cap (in bytes) on each tool invocation's stdout and stderr in
+  # the session record stream and when fed back to the model. Applies to each
+  # stream independently. Default is 64 KiB; minimum is 256 bytes.
+  max_tool_output_bytes: 65536
+
+agent_instructions:
+  # instruction files (AGENTS.md and any configured additions) larger than
+  # this many bytes are skipped at load time. Default is 64 KiB.
+  max_file_bytes: 65536
+
+agent:
+  # maximum number of independent agent work units codemeld may run in
+  # parallel within a single assistant turn. Use 1 to force fully sequential
+  # execution.
+  max_concurrency: 3
+
+# permission grants persisted by the permission prompt (folder-scoped and
+# global-scoped). The TUI appends entries here when you choose
+# "allow in this folder permanently" or "allow globally permanently".
+permissions: []
+
+# blocked_paths: the agent's tools and read-only commands can never read or
+# change these paths. codemeld wrote these recommended entries once, on first
+# start, and never adds more. They are not a complete list of your secrets.
+# Remove an entry to let the agent use it, or add your own absolute or ~/ paths.
+blocked_paths:
+  # Keys and passwords
+  - "~/.ssh"
+  - "~/.gnupg"
+  - "~/.password-store"
+  - "~/.local/share/keyrings"
+  - "~/.local/share/kwalletd"
+  - "~/Library/Keychains"
+  # Cloud and cluster logins
+  - "~/.aws"
+  - "~/.azure"
+  - "~/.config/gcloud"
+  - "~/AppData/Roaming/gcloud"
+  - "~/.kube"
+  - "~/.docker/config.json"
+  # Infrastructure tokens
+  - "~/.terraform.d/credentials.tfrc.json"
+  - "~/AppData/Roaming/terraform.d/credentials.tfrc.json"
+  - "~/.vault-token"
+  # Version-control config and tokens
+  - "~/.hgrc"
+  - "~/.config/hg/hgrc"
+  - "~/Mercurial.ini"
+  - "~/.gitconfig"
+  - "~/.config/git/config"
+  - "~/.git-credentials"
+  - "~/.config/git/credentials"
+  - "~/.config/gh"
+  - "~/AppData/Roaming/GitHub CLI"
+  - "~/.netrc"
+  - "~/_netrc"
+  # Package tokens
+  - "~/.npmrc"
+  - "~/.pypirc"
+  - "~/.config/pip/pip.conf"
+  - "~/.pip/pip.conf"
+  - "~/Library/Application Support/pip/pip.conf"
+  - "~/AppData/Roaming/pip/pip.ini"
+  - "~/.cargo/credentials.toml"
+  - "~/.cargo/credentials"
+  - "~/.gem/credentials"
+  - "~/.local/share/gem/credentials"
+  # Java build settings
+  - "~/.m2/settings.xml"
+  - "~/.m2/settings-security.xml"
+  - "~/.gradle/gradle.properties"
+  # Other AI coding tools' logins
+  - "~/.claude/.credentials.json"
+  - "~/.codex/auth.json"
+  - "~/.local/share/opencode/auth.json"
+  # Shell history
+  - "~/.bash_history"
+  - "~/.zsh_history"
+  - "~/.local/share/fish/fish_history"
+  - "~/.sh_history"
+  - "~/.history"
+  # Browser profiles
+  - "~/.mozilla/firefox"
+  - "~/.config/mozilla/firefox"
+  - "~/.config/google-chrome"
+  - "~/.config/chromium"
+  - "~/snap/firefox/common/.mozilla/firefox"
+  - "~/snap/chromium/common/chromium"
+  - "~/.var/app/org.mozilla.firefox/.mozilla/firefox"
+  - "~/.var/app/com.google.Chrome/config/google-chrome"
+  - "~/.var/app/org.chromium.Chromium/config/chromium"
+  - "~/Library/Application Support/Firefox/Profiles"
+  - "~/Library/Application Support/Google/Chrome"
+  - "~/Library/Application Support/Chromium"
+  - "~/AppData/Roaming/Mozilla/Firefox/Profiles"
+  - "~/AppData/Local/Google/Chrome/User Data"
+  - "~/AppData/Local/Chromium/User Data"
+
+# Web research (search and direct fetch) is ON by default. Nothing in this file
+# authorizes a host or starts a request on its own.
+#
+# It adds outbound network egress: search requests go to Exa (mcp.exa.ai) and
+# fetches go to the source hosts you follow. Nothing is contacted until it is
+# approved by you per request in the permission prompt.
+#
+# The prompt offers allow once, this session, or this project; the grants you
+# choose to keep are recorded under permissions: above.
+#
+# Direct fetch and search both work with no Exa key.
+# web_research.api_key is optional - supply your own Exa key to run search
+# against your own Exa account.
+#
+# On an install that must never make these requests, uncomment the block below:
+# that switch is the only way to turn web research off.
+#
+# web_research:
+#   enabled: false
+#   api_key: ""            # optional; your own Exa key, for your own Exa quota
+#   max_results: 6         # search candidates requested (5-25)
+#   timeout_seconds: 20    # per search or fetch request, in seconds (1-120)
+
+# OpenAI sign-in: codemeld ships two separate OpenAI providers. Pick the one that
+# matches how you pay for access; neither overrides the other.
+#
+#   openai-chatgpt (OpenAI ChatGPT subscription): built in, so it needs no entry
+#     below and no API key. From an interactive shell, sign in with
+#       codemeld auth login openai-chatgpt
+#     This uses your own ChatGPT subscription where OpenAI's entitlement and
+#     access policy allow it. codemeld is an independent client and is not
+#     endorsed by or affiliated with OpenAI.
+#
+#   openai (OpenAI Platform API key): pay-as-you-go usage billing. Uncomment the
+#     provider.openai example below and paste a Platform API key. CI, servers, and
+#     other non-interactive setups should use this provider, not ChatGPT login.
+#
+# Security: this file (~/.codemeld/global/settings.yaml) may hold plaintext
+# provider API keys and ChatGPT session tokens. It is readable by your local user
+# account. Do not check it into a project, paste it into a bug report, or sync it
+# to untrusted locations.
+
+# Add a provider entry to enable codemeld: uncomment the provider: block
+# below (delete the leading "# " on each line) and paste your API key.
+# Examples for the providers codemeld ships adapters for at launch:
+#
+# provider:
+#   openai:
+#     base_url: https://api.openai.com/v1
+#     api_key: ""                          # paste your key here
+#     # run /connect openai to validate the key and refresh the selectable model
+#     # list into codemeld's own store; no models list is needed here.
+#
+#   openrouter:
+#     base_url: https://openrouter.ai/api/v1
+#     api_key: ""                          # paste your key here
+#     # run /connect openrouter to validate the key and refresh the selectable
+#     # model list into codemeld's own store; no models list is needed here.
+#
+#   venice:
+#     base_url: https://api.venice.ai/api/v1
+#     api_key: ""                          # paste your key here
+#     # run /connect venice to validate the key and refresh the selectable model
+#     # list into codemeld's own store; no models list is needed here.
+
+# model.last_used is managed automatically by codemeld.
+# It records the most recent model and effort you picked in any project,
+# and is used as the default for folders you have not yet used with codemeld.
+# Manual edits to this key will be overwritten the next time you pick a model.
+model: {}

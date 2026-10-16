@@ -1,0 +1,5 @@
+codemeld: created default settings at <path>
+codemeld works once an OpenAI provider is set up. The two OpenAI providers are billed differently:
+  - OpenAI ChatGPT subscription: run `codemeld auth login openai-chatgpt` to sign in - no API key required.
+  - OpenAI Platform (pay-as-you-go API key): edit <path> and configure an OpenAI Platform API key under `provider:` (see the comments there).
+To use a different provider, configure it under `provider:` in <path>, then re-run codemeld.

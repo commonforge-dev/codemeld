@@ -1,0 +1,61 @@
+# codemeld built-in VCS template: jj (Jujutsu).
+#
+# Materialized to ~/.codemeld/global/vcs/jj.yaml on first run as a complete,
+# copy-and-modify reference. Each top-level key is one VCS action. 'detect' uses
+# a single 'marker' key; every other action uses 'argv' (run directly, with no
+# shell) and an optional 'cwd'. The placeholders {path}, {message}, and {branch}
+# are substituted before the command runs.
+#
+# Jujutsu's model differs from git/hg: the working copy is always a commit and
+# branches are "bookmarks". The actions below map onto the nearest jj concept;
+# a few (stash/stash-pop) have no direct equivalent and report state instead.
+# Edit this file to match your workflow.
+
+detect:
+  marker: .jj
+
+status:
+  argv: [jj, status]
+
+diff:
+  argv: [jj, diff]
+
+add:
+  argv: [jj, file, track, "{path}"]
+
+commit:
+  argv: [jj, commit, -m, "{message}"]
+
+log:
+  argv: [jj, log, --limit, "20"]
+
+branch-current:
+  argv: [jj, bookmark, list]
+
+branch-create:
+  argv: [jj, bookmark, create, "{branch}"]
+
+branch-switch:
+  argv: [jj, edit, "{branch}"]
+
+restore-file:
+  argv: [jj, restore, "{path}"]
+
+is-clean:
+  argv: [jj, diff, --stat]
+
+# No stash in jj: the working copy is already a commit. Reports state instead.
+stash:
+  argv: [jj, status]
+
+# No stash-pop in jj. Reports state instead; edit if your workflow needs one.
+stash-pop:
+  argv: [jj, status]
+
+# Probe-only: conflicts are recorded in commits; jj status reports them.
+merge-status:
+  argv: [jj, status]
+
+# Probe-only: jj has no interrupted-rebase state; jj status reports it.
+rebase-status:
+  argv: [jj, status]

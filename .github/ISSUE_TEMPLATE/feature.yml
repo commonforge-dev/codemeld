@@ -1,0 +1,63 @@
+name: Feature request
+description: Suggest an improvement to codemeld
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement. For project goals and tradeoffs, see
+        docs/RATIONALE.md before filing a large feature request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What are you trying to do, and what makes it hard today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like codemeld to have.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or different designs have you considered?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - TUI
+        - providers
+        - VCS
+        - config
+        - tools & permissions
+        - other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: llm-used
+    attributes:
+      label: Was an LLM used to write this request?
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues before filing this.
+          required: true

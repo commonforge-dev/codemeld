@@ -1,0 +1,97 @@
+[tools]
+go = "1.26.9"
+"go:golang.org/x/vuln/cmd/govulncheck" = "v1.6.0"
+
+# Machine-local, non-portable config (the process-tooling scripts PATH entry and
+# the personal scratch-build task) lives in the hgignored mise.local.toml, not here,
+# so the shipping mise.toml carries no developer-machine paths. mise merges
+# mise.local.toml automatically; recreate it per clone if you need those locally.
+
+[tasks.build]
+description = "Builds the codemeld binary (static, CGO disabled)"
+run = "CGO_ENABLED=0 go build -o codemeld ./cmd/codemeld"
+
+[tasks.check-dev]
+description = "Iterative review-fix gate: lint, non-race tests, and stale-stub checks"
+run = "mise run lint && mise run test-fast && mise run wiring-stub-check"
+
+[tasks.check]
+description = "Final local gate: lint, non-race tests, the static reachability/stub checks, and the shipping-set reference check"
+run = "mise run lint && mise run test-fast && mise run deadcode-check && mise run wiring-stub-check && mise run oss-reference-check"
+
+[tasks.check-race]
+description = "Full integration gate: lint, race tests, the static reachability/stub checks, and the shipping-set reference check"
+run = "mise run lint && mise run test && mise run deadcode-check && mise run wiring-stub-check && mise run oss-reference-check"
+
+# Larget -t values means larger amount of code with similar pattern
+[tasks.dups]
+description = "Find duplicate code blocks (manual; not part of check gate). Tune -t to adjust sensitivity."
+run = "dupl -t 80 ."
+
+[tasks.deadcode]
+description = "Report unreachable functions (whole-program)"
+run = "deadcode -filter=codemeld.dev/codemeld codemeld.dev/codemeld/cmd/codemeld"
+
+[tasks.deadcode-check]
+description = "Fail if deadcode reports an unreachable func not in .deadcode-allow"
+run = "scripts/deadcode-check.sh"
+
+[tasks.deadcode-test]
+description = "Report unreachable functions including test entrypoints"
+run = "deadcode -test -filter=codemeld.dev/codemeld codemeld.dev/codemeld/cmd/codemeld"
+
+[tasks.fmt]
+description = "Formats all Go source in place with gofmt"
+run = "gofmt -w ."
+
+[tasks.fuzz-slash]
+description = "Runs the slash-command parser fuzz target for 30 seconds"
+run = "go test ./internal/tui -run=^$ -fuzz=FuzzSlashParse -fuzztime=30s"
+
+[tasks.lint]
+description = "Runs golangci-lint across all packages"
+# --allow-serial-runners: golangci-lint takes an exclusive lock on $TMPDIR/golangci-lint.lock and,
+# by default, exits 3 with "parallel golangci-lint is running" the moment another clone holds it.
+# Parallel lanes lint concurrently, so that turned a busy neighbour into a failed integration gate
+# (check-race calls this task first). Serializing waits for the lock instead of failing; it is
+# preferred over --allow-parallel-runners, which would let concurrent runs thrash the shared cache.
+run = "golangci-lint run --allow-serial-runners"
+
+# The single system-prompt snapshot regeneration command (gate 1 in
+# docs/gated-changes.md). It rewrites the golden fixtures and then fails on
+# purpose, so review the diff and run `mise run check` to assert.
+[tasks.snapshot-update]
+description = "Rewrite the system-prompt golden fixtures (fails on purpose; review the diff, then run check)"
+run = "CODEMELD_UPDATE_SNAPSHOTS=1 go test ./internal/agentinstr/..."
+
+[tasks.test]
+description = "Runs all tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.test-fast]
+description = "Tests without the race detector (faster; reuses the normal build cache)"
+run = "go test ./..."
+
+[tasks.vet]
+description = "Runs go vet across all packages"
+run = "go vet ./..."
+
+[tasks.wiring-stub-check]
+description = "Inactive in the public tree: does nothing. The stale-stub check runs only in the development tree, which overrides this task"
+run = "true"
+
+[tasks.oss-reference-check]
+description = "Fail if a shipping file reintroduces a banned requirement/process reference (runs in check, check-race, and release-check)"
+run = "scripts/oss-reference-check.sh"
+
+[tasks.oss-secret-scan]
+description = "Release-only: fail if a shipping file contains a secret or private-machine path"
+run = "scripts/oss-secret-scan.sh"
+
+[tasks.oss-gate-selftest]
+description = "Self-test the OSS shipping-set scanners against fixtures (proves they fail/pass correctly)"
+run = "scripts/oss-reference-check.sh --self-test && scripts/oss-secret-scan.sh --self-test"
+
+[tasks.release-check]
+description = "Release gate: OSS reference check + secret scan, then go vet and the Go vulnerability scan (only the secret scan and govulncheck are exclusive to it; govulncheck needs outbound network)"
+run = "mise run oss-reference-check && mise run oss-secret-scan && go vet ./... && govulncheck ./..."

@@ -1,0 +1,3 @@
+/codemeld
+*.test
+coverage.out

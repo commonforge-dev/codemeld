@@ -1,0 +1,27 @@
+version: "2"
+
+linters:
+  # Pin an explicit linter set rather than relying on golangci-lint's defaults
+  # so the enabled checks don't drift between tool versions.
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+  exclusions:
+    rules:
+      # Advisory writes to stdout/stderr in the first-run bootstrap flow and a
+      # few CLI/error-reporting paths: at these call sites the process is either
+      # exiting or the message is purely informational, so a write error is not
+      # actionable. Scoped to the specific files that emit best-effort output so
+      # the rule cannot hide unchecked writes elsewhere; the lone deferred-close
+      # case is justified inline (see internal/fsutil/atomic.go).
+      - linters:
+          - errcheck
+        path: (internal/bootstrap/firstrun_|internal/cli/(root|auth|sessions|sessions_summary)\.go|internal/fserrors/opfail\.go|internal/config/load\.go|internal/sessions/folderdir\.go|internal/sessions/resume_lock\.go)
+        source: fmt\.Fprint(f|ln)?\(
+      # Close() in tests, where a teardown close error cannot affect the result.
+      - linters:
+          - errcheck
+        path: _test\.go
+        source: \.Close\(\)

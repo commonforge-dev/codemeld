@@ -1,0 +1,54 @@
+# codemeld built-in VCS template: hg (Mercurial).
+#
+# Materialized to ~/.codemeld/global/vcs/hg.yaml on first run as a complete,
+# copy-and-modify reference. Each top-level key is one VCS action. 'detect' uses
+# a single 'marker' key; every other action uses 'argv' (run directly, with no
+# shell) and an optional 'cwd'. The placeholders {path}, {message}, and {branch}
+# are substituted before the command runs.
+
+detect:
+  marker: .hg
+
+status:
+  argv: [hg, status]
+
+diff:
+  argv: [hg, diff]
+
+add:
+  argv: [hg, add, "{path}"]
+
+commit:
+  argv: [hg, commit, -m, "{message}"]
+
+log:
+  argv: [hg, log, --limit, "20"]
+
+branch-current:
+  argv: [hg, branch]
+
+branch-create:
+  argv: [hg, branch, "{branch}"]
+
+branch-switch:
+  argv: [hg, update, "{branch}"]
+
+restore-file:
+  argv: [hg, revert, "{path}"]
+
+is-clean:
+  argv: [hg, status]
+
+stash:
+  argv: [hg, shelve]
+
+stash-pop:
+  argv: [hg, unshelve]
+
+# Probe-only: list unresolved merge files; never start/continue/abort a merge.
+merge-status:
+  argv: [hg, resolve, --list]
+
+# Probe-only: report interrupted operations such as an in-progress rebase.
+rebase-status:
+  argv: [hg, summary]

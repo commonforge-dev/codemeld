@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codemeld.dev/schemas/settings.schema.json",
+  "title": "codemeld settings.yaml",
+  "description": "Canonical shape of ~/.codemeld/global/settings.yaml and per-project .codemeld/settings.yaml. Every key with a runtime hard-coded default is optional, so an empty document {} validates. The built-in provider id openai-chatgpt is reserved (a user-defined provider.openai-chatgpt entry is rejected) and auth.openai-chatgpt holds the codemeld-owned ChatGPT session; auth is global-only.",
+  "type": "object",
+  "properties": {
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "boundary": { "enum": ["launch-dir-only", "project-root"] }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "agent_instructions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_file_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retention_days": { "type": "integer", "minimum": 0 },
+        "max_tool_output_bytes": { "type": "integer", "minimum": 256 }
+      }
+    },
+    "vcs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "priority": { "type": "array", "items": { "type": "string" } },
+        "preferred": { "type": "string" }
+      }
+    },
+    "attribution": {
+      "type": "boolean",
+      "description": "Whether outbound OpenRouter chat-completion requests identify codemeld via the HTTP-Referer and X-Title headers. Defaults to true when omitted, is global-only (a per-project settings file carrying it fails to load), and affects no other provider. The settings tab of the /permissions overlay toggles it."
+    },
+    "mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": { "enum": ["plan", "build", "auto_edits"] }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "active": true,
+        "last_used": true,
+        "favorites": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/modelFavorite" }
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "openai-chatgpt": false,
+        "retry": { "$ref": "#/$defs/retryConfig" },
+        "openrouter": { "$ref": "#/$defs/openrouterProviderEntry" }
+      },
+      "additionalProperties": { "$ref": "#/$defs/providerEntry" }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "openai-chatgpt": { "$ref": "#/$defs/authSession" }
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/permissionEntry" }
+    },
+    "declared_commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Project-layer-only list of approved direct-command token prefixes Auto mode consults without prompting. Each entry authorizes any invocation whose canonical command tokens begin with it at a token boundary, on the direct route only, and only when that invocation carries no leading environment assignment and does not clear the environment. Rejected in the global settings file."
+    },
+    "blocked_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "^(~$|~[\\\\/]|/|[A-Za-z]:[\\\\/])" },
+      "description": "Files and folders codemeld's tools and confined commands may neither read nor write. Each entry is an absolute path or a ~-relative path. Accepted in both the global and the project settings file; entries from every file are combined, so no file can remove another file's entries."
+    },
+    "writable_folders": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Project-settings-only list of declared folder strings. Entries are parsed and validated as absolute folders (including expanded ~-relative paths), and invalid paths are skipped with notices, but the entries do not yet widen what Auto may write. Rejected in the global settings file."
+    },
+    "web_research": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Web-research settings. Global-only: any occurrence in a per-project settings file is rejected at load. enabled is on by default and only advertises the web tools: advertising authorizes no request, so every call still needs a prompt answer or a grant. api_key is the user's optional Exa key, max_results bounds requested candidates, and timeout_seconds bounds one search or fetch request. Configuration authorizes no host and initiates no request.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "api_key": { "type": "string" },
+        "max_results": { "type": "integer", "minimum": 5, "maximum": 25 },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 }
+      }
+    },
+    "confinement": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Global-only confinement settings: any occurrence in a per-project settings file is rejected at load. program_lookup chooses where confined programs are found (friendly, the default, uses the PATH codemeld launched with; strict uses only the fixed system PATH). shared_temp_folders is the saved answer to whether confined commands may write to the shared temp folders; absent means not yet answered.",
+      "properties": {
+        "program_lookup": { "enum": ["friendly", "strict"] },
+        "shared_temp_folders": { "enum": ["allow", "deny"] }
+      }
+    }
+  },
+  "$defs": {
+    "retryConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Transient-failure auto-retry. Reserved config under `provider` (not a provider entry): enabled toggles auto-retry, max_attempts caps total attempts including the first, and base_delay_ms/max_delay_ms bound the exponential backoff.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "base_delay_ms": { "type": "integer", "minimum": 0 },
+        "max_delay_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "providerEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url", "api_key"],
+      "description": "A configured provider entry: connection configuration only (base_url, api_key, optional auth_header). The openrouter entry is the one exception: it also accepts an optional `routing` block (see openrouterProviderEntry). Selectable model ids come solely from the system-owned discovered cache (models.yaml), refreshed by /connect. The retired `models` key is rejected; no migration or compatibility parsing is provided.",
+      "properties": {
+        "base_url": { "type": "string" },
+        "api_key": { "type": "string" },
+        "auth_header": { "$ref": "#/$defs/authHeader" },
+        "models": false
+      }
+    },
+    "openrouterProviderEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url", "api_key"],
+      "description": "The openrouter provider entry: connection configuration (base_url, api_key, optional auth_header) plus an optional `routing` block of OpenRouter provider-routing preferences sent with every request. Selectable model ids come solely from the system-owned discovered cache (models.yaml), refreshed by /connect. The retired `models` key is rejected; no migration or compatibility parsing is provided.",
+      "properties": {
+        "base_url": { "type": "string" },
+        "api_key": { "type": "string" },
+        "auth_header": { "$ref": "#/$defs/authHeader" },
+        "models": false,
+        "routing": { "$ref": "#/$defs/openrouterRouting" }
+      }
+    },
+    "openrouterRouting": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "OpenRouter provider-routing preferences. sort picks providers by throughput or latency instead of OpenRouter's default price-weighted routing, or best_value tries the cheapest providers first and moves providers slower than the median speed for the model to the end; data_collection deny restricts routing to providers that do not store or train on prompts; require_parameters true restricts routing to providers that support every request parameter; max_price caps, per exact model id, the prompt and completion price (US dollars per million tokens) a provider may charge. Absent keys keep OpenRouter's defaults.",
+      "properties": {
+        "sort": { "type": "string", "enum": ["throughput", "latency", "best_value"] },
+        "data_collection": { "type": "string", "enum": ["allow", "deny"] },
+        "require_parameters": { "type": "boolean" },
+        "max_price": {
+          "type": "object",
+          "description": "Per-model price caps keyed by the exact OpenRouter model id; a suffixed id such as `:free` or `:nitro` is a separate key. Each entry sets prompt, completion, or both.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "prompt": { "type": "number", "minimum": 0 },
+              "completion": { "type": "number", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "authSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["access_token", "refresh_token", "expires_at", "account_id"],
+      "properties": {
+        "access_token": { "type": "string" },
+        "refresh_token": { "type": "string" },
+        "expires_at": { "type": "string" },
+        "account_id": { "type": "string" }
+      }
+    },
+    "modelFavorite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "id"],
+      "description": "One favorited provider/model pair, in user-chosen order. Reasoning effort is not part of a favorite because it stays a per-selection picker control.",
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "authHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": { "type": "string" },
+        "value": { "type": "string" }
+      }
+    },
+    "permissionEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "subject", "grant_kind"],
+      "description": "One persisted grant, in exactly one of two disjoint shapes. A command/filesystem grant carries path_scope with grant_kind folder or global. A network grant carries host_scope instead: kind tool, subject web_search or web_fetch, one exact non-wildcard host, and grant_kind project, which is valid only in a project's .codemeld/settings.yaml.",
+      "properties": {
+        "kind": { "enum": ["direct", "literal", "tool"] },
+        "subject": { "type": "string" },
+        "path_scope": { "type": "string" },
+        "host_scope": { "type": "string" },
+        "grant_kind": { "enum": ["folder", "global", "project"] },
+        "argument_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["host_scope"] },
+          "then": {
+            "properties": {
+              "kind": { "const": "tool" },
+              "subject": { "enum": ["web_search", "web_fetch"] },
+              "host_scope": { "type": "string", "minLength": 1, "not": { "const": "*" } },
+              "grant_kind": { "const": "project" },
+              "path_scope": false,
+              "argument_hash": false
+            }
+          },
+          "else": {
+            "required": ["path_scope"],
+            "properties": {
+              "subject": { "not": { "enum": ["web_search", "web_fetch"] } },
+              "grant_kind": { "enum": ["folder", "global"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": { "kind": { "const": "literal" } }
+          },
+          "then": { "required": ["argument_hash"] },
+          "else": { "not": { "required": ["argument_hash"] } }
+        },
+        {
+          "if": {
+            "required": ["grant_kind"],
+            "properties": { "grant_kind": { "const": "global" } }
+          },
+          "then": { "properties": { "path_scope": { "const": "*" } } },
+          "else": { "properties": { "path_scope": { "not": { "const": "*" } } } }
+        }
+      ]
+    }
+  }
+}
