@@ -1,18 +1,5 @@
 # codemeld Roadmap
 
-## Planning policy
-
-This roadmap is the project's planning record. Forward-looking status is tracked through the
-release and priority entries below rather than a global phase tracker, and the project does not
-declare or advance project-wide phases beyond the completed foundation work.
-
-Specifications, backlog items, and deferred-capability descriptions may still use a phase label to
-scope one requirement or one deferral. Such a label describes only that item and does not
-establish a new project-wide phase.
-
-This policy covers planning records only. It does not change any phase-named gate in the code or
-configuration.
-
 ## Future work
 - Local models support through Ollama or similar tool
 - Jev powered permissions
@@ -56,6 +43,7 @@ configuration.
   - Streaming code-fence styling
   - codemeld run prints only the final answer on stdout; tool-round narration goes to stderr
   - codemeld sessions list lists recorded sessions without opening the resume picker (--all for every folder, --json)
+
 - **0.4 Alpha — August 2026:** Exa-backed web search and Web fetch. System prompt improvements.
 - **0.3 Alpha — July 2026:** Stability improvements: Reduce prompts for safe commands and UI fixes.
 - **0.2 Alpha — July 2026:** Usability and stability enhancements.
