@@ -98,14 +98,16 @@ Then follow the steps below, using `./codemeld` in place of `codemeld`.
 ## First run
 
 1. **Run `codemeld` once.** It writes `~/.codemeld/global/settings.yaml`, with comments explaining each key, and exits.
-2. **Connect a provider.** For OpenAI there are two separate, separately billed options. Pick one:
-   - **ChatGPT subscription** (interactive use, no API key): `codemeld auth login openai-chatgpt`. This opens a browser sign-in, with a device-code fallback.
-   - **OpenAI Platform** (pay-as-you-go API key, for CI or servers): set `OPENAI_API_KEY`, which takes precedence over a saved key, or add `provider.openai.api_key` to the settings file.
+2. **Run it in a project:** `cd ~/code/myproject && codemeld`
+3. **Connect a provider.**
+   - **API key (OpenAI Platform, OpenRouter, or Venice):** type `/connect`, pick the provider, and paste its key. The key is hidden as you type, checked by loading the provider's models, and saved to the global settings file only if that check succeeds. `/connect openrouter` skips the picker.
+   - **ChatGPT subscription** (no API key): run `codemeld auth login openai-chatgpt` in your shell. This opens a browser sign-in, with a device-code fallback.
 
-   For OpenRouter or Venice, add `api_key` under `provider.openrouter` or `provider.venice` in the same file.
+   A ChatGPT subscription and the OpenAI Platform are separate, separately billed options.
+
+   Without the app (for CI or servers): set `OPENAI_API_KEY`, which takes precedence over a saved key, or add `api_key` under `provider.openai`, `provider.openrouter`, or `provider.venice` in the settings file.
 
    Check your setup with `codemeld auth status`. It prints no secrets; add `--json` for machine-readable output.
-3. **Run it in a project:** `cd ~/code/myproject && codemeld`
 4. **Resume a session in the same folder:** `codemeld --resume` lists resumable sessions, and `codemeld --resume <id>` opens one.
 
 > **Keep the global settings file private.** It is written with mode `0600`, but it holds plaintext provider API keys and your ChatGPT session token (there is no OS keychain support). Don't commit it, paste it into bug reports, or sync it to untrusted places.
