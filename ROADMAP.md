@@ -1,8 +1,10 @@
 # codemeld Roadmap
 
 ## Future work
-- Local models support through Ollama or similar tool
 - Jev powered permissions
+- Local models support through Ollama or similar tool
+- MCP support
+- Skills support
 - Tool tips
 
 ## Ongoing
