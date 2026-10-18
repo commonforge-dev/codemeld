@@ -15,7 +15,7 @@
 
 ## Why try it
 
-- **Your choice of provider:** ChatGPT subscription, OpenRouter, or Venice. Any other OpenAI-compatible provider can be added in config.
+- **Your choice of provider:** ChatGPT subscription, OpenRouter, or Venice.
 - **Your choice of version control:** Git, Jujutsu, and Mercurial work out of the box. Other systems are added with YAML templates.
 - **Permission modes** from read-only to auto-approved edits inside your project. See below.
 - **No phone-home:** no telemetry, analytics, crash reporter, or auto-updater.
