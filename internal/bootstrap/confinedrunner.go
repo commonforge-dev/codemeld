@@ -26,6 +26,7 @@ type confinement struct {
 	mode        func() string
 	home        string
 	projectRoot string
+	writeRoots  []string
 	blocked     *permissions.BlockedPaths
 	lookupPath  string
 	lookupSet   bool
@@ -174,6 +175,11 @@ func (c *confinement) policy(current, tmpDir, authority string) (enforce.Policy,
 			continue
 		}
 		p.WriteRoots = append(p.WriteRoots, target)
+	}
+	for _, folder := range c.writeRoots {
+		if !slices.Contains(p.WriteRoots, folder) {
+			p.WriteRoots = append(p.WriteRoots, folder)
+		}
 	}
 	p.TmpDir = tmpDir
 	if authority == enforce.NetworkAccessAuthority {

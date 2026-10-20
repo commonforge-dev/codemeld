@@ -8,9 +8,11 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/ssestream"
@@ -218,8 +220,9 @@ func TestRun_ChildHistoryHoldsOnlyItsOwnConversation(t *testing.T) {
 	if len(first) != 2 {
 		t.Fatalf("initial round sent %d messages, want the system prompt and the instruction only: %+v", len(first), first)
 	}
-	if first[1].Role != "user" || first[1].Content != childInstruction {
-		t.Fatalf("the instruction is not the child's sole user message: %+v", first[1])
+	want := childInstruction + "\n\nIf an operation you attempt is refused, your final reply must name each refused operation and say what you could not do or verify because of it."
+	if first[1].Role != "user" || first[1].Content != want {
+		t.Fatalf("the child's sole user message = %+v, want the instruction followed by the refusal-impact sentence", first[1])
 	}
 
 	second := client.requests[1].Messages
@@ -1021,5 +1024,135 @@ func TestRun_NilActivitySinkIsAccepted(t *testing.T) {
 	}
 	if res.Reason != ReasonCompleted {
 		t.Fatalf("Reason = %q, want %q", res.Reason, ReasonCompleted)
+	}
+}
+
+func toolCallsChunk(calls ...turn.AssembledToolCall) []byte {
+	var parts []string
+	for i, call := range calls {
+		parts = append(parts, fmt.Sprintf(`{"index":%d,"id":%q,"type":"function","function":{"name":%q,"arguments":%q}}`, i, call.ID, call.Name, call.Arguments))
+	}
+	return []byte(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[` +
+		strings.Join(parts, ",") + `]},"finish_reason":"tool_calls"}]}`)
+}
+
+func denied(deniedBy, reason string) turn.ToolResult {
+	return turn.ToolResult{Content: fmt.Sprintf(`{"denied_by":%q,"reason":%q}`, deniedBy, reason), Denied: true}
+}
+
+func refusalLines(refusals []Refusal) []string {
+	var lines []string
+	for _, r := range refusals {
+		lines = append(lines, r.Line())
+	}
+	return lines
+}
+
+func TestRun_RecordsEachDistinctRefusalInModelCallOrder(t *testing.T) {
+	client := &scriptedClient{rounds: []func(context.Context) (provider.Response, error){
+		streamRound(toolCallsChunk(
+			turn.AssembledToolCall{ID: "c1", Name: "read", Arguments: `{"path":"../secret.txt"}`},
+			turn.AssembledToolCall{ID: "c2", Name: "grep", Arguments: `{"pattern":"TODO","path":"a"}`},
+			turn.AssembledToolCall{ID: "c3", Name: "grep", Arguments: `{"pattern":"TODO","path":"b"}`},
+			turn.AssembledToolCall{ID: "c4", Name: "move", Arguments: `{"source":"x.txt","destination":"y.txt"}`},
+			turn.AssembledToolCall{ID: "c5", Name: "delete", Arguments: `{"path":"old.txt"}`},
+			turn.AssembledToolCall{ID: "c6", Name: "read", Arguments: `{"path":"../secret.txt"}`},
+			turn.AssembledToolCall{ID: "c7", Name: "read", Arguments: `{"path": "../secret.txt"}`},
+			turn.AssembledToolCall{ID: "c8", Name: "read", Arguments: `{"path":"ok.txt"}`},
+			turn.AssembledToolCall{ID: "c9", Name: "vcs_status", Arguments: `{}`},
+		)),
+		streamRound(contentChunk("all done"), finishChunk()),
+	}}
+	disp := &stubDispatcher{byID: map[string]turn.ToolResult{
+		"c1": denied("guard", "blocked path"),
+		"c2": denied("unattended", "needs approval"),
+		"c3": denied("unattended", "needs approval"),
+		"c4": denied("unattended", "outside the declared scope"),
+		"c5": denied("mode", "plan mode"),
+		"c6": denied("unattended", "a different reason"),
+		"c7": denied("unattended", "spaced arguments"),
+		"c9": denied("unattended", "no approver"),
+	}}
+
+	res, err := Run(t.Context(), baseRequest(client, disp))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Reason != ReasonCompleted || res.Reply != "all done" {
+		t.Fatalf("reason = %q reply = %q, want a completed child whose reply mentions no refusal", res.Reason, res.Reply)
+	}
+	want := []string{
+		"Read ../secret.txt (denied_by guard): blocked path",
+		"Grep TODO in a (denied_by unattended): needs approval",
+		"Grep TODO in b (denied_by unattended): needs approval",
+		"Move x.txt -> y.txt (denied_by unattended): outside the declared scope",
+		"delete old.txt (denied_by mode): plan mode",
+		"Read ../secret.txt (denied_by unattended): spaced arguments",
+		"vcs_status (denied_by unattended): no approver",
+	}
+	if got := refusalLines(res.Refusals); !slices.Equal(got, want) || res.RefusalTotal != len(want) {
+		t.Fatalf("refusals = %q (total %d), want %q", got, res.RefusalTotal, want)
+	}
+}
+
+func TestRun_UnclassifiableRefusalStaysUnknown(t *testing.T) {
+	client := &scriptedClient{rounds: []func(context.Context) (provider.Response, error){
+		streamRound(toolCallChunkArgs("c1", "read_image", `{"path":"pic.png"}`)),
+	}}
+	disp := &stubDispatcher{byID: map[string]turn.ToolResult{
+		"c1": {Content: `{"denied_by":"admin","reason":"raw tool output"}`, Denied: true},
+	}}
+
+	res, err := Run(t.Context(), baseRequest(client, disp))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := refusalLines(res.Refusals); !slices.Equal(got, []string{"read_image pic.png (denied_by unknown)"}) {
+		t.Fatalf("refusals = %q, want the operation with an unknown classification and no envelope text", got)
+	}
+}
+
+func TestRun_ListsTwentyRefusalsAndCountsTheRest(t *testing.T) {
+	var calls []turn.AssembledToolCall
+	byID := map[string]turn.ToolResult{}
+	for i := range 25 {
+		id := fmt.Sprintf("c%d", i)
+		calls = append(calls, turn.AssembledToolCall{ID: id, Name: "read", Arguments: fmt.Sprintf(`{"path":"f%d.txt"}`, i)})
+		byID[id] = denied("unattended", "no approver")
+	}
+	client := &scriptedClient{rounds: []func(context.Context) (provider.Response, error){
+		streamRound(toolCallsChunk(calls...)),
+		streamRound(contentChunk("done"), finishChunk()),
+	}}
+
+	res, err := Run(t.Context(), baseRequest(client, &stubDispatcher{byID: byID}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Refusals) != 20 || res.RefusalTotal != 25 || res.Refusals[19].Operation != "Read f19.txt" {
+		t.Fatalf("refusals = %d listed of %d, last %+v; want the first 20 of 25", len(res.Refusals), res.RefusalTotal, res.Refusals[len(res.Refusals)-1])
+	}
+}
+
+func TestRun_ChildWithNoRefusalsReportsNone(t *testing.T) {
+	client := &scriptedClient{rounds: []func(context.Context) (provider.Response, error){
+		streamRound(toolCallChunk("c1", "read")),
+		streamRound(contentChunk("done"), finishChunk()),
+	}}
+
+	res, err := Run(t.Context(), baseRequest(client, &stubDispatcher{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Refusals != nil || res.RefusalTotal != 0 {
+		t.Fatalf("refusals = %+v (total %d), want none", res.Refusals, res.RefusalTotal)
+	}
+}
+
+func TestRefusalLine_CutsAtARuneBoundaryWithin512Bytes(t *testing.T) {
+	r := Refusal{Operation: "Read " + strings.Repeat("é", 400), DeniedBy: "guard", Reason: "blocked"}
+	line := r.Line()
+	if len(line) > 512 || len(line) < 510 || !utf8.ValidString(line) {
+		t.Fatalf("line is %d bytes, valid UTF-8 %v; want a rune-safe cut at 512 bytes", len(line), utf8.ValidString(line))
 	}
 }

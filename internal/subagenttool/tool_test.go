@@ -300,6 +300,12 @@ func declareArgs(instruction string, write, remove []string) map[string]any {
 	return args
 }
 
+func mkdirDeclareArgs(instruction string, write []string, dirs ...any) map[string]any {
+	args := declareArgs(instruction, write, nil)
+	args[filesMkdirArg] = append([]any{}, dirs...)
+	return args
+}
+
 func anyList(paths []string) []any {
 	list := make([]any, 0, len(paths))
 	for _, p := range paths {
@@ -336,11 +342,41 @@ func TestDelegate_AdvertiseMetadata(t *testing.T) {
 	}
 	required, ok := md.Parameters["required"].([]string)
 	if !ok || !reflect.DeepEqual(required, []string{"instructions"}) {
-		t.Fatalf("Parameters.required = %v, want [instructions] — files, files_delete and files_move are each optional", md.Parameters["required"])
+		t.Fatalf("Parameters.required = %v, want [instructions] — files, files_delete, files_move and files_mkdir are each optional", md.Parameters["required"])
 	}
 	props, ok := md.Parameters["properties"].(map[string]any)
-	if !ok || len(props) != 4 {
-		t.Fatalf("Parameters.properties = %v, want exactly instructions, files, files_delete and files_move", md.Parameters["properties"])
+	if !ok || len(props) != 5 {
+		t.Fatalf("Parameters.properties = %v, want exactly instructions, files, files_delete, files_move and files_mkdir", md.Parameters["properties"])
+	}
+	for name := range props {
+		if _, accepted := allowedArgs[name]; !accepted {
+			t.Fatalf("advertised property %q is not an accepted argument", name)
+		}
+	}
+	if len(allowedArgs) != len(props) {
+		t.Fatalf("accepted arguments %v differ from the advertised properties %v", allowedArgs, props)
+	}
+	rule := "At least one of files, files_delete, files_move, or files_mkdir must name a path"
+	if !strings.Contains(md.Description, rule) {
+		t.Fatalf("Description = %q, want it to state the four-form rule %q", md.Description, rule)
+	}
+	if !strings.Contains(md.Description, "create only the exact directories listed in files_mkdir, which grant nothing inside them") {
+		t.Fatalf("Description = %q, want it to state that files_mkdir grants exact directory creation only", md.Description)
+	}
+	for name, others := range map[string]string{
+		"files":        "files_delete, files_move, or files_mkdir",
+		"files_delete": "files, files_move, or files_mkdir",
+		"files_move":   "files, files_delete, or files_mkdir",
+		"files_mkdir":  "files, files_delete, or files_move",
+	} {
+		form, _ := props[name].(map[string]any)
+		if desc, _ := form["description"].(string); !strings.Contains(desc, "Optional when "+others+" names a path.") {
+			t.Fatalf("%s description = %q, want it optional when %s names a path", name, desc, others)
+		}
+	}
+	mkdirs, _ := props["files_mkdir"].(map[string]any)
+	if desc, _ := mkdirs["description"].(string); !strings.Contains(desc, "A listed directory authorizes nothing inside it") {
+		t.Fatalf("files_mkdir description = %q, want it to say a listed directory grants nothing inside it", desc)
 	}
 	moves, ok := props["files_move"].(map[string]any)
 	if !ok || moves["type"] != "array" {
@@ -354,7 +390,7 @@ func TestDelegate_AdvertiseMetadata(t *testing.T) {
 	if !ok || instructions["type"] != "string" {
 		t.Fatalf("instructions property = %v, want a string", props["instructions"])
 	}
-	for _, name := range []string{"files", "files_delete"} {
+	for _, name := range []string{"files", "files_delete", "files_mkdir"} {
 		list, ok := props[name].(map[string]any)
 		if !ok || list["type"] != "array" {
 			t.Fatalf("%s property = %v, want an array", name, props[name])
@@ -396,7 +432,80 @@ func TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
 			args := callArgs("do it", "a.txt")
 			args["model"] = "sonnet"
 			return args
-		}, want: `unexpected argument "model"`},
+		}, want: `unexpected argument "model"; only instructions, files, files_delete, files_move and files_mkdir are accepted`},
+		{name: "files_mkdir not an array", args: func(string) map[string]any {
+			args := callArgs("do it", "a.txt")
+			args[filesMkdirArg] = "made"
+			return args
+		}, want: `argument "files_mkdir" must be an array of strings`},
+		{name: "non-string files_mkdir entry", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "made", 3)
+		}, want: `argument "files_mkdir"[1] must be a string`},
+		{name: "empty files_mkdir entry", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "")
+		}, want: `argument "files_mkdir"[0] must not be empty`},
+		{name: "whitespace-only files_mkdir entry", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "made", " \t")
+		}, want: `argument "files_mkdir"[1] must not be empty`},
+		{name: "~user files_mkdir entry", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "~root/made")
+		}, want: "unsupported ~user path form"},
+		{name: "files_mkdir naming the project root as .", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, ".")
+		}, want: "not inside the project below its root"},
+		{name: "files_mkdir naming the absolute project root", args: func(root string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, root+"/")
+		}, want: "not inside the project below its root"},
+		{name: "files_mkdir naming the project root through traversal", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "made/..")
+		}, want: "not inside the project below its root"},
+		{
+			name: "files_mkdir naming the project root through a symlink alias",
+			seed: func(t *testing.T, root string) {
+				if err := os.Symlink(root, filepath.Join(root, "self")); err != nil {
+					t.Fatalf("seed symlink: %v", err)
+				}
+			},
+			args: func(string) map[string]any { return mkdirDeclareArgs("do it", []string{"a.txt"}, "self") },
+			want: "not inside the project below its root",
+		},
+		{name: "relative files_mkdir entry outside the project", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "../escape")
+		}, want: "not inside the project below its root"},
+		{name: "absolute files_mkdir entry outside the project", args: func(root string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, filepath.Join(filepath.Dir(root), "escape"))
+		}, want: "not inside the project below its root"},
+		{name: "home-relative files_mkdir entry outside the project", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{"a.txt"}, "~/made")
+		}, want: "not inside the project below its root"},
+		{
+			name: "files_mkdir entry escaping through an in-project symlink",
+			seed: func(t *testing.T, root string) {
+				if err := os.Symlink(t.TempDir(), filepath.Join(root, "outlink")); err != nil {
+					t.Fatalf("seed symlink: %v", err)
+				}
+			},
+			args: func(string) map[string]any { return mkdirDeclareArgs("do it", []string{"a.txt"}, "outlink/made") },
+			want: "not inside the project below its root",
+		},
+		{
+			name: "unresolvable files_mkdir entry",
+			seed: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "blocker"), []byte("x"), 0o644); err != nil {
+					t.Fatalf("seed blocker: %v", err)
+				}
+			},
+			args: func(string) map[string]any { return mkdirDeclareArgs("do it", []string{"a.txt"}, "blocker/made") },
+			want: "an existing path component is not a directory",
+		},
+		{name: "an escaping files_mkdir entry refuses valid files and files_delete lists with it", args: func(string) map[string]any {
+			args := mkdirDeclareArgs("do it", []string{"a.txt"}, "made", "../escape")
+			args[filesDeleteArg] = []any{"b.txt"}
+			return args
+		}, want: `argument "files_mkdir"[1]`},
+		{name: "no path in any of the four forms", args: func(string) map[string]any {
+			return mkdirDeclareArgs("do it", []string{})
+		}, want: `arguments "files", "files_delete", "files_move" and "files_mkdir" must name at least one path between them`},
 		{name: "missing both path lists", args: func(string) map[string]any {
 			return map[string]any{instructionsArg: "do it"}
 		}, want: "at least one path"},
@@ -494,7 +603,7 @@ func TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
 func TestDelegate_PrepareCanonicalizesWithoutStartingAChild(t *testing.T) {
 	h := newHarness(t)
 
-	instruction, declared, remove, _, targets, err := h.tool().PrepareDelegate(callArgs("do it", "a.txt", "dir/sub/b.txt"))
+	instruction, declared, remove, _, _, targets, err := h.tool().PrepareDelegate(callArgs("do it", "a.txt", "dir/sub/b.txt"))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
@@ -530,11 +639,11 @@ func TestDelegate_PrepareCanonicalizesWithoutStartingAChild(t *testing.T) {
 func TestDelegate_PrepareSharesTheMissingParentOfDisjointLeaves(t *testing.T) {
 	h := newHarness(t)
 
-	_, declaredA, _, _, targetsA, err := h.tool().PrepareDelegate(callArgs("first", "shared/a.txt"))
+	_, declaredA, _, _, _, targetsA, err := h.tool().PrepareDelegate(callArgs("first", "shared/a.txt"))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
-	_, declaredB, _, _, targetsB, err := h.tool().PrepareDelegate(callArgs("second", "shared/b.txt"))
+	_, declaredB, _, _, _, targetsB, err := h.tool().PrepareDelegate(callArgs("second", "shared/b.txt"))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
@@ -550,7 +659,7 @@ func TestDelegate_PrepareSharesTheMissingParentOfDisjointLeaves(t *testing.T) {
 	if err := os.MkdirAll(shared, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	_, _, _, _, targetsExisting, err := h.tool().PrepareDelegate(callArgs("third", "shared/c.txt"))
+	_, _, _, _, _, targetsExisting, err := h.tool().PrepareDelegate(callArgs("third", "shared/c.txt"))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
@@ -562,7 +671,7 @@ func TestDelegate_PrepareSharesTheMissingParentOfDisjointLeaves(t *testing.T) {
 func TestDelegate_PreparedTargetsAreNotSharedBetweenCalls(t *testing.T) {
 	h := newHarness(t)
 
-	_, _, _, _, first, err := h.tool().PrepareDelegate(callArgs("do it", "dir/sub/b.txt"))
+	_, _, _, _, _, first, err := h.tool().PrepareDelegate(callArgs("do it", "dir/sub/b.txt"))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
@@ -570,7 +679,7 @@ func TestDelegate_PreparedTargetsAreNotSharedBetweenCalls(t *testing.T) {
 	for i := range first {
 		first[i] = filepath.Join(h.dir, "elsewhere.txt")
 	}
-	_, _, _, _, second, err := h.tool().PrepareDelegate(callArgs("do it", "dir/sub/b.txt"))
+	_, _, _, _, _, second, err := h.tool().PrepareDelegate(callArgs("do it", "dir/sub/b.txt"))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
@@ -582,7 +691,7 @@ func TestDelegate_PreparedTargetsAreNotSharedBetweenCalls(t *testing.T) {
 func TestDelegate_PreparationRefusalCarriesTheInBandCorrective(t *testing.T) {
 	h := newHarness(t)
 
-	_, _, _, _, _, err := h.tool().PrepareDelegate(callArgs("do it"))
+	_, _, _, _, _, _, err := h.tool().PrepareDelegate(callArgs("do it"))
 	var refusal *PreparationError
 	if !errors.As(err, &refusal) {
 		t.Fatalf("PrepareDelegate error = %v, want a *PreparationError", err)
@@ -609,7 +718,7 @@ func TestDelegate_InvokeFromAPreparedDeclarationSkipsTheRawArguments(t *testing.
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 	prepared := map[string]bool{filepath.Join(h.dir, "a.txt"): true}
 
-	res, err := h.tool().InvokeWithPreparedDelegate(t.Context(), "narrow the fix", prepared, nil, nil)
+	res, err := h.tool().InvokeWithPreparedDelegate(t.Context(), "narrow the fix", prepared, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("InvokeWithPreparedDelegate error = %v, want nil", err)
 	}
@@ -624,7 +733,7 @@ func TestDelegate_InvokeFromAPreparedDeclarationSkipsTheRawArguments(t *testing.
 		t.Fatalf("child ceiling = %+v, want the prepared declaration %v marked as a child", mc, prepared)
 	}
 	msgs := h.client.requests[0].Messages
-	if msgs[len(msgs)-1].Content != "narrow the fix" {
+	if msgs[len(msgs)-1].Content != "narrow the fix"+subagent.InstructionSuffix {
 		t.Fatalf("child instruction = %q, want the prepared instruction", msgs[len(msgs)-1].Content)
 	}
 }
@@ -647,8 +756,8 @@ func TestDelegate_InstructionReachesTheChildByteIdentical(t *testing.T) {
 	if len(msgs) != 2 || msgs[1].Role != "user" {
 		t.Fatalf("child's first round = %+v, want a system prompt and one user message", msgs)
 	}
-	if msgs[1].Content != instruction {
-		t.Fatalf("child instruction = %q, want the tool argument byte for byte %q", msgs[1].Content, instruction)
+	if msgs[1].Content != instruction+subagent.InstructionSuffix {
+		t.Fatalf("child instruction = %q, want the tool argument byte for byte %q followed by the fixed suffix", msgs[1].Content, instruction)
 	}
 }
 
@@ -1162,6 +1271,7 @@ type writingDispatcher struct {
 	create   *filetools.CreateTool
 	remove   *filetools.DeleteTool
 	move     *filetools.MoveTool
+	mkdir    *filetools.MkdirTool
 	onCall   func()
 	onSeeCtx func(context.Context)
 }
@@ -1199,6 +1309,8 @@ func (d *writingDispatcher) Dispatch(ctx context.Context, call turn.AssembledToo
 		}
 		written = ""
 		moved = turn.MoveTarget{Source: source, Destination: destination}
+	case filetools.MkdirToolName:
+		invoke, written = d.mkdir.InvokeWithResolvedTarget, ""
 	}
 	res, err := invoke(ctx, args, target)
 	if err != nil {
@@ -1380,7 +1492,7 @@ func TestDelegate_PrepareAcceptsEveryDeleteDeclarationForm(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, write, remove, _, targets, err := h.tool().PrepareDelegate(declareArgs("do it", nil, []string{tc.remove}))
+			_, write, remove, _, _, targets, err := h.tool().PrepareDelegate(declareArgs("do it", nil, []string{tc.remove}))
 			if err != nil {
 				t.Fatalf("PrepareDelegate error = %v, want a delete-only declaration accepted", err)
 			}
@@ -1413,7 +1525,7 @@ func TestDelegate_OmittedAndSuppliedEmptyListsStayDistinct(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, write, remove, _, _, err := newHarness(t).tool().PrepareDelegate(tc.args)
+			_, write, remove, _, _, _, err := newHarness(t).tool().PrepareDelegate(tc.args)
 			if err != nil {
 				t.Fatalf("PrepareDelegate error = %v, want nil", err)
 			}
@@ -1427,7 +1539,7 @@ func TestDelegate_OmittedAndSuppliedEmptyListsStayDistinct(t *testing.T) {
 func TestDelegate_SchedulerTargetsCoverTheWriteAndDeleteUnionOnce(t *testing.T) {
 	h := newHarness(t)
 
-	_, _, _, _, targets, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"both.txt", "dir/new.txt"}, []string{"both.txt", "gone.txt"}))
+	_, _, _, _, _, targets, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"both.txt", "dir/new.txt"}, []string{"both.txt", "gone.txt"}))
 	if err != nil {
 		t.Fatalf("PrepareDelegate error = %v, want nil", err)
 	}
@@ -1670,6 +1782,45 @@ func TestRender_NamesRestoredAndRetainedOutcomes(t *testing.T) {
 	}
 	if strings.Contains(out, "its changes were undone") {
 		t.Fatalf("result = %q, want an unrecovered outcome not to claim a rollback", out)
+	}
+}
+
+func TestRender_ListsRefusedOperationsWhateverTheReplySays(t *testing.T) {
+	refusalHeader := "refused operations: targets are shown as the child gave them, not as resolved paths; " +
+		"a refusal grants nothing, so retry one only through ordinary authorization, and a guard refusal cannot be approved\n"
+	completed := render(subagent.Result{
+		Reason:           subagent.ReasonCompleted,
+		ProviderRequests: 2,
+		Reply:            "all done",
+		Refusals: []subagent.Refusal{
+			{Operation: "Read ../secret.txt", DeniedBy: "guard", Reason: "blocked path"},
+			{Operation: "read_image pic.png", DeniedBy: "unknown"},
+		},
+		RefusalTotal: 5,
+	})
+	want := "child agent completed after 2 provider request(s)\nall done\n" + refusalHeader +
+		"  Read ../secret.txt (denied_by guard): blocked path\n  read_image pic.png (denied_by unknown)\n  and 3 more\n"
+	if got := string(completed.Stdout); got != want || completed.ExitCode != 0 {
+		t.Fatalf("result = %q (exit %d), want %q with exit 0", got, completed.ExitCode, want)
+	}
+
+	failed := render(subagent.Result{
+		Reason:           subagent.ReasonFailed,
+		ProviderRequests: 1,
+		Refusals:         []subagent.Refusal{{Operation: "Edit other.txt", DeniedBy: "unattended", Reason: "outside the declared scope"}},
+		RefusalTotal:     1,
+		RestoredPaths:    []string{"/repo/a.txt"},
+	})
+	want = "child agent failed after 1 provider request(s)\n" + refusalHeader +
+		"  Edit other.txt (denied_by unattended): outside the declared scope\n" +
+		"the child agent did not complete, so its changes were undone; restored:\n  /repo/a.txt\n"
+	if got := string(failed.Stdout); got != want || failed.ExitCode != 1 {
+		t.Fatalf("result = %q (exit %d), want %q with exit 1", got, failed.ExitCode, want)
+	}
+
+	none := render(subagent.Result{Reason: subagent.ReasonCompleted, ProviderRequests: 1, Reply: "done"})
+	if got := string(none.Stdout); got != "child agent completed after 1 provider request(s)\ndone\n" {
+		t.Fatalf("result = %q, want no refused operations section", got)
 	}
 }
 
@@ -2289,7 +2440,7 @@ func TestDelegate_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *test
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, _, moves, targets, err := h.tool().PrepareDelegate(moveDeclareArgs("do it", nil, tc.pair))
+			_, _, _, moves, _, targets, err := h.tool().PrepareDelegate(moveDeclareArgs("do it", nil, tc.pair))
 			if err != nil {
 				t.Fatalf("PrepareDelegate error = %v, want a move-only declaration accepted", err)
 			}
@@ -2302,11 +2453,11 @@ func TestDelegate_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *test
 		})
 	}
 
-	_, _, _, omitted, _, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"a.txt"}, nil))
+	_, _, _, omitted, _, _, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"a.txt"}, nil))
 	if err != nil || omitted != nil {
 		t.Fatalf("omitted files_move = %#v (err=%v), want nil", omitted, err)
 	}
-	_, _, _, empty, _, err := h.tool().PrepareDelegate(moveDeclareArgs("do it", []string{"a.txt"}))
+	_, _, _, empty, _, _, err := h.tool().PrepareDelegate(moveDeclareArgs("do it", []string{"a.txt"}))
 	if err != nil || empty == nil || len(empty) != 0 {
 		t.Fatalf("supplied empty files_move = %#v (err=%v), want a non-nil empty set", empty, err)
 	}
@@ -2498,5 +2649,280 @@ func TestDelegate_UndoesTheMovesOfAChildThatDidNotComplete(t *testing.T) {
 	}
 	if left := journalsLeft(t, h.deps.Home); len(left) != 0 {
 		t.Fatalf("journal storage left behind: %v", left)
+	}
+}
+
+func TestDelegate_PrepareResolvesEveryDirectorySpellingToItsCanonicalTarget(t *testing.T) {
+	h := newHarness(t)
+	home := filepath.Join(h.dir, "home")
+	for _, dir := range []string{home, filepath.Join(h.dir, "work")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(h.dir, "work"), filepath.Join(h.dir, "worklink")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	h.deps.Home = home
+	made := filepath.Join(h.dir, "made", "sub")
+
+	tests := []struct {
+		name, spelling, want string
+	}{
+		{"relative", "made/sub", made},
+		{"normalized with a trailing separator", "./made/./sub/", made},
+		{"traversal", "work/../made/sub", made},
+		{"absolute", made, made},
+		{"in-project symlink alias", "worklink/sub", filepath.Join(h.dir, "work", "sub")},
+		{"home-relative", "~/made", filepath.Join(home, "made")},
+		{"home itself", "~", home},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, _, dirs, targets, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}, tc.spelling))
+			if err != nil {
+				t.Fatalf("PrepareDelegate error = %v, want the directory accepted", err)
+			}
+			if want := map[string]bool{tc.want: true}; !reflect.DeepEqual(dirs, want) {
+				t.Fatalf("directory declaration = %v, want the canonical target %v", dirs, want)
+			}
+			if !slices.Contains(targets, tc.want) {
+				t.Fatalf("scheduler targets = %v, want the directory %s", targets, tc.want)
+			}
+		})
+	}
+
+	_, _, _, _, dirs, _, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}, "made/sub", "./made/sub/", made))
+	if err != nil || !reflect.DeepEqual(dirs, map[string]bool{made: true}) {
+		t.Fatalf("equivalent spellings = %v (err=%v), want one canonical entry %s", dirs, err, made)
+	}
+	_, _, _, _, omitted, _, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"a.txt"}, nil))
+	if err != nil || omitted != nil {
+		t.Fatalf("omitted files_mkdir = %#v (err=%v), want nil", omitted, err)
+	}
+	_, _, _, _, empty, _, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}))
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("supplied empty files_mkdir = %#v (err=%v), want a non-nil empty set", empty, err)
+	}
+	if h.snapshotted != 0 {
+		t.Fatalf("parent state snapshotted %d times, want 0 — preparation starts no child", h.snapshotted)
+	}
+}
+
+func TestDelegate_SchedulerTargetsAddTheMissingParentsOfDeclaredDirectoriesAsOrderingOnly(t *testing.T) {
+	h := newHarness(t)
+	if err := os.MkdirAll(filepath.Join(h.dir, "work"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	_, _, _, _, dirs, targets, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}, "x/y", "x/z", "work/new"))
+	if err != nil {
+		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+	}
+	want := []string{filepath.Join(h.dir, "a.txt"), filepath.Join(h.dir, "work", "new"), filepath.Join(h.dir, "x"), filepath.Join(h.dir, "x", "y"), filepath.Join(h.dir, "x", "z")}
+	if !slices.Equal(targets, want) {
+		t.Fatalf("scheduler targets = %v, want %v", targets, want)
+	}
+	if dirs[filepath.Join(h.dir, "x")] {
+		t.Fatalf("directory declaration = %v, want the shared missing parent kept out of the ceiling", dirs)
+	}
+}
+
+func TestDelegate_CarriesTheDirectoryDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
+	h := newHarness(t,
+		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files":["report.txt"],"files_mkdir":["made"]}`)),
+		streamRound(contentChunk("done"), finishChunk()),
+	)
+
+	if _, err := h.tool().Invoke(t.Context(), mkdirDeclareArgs("do it", []string{"report.txt"}, "made")); err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	if len(h.modeCtxs) != 2 {
+		t.Fatalf("authorization contexts built = %d, want the child's own and the nested call's", len(h.modeCtxs))
+	}
+	want := map[string]bool{filepath.Join(h.dir, "made"): true}
+	for i, mc := range h.modeCtxs {
+		if !reflect.DeepEqual(mc.DeclaredDirs, want) {
+			t.Fatalf("authorization context %d DeclaredDirs = %v, want the child's directories %v", i, mc.DeclaredDirs, want)
+		}
+	}
+	if !reflect.DeepEqual(h.modeCtxs[1].DelegateDirs, want) {
+		t.Fatalf("nested DelegateDirs = %v, want the resolved nested directories %v", h.modeCtxs[1].DelegateDirs, want)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		args    map[string]any
+		wantNil bool
+	}{
+		{"omitted", declareArgs("do it", []string{"report.txt"}, nil), true},
+		{"supplied empty", mkdirDeclareArgs("do it", []string{"report.txt"}), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
+			if _, err := h.tool().Invoke(t.Context(), tc.args); err != nil {
+				t.Fatalf("Invoke error = %v, want nil", err)
+			}
+			if got := h.modeCtxs[0].DeclaredDirs; (got == nil) != tc.wantNil || len(got) != 0 {
+				t.Fatalf("child DeclaredDirs = %#v, want nil=%v and empty", got, tc.wantNil)
+			}
+		})
+	}
+}
+
+func TestDelegate_KeepsTheDeclaredDirectoryOfACompletedChild(t *testing.T) {
+	h := newHarness(t)
+	target := filepath.Join(h.dir, "made", "sub")
+	h.client.rounds = []func() (provider.Response, error){
+		streamRound(toolCallChunkWithArgs("call_1", filetools.MkdirToolName, fmt.Sprintf(`{"path":%q}`, target))),
+		streamRound(contentChunk("made it"), finishChunk()),
+	}
+	h.override = func(permissions.ModeContext) turn.ToolDispatcher {
+		return &writingDispatcher{mkdir: filetools.NewMkdirTool(h.deps.Home, h.dir, h.dir)}
+	}
+
+	res, err := h.tool().Invoke(t.Context(), mkdirDeclareArgs("make it", []string{"report.txt"}, "made/sub"))
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("Invoke = exit %d, err %v; stdout=%q stderr=%q, want a clean completion", res.ExitCode, err, res.Stdout, res.Stderr)
+	}
+	if info, serr := os.Stat(target); serr != nil || !info.IsDir() {
+		t.Fatalf("%s = %v (err=%v), want the child's directory kept", target, info, serr)
+	}
+	if left := journalsLeft(t, h.deps.Home); len(left) != 0 {
+		t.Fatalf("journal storage left behind: %v", left)
+	}
+}
+
+func TestDelegate_UndoesTheDeclaredDirectoryOfAChildThatDidNotComplete(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	h := newHarness(t)
+	target := filepath.Join(h.dir, "made", "sub")
+	h.client.rounds = []func() (provider.Response, error){
+		streamRound(toolCallChunkWithArgs("call_1", filetools.MkdirToolName, fmt.Sprintf(`{"path":%q}`, target))),
+		streamRound(contentChunk("never reached"), finishChunk()),
+	}
+	h.override = func(permissions.ModeContext) turn.ToolDispatcher {
+		return &writingDispatcher{mkdir: filetools.NewMkdirTool(h.deps.Home, h.dir, h.dir), onCall: cancel}
+	}
+
+	res, err := h.tool().Invoke(ctx, mkdirDeclareArgs("make it", []string{"report.txt"}, "made/sub"))
+	if err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0, want non-zero for a child that did not complete; stdout=%q", res.Stdout)
+	}
+	if _, serr := os.Lstat(filepath.Join(h.dir, "made")); !os.IsNotExist(serr) {
+		t.Fatalf("made still exists (err=%v), want the declared directory and its created parent removed", serr)
+	}
+	if left := journalsLeft(t, h.deps.Home); len(left) != 0 {
+		t.Fatalf("journal storage left behind: %v", left)
+	}
+}
+
+func TestDelegate_StartsADirectoryOnlyChildAndRecordsItsDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		complete bool
+	}{
+		{"completed child keeps the directory", true},
+		{"cancelled child has the directory rolled back", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			h := newHarness(t)
+			target := filepath.Join(h.dir, "made", "sub")
+			h.client.rounds = []func() (provider.Response, error){
+				streamRound(toolCallChunkWithArgs("call_1", filetools.MkdirToolName, fmt.Sprintf(`{"path":%q}`, target))),
+				streamRound(contentChunk("made it"), finishChunk()),
+			}
+			var bound filetools.WriteJournal
+			h.override = func(permissions.ModeContext) turn.ToolDispatcher {
+				d := &writingDispatcher{
+					mkdir:    filetools.NewMkdirTool(h.deps.Home, h.dir, h.dir),
+					onSeeCtx: func(ctx context.Context) { bound = filetools.WriteJournalFromContext(ctx) },
+				}
+				if !tc.complete {
+					d.onCall = cancel
+				}
+				return d
+			}
+
+			instruction, write, remove, moves, dirs, _, err := h.tool().PrepareDelegate(mkdirDeclareArgs("make it", nil, "made/sub"))
+			if err != nil {
+				t.Fatalf("PrepareDelegate error = %v, want a directory-only delegate admitted", err)
+			}
+			want := map[string]bool{target: true}
+			if !reflect.DeepEqual(dirs, want) {
+				t.Fatalf("prepared directories = %v, want %v", dirs, want)
+			}
+			res, err := h.tool().InvokeWithPreparedDelegate(ctx, instruction, write, remove, moves, dirs)
+			if err != nil {
+				t.Fatalf("Invoke error = %v, want nil", err)
+			}
+			if (res.ExitCode == 0) != tc.complete {
+				t.Fatalf("ExitCode = %d, want success only for a completed child; stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+			}
+			if !reflect.DeepEqual(h.modeCtxs[0].DeclaredDirs, want) {
+				t.Fatalf("child DeclaredDirs = %v, want %v", h.modeCtxs[0].DeclaredDirs, want)
+			}
+			if _, ok := bound.(*subagent.Journal); !ok {
+				t.Fatalf("dispatch context journal = %T, want the child's *subagent.Journal", bound)
+			}
+			_, serr := os.Lstat(filepath.Join(h.dir, "made"))
+			if tc.complete && serr != nil {
+				t.Fatalf("made = %v, want the completed child's directory kept", serr)
+			}
+			if !tc.complete && !os.IsNotExist(serr) {
+				t.Fatalf("made still exists (err=%v), want the cancelled child's directory removed", serr)
+			}
+
+			start, _, _ := h.onePair(t)
+			if !reflect.DeepEqual(start.DeclaredDirs, []string{target}) {
+				t.Errorf("start declared_dirs = %v, want [%s]", start.DeclaredDirs, target)
+			}
+			if len(start.DeclaredPaths)+len(start.DeclaredDeletePaths)+len(start.DeclaredMovePairs) != 0 {
+				t.Errorf("start carries write/delete/move authority %v / %v / %v, want none", start.DeclaredPaths, start.DeclaredDeletePaths, start.DeclaredMovePairs)
+			}
+		})
+	}
+}
+
+func TestDelegate_CarriesADirectoryOnlyDeclarationIntoANestedCall(t *testing.T) {
+	h := newHarness(t,
+		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files_mkdir":["made"]}`)),
+		streamRound(contentChunk("done"), finishChunk()),
+	)
+
+	if _, err := h.tool().Invoke(t.Context(), mkdirDeclareArgs("do it", nil, "made")); err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	if len(h.modeCtxs) != 2 {
+		t.Fatalf("authorization contexts built = %d, want the child's own and the nested call's", len(h.modeCtxs))
+	}
+	want := map[string]bool{filepath.Join(h.dir, "made"): true}
+	if !reflect.DeepEqual(h.modeCtxs[1].DeclaredDirs, want) || !reflect.DeepEqual(h.modeCtxs[1].DelegateDirs, want) {
+		t.Fatalf("nested DeclaredDirs/DelegateDirs = %v / %v, want %v for both", h.modeCtxs[1].DeclaredDirs, h.modeCtxs[1].DelegateDirs, want)
+	}
+}
+
+func TestDelegate_AnOverCapDirectoryDeclarationStartsNoChild(t *testing.T) {
+	h := newHarness(t)
+	dirs := make([]any, 33)
+	for i := range dirs {
+		dirs[i] = fmt.Sprintf("d%02d", i)
+	}
+	res, err := h.tool().Invoke(t.Context(), mkdirDeclareArgs("make them", nil, dirs...))
+	if err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	if res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "no child agent started") {
+		t.Fatalf("Invoke = exit %d stdout=%q stderr=%q, want the over-cap directory list refused", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if len(h.client.requests) != 0 {
+		t.Fatalf("provider requests = %d, want no child turn", len(h.client.requests))
 	}
 }

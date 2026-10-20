@@ -332,7 +332,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	if composed == nil {
 		composed = map[string]any{}
 	}
-	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths)
+	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths, result.Home)
 	if err != nil {
 		return fmt.Errorf("bootstrap: headless build config cache: %w", err)
 	}
@@ -820,6 +820,7 @@ type headlessAuthorizer struct {
 	childInvocationID    string
 	delegateWrite        map[string]bool
 	executionConstrained bool
+	writableFolders      []string
 	blocked              *permissions.BlockedPaths
 	localNotice          sync.Once
 
@@ -860,6 +861,7 @@ func newHeadlessAuthorizer(cache *config.Cache, activeStore func() *sessions.Sto
 		localSettingsPath:  config.LocalSettingsPath(cache.ProjectRoot()),
 		notices:            notices,
 		declaredCommands:   cache.DeclaredCommands(),
+		writableFolders:    cache.WritableFolders(),
 		seen:               map[DeniedCall]bool{},
 		refusals:           map[any]int{},
 	}
@@ -894,6 +896,7 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 	modeCtx.ChildInvocationID = a.childInvocationID
 	modeCtx.ExecutionConstrained = a.executionConstrained
 	modeCtx.SettingsBroken = a.executionConstrained && a.blocked.Current().Degraded()
+	modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, modeCtx.SettingsBroken, a.writableFolders)
 	// A prepared delegate call already carries the exact candidate its child would be built from.
 	if len(modeCtx.DelegateWrite) == 0 {
 		modeCtx.DelegateWrite = a.delegateWrite

@@ -29,7 +29,7 @@ SESSION_RE='\.codemeld/sessions/[0-9a-f]{16,}'
 # identity — and is allowed only in *_test.go, where a representative absolute path
 # is intentional.
 HOME_PATH="${HOME:-}"
-STORE_RE='/data/srht'
+STORE_RE='/data/vcs'
 
 # Scan repo-relative file paths read on stdin (resolved against the current
 # directory). Returns 1 on any finding, 0 otherwise; diagnostics go to stderr.
@@ -104,11 +104,11 @@ run_self_test() {
   fi
 
   # Project-storage path: caught in non-test files, carved out for *_test.go.
-  printf 'package x\nconst root = "/data/srht/codemeld/main"\n' > internal/cfg.go
+  printf 'package x\nconst root = "/data/vcs/codemeld/main"\n' > internal/cfg.go
   if printf 'internal/cfg.go\n' | scan_secrets 2>/dev/null; then
     echo "self-test FAIL: a project-storage path in a non-test file must be caught" >&2; fails=1
   fi
-  printf 'package x\nconst root = "/data/srht/codemeld/main"\n' > internal/cfg_test.go
+  printf 'package x\nconst root = "/data/vcs/codemeld/main"\n' > internal/cfg_test.go
   if ! printf 'internal/cfg_test.go\n' | scan_secrets; then
     echo "self-test FAIL: a project-storage path in a *_test.go fixture must pass" >&2; fails=1
   fi

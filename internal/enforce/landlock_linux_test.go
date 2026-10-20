@@ -308,6 +308,66 @@ func TestLandlockRules(t *testing.T) {
 			policy: autoPolicy([]string{"/home/v/d"}, nil),
 			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:RWf"},
 		},
+		{
+			name:   "write root inside another write root",
+			extra:  []string{"/home/v/p/sub/"},
+			policy: autoPolicy([]string{"/home/v/p/sub", "/home/v/p"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/home/v/p:RW"},
+		},
+		{
+			name:   "write root inside the temp folder",
+			extra:  []string{"/tmp/d/"},
+			policy: autoPolicy([]string{"/tmp/d"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N"},
+		},
+		{
+			name:   "regular-file write root inside another write root",
+			extra:  []string{"/home/v/p/f"},
+			policy: autoPolicy([]string{"/home/v/p/f", "/home/v/p"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/home/v/p:RW"},
+		},
+		{
+			name:   "duplicate write roots",
+			extra:  []string{"/home/v/p/"},
+			policy: autoPolicy([]string{"/home/v/p", "/tmp", "/home/v/p"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/home/v/p:RW"},
+		},
+		{
+			name:   "sibling write roots sharing a name prefix",
+			extra:  []string{"/home/v/p/", "/home/v/pq/"},
+			policy: autoPolicy([]string{"/home/v/pq", "/home/v/p"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/home/v/pq:RW", "/home/v/p:RW"},
+		},
+		{
+			name:   "nested write root now a symlink to an outside folder",
+			extra:  []string{"/home/v/p/sub -> /etc"},
+			policy: autoPolicy([]string{"/home/v/p", "/home/v/p/sub"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/home/v/p:RW"},
+		},
+		{
+			name:   "write root in the temp folder now a symlink to an outside folder",
+			extra:  []string{"/tmp/d -> /home/v"},
+			policy: autoPolicy([]string{"/tmp/d"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N"},
+		},
+		{
+			name:   "write root beneath /dev/shm with an outer root above /dev/shm",
+			extra:  []string{"/dev/shm/x/"},
+			policy: autoPolicy([]string{"/dev", "/dev/shm/x"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:RWf", "/dev/shm/x:RW"},
+		},
+		{
+			name:   "write root beneath /dev/shm with /dev/shm as a write root",
+			extra:  []string{"/dev/shm/x/"},
+			policy: autoPolicy([]string{"/dev/shm", "/dev/shm/x"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/dev/shm/x:RW"},
+		},
+		{
+			name:   "write root nested strictly beneath /dev/shm",
+			extra:  []string{"/dev/shm/x/y/"},
+			policy: autoPolicy([]string{"/dev/shm/x/y", "/dev/shm/x"}, nil),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/dev/shm/x:RW"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -329,6 +389,96 @@ func TestLandlockRules(t *testing.T) {
 				if c.policy.Mode == ModePlan && r.Access&^allowed != 0 {
 					t.Errorf("plan rule %s carries %v", r.Path, r.Access)
 				}
+			}
+		})
+	}
+}
+
+func TestLandlockRulesOuterWriteRoot(t *testing.T) {
+	cases := []struct {
+		name       string
+		extra      []string
+		blocked    []string
+		noWrite    []string
+		root       string
+		wantWrites []string
+	}{
+		{
+			name:       "plain write root",
+			root:       "/tmp",
+			wantWrites: []string{"/s/private:RW", "/tmp:RW"},
+		},
+		{
+			name:       "blocked path inside the write root",
+			extra:      []string{"/tmp/keep/", "/tmp/secret"},
+			blocked:    []string{"/tmp/secret"},
+			root:       "/tmp",
+			wantWrites: []string{"/s/private:RW", "/tmp/keep:RW"},
+		},
+		{
+			name:       "project .codemeld under the write root",
+			extra:      []string{"/tmp/p/.codemeld/", "/tmp/p/a.go"},
+			noWrite:    []string{"/tmp/p/.codemeld"},
+			root:       "/tmp",
+			wantWrites: []string{"/s/private:RW", "/tmp/p/a.go:RWf"},
+		},
+		{
+			name:       "write root equal to /dev/shm",
+			root:       "/dev/shm",
+			wantWrites: []string{"/s/private:RW"},
+		},
+		{
+			name:       "write root above /dev/shm",
+			root:       "/dev",
+			wantWrites: []string{"/dev/null:RWf", "/s/private:RW"},
+		},
+		{
+			name:       "write root inside the fixed floor",
+			extra:      []string{"/home/u/.codemeld/t/"},
+			root:       "/home/u/.codemeld/t",
+			wantWrites: []string{"/s/private:RW"},
+		},
+		{
+			name:       "home under the write root",
+			extra:      []string{"/tmp/h/.codemeld/", "/tmp/h/notes", "/tmp/h/work/", "/tmp/other/"},
+			blocked:    []string{"/tmp/h/.codemeld"},
+			root:       "/tmp",
+			wantWrites: []string{"/s/private:RW", "/tmp/h/notes:RWf", "/tmp/h/work:RW", "/tmp/other:RW"},
+		},
+	}
+	writes := func(rules []pathRule) []string {
+		var out []pathRule
+		for _, r := range rules {
+			if r.Access&(llsys.AccessFSMakeReg|llsys.AccessFSTruncate) != 0 {
+				out = append(out, r)
+			}
+		}
+		labels := ruleLabels(out)
+		sort.Strings(labels)
+		return labels
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tree := append(append([]string{}, baseTree...), "/s/private/")
+			blocked := append([]string{floor}, c.blocked...)
+			declared := Policy{Mode: ModeAutoEdits, BlockedPaths: blocked, NoWritePaths: c.noWrite, TmpDir: "/s/private", WriteRoots: []string{c.root}}
+			asTmp := Policy{Mode: ModeAutoEdits, BlockedPaths: blocked, NoWritePaths: c.noWrite, TmpDir: c.root, WriteRoots: []string{"/s/private"}}
+			got, err := landlockRules(declared, newFakeFS(append(tree, c.extra...)...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := landlockRules(asTmp, newFakeFS(append(tree, c.extra...)...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotLabels, wantLabels := ruleLabels(got), ruleLabels(want)
+			sort.Strings(gotLabels)
+			sort.Strings(wantLabels)
+			if !reflect.DeepEqual(gotLabels, wantLabels) {
+				t.Errorf("write root rules differ from the same folder as tmp_dir\n got %q\nwant %q", gotLabels, wantLabels)
+			}
+			if w := writes(got); !reflect.DeepEqual(w, c.wantWrites) {
+				t.Errorf("write rules\n got %q\nwant %q", w, c.wantWrites)
 			}
 		})
 	}

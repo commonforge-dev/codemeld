@@ -25,15 +25,18 @@ import (
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
+	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/filetools"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/permissions"
+	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/trust"
 	"codemeld.dev/codemeld/internal/tui"
+	"codemeld.dev/codemeld/internal/turn"
 	"codemeld.dev/codemeld/internal/vcs"
 )
 
@@ -5571,5 +5574,273 @@ func TestProductionAuthorizer_EntryPinOutlivesASwitchBeforeAuthorization(t *test
 				}
 			})
 		}
+	}
+}
+
+var failedSelfTest = enforce.Resolution{Capability: enforce.Refused, Reason: "test: no self-test"}
+
+func writableFoldersYAML(folders ...string) string {
+	if len(folders) == 0 {
+		return "writable_folders: []\n"
+	}
+	return "writable_folders:\n  - " + strings.Join(folders, "\n  - ") + "\n"
+}
+
+type writableLaunch struct {
+	home, project, folder, target string
+	decision                      trust.Decision
+	composition                   ConfigComposition
+	layers                        []securitystate.LayerSnapshot
+	layerPaths                    []string
+}
+
+func gateWritableLaunch(t *testing.T, home, project string, approved bool, projectYAML func(folder string) string) writableLaunch {
+	t.Helper()
+	l := writableLaunch{home: home, project: project, folder: declaredScopeDir(t)}
+	l.target = filepath.Join(l.folder, "notes.txt")
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
+	writeProjectSettings(t, project, projectYAML(l.folder))
+	if approved {
+		approveRoot(t, home, project)
+	}
+	l.decision = headlessTrustGate(io.Discard)(home, project, project)
+	global, err := defaultLoadGlobalSettings(home)
+	if err != nil {
+		t.Fatalf("defaultLoadGlobalSettings: %v", err)
+	}
+	composeRoot := project
+	l.layerPaths = []string{SettingsPath(home), projectSettingsPath(project)}
+	if !vcsTemplatesApproved(l.decision) {
+		composeRoot = ""
+		l.layerPaths = l.layerPaths[:1]
+	}
+	if l.composition, err = defaultComposeConfig(global, composeRoot); err != nil {
+		t.Fatalf("defaultComposeConfig: %v", err)
+	}
+	l.layers = settingsLayerSnapshots(home, project, global, l.decision.Trusted, l.composition)
+	return l
+}
+
+func declaringWritableFolder(folder string) string { return writableFoldersYAML(folder) }
+
+func requireUnapprovedLaunchWithholdsFolders(t *testing.T, l writableLaunch, cache *config.Cache) {
+	t.Helper()
+	if l.decision.Trusted || l.decision.Reason != trust.ReasonNoRecord {
+		t.Fatalf("trust decision = %+v, want untrusted with %q", l.decision, trust.ReasonNoRecord)
+	}
+	if l.composition.ProjectPresent || l.composition.ProjectLayer != nil {
+		t.Fatalf("composition = %+v, want the project layer withheld", l.composition)
+	}
+	if _, ok := l.composition.Config["writable_folders"]; ok {
+		t.Fatalf("composed config = %+v, want no writable_folders", l.composition.Config)
+	}
+	if folders := cache.WritableFolders(); len(folders) != 0 {
+		t.Fatalf("cache writable folders = %v, want none", folders)
+	}
+}
+
+type writableHarness struct {
+	auth       *productionAuthorizer
+	dispatcher *productionToolDispatcher
+	store      *sessions.Store
+	cache      *config.Cache
+	prompts    int
+	answer     bool
+}
+
+func newWritableHarness(t *testing.T, l writableLaunch, resolution enforce.Resolution) *writableHarness {
+	t.Helper()
+	cache, err := config.NewCache(l.composition.Config, l.project, l.layerPaths, l.home)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	guard := mustProtectedStatePolicy(t, l.home, l.project, l.layers)
+	h := &writableHarness{store: mkStore(t), cache: cache}
+	app := tui.New(nil)
+	app.SetActiveStore(h.store)
+	show := func(tui.PromptRequest) (tui.PromptDecision, error) {
+		h.prompts++
+		if !h.answer {
+			return tui.PromptDecision{}, errors.New("no prompt expected")
+		}
+		return tui.PromptDecision{Option: tui.OptionAllowOnce}, nil
+	}
+	h.auth = newProductionAuthorizer(app, cache, permissions.NewTurnCache(), newPromptGateBuilder(show), l.home, l.project, mode.NewActiveState(mode.AutoEdits, mode.SourceConfig))
+	h.auth.executionConstrained = resolution.SelfTestPassed
+	h.auth.blocked = guard.Blocked
+	active := func() *sessions.Store { return h.store }
+	reg, err := (&toolRegistryFactory{active: nil}).realize(cache, active, l.home, l.project, guard)
+	if err != nil {
+		t.Fatalf("realize production registry: %v", err)
+	}
+	h.dispatcher = newProductionToolDispatcher(reg, &fakeDispatchRunner{}, h.auth, l.home, l.project, active, cache.MaxToolOutputBytes(), guard)
+	return h
+}
+
+func (h *writableHarness) edit(t *testing.T, target string, wantPrompts int) {
+	t.Helper()
+	if err := os.WriteFile(target, []byte("old\n"), 0o600); err != nil {
+		t.Fatalf("seed %s: %v", target, err)
+	}
+	h.answer = wantPrompts > 0
+	before := h.prompts
+	call := turn.AssembledToolCall{ID: "c1", Name: filetools.EditToolName, Arguments: toolArgs(t, map[string]any{"path": target, "old_text": "old", "new_text": "new"})}
+	res, err := h.dispatcher.Dispatch(context.Background(), call)
+	if err != nil || res.Denied || res.WriteTarget != target {
+		t.Fatalf("Dispatch(edit) = %+v, %v; want a successful edit of %s", res, err, target)
+	}
+	if got := mustReadFile(t, target); got != "new\n" {
+		t.Fatalf("%s = %q, want the edit applied", target, got)
+	}
+	if got := h.prompts - before; got != wantPrompts {
+		t.Fatalf("prompts = %d, want %d", got, wantPrompts)
+	}
+}
+
+func (h *writableHarness) modeAutoAllows(t *testing.T) []events.PermissionMatched {
+	t.Helper()
+	var out []events.PermissionMatched
+	for _, m := range decodePermissionMatched(t, reloadStore(t, h.store)) {
+		if m.OutcomeSource == "mode_auto" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func writableEditRequest(l writableLaunch) dispatch.BatchAuthRequest {
+	return dispatch.BatchAuthRequest{
+		Req:     permissions.MatchRequest{Kind: "tool", Subject: filetools.EditToolName, PathScope: l.folder},
+		Display: dispatch.PromptDisplay{Action: dispatch.ActionRunTool, Subject: filetools.EditToolName},
+		ModeCtx: permissions.ModeContext{Class: permissions.ClassMutating, ToolName: filetools.EditToolName, TargetPath: l.target},
+	}
+}
+
+func TestProductionAuthorizer_WritableFolderEditIsAutoAllowedUnderAConstrainedLaunch(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	if got := h.cache.WritableFolders(); !slices.Equal(got, []string{l.folder}) {
+		t.Fatalf("cache writable folders = %v, want [%s]", got, l.folder)
+	}
+
+	h.edit(t, l.target, 0)
+
+	want := events.PermissionMatched{SubjectKind: "tool", Subject: filetools.EditToolName, PathScope: l.folder, Outcome: "once", OutcomeSource: "mode_auto"}
+	if matched := decodePermissionMatched(t, reloadStore(t, h.store)); len(matched) != 1 || matched[0] != want {
+		t.Fatalf("permission_matched on disk = %+v, want exactly %+v", matched, want)
+	}
+}
+
+func TestProductionAuthorizer_WritableFolderEditPromptsWithoutAPassedSelfTest(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, failedSelfTest)
+
+	h.edit(t, l.target, 1)
+
+	if allows := h.modeAutoAllows(t); len(allows) != 0 {
+		t.Fatalf("mode_auto matches = %+v, want none", allows)
+	}
+}
+
+func TestProductionAuthorizer_WritableFolderEditFollowsBrokenSettingsUntilFixed(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	global := SettingsPath(l.home)
+
+	h.edit(t, l.target, 0)
+	if n := len(h.modeAutoAllows(t)); n != 1 {
+		t.Fatalf("mode_auto matches after the valid edit = %d, want 1", n)
+	}
+
+	rewriteSettings(t, global, "blocked_paths: [\n")
+	live := liveExecutionCapability(constrainedLaunch, h.auth.blocked.Current().Degraded())
+	if live.Capability != enforce.Refused || live.Reason != "settings file is broken" {
+		t.Fatalf("displayed capability = %+v, want refused with %q", live, "settings file is broken")
+	}
+	if len(h.auth.writableFolders) == 0 {
+		t.Fatal("the cached writable-folder snapshot is empty")
+	}
+	h.edit(t, l.target, 1)
+	if n := len(h.modeAutoAllows(t)); n != 1 {
+		t.Fatalf("mode_auto matches after the broken edit = %d, want still 1", n)
+	}
+
+	rewriteSettings(t, global, blockedYAML())
+	h.edit(t, l.target, 0)
+	if n := len(h.modeAutoAllows(t)); n != 2 {
+		t.Fatalf("mode_auto matches after the fix = %d, want 2", n)
+	}
+}
+
+func TestProductionAuthorizer_WritableFolderOverlayAtTheBatchSeams(t *testing.T) {
+	for _, site := range []string{"AuthorizeBatch", "AuthorizeIndependent"} {
+		t.Run(site, func(t *testing.T) {
+			l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+			h := newWritableHarness(t, l, constrainedLaunch)
+			global := SettingsPath(l.home)
+			step := func(state string, wantPrompts int, wantAllows int) {
+				t.Helper()
+				h.answer = wantPrompts > 0
+				before := h.prompts
+				dec, err := authorizerSites[site](h.auth, writableEditRequest(l))
+				if err != nil || dec.Outcome != "once" {
+					t.Fatalf("%s: decision = %+v, %v; want an allow", state, dec, err)
+				}
+				if got := h.prompts - before; got != wantPrompts {
+					t.Fatalf("%s: prompts = %d, want %d", state, got, wantPrompts)
+				}
+				if n := len(h.modeAutoAllows(t)); n != wantAllows {
+					t.Fatalf("%s: mode_auto matches = %d, want %d", state, n, wantAllows)
+				}
+			}
+			step("valid", 0, 1)
+			rewriteSettings(t, global, "blocked_paths: [\n")
+			step("broken", 1, 1)
+			rewriteSettings(t, global, blockedYAML())
+			step("fixed", 0, 2)
+		})
+	}
+}
+
+func TestProductionAuthorizer_AbsentOrEmptyWritableFoldersKeepTheOutOfRootPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml func(string) string
+	}{
+		{"absent", func(string) string { return blockedYAML() }},
+		{"empty", func(string) string { return writableFoldersYAML() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, tc.yaml)
+			h := newWritableHarness(t, l, constrainedLaunch)
+			if !l.decision.Trusted || len(h.cache.WritableFolders()) != 0 || len(h.auth.writableFolders) != 0 {
+				t.Fatalf("decision = %+v, cache folders = %v, authorizer folders = %v; want a trusted project with none", l.decision, h.cache.WritableFolders(), h.auth.writableFolders)
+			}
+
+			h.edit(t, l.target, 1)
+			for site, call := range authorizerSites {
+				h.auth.resetTurnCache()
+				h.answer = true
+				before := h.prompts
+				if dec, err := call(h.auth, writableEditRequest(l)); err != nil || dec.Outcome != "once" || h.prompts-before != 1 {
+					t.Fatalf("%s = %+v, %v with %d prompts; want one prompt", site, dec, err, h.prompts-before)
+				}
+			}
+			if allows := h.modeAutoAllows(t); len(allows) != 0 {
+				t.Fatalf("mode_auto matches = %+v, want none", allows)
+			}
+		})
+	}
+}
+
+func TestProductionAuthorizer_UnapprovedProjectWritableFoldersHaveNoEffect(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), false, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	requireUnapprovedLaunchWithholdsFolders(t, l, h.cache)
+
+	h.edit(t, l.target, 1)
+
+	if allows := h.modeAutoAllows(t); len(allows) != 0 {
+		t.Fatalf("mode_auto matches = %+v, want none", allows)
 	}
 }

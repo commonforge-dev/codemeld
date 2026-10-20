@@ -93,7 +93,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	store.Append(sessions.Message{
 		ID:        ids.NewV7(),
 		Role:      "user",
-		Content:   sessions.TextContent(req.Instruction),
+		Content:   sessions.TextContent(req.Instruction + InstructionSuffix),
 		Timestamp: time.Now().UTC(),
 	})
 
@@ -130,6 +130,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		DeleteTargets:    recorder.targets(func(res turn.ToolResult) string { return res.DeleteTarget }),
 		MoveTargets:      recorder.moves(),
 	}
+	result.Refusals, result.RefusalTotal = recorder.refusals()
 	result.Reply, result.ReplyTruncated = boundReply(reply.String())
 	switch {
 	case errors.Is(runErr, errStepCap):
@@ -200,8 +201,13 @@ type callRecorder struct {
 	names []string
 	// One slot per planned unit per round: a unit writes only its own slot, so the flattened
 	// order stays model-call order however the scheduler interleaves the units.
-	rounds  [][]turn.ToolResult
+	rounds  [][]recordedCall
 	onRound func([]turn.AssembledToolCall)
+}
+
+type recordedCall struct {
+	result  turn.ToolResult
+	refusal *Refusal
 }
 
 // Plan is the capture point because it receives one round's calls in model-call
@@ -217,7 +223,7 @@ func (r *callRecorder) Plan(calls []turn.AssembledToolCall, maxConcurrency int) 
 	if r.onRound != nil && len(calls) > 0 {
 		r.onRound(calls)
 	}
-	targets := make([]turn.ToolResult, len(plan.Units))
+	targets := make([]recordedCall, len(plan.Units))
 	r.rounds = append(r.rounds, targets)
 	for i := range plan.Units {
 		if plan.Units[i].Run == nil {
@@ -231,26 +237,51 @@ func (r *callRecorder) Plan(calls []turn.AssembledToolCall, maxConcurrency int) 
 // admit is where a child tool call starts: the guard runs immediately before the planned unit,
 // so a cancellation that lands after the scheduler launched the unit still stops it before the
 // unit does anything.
-func (r *callRecorder) admit(unit *turn.PlannedToolCall, target *turn.ToolResult) {
+func (r *callRecorder) admit(unit *turn.PlannedToolCall, target *recordedCall) {
 	inner := unit.Run
+	call := unit.Call
 	unit.Run = func(ctx context.Context) (turn.ToolResult, error) {
 		if err := ctx.Err(); err != nil {
 			return turn.ToolResult{}, err
 		}
 		res, err := inner(ctx)
 		if err == nil {
-			*target = turn.ToolResult{WriteTarget: res.WriteTarget, DeleteTarget: res.DeleteTarget, MoveTarget: res.MoveTarget}
+			target.result = turn.ToolResult{WriteTarget: res.WriteTarget, DeleteTarget: res.DeleteTarget, MoveTarget: res.MoveTarget}
+			if res.Denied {
+				target.refusal = newRefusal(call, res.Content)
+			}
 		}
 		return res, err
 	}
 }
 
+func (r *callRecorder) refusals() (listed []Refusal, total int) {
+	seen := map[[2]string]bool{}
+	for _, round := range r.rounds {
+		for _, rec := range round {
+			if rec.refusal == nil {
+				continue
+			}
+			key := [2]string{rec.refusal.call.Name, rec.refusal.call.Arguments}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			total++
+			if len(listed) < maxListedRefusals {
+				listed = append(listed, *rec.refusal)
+			}
+		}
+	}
+	return listed, total
+}
+
 func (r *callRecorder) moves() []turn.MoveTarget {
 	var moves []turn.MoveTarget
 	for _, round := range r.rounds {
-		for _, res := range round {
-			if res.MoveTarget != (turn.MoveTarget{}) {
-				moves = append(moves, res.MoveTarget)
+		for _, rec := range round {
+			if rec.result.MoveTarget != (turn.MoveTarget{}) {
+				moves = append(moves, rec.result.MoveTarget)
 			}
 		}
 	}
@@ -260,8 +291,8 @@ func (r *callRecorder) moves() []turn.MoveTarget {
 func (r *callRecorder) targets(pick func(turn.ToolResult) string) []string {
 	var targets []string
 	for _, round := range r.rounds {
-		for _, res := range round {
-			if target := pick(res); target != "" {
+		for _, rec := range round {
+			if target := pick(rec.result); target != "" {
 				targets = append(targets, target)
 			}
 		}

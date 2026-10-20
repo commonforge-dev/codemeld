@@ -142,11 +142,12 @@ const (
 	toolNameDelegate = "delegate"
 )
 
-// Must stay equal to the delegate tool's delete- and move-declaration arguments, for the same import
-// reason.
+// Must stay equal to the delegate tool's delete-, move-, and directory-declaration arguments, for the
+// same import reason.
 const (
 	childDeleteArg = "files_delete"
 	childMoveArg   = "files_move"
+	childMkdirArg  = "files_mkdir"
 )
 
 type OperationClass string
@@ -174,11 +175,12 @@ type ModeContext struct {
 	// DeclaredWrite and DeclaredDelete are the run's canonical declared file scopes. A
 	// non-empty pair activates the ceiling, so an empty list under an active ceiling denies
 	// its operation class rather than deferring it to ordinary authorization. Under ChildAgent a nil
-	// DeclaredDelete or DeclaredMoves is an omitted declaration and a non-nil empty one was supplied
-	// empty. No codemeld run flag sets DeclaredMoves.
+	// DeclaredDelete, DeclaredMoves, or DeclaredDirs is an omitted declaration and a non-nil empty one
+	// was supplied empty. No codemeld run flag sets DeclaredMoves or DeclaredDirs.
 	DeclaredWrite  map[string]bool
 	DeclaredDelete map[string]bool
 	DeclaredMoves  map[MovePair]bool
+	DeclaredDirs   map[string]bool
 	// ChildAgent marks the declared scopes as a child agent's delegate declaration rather than a
 	// codemeld run flag pair.
 	ChildAgent bool
@@ -188,12 +190,12 @@ type ModeContext struct {
 	// DeclaredCommands is the project's declared command list: Auto posture only, and
 	// never consulted in Plan or Build.
 	DeclaredCommands []DeclaredCommand
-	// DelegateWrite, DelegateDelete, and DelegateMoves are resolved before the grandchild starts, so the
-	// subset checks against the declared forms are an authorization decision rather than a report on a
-	// running child.
+	// The Delegate forms are resolved before the grandchild starts, so the subset checks against the
+	// declared forms are an authorization decision rather than a report on a running child.
 	DelegateWrite  map[string]bool
 	DelegateDelete map[string]bool
 	DelegateMoves  map[MovePair]bool
+	DelegateDirs   map[string]bool
 	OpenRead       bool
 	ExternalRead   bool
 	ShellPathAsk   bool
@@ -244,6 +246,10 @@ func Authorize(ctx context.Context, req MatchRequest, modeCtx ModeContext, deps 
 }
 
 func resolveWithoutPrompt(req MatchRequest, modeCtx ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
+	if req.Kind == subjectKindTool && topLevelDelegate(modeCtx) {
+		dec, err := topLevelDelegateRefusal(req, modeCtx, deps)
+		return dec, true, err
+	}
 	if dec, handled, err := declaredScopePosture(req, modeCtx, deps); handled {
 		return dec, true, err
 	}
@@ -977,7 +983,7 @@ func declaredScopePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) 
 	}
 	if declaredScopeCovers(mc) {
 		// A parent run's file declaration bounds a child agent but never grants permission to start
-		// one, so a covered top-level delegate call is left to the ordinary authorization path.
+		// one, so a covered top-level delegate call records no approval of its own.
 		if topLevelDelegate(mc) {
 			return Decision{}, false, nil
 		}
@@ -998,6 +1004,19 @@ func declaredScopePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) 
 	}, true, nil
 }
 
+// The allow returned here is not an approval: the caller still authorizes each operation the
+// delegate declares, so no grant, cache entry, or prompt for the tool delegate is ever consulted.
+func topLevelDelegateRefusal(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, error) {
+	posture := declaredScopePosture
+	if mc.Mode == modePlan {
+		posture = modePosture
+	}
+	if dec, handled, err := posture(req, mc, deps); handled {
+		return dec, err
+	}
+	return Decision{Outcome: outcomeOnce}, nil
+}
+
 // A child agent is under a ceiling whatever its lists hold, so a child that reached authorization
 // with no resolvable declaration denies rather than falling through to a grant or the prompt.
 func declaredScopeActive(mc ModeContext) bool {
@@ -1010,7 +1029,7 @@ func isDeclaredScopeTool(mc ModeContext) bool {
 		return true
 	case toolNameDelegate:
 		// A top-level call is judged only once dispatch has prepared its candidate.
-		return mc.ChildAgent || len(mc.DelegateWrite) > 0 || len(mc.DelegateDelete) > 0 || len(mc.DelegateMoves) > 0
+		return mc.ChildAgent || len(mc.DelegateWrite) > 0 || len(mc.DelegateDelete) > 0 || len(mc.DelegateMoves) > 0 || len(mc.DelegateDirs) > 0
 	}
 	return false
 }
@@ -1025,6 +1044,8 @@ func declaredScopeCovers(mc ModeContext) bool {
 		return mc.TargetPath != "" && mc.DeclaredWrite[mc.TargetPath]
 	case toolNameDelete:
 		return mc.TargetPath != "" && mc.DeclaredDelete[mc.TargetPath]
+	case toolNameMkdir:
+		return mc.ChildAgent && mc.TargetPath != "" && mc.DeclaredDirs[mc.TargetPath]
 	case toolNameMove:
 		return mc.ChildAgent && mc.DeclaredMoves[MovePair{Source: mc.MoveSource, Destination: mc.MoveDestination}]
 	case toolNameDelegate:
@@ -1036,11 +1057,11 @@ func declaredScopeCovers(mc ModeContext) bool {
 // A resolved delegate declaration always names a path, so a candidate empty in every form is one that
 // did not resolve and fails rather than passing as the empty subset.
 func delegateWithinParent(mc ModeContext) bool {
-	if len(mc.DelegateWrite) == 0 && len(mc.DelegateDelete) == 0 && len(mc.DelegateMoves) == 0 {
+	if len(mc.DelegateWrite) == 0 && len(mc.DelegateDelete) == 0 && len(mc.DelegateMoves) == 0 && len(mc.DelegateDirs) == 0 {
 		return false
 	}
 	return isDeclaredSubset(mc.DelegateWrite, mc.DeclaredWrite) && isDeclaredSubset(mc.DelegateDelete, mc.DeclaredDelete) &&
-		isDeclaredSubset(mc.DelegateMoves, mc.DeclaredMoves)
+		isDeclaredSubset(mc.DelegateMoves, mc.DeclaredMoves) && isDeclaredSubset(mc.DelegateDirs, mc.DeclaredDirs)
 }
 
 func isDeclaredSubset[K comparable](nested, parent map[K]bool) bool {
@@ -1081,6 +1102,14 @@ func topLevelDelegateDenyReason(mc ModeContext) string {
 		return strings.Join([]string{
 			"a declared-scope ceiling is active for this run and a child agent may declare no move pairs",
 			"neither " + declaredWriteFlag + " nor " + declaredDeleteFlag + " can authorize " + childMoveArg,
+			"the ceiling cannot widen during the run",
+			childScopeTargetClause(mc),
+		}, "; ")
+	}
+	if delegateWidensOnlyDirs(mc) {
+		return strings.Join([]string{
+			"a declared-scope ceiling is active for this run and a child agent may declare no directories",
+			"neither " + declaredWriteFlag + " nor " + declaredDeleteFlag + " can authorize " + childMkdirArg,
 			"the ceiling cannot widen during the run",
 			childScopeTargetClause(mc),
 		}, "; ")
@@ -1150,7 +1179,7 @@ func childScopeFormClause(mc ModeContext) string {
 	case toolNameDelete:
 		return childDeleteFormClause(mc.DeclaredDelete)
 	case toolNameMkdir:
-		return "this delegate call carries no child directories declaration"
+		return childDirFormClause(mc.DeclaredDirs)
 	case toolNameMove:
 		return childMoveFormClause(mc.DeclaredMoves)
 	case toolNameDelegate:
@@ -1159,6 +1188,8 @@ func childScopeFormClause(mc ModeContext) string {
 			return "a nested delegate call may declare in " + childDeleteArg + " only delete paths its own parent already declared"
 		case delegateWidensOnlyMoves(mc):
 			return "a nested delegate call may declare in " + childMoveArg + " only whole move pairs its own parent already declared"
+		case delegateWidensOnlyDirs(mc):
+			return "a nested delegate call may declare in " + childMkdirArg + " only directories its own parent already declared"
 		}
 		return "a nested delegate call may declare only write paths its own parent already declared"
 	default:
@@ -1177,6 +1208,17 @@ func childDeleteFormClause(declared map[string]bool) string {
 	}
 }
 
+func childDirFormClause(declared map[string]bool) string {
+	switch {
+	case declared == nil:
+		return "this delegate call did not supply " + childMkdirArg
+	case len(declared) == 0:
+		return "this delegate call supplied an empty " + childMkdirArg
+	default:
+		return "this delegate call's " + childMkdirArg + " does not list this directory"
+	}
+}
+
 func childScopeTargetClause(mc ModeContext) string {
 	if mc.ToolName != toolNameDelegate {
 		return declaredScopeTargetClause(mc)
@@ -1184,8 +1226,9 @@ func childScopeTargetClause(mc ModeContext) string {
 	write := undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)
 	remove := undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)
 	moves := undeclaredMoves(mc.DelegateMoves, mc.DeclaredMoves)
+	dirs := undeclaredPaths(mc.DelegateDirs, mc.DeclaredDirs)
 	var clauses []string
-	if len(write) > 0 || (len(remove) == 0 && len(moves) == 0) {
+	if len(write) > 0 || (len(remove) == 0 && len(moves) == 0 && len(dirs) == 0) {
 		clauses = append(clauses, "undeclared="+strconv.Quote(strings.Join(write, " ")))
 	}
 	if len(remove) > 0 {
@@ -1193,6 +1236,9 @@ func childScopeTargetClause(mc ModeContext) string {
 	}
 	if len(moves) > 0 {
 		clauses = append(clauses, "undeclared_move="+strconv.Quote(strings.Join(moves, ", ")))
+	}
+	if len(dirs) > 0 {
+		clauses = append(clauses, "undeclared_mkdir="+strconv.Quote(strings.Join(dirs, " ")))
 	}
 	return strings.Join(clauses, "; ")
 }
@@ -1212,6 +1258,13 @@ func delegateWidensOnlyMoves(mc ModeContext) bool {
 	return len(undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)) == 0 &&
 		len(undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)) == 0 &&
 		len(undeclaredMoves(mc.DelegateMoves, mc.DeclaredMoves)) > 0
+}
+
+func delegateWidensOnlyDirs(mc ModeContext) bool {
+	return len(undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)) == 0 &&
+		len(undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)) == 0 &&
+		len(undeclaredMoves(mc.DelegateMoves, mc.DeclaredMoves)) == 0 &&
+		len(undeclaredPaths(mc.DelegateDirs, mc.DeclaredDirs)) > 0
 }
 
 func undeclaredMoves(nested, parent map[MovePair]bool) []string {

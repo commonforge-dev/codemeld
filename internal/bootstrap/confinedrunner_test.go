@@ -15,6 +15,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/fserrors"
@@ -23,7 +24,9 @@ import (
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/provider"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
+	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/testsupport"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/vcs"
 )
@@ -581,6 +584,110 @@ func TestConfinedRunner_AutoEditsPolicyWriteRoots(t *testing.T) {
 	}
 	if policy, _ := decodeFrame(t, inner.bounded[1].Stdin); policy.TmpDir != switched {
 		t.Fatalf("after a session switch tmp = %q, want %q", policy.TmpDir, switched)
+	}
+}
+
+func TestConfinedRunner_PolicyAppendsWritableFoldersAfterProjectRoots(t *testing.T) {
+	project := canonicalTempDir(t)
+	if err := os.Mkdir(filepath.Join(project, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "b.go"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projectRoots := []string{filepath.Join(project, "a"), filepath.Join(project, "b.go")}
+	frame := func(t *testing.T, current string, writeRoots []string) enforce.Policy {
+		t.Helper()
+		conf := &confinement{constrained: true, mode: fixedMode(current), lookupPath: programDir(t, "ls"), tmpDir: t.TempDir(),
+			projectRoot: project, writeRoots: writeRoots, blocked: testBlocked(t)}
+		inner := &confineInner{}
+		if _, err := (&confinedRunner{inner: inner, conf: conf}).Exec(context.Background(), confinedSpec(project, "ls")); err != nil {
+			t.Fatal(err)
+		}
+		policy, _ := decodeFrame(t, inner.bounded[0].Stdin)
+		return policy
+	}
+
+	for _, tc := range []struct {
+		name       string
+		writeRoots []string
+		want       []string
+	}{
+		{"one folder", []string{"/w"}, append(slices.Clone(projectRoots), "/w")},
+		{"deduplicated", []string{"/w", projectRoots[0], "/v", "/w", "/v"}, append(slices.Clone(projectRoots), "/w", "/v")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := frame(t, string(mode.AutoEdits), tc.writeRoots).WriteRoots; !slices.Equal(got, tc.want) {
+				t.Fatalf("auto_edits write roots = %q, want %q", got, tc.want)
+			}
+			if got := frame(t, string(mode.Plan), tc.writeRoots).WriteRoots; len(got) != 0 {
+				t.Fatalf("plan write roots = %q, want none", got)
+			}
+		})
+	}
+}
+
+func requirePrivateTempOnly(t *testing.T, conf *confinement, project, launchTmp string) {
+	t.Helper()
+	if conf == nil || !conf.constrained || conf.tmpDir == "" {
+		t.Fatalf("confinement = %+v, want a constrained confinement with a private temp folder", conf)
+	}
+	inner := &confineInner{}
+	if _, err := (&confinedRunner{inner: inner, conf: conf}).Exec(context.Background(), confinedSpec(project, "ls")); err != nil {
+		t.Fatal(err)
+	}
+	policy, _ := decodeFrame(t, inner.bounded[0].Stdin)
+	if slices.Contains(policy.WriteRoots, "/tmp") || slices.Contains(policy.WriteRoots, launchTmp) {
+		t.Fatalf("auto_edits write roots = %q, want neither /tmp nor the launch TMPDIR %s", policy.WriteRoots, launchTmp)
+	}
+	if policy.TmpDir != conf.tmpDir || filepath.Dir(policy.TmpDir) != launchTmp {
+		t.Fatalf("policy tmp = %q, want the private session folder %q inside %s", policy.TmpDir, conf.tmpDir, launchTmp)
+	}
+	if !slices.Contains(inner.bounded[0].Env, "TMPDIR="+policy.TmpDir) {
+		t.Fatalf("command env = %v, want TMPDIR=%s", inner.bounded[0].Env, policy.TmpDir)
+	}
+	plan, err := conf.policy(string(mode.Plan), "", "")
+	if err != nil || len(plan.WriteRoots) != 0 || plan.TmpDir != "" {
+		t.Fatalf("plan policy = %+v, %v; want no write roots and no temp folder", plan, err)
+	}
+}
+
+func TestLaunchConfinement_WritableFoldersFromTheLaunchCache(t *testing.T) {
+	home, project, folder := canonicalTempDir(t), canonicalTempDir(t), canonicalTempDir(t)
+	t.Setenv("HOME", canonicalTempDir(t))
+	settings := projectSettingsPath(project)
+	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, []byte("writable_folders: [\""+folder+"\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	composition, err := defaultComposeConfig(nil, project)
+	if err != nil {
+		t.Fatalf("defaultComposeConfig: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, home string
+		want       []string
+	}{
+		{"resolved home", home, []string{folder}},
+		{"empty home", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cache *config.Cache
+			out := testsupport.CaptureStderr(t, func() {
+				cache, err = config.NewCache(composition.Config, project, []string{SettingsPath(tc.home), settings}, tc.home)
+			})
+			if err != nil {
+				t.Fatalf("config.NewCache: %v", err)
+			}
+			conf := launchConfinement(enforce.Resolution{SelfTestPassed: true}, t.TempDir(), mode.NewActiveState(mode.AutoEdits, mode.SourceDefault),
+				cache, tc.home, securitystate.Policy{Blocked: testBlocked(t)})
+			if !slices.Equal(conf.writeRoots, tc.want) || strings.Contains(out, "writable_folders") {
+				t.Fatalf("writeRoots = %q, stderr = %q; want %q and no writable-folder notice", conf.writeRoots, out, tc.want)
+			}
+		})
 	}
 }
 

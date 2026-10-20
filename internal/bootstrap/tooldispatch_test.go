@@ -3724,8 +3724,9 @@ func askUserCall(args string) turn.AssembledToolCall {
 }
 
 const askUserValidArgs = `{"questions":[` +
-	`{"id":"storage","prompt":"Where should sessions be stored?","options":["Local disk","Object store"]},` +
-	`{"id":"targets","prompt":"Which platforms?","options":["Linux","macOS"],"multi_select":true,"allow_custom":true}]}`
+	`{"id":"storage","prompt":"Where should sessions be stored?","context":"Sessions are replayed on /resume.\nWhere they live decides what survives a restart.",` +
+	`"options":[{"label":"Local disk","description":"Fast, lost with the machine"},{"label":"Object store"}]},` +
+	`{"id":"targets","prompt":"Which platforms?","options":[{"label":"Linux"},{"label":"macOS"}],"multi_select":true,"allow_custom":true}]}`
 
 func TestProductionDispatcher_AskUserPlansAsAnOrdinarySerialCall(t *testing.T) {
 	d := dispatcherFor(t, tools.NewRegistry(), &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()})
@@ -6529,7 +6530,8 @@ func TestProductionDispatcher_InvalidDelegateStaysASerialBarrier(t *testing.T) {
 }
 
 // Between planning and execution the declared path's missing parent appears as a symlink out of the
-// project, which a second resolution of the raw declaration would follow.
+// project. The launch check resolves the planned canonical target, sees it moved, and refuses
+// before any authorization, so no child starts with a ceiling other than the planned one.
 func TestProductionDispatcher_DelegatePlanIsNotReresolvedBeforeTheChildStarts(t *testing.T) {
 	d, probe, project := delegateProbeDispatcher(t)
 	calls := []turn.AssembledToolCall{plannedDelegateCall("c1", "link/a.txt")}
@@ -6547,13 +6549,18 @@ func TestProductionDispatcher_DelegatePlanIsNotReresolvedBeforeTheChildStarts(t 
 	if err := os.Symlink(elsewhere, filepath.Join(project, "link")); err != nil {
 		t.Fatalf("Symlink: %v", err)
 	}
-	if _, err := plan.Units[0].Run(context.Background()); err != nil {
+	res, err := plan.Units[0].Run(context.Background())
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-
-	want := []map[string]bool{{filepath.Join(project, "link", "a.txt"): true}}
-	if !reflect.DeepEqual(probe.ceilings(), want) {
-		t.Fatalf("child ceiling = %v, want the declaration canonicalized while planning %v", probe.ceilings(), want)
+	if !strings.Contains(res.Content, "no longer resolves") {
+		t.Fatalf("result = %q, want the launch refused on the moved declaration", res.Content)
+	}
+	if probe.started() != 0 || len(probe.ceilings()) != 0 {
+		t.Fatalf("children started = %d with ceilings %v, want none", probe.started(), probe.ceilings())
+	}
+	if auth := d.authorizer.(*recordingAuthorizer); auth.callCount() != 0 {
+		t.Fatalf("authorizations = %d, want none before the drift refusal", auth.callCount())
 	}
 	if !slices.Equal(plan.Units[0].Targets, planned) {
 		t.Fatalf("delegate targets = %v after the parent appeared, want the planned %v", plan.Units[0].Targets, planned)
@@ -7080,7 +7087,7 @@ func TestChildCeiling_MkdirMoveAndDeleteNameTheMissingChildForm(t *testing.T) {
 		{
 			name: "mkdir",
 			call: structuredCall("d2", filetools.MkdirToolName, map[string]any{"path": "work/sub"}),
-			form: "no child directories declaration",
+			form: "this delegate call did not supply files_mkdir",
 		},
 		{
 			name: "move",
@@ -8832,5 +8839,793 @@ func TestProductionDispatcher_EntryPinRespectsExistingPinsAndMissingModeSources(
 				t.Fatalf("exec/bounded = %d/%d, want %d/%d", len(h.inner.execs), len(h.inner.bounded), tc.wantExecs, tc.wantBound)
 			}
 		})
+	}
+}
+
+func childDirsFixture(t *testing.T, write []string, dirs ...string) (turn.ToolDispatcher, *sessions.Store, string, string, map[string]bool) {
+	t.Helper()
+	cache, home, project, active, modeActive := delegateFixture(t)
+	seedChildMoveProject(t, project)
+	declared, _, err := filetools.ResolveDeclaredScopes(home, project, write, nil)
+	if err != nil {
+		t.Fatalf("ResolveDeclaredScopes: %v", err)
+	}
+	mkdir := filetools.NewMkdirTool(home, project, project)
+	var declaredDirs map[string]bool
+	for _, dir := range dirs {
+		target, _, rerr := mkdir.ResolveTarget(map[string]any{"path": dir})
+		if rerr != nil {
+			t.Fatalf("ResolveTarget(%s): %v", dir, rerr)
+		}
+		if declaredDirs == nil {
+			declaredDirs = map[string]bool{}
+		}
+		declaredDirs[target] = true
+	}
+	store := mkStore(t)
+	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	return deps.NewDispatcher(permissions.ModeContext{
+		Mode:          string(mode.Build),
+		ChildAgent:    true,
+		DeclaredWrite: declared,
+		DeclaredDirs:  declaredDirs,
+	}), store, home, project, declaredDirs
+}
+
+func TestChildCeiling_MkdirAdmitsEverySpellingOfTheExactDeclaredDirectory(t *testing.T) {
+	tests := []struct {
+		spelling string
+		absolute bool
+	}{
+		{spelling: "work/new/sub"},
+		{spelling: "work/new/sub/"},
+		{spelling: "./work/./new/sub"},
+		{spelling: "work/../work/new/sub"},
+		{spelling: "work/new/../new/sub"},
+		{spelling: "worklink/new/sub"},
+		{spelling: "work/new/sub", absolute: true},
+		{spelling: "work/new/sub/", absolute: true},
+	}
+	for i, tc := range tests {
+		name := tc.spelling
+		if tc.absolute {
+			name = "absolute " + name
+		}
+		t.Run(name, func(t *testing.T) {
+			d, store, _, project, dirs := childDirsFixture(t, nil, filepath.Join("work", "new", "sub"))
+			target := filepath.Join(project, "work", "new", "sub")
+			if !dirs[target] {
+				t.Fatalf("declaration %v does not name %s", dirs, target)
+			}
+			path := tc.spelling
+			if tc.absolute {
+				path = project + "/" + tc.spelling
+			}
+
+			res, err := d.Dispatch(context.Background(), structuredCall(fmt.Sprintf("mk-%d", i), filetools.MkdirToolName, map[string]any{"path": path}))
+			if err != nil {
+				t.Fatalf("Dispatch error = %v, want nil", err)
+			}
+			if res.Denied {
+				t.Fatalf("result = %+v, want the declaration to admit a canonical-equivalent spelling", res)
+			}
+			matched := decodePermissionMatched(t, store)
+			if len(matched) != 1 || matched[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope || matched[0].Outcome != "once" {
+				t.Fatalf("permission_matched = %+v, want exactly one declared_scope/once", matched)
+			}
+			if info, statErr := os.Stat(target); statErr != nil || !info.IsDir() {
+				t.Fatalf("declared directory %s was not created: %v", target, statErr)
+			}
+		})
+	}
+}
+
+func TestChildCeiling_MkdirBypassAttemptsAllDeny(t *testing.T) {
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	d, store, home, project, dirs := childDirsFixture(t, []string{filepath.Join("work", "notes.txt")}, filepath.Join("work", "new", "sub"))
+	if err := os.Symlink(outside, filepath.Join(project, "outlink")); err != nil {
+		t.Fatalf("Symlink outlink: %v", err)
+	}
+	tests := []struct {
+		name        string
+		path        string
+		want        string
+		caseVariant bool
+	}{
+		{name: "a traversal to another directory", path: "work/new/../other-sub", want: filepath.Join(project, "work", "other-sub")},
+		{name: "a symlink alias resolving elsewhere", path: "otherlink/new/sub", want: filepath.Join(project, "other", "new", "sub")},
+		{name: "a symlink alias resolving out of the project", path: "outlink/new/sub", want: filepath.Join(outside, "new", "sub")},
+		{name: "the missing parent the declared mkdir would create", path: "./work/./new/", want: filepath.Join(project, "work", "new")},
+		{name: "a directory below the declared one", path: "work/new/sub/deeper", want: filepath.Join(project, "work", "new", "sub", "deeper")},
+		{name: "an absolute path outside the project root", path: filepath.Join(outside, "beyond"), want: filepath.Join(outside, "beyond")},
+		{name: "a home-relative path outside the project root", path: "~/beyond", want: filepath.Join(home, "beyond")},
+		{name: "a case-variant spelling", path: "WORK/new/sub", want: filepath.Join(project, "WORK", "new", "sub"), caseVariant: true},
+	}
+	seen := map[string]bool{}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.caseVariant && sameFilesystemObject(filepath.Join(project, "WORK"), filepath.Join(project, "work")) {
+				t.Skip("this volume is case-insensitive, so a case variant names the declared directory itself")
+			}
+			resolved, _, rerr := filetools.NewMkdirTool(home, project, project).ResolveTarget(map[string]any{"path": tc.path})
+			if rerr != nil {
+				t.Fatalf("ResolveTarget(%s) = %v, want the row to reach authorization", tc.path, rerr)
+			}
+			if resolved != tc.want {
+				t.Fatalf("production canonical target = %s, want %s", resolved, tc.want)
+			}
+			if dirs[resolved] || seen[resolved] {
+				t.Fatalf("row target %s is declared or repeats an earlier row, so the row proves nothing", resolved)
+			}
+			seen[resolved] = true
+
+			before := len(decodePermissionMatched(t, store))
+			res, derr := d.Dispatch(context.Background(), structuredCall(fmt.Sprintf("mkdir-bypass-%d", i), filetools.MkdirToolName, map[string]any{"path": tc.path}))
+			if derr != nil {
+				t.Fatalf("Dispatch error = %v, want nil", derr)
+			}
+			assertChildScopeDenialBy(t, store, before, res, "unattended")
+			if _, statErr := os.Lstat(resolved); !os.IsNotExist(statErr) {
+				t.Fatalf("%s exists after a refused call (err=%v)", resolved, statErr)
+			}
+		})
+	}
+	if _, statErr := os.Lstat(filepath.Join(project, "work", "new")); !os.IsNotExist(statErr) {
+		t.Fatalf("work/new exists after only refused calls (err=%v)", statErr)
+	}
+}
+
+func TestChildCeiling_ADeclaredWriteStillCreatesItsMissingParentsWithoutADirectoryDeclaration(t *testing.T) {
+	d, store, _, project, dirs := childDirsFixture(t, []string{filepath.Join("fresh", "deep", "new.txt")})
+	if len(dirs) != 0 {
+		t.Fatalf("directory declaration = %v, want none", dirs)
+	}
+	res, err := d.Dispatch(context.Background(), structuredCall("c1", filetools.CreateToolName, map[string]any{"path": "fresh/deep/new.txt", "content": "x"}))
+	if err != nil || res.Denied {
+		t.Fatalf("declared create = %+v, %v; want it authorized", res, err)
+	}
+	if matched := decodePermissionMatched(t, store); len(matched) != 1 || matched[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope || matched[0].Outcome != "once" {
+		t.Fatalf("permission_matched = %+v, want exactly one declared_scope/once", matched)
+	}
+	if body, rerr := os.ReadFile(filepath.Join(project, "fresh", "deep", "new.txt")); rerr != nil || string(body) != "x" {
+		t.Fatalf("fresh/deep/new.txt = %q (err=%v), want the declared file created with its parents", body, rerr)
+	}
+
+	res, err = d.Dispatch(context.Background(), structuredCall("c2", filetools.MkdirToolName, map[string]any{"path": "fresh/other"}))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want nil", err)
+	}
+	reason := assertChildScopeDenial(t, store, 1, res)
+	if !strings.Contains(reason, "this delegate call did not supply files_mkdir") {
+		t.Fatalf("reason %q does not name the absent directory declaration", reason)
+	}
+}
+
+func plannedDelegateArgsCall(id string, args map[string]any) turn.AssembledToolCall {
+	args["instructions"] = "do it"
+	return structuredCall(id, subagenttool.ToolName, args)
+}
+
+func TestProductionDispatcher_DelegateDirectoriesOrderLikeEveryOtherForm(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, second map[string]any
+		wantOverlap   bool
+	}{
+		{"equal directories",
+			map[string]any{"files": []any{"one.txt"}, "files_mkdir": []any{"made"}},
+			map[string]any{"files": []any{"two.txt"}, "files_mkdir": []any{"made"}}, false},
+		{"a directory and a write below it",
+			map[string]any{"files": []any{"one.txt"}, "files_mkdir": []any{"made"}},
+			map[string]any{"files": []any{"made/notes.txt"}}, false},
+		{"a directory and a delete of it",
+			map[string]any{"files": []any{"one.txt"}, "files_mkdir": []any{"made"}},
+			map[string]any{"files_delete": []any{"made"}}, false},
+		{"a directory and a move onto it",
+			map[string]any{"files": []any{"one.txt"}, "files_mkdir": []any{"made"}},
+			map[string]any{"files_move": []any{map[string]any{"source": "main.go", "destination": "made"}}}, false},
+		{"sibling directories sharing a missing parent",
+			map[string]any{"files": []any{"one.txt"}, "files_mkdir": []any{"x/y"}},
+			map[string]any{"files": []any{"two.txt"}, "files_mkdir": []any{"x/z"}}, false},
+		{"disjoint directories",
+			map[string]any{"files": []any{"one.txt"}, "files_mkdir": []any{"p"}},
+			map[string]any{"files": []any{"two.txt"}, "files_mkdir": []any{"q"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, probe, _ := delegateProbeDispatcher(t)
+			calls := []turn.AssembledToolCall{plannedDelegateArgsCall("c1", tc.first), plannedDelegateArgsCall("c2", tc.second)}
+			plan := d.Plan(calls, 2)
+			assertPartitionedPlan(t, plan, calls, "dd")
+
+			run, err := schedulePlanHeld(plan, 2, nil, delegateHold)
+			if err != nil {
+				t.Fatalf("Schedule: %v", err)
+			}
+			if got := run.overlapped("c1", "c2"); got != tc.wantOverlap {
+				t.Fatalf("delegates overlapped = %v, want %v; execution order %v", got, tc.wantOverlap, run.ids())
+			}
+			if want := []string{"c1", "c2"}; !tc.wantOverlap && !slices.Equal(run.ids(), want) {
+				t.Fatalf("execution order = %v, want the model-call order %v", run.ids(), want)
+			}
+			if probe.started() != 2 {
+				t.Fatalf("children started = %d, want 2", probe.started())
+			}
+		})
+	}
+}
+
+// --- top-level delegate launch authorization ---------------------------------
+
+type launchPrompts struct {
+	mu       sync.Mutex
+	requests []tui.PromptRequest
+	active   int
+	overlap  bool
+	hold     time.Duration
+	answer   func(i int) tui.PromptOption
+}
+
+func (p *launchPrompts) show(req tui.PromptRequest) (tui.PromptDecision, error) {
+	p.mu.Lock()
+	i := len(p.requests)
+	p.requests = append(p.requests, req)
+	p.active++
+	if p.active > 1 {
+		p.overlap = true
+	}
+	p.mu.Unlock()
+	time.Sleep(p.hold)
+	p.mu.Lock()
+	p.active--
+	p.mu.Unlock()
+	option := tui.OptionAllowOnce
+	if p.answer != nil {
+		option = p.answer(i)
+	}
+	return tui.PromptDecision{Option: option, StoredSubject: req.CapabilityStoredSubject}, nil
+}
+
+func (p *launchPrompts) shown() []tui.PromptRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.requests)
+}
+
+type launchFixture struct {
+	d       *productionToolDispatcher
+	auth    *productionAuthorizer
+	turn    *permissions.TurnCache
+	probe   *delegateProbe
+	prompts *launchPrompts
+	store   *sessions.Store
+	project string
+	home    string
+}
+
+type launchOptions struct {
+	mode   mode.Mode
+	grants func(project string) []any
+	layers func(project string) []securitystate.LayerSnapshot
+	answer func(i int) tui.PromptOption
+	hold   time.Duration
+}
+
+func newLaunchFixture(t *testing.T, opts launchOptions) *launchFixture {
+	t.Helper()
+	project := readToolsProject(t)
+	home := t.TempDir()
+	cfg := map[string]any{}
+	if opts.grants != nil {
+		cfg["permissions"] = opts.grants(project)
+	}
+	cache, err := config.NewCache(cfg, project, nil)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	m := opts.mode
+	if m == "" {
+		m = mode.Build
+	}
+	var layers []securitystate.LayerSnapshot
+	if opts.layers != nil {
+		layers = opts.layers(project)
+	}
+	guard := mustProtectedStatePolicy(t, home, project, layers)
+	store := mkStore(t)
+	app := tui.New(nil)
+	app.SetActiveStore(store)
+	prompts := &launchPrompts{answer: opts.answer, hold: opts.hold}
+	turnCache := permissions.NewTurnCache()
+	auth := newProductionAuthorizer(app, cache, turnCache, newPromptGateBuilder(prompts.show), home, project, mode.NewActiveState(m, mode.SourceDefault))
+	activeStore := func() *sessions.Store { return store }
+	reg, err := (&toolRegistryFactory{active: nil}).realize(cache, activeStore, home, project, guard)
+	if err != nil {
+		t.Fatalf("realize production registry: %v", err)
+	}
+	probe := &delegateProbe{}
+	if err := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
+		Home:          home,
+		LaunchDir:     project,
+		ProjectRoot:   project,
+		Snapshot:      probe.snapshot,
+		NewDispatcher: probe.newDispatcher,
+		Store:         activeStore,
+	})); err != nil {
+		t.Fatalf("Register delegate: %v", err)
+	}
+	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, auth, home, project, activeStore, 65536, guard)
+	return &launchFixture{d: d, auth: auth, turn: turnCache, probe: probe, prompts: prompts, store: store, project: project, home: home}
+}
+
+func (f *launchFixture) seed(t *testing.T, rel ...string) {
+	t.Helper()
+	for _, r := range rel {
+		path := filepath.Join(f.project, r)
+		dir := filepath.Dir(path)
+		if strings.HasSuffix(r, "/") {
+			dir = path
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if strings.HasSuffix(r, "/") {
+			continue
+		}
+		if err := os.WriteFile(path, []byte("body\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+}
+
+func (f *launchFixture) launch(t *testing.T, args map[string]any) turn.ToolResult {
+	t.Helper()
+	args["instructions"] = "do it"
+	res, err := f.d.Dispatch(context.Background(), structuredCall("c1", subagenttool.ToolName, args))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want nil", err)
+	}
+	return res
+}
+
+type launchPrompt struct {
+	action, subject, scope string
+}
+
+func (f *launchFixture) launchPromptsShown(t *testing.T) []launchPrompt {
+	t.Helper()
+	shown := f.prompts.shown()
+	recorded := decodeStoreEvents[events.PermissionPromptShown](t, f.store, events.KindPermissionPromptShown)
+	if len(shown) != len(recorded) {
+		t.Fatalf("prompt surface showed %d prompts, event store recorded %d", len(shown), len(recorded))
+	}
+	out := make([]launchPrompt, len(shown))
+	for i, req := range shown {
+		if recorded[i].Subject == subagenttool.ToolName || req.Action == dispatch.ActionRunTool {
+			t.Fatalf("prompt %+v / %+v asks about the tool delegate", req, recorded[i])
+		}
+		out[i] = launchPrompt{action: req.Action, subject: req.Subject, scope: recorded[i].PathScope}
+	}
+	for _, m := range decodePermissionMatched(t, f.store) {
+		if m.Subject == subagenttool.ToolName {
+			t.Fatalf("permission_matched %+v decided the tool delegate", m)
+		}
+	}
+	return out
+}
+
+func pathList(values ...string) []any { return stringsAsAny(values) }
+
+func movePair(source, destination string) map[string]any {
+	return map[string]any{"source": source, "destination": destination}
+}
+
+func TestProductionDispatcher_TopLevelDelegateLaunchAuthorizesEachDeclaredOperation(t *testing.T) {
+	folderGrant := func(subject, scope string) map[string]any {
+		return map[string]any{"kind": "tool", "subject": subject, "path_scope": scope, "grant_kind": "folder"}
+	}
+	type row struct {
+		name        string
+		mode        mode.Mode
+		seed        []string
+		grants      func(project string) []any
+		args        map[string]any
+		answer      func(i int) tui.PromptOption
+		wantPrompts func(project string) []launchPrompt
+		wantStart   bool
+	}
+	p := filepath.Join
+	rows := []row{
+		{
+			name:      "an edit already allowed by a grant",
+			seed:      []string{"a.txt"},
+			grants:    func(project string) []any { return []any{folderGrant("edit", project)} },
+			args:      map[string]any{"files": pathList("a.txt")},
+			wantStart: true,
+		},
+		{
+			name:      "an edit already allowed by Auto edits",
+			mode:      mode.AutoEdits,
+			seed:      []string{"a.txt"},
+			args:      map[string]any{"files": pathList("a.txt")},
+			wantStart: true,
+		},
+		{
+			name: "a create, delete, move, and mkdir already allowed",
+			seed: []string{"old.txt", "src.txt"},
+			grants: func(project string) []any {
+				return []any{folderGrant("create", project), folderGrant("delete", project), folderGrant("move", project), folderGrant("mkdir", project)}
+			},
+			args: map[string]any{
+				"files": pathList("new.txt"), "files_delete": pathList("old.txt"),
+				"files_move": []any{movePair("src.txt", "dst.txt")}, "files_mkdir": pathList("made"),
+			},
+			wantStart: true,
+		},
+		{
+			name:   "one uncovered declared path",
+			seed:   []string{"a.txt"},
+			grants: func(project string) []any { return []any{folderGrant("edit", project)} },
+			args:   map[string]any{"files": pathList("a.txt", "new.txt")},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionCreateFile, p(project, "new.txt"), project}}
+			},
+			wantStart: true,
+		},
+		{
+			name:   "a read grant does not cover a declared write",
+			grants: func(project string) []any { return []any{folderGrant("read", project)} },
+			args:   map[string]any{"files": pathList("new.txt")},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionCreateFile, p(project, "new.txt"), project}}
+			},
+			wantStart: true,
+		},
+		{
+			name: "a write grant does not cover a declared delete",
+			seed: []string{"old.txt"},
+			grants: func(project string) []any {
+				return []any{folderGrant(permissions.CapabilityWriteTree, project)}
+			},
+			args: map[string]any{"files": pathList("new.txt"), "files_delete": pathList("old.txt")},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionDeleteFile, p(project, "old.txt"), project}}
+			},
+			wantStart: true,
+		},
+		{
+			name: "a delegate grant does not cover uncovered operations",
+			grants: func(string) []any {
+				return []any{map[string]any{"kind": "tool", "subject": "delegate", "path_scope": "*", "grant_kind": "global"}}
+			},
+			args:   map[string]any{"files": pathList("new.txt")},
+			answer: func(int) tui.PromptOption { return tui.OptionDeny },
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionCreateFile, p(project, "new.txt"), project}}
+			},
+		},
+		{
+			name: "uncovered operations prompt in form and path order",
+			seed: []string{"w1/", "w2/", "d1/x.txt", "d2/y.txt", "mv/a.txt", "mv2/", "k1/", "k2/"},
+			args: map[string]any{
+				"files_mkdir":  pathList("k2/new", "k1/new"),
+				"files_move":   []any{movePair("mv/a.txt", "mv2/a.txt")},
+				"files_delete": pathList("d2/y.txt", "d1/x.txt"),
+				"files":        pathList("w2/b.txt", "w1/a.txt"),
+			},
+			wantPrompts: func(project string) []launchPrompt {
+				move := p(project, "mv", "a.txt") + " -> " + p(project, "mv2", "a.txt")
+				return []launchPrompt{
+					{dispatch.ActionCreateFile, p(project, "w1", "a.txt"), p(project, "w1")},
+					{dispatch.ActionCreateFile, p(project, "w2", "b.txt"), p(project, "w2")},
+					{dispatch.ActionDeleteFile, p(project, "d1", "x.txt"), p(project, "d1")},
+					{dispatch.ActionDeleteFile, p(project, "d2", "y.txt"), p(project, "d2")},
+					{dispatch.ActionMoveFile, move, p(project, "mv")},
+					{dispatch.ActionMoveFile, move, p(project, "mv2")},
+					{dispatch.ActionCreateDirectory, p(project, "k1", "new"), p(project, "k1")},
+					{dispatch.ActionCreateDirectory, p(project, "k2", "new"), p(project, "k2")},
+				}
+			},
+			wantStart: true,
+		},
+		{
+			name: "an identical operation scope reuses the earlier decision",
+			args: map[string]any{"files": pathList("b.txt", "a.txt")},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionCreateFile, p(project, "a.txt"), project}}
+			},
+			wantStart: true,
+		},
+		{
+			name: "a delete of a path the child will create",
+			args: map[string]any{"files": pathList("new.txt"), "files_delete": pathList("new.txt")},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{
+					{dispatch.ActionCreateFile, p(project, "new.txt"), project},
+					{dispatch.ActionDeleteFile, p(project, "new.txt"), project},
+				}
+			},
+			wantStart: true,
+		},
+		{
+			name: "a delete under a missing parent",
+			seed: []string{"sub/"},
+			args: map[string]any{"files_delete": pathList("sub/missing/x.txt")},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionDeleteFile, p(project, "sub", "missing", "x.txt"), p(project, "sub")}}
+			},
+			wantStart: true,
+		},
+		{
+			name: "a same-directory move needs one authorization",
+			seed: []string{"a.txt"},
+			args: map[string]any{"files_move": []any{movePair("a.txt", "b.txt")}},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionMoveFile, p(project, "a.txt") + " -> " + p(project, "b.txt"), project}}
+			},
+			wantStart: true,
+		},
+		{
+			name:   "a denied move source stops before the destination",
+			seed:   []string{"src/a.txt", "dst/"},
+			args:   map[string]any{"files_move": []any{movePair("src/a.txt", "dst/a.txt")}},
+			answer: func(int) tui.PromptOption { return tui.OptionDeny },
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{{dispatch.ActionMoveFile, p(project, "src", "a.txt") + " -> " + p(project, "dst", "a.txt"), p(project, "src")}}
+			},
+		},
+		{
+			name: "the second of two prompts is denied",
+			seed: []string{"w1/", "w2/"},
+			args: map[string]any{"files": pathList("w1/a.txt", "w2/b.txt")},
+			answer: func(i int) tui.PromptOption {
+				if i == 1 {
+					return tui.OptionDeny
+				}
+				return tui.OptionAllowOnce
+			},
+			wantPrompts: func(project string) []launchPrompt {
+				return []launchPrompt{
+					{dispatch.ActionCreateFile, p(project, "w1", "a.txt"), p(project, "w1")},
+					{dispatch.ActionCreateFile, p(project, "w2", "b.txt"), p(project, "w2")},
+				}
+			},
+		},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLaunchFixture(t, launchOptions{mode: tc.mode, grants: tc.grants, answer: tc.answer})
+			f.seed(t, tc.seed...)
+
+			res := f.launch(t, tc.args)
+
+			var want []launchPrompt
+			if tc.wantPrompts != nil {
+				want = tc.wantPrompts(f.project)
+			}
+			if got := f.launchPromptsShown(t); !slices.Equal(got, want) {
+				t.Fatalf("prompts = %+v, want %+v", got, want)
+			}
+			wantStarts := 0
+			if tc.wantStart {
+				wantStarts = 1
+			}
+			if f.probe.started() != wantStarts {
+				t.Fatalf("children started = %d, want %d (result %+v)", f.probe.started(), wantStarts, res)
+			}
+			if !tc.wantStart && !res.Denied {
+				t.Fatalf("result = %+v, want the operation's denial", res)
+			}
+		})
+	}
+}
+
+func TestProductionDispatcher_PlanRefusesADelegateLaunchLikeTheDirectWrite(t *testing.T) {
+	f := newLaunchFixture(t, launchOptions{mode: mode.Plan})
+
+	direct, err := f.d.Dispatch(context.Background(), structuredCall("c0", filetools.CreateToolName, map[string]any{"path": "new.txt", "content": "x"}))
+	if err != nil {
+		t.Fatalf("Dispatch(create) error = %v", err)
+	}
+	launched := f.launch(t, map[string]any{"files": pathList("new.txt")})
+
+	for _, res := range []turn.ToolResult{direct, launched} {
+		if !res.Denied || !permissions.IsModeDenyEnvelope(res.Content) {
+			t.Fatalf("result = %+v, want Plan's mode denial", res)
+		}
+	}
+	if shown := f.prompts.shown(); len(shown) != 0 {
+		t.Fatalf("prompts = %+v, want none", shown)
+	}
+	if f.probe.started() != 0 {
+		t.Fatalf("children started = %d, want 0", f.probe.started())
+	}
+	mustNotExist(t, filepath.Join(f.project, "new.txt"), "Plan writes nothing")
+}
+
+func TestProductionDispatcher_GuardedDeclarationsRefuseTheLaunchBeforeAnyPrompt(t *testing.T) {
+	blocked := func(project string) []securitystate.LayerSnapshot {
+		return []securitystate.LayerSnapshot{{
+			Kind: securitystate.LayerProject, Path: projectSettingsPath(project), Present: true,
+			Raw: map[string]any{"blocked_paths": []any{filepath.Join(project, "box", "secret.txt"), filepath.Join(project, "blocked.txt")}},
+		}}
+	}
+	everything := func(project string) []any {
+		var grants []any
+		for _, subject := range []string{"edit", "create", "delete", "move", "mkdir"} {
+			grants = append(grants, map[string]any{"kind": "tool", "subject": subject, "path_scope": "*", "grant_kind": "global"})
+		}
+		return grants
+	}
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{"a protected settings target after an uncovered write", map[string]any{"files": pathList("a.txt"), "files_delete": pathList(".codemeld/settings.yaml")}},
+		{"a blocked write target", map[string]any{"files": pathList("blocked.txt")}},
+		{"a delete of a directory holding a blocked path", map[string]any{"files_delete": pathList("box")}},
+		{"a move of a directory holding a blocked path", map[string]any{"files_move": []any{movePair("box", "moved")}}},
+	}
+	for _, m := range []mode.Mode{mode.Build, mode.AutoEdits} {
+		for _, grants := range []func(string) []any{nil, everything} {
+			for _, tc := range tests {
+				t.Run(fmt.Sprintf("%s/grants=%v/%s", m, grants != nil, tc.name), func(t *testing.T) {
+					f := newLaunchFixture(t, launchOptions{mode: m, grants: grants, layers: blocked})
+					f.seed(t, ".codemeld/settings.yaml", "box/secret.txt")
+
+					res := f.launch(t, tc.args)
+
+					if !res.Denied {
+						t.Fatalf("result = %+v, want a guard refusal", res)
+					}
+					if shown := f.prompts.shown(); len(shown) != 0 {
+						t.Fatalf("prompts = %+v, want none", shown)
+					}
+					if f.probe.started() != 0 {
+						t.Fatalf("children started = %d, want 0", f.probe.started())
+					}
+					for _, ev := range decodePermissionMatched(t, f.store) {
+						if ev.Outcome != "deny" {
+							t.Fatalf("permission_matched %+v, want only the guard refusal", ev)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestProductionDispatcher_ALaterLaunchDenialKeepsEarlierApprovals(t *testing.T) {
+	tests := []struct {
+		name   string
+		option tui.PromptOption
+		check  func(t *testing.T, f *launchFixture, scope string)
+	}{
+		{"once", tui.OptionAllowOnce, func(t *testing.T, f *launchFixture, scope string) {
+			req := permissions.MatchRequest{Kind: "tool", Subject: filetools.CreateToolName, PathScope: scope}
+			if outcome, hit := f.turn.Lookup(req); !hit || outcome != "once" {
+				t.Fatalf("turn cache = %q (hit %v), want the earlier allow-once kept", outcome, hit)
+			}
+		}},
+		{"session", tui.OptionAllowSession, func(t *testing.T, f *launchFixture, scope string) {
+			assertLaunchGrant(t, f.auth.grants.Permissions(), "session", scope)
+		}},
+		{"folder", tui.OptionAllowFolder, func(t *testing.T, f *launchFixture, scope string) {
+			assertLaunchGrant(t, readPersistedPermissions(t, config.LocalSettingsPath(f.project), f.project), "folder", scope)
+		}},
+		{"global", tui.OptionAllowGlobal, func(t *testing.T, f *launchFixture, scope string) {
+			assertLaunchGrant(t, readPersistedPermissions(t, SettingsPath(f.home), f.project), "global", "")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			first := tc.option
+			f := newLaunchFixture(t, launchOptions{answer: func(i int) tui.PromptOption {
+				if i == 0 {
+					return first
+				}
+				return tui.OptionDeny
+			}})
+			f.seed(t, "w1/", "w2/old.txt")
+
+			res := f.launch(t, map[string]any{"files": pathList("w1/a.txt"), "files_delete": pathList("w2/old.txt")})
+
+			if !res.Denied || f.probe.started() != 0 {
+				t.Fatalf("result = %+v with %d children started, want the launch refused", res, f.probe.started())
+			}
+			if got := len(f.launchPromptsShown(t)); got != 2 {
+				t.Fatalf("prompts = %d, want 2", got)
+			}
+			tc.check(t, f, filepath.Join(f.project, "w1"))
+		})
+	}
+}
+
+func assertLaunchGrant(t *testing.T, entries []permissions.PermissionEntry, kind, scope string) {
+	t.Helper()
+	for _, e := range entries {
+		if e.GrantKind == kind && (scope == "" || e.PathScope == scope) {
+			return
+		}
+	}
+	t.Fatalf("grants = %+v, want the earlier %s grant for %q kept", entries, kind, scope)
+}
+
+func TestProductionDispatcher_ParallelDelegateLaunchesSerializeTheirPrompts(t *testing.T) {
+	f := newLaunchFixture(t, launchOptions{hold: 20 * time.Millisecond})
+	f.seed(t, "w1/", "w2/")
+	calls := []turn.AssembledToolCall{plannedDelegateCall("c1", "w1/a.txt"), plannedDelegateCall("c2", "w2/b.txt")}
+	plan := f.d.Plan(calls, 2)
+	assertPartitionedPlan(t, plan, calls, "dd")
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(plan.Units))
+	for i := range plan.Units {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = plan.Units[i].Run(context.Background())
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	}
+
+	if got := len(f.launchPromptsShown(t)); got != 2 {
+		t.Fatalf("prompts = %d, want one per launch", got)
+	}
+	if f.prompts.overlap {
+		t.Fatal("two launch prompts were active at once")
+	}
+	if f.probe.started() != 2 {
+		t.Fatalf("children started = %d, want 2", f.probe.started())
+	}
+}
+
+func TestChildCeiling_PlannedNestedDelegateBuildsNoLaunchRequests(t *testing.T) {
+	cache, home, project, active, modeActive := delegateFixture(t)
+	declared, _, err := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt"}, nil)
+	if err != nil {
+		t.Fatalf("ResolveDeclaredScopes: %v", err)
+	}
+	store := mkStore(t)
+	activeStore := func() *sessions.Store { return store }
+	guard := mustProtectedStatePolicy(t, home, project, nil)
+	reg, err := (&toolRegistryFactory{active: nil}).realize(cache, activeStore, home, project, guard)
+	if err != nil {
+		t.Fatalf("realize production registry: %v", err)
+	}
+	probe := &delegateProbe{}
+	if err := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
+		Home: home, LaunchDir: project, ProjectRoot: project,
+		Snapshot: probe.snapshot, NewDispatcher: probe.newDispatcher, Store: activeStore,
+	})); err != nil {
+		t.Fatalf("Register delegate: %v", err)
+	}
+	deps := delegateTestBinding(active, modeActive).deps(reg, cache, activeStore, home, project, guard)
+	d := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.Build), ChildAgent: true, DeclaredWrite: declared}).(*productionToolDispatcher)
+
+	calls := []turn.AssembledToolCall{plannedDelegateCall("n1", "a.txt")}
+	plan := d.Plan(calls, 2)
+	assertPartitionedPlan(t, plan, calls, "d")
+	if _, err := plan.Units[0].Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	matched := decodePermissionMatched(t, store)
+	if len(matched) != 1 || matched[0].Subject != subagenttool.ToolName || matched[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope {
+		t.Fatalf("permission_matched = %+v, want the one declared-scope delegate decision", matched)
+	}
+	if prompts := decodeStoreEvents[events.PermissionPromptShown](t, store, events.KindPermissionPromptShown); len(prompts) != 0 {
+		t.Fatalf("prompts = %+v, want none", prompts)
+	}
+	if probe.started() != 1 {
+		t.Fatalf("grandchildren started = %d, want 1", probe.started())
 	}
 }

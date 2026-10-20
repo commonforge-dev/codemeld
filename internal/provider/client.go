@@ -160,10 +160,12 @@ type openAIClient struct {
 // OpenRouter groups dashboard activity by HTTP-Referer and fetches that URL for the
 // app's icon and description, so the value must be codemeld's real site.
 const (
-	attributionRefererHeader = "HTTP-Referer"
-	attributionRefererValue  = "https://codemeld.dev"
-	attributionTitleHeader   = "X-Title"
-	attributionTitleValue    = "Codemeld"
+	attributionRefererHeader    = "HTTP-Referer"
+	attributionRefererValue     = "https://codemeld.dev"
+	attributionTitleHeader      = "X-Title"
+	attributionTitleValue       = "Codemeld"
+	attributionCategoriesHeader = "X-OpenRouter-Categories"
+	attributionCategoriesValue  = "cli-agent,programming-app"
 )
 
 // NewClient builds the shared openai-go-backed Client for any OpenAI-compatible
@@ -184,6 +186,7 @@ func NewClient(cfg ClientConfig) Client {
 		opts = append(opts,
 			option.WithHeader(attributionRefererHeader, attributionRefererValue),
 			option.WithHeader(attributionTitleHeader, attributionTitleValue),
+			option.WithHeader(attributionCategoriesHeader, attributionCategoriesValue),
 		)
 	}
 	hc := cfg.HTTPClient

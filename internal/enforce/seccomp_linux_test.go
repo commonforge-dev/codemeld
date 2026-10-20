@@ -15,7 +15,7 @@ import (
 
 var (
 	wantDenyAll = []string{
-		"socket", "socketpair", "ptrace", "process_vm_readv", "process_vm_writev", "shmget", "shmat",
+		"socket", "ptrace", "process_vm_readv", "process_vm_writev", "shmget", "shmat",
 		"shmctl", "msgget", "msgsnd", "msgrcv", "msgctl", "semget", "semop", "semtimedop", "semctl",
 		"mq_open", "io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "mount",
 		"umount2", "pivot_root", "chroot", "fsopen", "fsconfig", "fsmount", "fspick", "move_mount",
@@ -107,10 +107,10 @@ func TestSeccompFilterDeniesExactlyTheLists(t *testing.T) {
 		}{
 			{"plan", seccompPlan, append(slices.Clone(wantDenyAll), wantDenyPlan...)},
 			{"auto_edits", seccompAuto, wantDenyAll},
-			{"auto_edits network", seccompNetwork, slices.DeleteFunc(slices.Clone(wantDenyAll), func(n string) bool { return n == "socketpair" })},
+			{"auto_edits network", seccompNetwork, wantDenyAll},
 		} {
 			got := deniedNames(newSeccompVM(t, tc.policy, info))
-			want := map[string]uint32{"clone3": retENOSYS}
+			want := map[string]uint32{"clone3": retENOSYS, "socketpair": retEPERM}
 			for _, n := range present(info, tc.want...) {
 				want[n] = retEPERM
 			}
@@ -149,7 +149,7 @@ func TestSeccompFilterGuardsArchitecture(t *testing.T) {
 
 func TestSeccompArchitectureAbsentSyscalls(t *testing.T) {
 	all := append(slices.Clone(wantDenyAll), wantDenyPlan...)
-	all = append(all, "clone", "clone3", "ioctl")
+	all = append(all, "clone", "clone3", "ioctl", "socketpair")
 	if missing := slices.DeleteFunc(slices.Clone(all), func(n string) bool { return slices.Contains(present(arch.X86_64, n), n) }); len(missing) != 0 {
 		t.Errorf("x86_64 missing %v", missing)
 	}
@@ -247,6 +247,30 @@ func TestSeccompNetworkVariant(t *testing.T) {
 		}
 		if got := net.run("socketpair", unix.AF_UNIX, unix.SOCK_STREAM); got != retAllow {
 			t.Errorf("%s network socketpair: ret %#x, want allow", info.Name, got)
+		}
+	}
+}
+
+func TestSeccompSocketpair(t *testing.T) {
+	policies := map[string]Policy{"plan": seccompPlan, "auto_edits": seccompAuto, "auto_edits network": seccompNetwork}
+	for _, info := range seccompArches {
+		for name, p := range policies {
+			v := newSeccompVM(t, p, info)
+			for _, flags := range []uint64{0, unix.SOCK_NONBLOCK, unix.SOCK_CLOEXEC, unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC} {
+				if got := v.run("socketpair", unix.AF_UNIX, unix.SOCK_STREAM|flags); got != retAllow {
+					t.Errorf("%s %s socketpair(AF_UNIX, %#x): ret %#x, want allow", info.Name, name, unix.SOCK_STREAM|flags, got)
+				}
+			}
+			for _, family := range []uint64{unix.AF_UNSPEC, unix.AF_INET, unix.AF_INET6, unix.AF_NETLINK, unix.AF_TIPC, 1000} {
+				if got := v.run("socketpair", family, unix.SOCK_STREAM); got != retEPERM {
+					t.Errorf("%s %s socketpair(%d, SOCK_STREAM): ret %#x, want EPERM", info.Name, name, family, got)
+				}
+			}
+			for _, typ := range []uint64{unix.SOCK_DGRAM, unix.SOCK_SEQPACKET, unix.SOCK_RAW, unix.SOCK_STREAM | 0x100, unix.SOCK_SEQPACKET | unix.SOCK_CLOEXEC} {
+				if got := v.run("socketpair", unix.AF_UNIX, typ); got != retEPERM {
+					t.Errorf("%s %s socketpair(AF_UNIX, %#x): ret %#x, want EPERM", info.Name, name, typ, got)
+				}
+			}
 		}
 	}
 }

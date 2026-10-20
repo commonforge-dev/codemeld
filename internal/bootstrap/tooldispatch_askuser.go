@@ -42,7 +42,7 @@ func decodeAskUserRequest(arguments string) (tui.QuestionRequest, error) {
 	if err != nil {
 		return tui.QuestionRequest{}, err
 	}
-	req := tui.QuestionRequest{Context: decoded.Context, Questions: make([]tui.QuestionSpec, 0, len(decoded.Questions))}
+	req := tui.QuestionRequest{Questions: make([]tui.QuestionSpec, 0, len(decoded.Questions))}
 	for _, q := range decoded.Questions {
 		req.Questions = append(req.Questions, tui.QuestionSpec(q))
 	}

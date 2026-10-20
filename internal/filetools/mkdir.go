@@ -139,22 +139,22 @@ func (t *MkdirTool) OutOfRootScope(scope string) bool {
 // resolved-before-authorize / reuse-at-invoke contract the create tool follows. Production dispatch
 // routes the mkdir tool through InvokeWithAuthorizedScope instead, which carries the authorized
 // directory's identity as well as the target.
-func (t *MkdirTool) InvokeWithResolvedTarget(_ context.Context, args map[string]any, resolvedTarget string) (tools.Result, error) {
-	return t.mkdir(nil, resolvedTarget, args), nil
+func (t *MkdirTool) InvokeWithResolvedTarget(ctx context.Context, args map[string]any, resolvedTarget string) (tools.Result, error) {
+	return t.mkdir(ctx, nil, resolvedTarget, args), nil
 }
 
 // InvokeWithAuthorizedScope is the seam production dispatch invokes the mkdir tool through. scope is the
 // ancestor that was authorized, not the deepest ancestor existing now, so an intermediate directory
 // legitimately created while the prompt was open does not read as a replacement. The confirmed scope
 // descriptor is held for the whole mkdir and the ancestor the create runs under is reached through it.
-func (t *MkdirTool) InvokeWithAuthorizedScope(_ context.Context, args map[string]any, resolvedTarget string, scope string, scopeIdentity ScopeIdentity) (tools.Result, error) {
+func (t *MkdirTool) InvokeWithAuthorizedScope(ctx context.Context, args map[string]any, resolvedTarget string, scope string, scopeIdentity ScopeIdentity) (tools.Result, error) {
 	confirmed, replaced := confirmAuthorizedScope(scope, scopeIdentity)
 	if replaced != "" {
 		return failResult(replaced), nil
 	}
 	defer confirmed.Close()
 	afterScopeConfirmed()
-	return t.mkdir(confirmed, resolvedTarget, args), nil
+	return t.mkdir(ctx, confirmed, resolvedTarget, args), nil
 }
 
 // Invoke resolves the target and creates the directory tree in one call (the standalone, non-dispatch
@@ -166,7 +166,7 @@ func (t *MkdirTool) InvokeWithAuthorizedScope(_ context.Context, args map[string
 // resolved scope (OutOfRootScope) is reachable only by explicit per-write approval, which only the dispatch
 // path can obtain. This method therefore refuses an out-of-root target in-band rather than creating it. The
 // in-root path is unchanged.
-func (t *MkdirTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
+func (t *MkdirTool) Invoke(ctx context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
 		return failResult(err.Error()), nil
@@ -174,7 +174,7 @@ func (t *MkdirTool) Invoke(_ context.Context, args map[string]any) (tools.Result
 	if t.OutOfRootScope(scope) {
 		return failResult("mkdir target outside the project root requires permission approval through dispatch"), nil
 	}
-	return t.mkdir(nil, target, args), nil
+	return t.mkdir(ctx, nil, target, args), nil
 }
 
 // mkdir creates target (and any missing parents) under the authorized deepest-existing ancestor. The
@@ -192,7 +192,7 @@ func (t *MkdirTool) Invoke(_ context.Context, args map[string]any) (tools.Result
 // located
 // at. An already-existing target directory is idempotent success. Preconditions surface as a result (not a
 // Go error) so the tool-call loop records them in-band and the model can correct itself.
-func (t *MkdirTool) mkdir(scope *authorizedScope, target string, args map[string]any) tools.Result {
+func (t *MkdirTool) mkdir(ctx context.Context, scope *authorizedScope, target string, args map[string]any) (res tools.Result) {
 	if verr := rejectUnknownMkdirArgs(args); verr != nil {
 		return failResult(verr.Error())
 	}
@@ -204,8 +204,29 @@ func (t *MkdirTool) mkdir(scope *authorizedScope, target string, args map[string
 	if reason != "" {
 		return failResult(reason)
 	}
+	alreadyExists := tools.Result{ExitCode: 0, Stdout: []byte(fmt.Sprintf("directory %s already exists\n", target))}
+	var hooks []fsutil.DirLifecycle
+	if journal, ok := WriteJournalFromContext(ctx).(mkdirJournal); ok {
+		declared, lifecycle, err := journal.BeginMkdir(target, ancestor)
+		switch {
+		case err != nil:
+			return failResult(err.Error())
+		case declared && lifecycle == nil:
+			return alreadyExists
+		case lifecycle != nil:
+			hooks = append(hooks, *lifecycle)
+			defer func() {
+				if rerr := journal.ResolveMkdir(target); rerr != nil && res.ExitCode == 0 {
+					res = failResult(rerr.Error())
+				}
+			}()
+			if exists {
+				return failResult("directory " + target + " appeared after the child agent's journal found it absent")
+			}
+		}
+	}
 	if exists {
-		return tools.Result{ExitCode: 0, Stdout: []byte(fmt.Sprintf("directory %s already exists\n", target))}
+		return alreadyExists
 	}
 
 	parentDir, openReason := t.openAuthorizedAncestor(scope, ancestor)
@@ -216,7 +237,7 @@ func (t *MkdirTool) mkdir(scope *authorizedScope, target string, args map[string
 
 	beforeMkdirCreate()
 
-	_, createdDirs, _, derr := fsutil.EnsureDirAt(parentDir, strings.Join(segs, "/"))
+	_, createdDirs, _, derr := fsutil.EnsureDirAt(parentDir, strings.Join(segs, "/"), hooks...)
 	if derr != nil {
 		return failResult("failed to create the directory: " + derr.Error())
 	}
@@ -347,6 +368,11 @@ func confirmAncestorStillAuthorized(parentDir *os.File, ancestor string) string 
 		return moved
 	}
 	return ""
+}
+
+type mkdirJournal interface {
+	BeginMkdir(target, ancestor string) (declared bool, lifecycle *fsutil.DirLifecycle, err error)
+	ResolveMkdir(target string) error
 }
 
 // allowedMkdirArgs is the exact closed set of argument keys the mkdir tool accepts, matching the advertised

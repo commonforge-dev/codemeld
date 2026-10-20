@@ -357,7 +357,7 @@ func (b delegateBinding) deps(reg *tools.Registry, cache *config.Cache, turnStor
 			auth.delegateWrite = modeCtx.DelegateWrite
 			auth.executionConstrained = b.confinement != nil && b.confinement.constrained
 			auth.blocked = guard.Blocked
-			child := newProductionToolDispatcher(reg, newChildToolRunner(), childMoveAuthorizer{Authorizer: auth, moves: modeCtx.DeclaredMoves},
+			child := newProductionToolDispatcher(reg, newChildToolRunner(), childMoveAuthorizer{Authorizer: auth, moves: modeCtx.DeclaredMoves, dirs: modeCtx.DeclaredDirs},
 				home, processCWD, turnStore, cache.MaxToolOutputBytes(), guard)
 			child.childCeiling = modeCtx.ChildAgent
 			child.childInvocationID = modeCtx.ChildInvocationID
@@ -377,15 +377,17 @@ func (b delegateBinding) deps(reg *tools.Registry, cache *config.Cache, turnStor
 	return deps
 }
 
-// headlessAuthorizer overlays a child's write and delete declarations but not its move pairs, which
-// this overlays on every call instead.
+// headlessAuthorizer overlays a child's write and delete declarations but not its move pairs or
+// directories, which this overlays on every call instead.
 type childMoveAuthorizer struct {
 	dispatch.Authorizer
 	moves map[permissions.MovePair]bool
+	dirs  map[string]bool
 }
 
 func (a childMoveAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, disp dispatch.PromptDisplay, modeCtx permissions.ModeContext) (permissions.Decision, error) {
 	modeCtx.DeclaredMoves = a.moves
+	modeCtx.DeclaredDirs = a.dirs
 	return a.Authorizer.Authorize(ctx, req, disp, modeCtx)
 }
 
@@ -637,7 +639,7 @@ func (d *productionToolDispatcher) prepareDelegates(calls []turn.AssembledToolCa
 }
 
 func (d *productionToolDispatcher) dispatchPreparedDelegate(ctx context.Context, prepared dispatch.PreparedTool) (turn.ToolResult, error) {
-	res, derr := dispatch.DispatchPreparedTool(d.childCtx(ctx), prepared, d.authorizer)
+	res, derr := dispatch.DispatchPreparedDelegate(d.childCtx(ctx), prepared, d.authorizer, d.childCeiling)
 	return d.adaptTool(subagenttool.ToolName, res, derr)
 }
 
@@ -1091,7 +1093,7 @@ func (d *productionToolDispatcher) dispatchDelegate(ctx context.Context, args ma
 	if refusal := prepared.DelegateRefusal(); refusal != nil && !d.childCeiling {
 		return d.adaptTool(subagenttool.ToolName, tools.Result{}, refusal)
 	}
-	res, derr := dispatch.DispatchPreparedTool(ctx, prepared, d.authorizer)
+	res, derr := dispatch.DispatchPreparedDelegate(ctx, prepared, d.authorizer, d.childCeiling)
 	return d.adaptTool(subagenttool.ToolName, res, derr)
 }
 

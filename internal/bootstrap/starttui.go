@@ -56,7 +56,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Alpha 0.4.5"
+var codemeldVersion = "Alpha 0.4.6"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -102,7 +102,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	if composed == nil {
 		composed = map[string]any{}
 	}
-	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths)
+	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths, result.Home)
 	if err != nil {
 		return fmt.Errorf("bootstrap: StartTUI build config cache: %w", err)
 	}
@@ -1412,6 +1412,7 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 		},
 		home:        home,
 		projectRoot: cache.ProjectRoot(),
+		writeRoots:  cache.WritableFolders(),
 		blocked:     guard.Blocked,
 		lookupPath:  lookupPath,
 		lookupSet:   true,

@@ -541,3 +541,52 @@ func TestChildAgent_OffLoopMarshalsThroughQueue(t *testing.T) {
 	}
 	stop()
 }
+
+func childDirsStart(invocation string, write []string, dirs ...string) events.ChildAgentStart {
+	start := childStart(invocation)
+	start.DeclaredPaths, start.DeclaredDirs = write, dirs
+	return start
+}
+
+func TestChildAgent_DirectoryOnlyChildShowsDirectoryAuthorityLiveAndReplayed(t *testing.T) {
+	start := childDirsStart(childA, nil, "/project/build", "/project/[red]out")
+	end := childEnd(childA, events.ChildAgentReasonCompleted, events.ChildRollbackNotNeeded)
+
+	live := New(nil)
+	live.ChildAgentStarted(start)
+	running := childAgentRunningHeading + "\n" +
+		"  may create directories:\n    /project/build\n    /project/[red]out"
+	if got := live.TranscriptText(); got != running {
+		t.Fatalf("running block = %q, want %q", got, running)
+	}
+	live.ChildAgentEnded(end)
+
+	replayed := New(nil)
+	replayed.ReplaySessionRecords([]sessions.Record{childStartEvent(start), childEndEvent(end)})
+	if got, want := replayed.TranscriptText(), live.TranscriptText(); got != want {
+		t.Fatalf("replayed block = %q, want the live block %q", got, want)
+	}
+	if got := replayed.TranscriptText(); !strings.Contains(got, "  may create directories:\n    /project/build") || strings.Contains(got, "may write:") {
+		t.Fatalf("replayed block = %q, want directories under their own heading and no write authority", got)
+	}
+}
+
+func TestChildAgent_DirectoriesFollowTheOtherFormsWithinTheDisplayBound(t *testing.T) {
+	dirs := make([]string, maxChildAgentPaths+1)
+	for i := range dirs {
+		dirs[i] = "/project/d" + string(rune('a'+i))
+	}
+	start := childDirsStart(childA, []string{"/project/a.go"}, dirs...)
+	start.DeclaredMovePairs = []events.ChildMovePair{childMovedPair}
+
+	a := New(nil)
+	a.ChildAgentStarted(start)
+	want := childAgentRunningHeading + "\n" +
+		"  may write:\n    /project/a.go\n" +
+		"  may move:\n    /project/old.md -> /project/new.md\n" +
+		"  may create directories:\n    " + strings.Join(dirs[:maxChildAgentPaths], "\n    ") + "\n" +
+		"    … and 1 more"
+	if got := a.TranscriptText(); got != want {
+		t.Fatalf("running block = %q, want %q", got, want)
+	}
+}

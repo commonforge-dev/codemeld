@@ -2,48 +2,127 @@ package subagent
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"codemeld.dev/codemeld/internal/permissions"
-	"codemeld.dev/codemeld/internal/procowner"
 	"codemeld.dev/codemeld/internal/sessions"
 )
 
-// exitedPID starts a process that runs no test and waits for it, so the pid it returns names a
-// process that has already exited and been reaped — what a killed codemeld leaves in its journal.
-func exitedPID(t *testing.T) int {
-	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("run a short-lived process: %v", err)
-	}
-	return cmd.ProcessState.Pid()
-}
+func lockPath(j *Journal) string { return filepath.Join(j.Path(), journalLockName) }
 
-func rewriteOwner(t *testing.T, j *Journal, owner procowner.Owner) {
-	t.Helper()
-	rec := onDiskRecord(t, j)
-	rec.Owner = owner
-	data, err := json.Marshal(&rec)
-	if err != nil {
-		t.Fatalf("encode journal record: %v", err)
-	}
-	if err := os.WriteFile(recordPath(j), data, journalRecordMode); err != nil {
-		t.Fatalf("write journal record: %v", err)
-	}
-}
-
+// orphan swaps the journal's lock for a fresh unlocked file, the on-disk state a writer that died
+// leaves behind, while this process keeps its descriptor on the old one.
 func orphan(t *testing.T, j *Journal) {
 	t.Helper()
-	owner := onDiskRecord(t, j).Owner
-	owner.PID = exitedPID(t)
-	rewriteOwner(t, j, owner)
+	if err := os.Remove(lockPath(j)); err != nil {
+		t.Fatalf("remove the writer's lock: %v", err)
+	}
+	if err := os.WriteFile(lockPath(j), nil, journalRecordMode); err != nil {
+		t.Fatalf("leave an unlocked lock file: %v", err)
+	}
+}
+
+// holdLock takes the journal's lock through a descriptor of its own until the returned release runs.
+func holdLock(t *testing.T, j *Journal) (release func()) {
+	t.Helper()
+	fd, err := unix.Open(lockPath(j), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open the journal lock: %v", err)
+	}
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("take the journal lock: %v", err)
+	}
+	released := false
+	release = func() {
+		if !released {
+			released = true
+			_ = unix.Close(fd)
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func assertLockHeld(t *testing.T, j *Journal) {
+	t.Helper()
+	fd, err := unix.Open(lockPath(j), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open the journal lock: %v", err)
+	}
+	defer unix.Close(fd) //nolint:errcheck // probe descriptor
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatalf("flock = %v, want the writer still holding the journal lock", err)
+	}
+}
+
+func readBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
+const deadWriterEnv = "CODEMELD_TEST_DEAD_JOURNAL_WRITER"
+
+// TestDeadJournalWriterHelper is not a test: run as a separate process, it opens a journal, lets the
+// child edit through it, and exits without closing it, as a killed codemeld would.
+func TestDeadJournalWriterHelper(t *testing.T) {
+	spec := os.Getenv(deadWriterEnv)
+	if spec == "" {
+		t.Skip("runs only as the dead journal writer process")
+	}
+	var dirs [2]string
+	if err := json.Unmarshal([]byte(spec), &dirs); err != nil {
+		t.Fatalf("decode %s: %v", deadWriterEnv, err)
+	}
+	f := &fixture{home: dirs[0], project: dirs[1]}
+	target := filepath.Join(f.project, "a.txt")
+	j, err := OpenJournal(JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), Declared: []string{target}})
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	mustSucceed(t, f.childEdit(t, j, target, "ORIGINAL", "CHILD"))
+}
+
+func TestRecover_PutsBackTheWritesOfAWriterProcessThatExited(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	spec, err := json.Marshal([2]string{f.home, f.project})
+	if err != nil {
+		t.Fatalf("encode the helper's folders: %v", err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDeadJournalWriterHelper$")
+	cmd.Env = append(os.Environ(), deadWriterEnv+"="+string(spec))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run the journal writer process: %v\n%s", err, out)
+	}
+	journal := filepath.Join(filepath.Dir(sessions.SessionRoot(f.home)), journalsDirName, sessions.FolderDirName(f.project), f.invocation())
+	if got := readFile(t, target); got != "CHILD\n" {
+		t.Fatalf("%s = %q, want the exited writer's child edit on disk", target, got)
+	}
+	if _, err := os.Stat(filepath.Join(journal, journalRecordName)); err != nil {
+		t.Fatalf("stat the exited writer's record: %v", err)
+	}
+
+	report := Recover(f.home, f.project, nil)
+
+	if got := readFile(t, target); got != "ORIGINAL\n" {
+		t.Fatalf("%s = %q, want its pre-run bytes read back from disk", target, got)
+	}
+	assertGone(t, journal)
+	if !slices.Contains(report.Restored, target) || len(report.Retained) != 0 || len(report.LeftAlone) != 0 {
+		t.Fatalf("report = %+v, want the exited writer's edit reported as put back", report)
+	}
 }
 
 func (f *fixture) openNested(t *testing.T, parent *Journal, declared ...string) *Journal {
@@ -92,28 +171,96 @@ func TestRecover_PutsBackTheWritesOfAnOrphanedChild(t *testing.T) {
 	}
 }
 
-func TestRecover_LeavesAJournalWhoseOwnerIsNotProvablyGone(t *testing.T) {
+func TestRecover_SkipsAJournalWhoseLockIsHeldWithoutReadingItsRecord(t *testing.T) {
 	cases := []struct {
-		name  string
-		owner func(procowner.Owner) procowner.Owner
+		name   string
+		record func(t *testing.T, j *Journal)
+	}{
+		{name: "an active record", record: func(*testing.T, *Journal) {}},
+		{name: "an absent record", record: func(t *testing.T, j *Journal) {
+			if err := os.Remove(recordPath(j)); err != nil {
+				t.Fatalf("remove the record: %v", err)
+			}
+		}},
+		{name: "a malformed record", record: func(t *testing.T, j *Journal) {
+			if err := os.WriteFile(recordPath(j), []byte("{not json"), journalRecordMode); err != nil {
+				t.Fatalf("corrupt the record: %v", err)
+			}
+		}},
+		{name: "an unsupported schema", record: func(t *testing.T, j *Journal) {
+			rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalAnswerSchemaVersion + 1 })
+		}},
+		{name: "a mismatched directory identity", record: func(t *testing.T, j *Journal) {
+			rewriteRecord(t, j, func(rec *journalRecord) { rec.DirIno++ })
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := f.seed(t, "a.txt", "ORIGINAL\n")
+			j := f.open(t, target)
+			f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+			tc.record(t, j)
+			before, _ := os.ReadFile(recordPath(j))
+
+			report := Recover(f.home, f.project, answer(ChoiceRestore))
+
+			if got := readFile(t, target); got != "CHILD\n" {
+				t.Fatalf("%s = %q, want the running writer's file untouched", target, got)
+			}
+			if after, _ := os.ReadFile(recordPath(j)); string(after) != string(before) {
+				t.Fatalf("record = %q, want it untouched (%q)", after, before)
+			}
+			if !report.Empty() {
+				t.Fatalf("report = %+v, want a running writer's journal to add nothing", report)
+			}
+			assertLockHeld(t, j)
+		})
+	}
+}
+
+func TestRecover_LeavesAJournalItCannotTellHasEnded(t *testing.T) {
+	cases := []struct {
+		name   string
+		lock   func(t *testing.T, j *Journal)
+		reason string
 	}{
 		{
-			name:  "the owning process is still running",
-			owner: func(o procowner.Owner) procowner.Owner { return o },
+			name: "a record without a lock",
+			lock: func(t *testing.T, j *Journal) {
+				if err := os.Remove(lockPath(j)); err != nil {
+					t.Fatalf("remove the lock: %v", err)
+				}
+			},
+			reason: "written by an earlier codemeld version that cannot show whether its run has ended",
 		},
 		{
-			name: "the pid may have been reused since",
-			owner: func(o procowner.Owner) procowner.Owner {
-				o.StartTime = "1"
-				return o
+			name: "a symlink in place of the lock",
+			lock: func(t *testing.T, j *Journal) {
+				outside := filepath.Join(t.TempDir(), "lock")
+				if err := os.WriteFile(outside, nil, 0o600); err != nil {
+					t.Fatalf("seed the symlink target: %v", err)
+				}
+				if err := os.Remove(lockPath(j)); err != nil {
+					t.Fatalf("remove the lock: %v", err)
+				}
+				if err := os.Symlink(outside, lockPath(j)); err != nil {
+					t.Fatalf("plant the symlink: %v", err)
+				}
 			},
+			reason: "its lock could not be checked: ",
 		},
 		{
-			name: "the record cannot be interpreted by this build",
-			owner: func(o procowner.Owner) procowner.Owner {
-				o.OS = runtime.GOOS + "-unknown"
-				return o
+			name: "a directory in place of the lock",
+			lock: func(t *testing.T, j *Journal) {
+				if err := os.Remove(lockPath(j)); err != nil {
+					t.Fatalf("remove the lock: %v", err)
+				}
+				if err := os.Mkdir(lockPath(j), 0o700); err != nil {
+					t.Fatalf("plant the directory: %v", err)
+				}
 			},
+			reason: "its lock could not be checked: it is not a regular file",
 		},
 	}
 	for _, tc := range cases {
@@ -122,24 +269,213 @@ func TestRecover_LeavesAJournalWhoseOwnerIsNotProvablyGone(t *testing.T) {
 			target := f.seed(t, "a.txt", "ORIGINAL\n")
 			j := f.open(t, target)
 			f.childEdit(t, j, target, "ORIGINAL", "CHILD")
-			rewriteOwner(t, j, tc.owner(onDiskRecord(t, j).Owner))
+			tc.lock(t, j)
+			before := readBytes(t, recordPath(j))
 
 			report := Recover(f.home, f.project, answer(ChoiceRestore))
 
 			if got := readFile(t, target); got != "CHILD\n" {
-				t.Fatalf("%s = %q, want the other codemeld's file untouched", target, got)
+				t.Fatalf("%s = %q, want the file left as it is", target, got)
 			}
-			assertRecordPresent(t, j)
+			if after := readBytes(t, recordPath(j)); string(after) != string(before) {
+				t.Fatalf("record = %q, want it untouched", after)
+			}
 			if len(report.Restored) > 0 || len(report.Kept) > 0 || len(report.Retained) > 0 {
-				t.Fatalf("report = %+v, want no path recovered or retained for a journal left alone", report)
+				t.Fatalf("report = %+v, want nothing recovered or retained for a journal left alone", report)
 			}
-			if len(report.LeftAlone) != 1 || report.LeftAlone[0].Path != j.Path() {
-				t.Fatalf("report.LeftAlone = %+v, want the untouched journal %s named", report.LeftAlone, j.Path())
-			}
-			if report.LeftAlone[0].Reason == "" {
-				t.Fatalf("report.LeftAlone = %+v, want a plain reason it was left alone", report.LeftAlone)
+			if len(report.LeftAlone) != 1 || report.LeftAlone[0].Path != j.Path() || !strings.HasPrefix(report.LeftAlone[0].Reason, tc.reason) {
+				t.Fatalf("report.LeftAlone = %+v, want %s named with reason %q", report.LeftAlone, j.Path(), tc.reason)
 			}
 		})
+	}
+
+	t.Run("a lock and record that are both gone", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		for _, path := range []string{lockPath(j), recordPath(j)} {
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove %s: %v", path, err)
+			}
+		}
+
+		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+			t.Fatalf("report = %+v, want record-less storage passed over in silence", report)
+		}
+		if got := readFile(t, target); got != "CHILD\n" {
+			t.Fatalf("%s = %q, want the file left as it is", target, got)
+		}
+	})
+
+	t.Run("a record whose existence cannot be checked", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		if err := os.Chmod(j.Path(), 0o600); err != nil {
+			t.Fatalf("remove search permission: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(j.Path(), journalDirMode) })
+
+		report := Recover(f.home, f.project, answer(ChoiceRestore))
+
+		if len(report.LeftAlone) != 0 || len(report.Retained) != 1 || report.Retained[0].Path != j.Path() ||
+			!strings.Contains(strings.Join(report.Retained[0].Notes, "\n"), "permission denied") {
+			t.Fatalf("report = %+v, want the unchecked record reported as unreadable", report)
+		}
+		if got := readFile(t, target); got != "CHILD\n" {
+			t.Fatalf("%s = %q, want the file left as it is", target, got)
+		}
+	})
+}
+
+func TestRecover_SkipsARecordLessDirectoryWhoseLockIsFree(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	orphan(t, j)
+	if err := os.Remove(recordPath(j)); err != nil {
+		t.Fatalf("remove the record: %v", err)
+	}
+
+	if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		t.Fatalf("report = %+v, want record-less residue passed over in silence", report)
+	}
+	if got := readFile(t, target); got != "CHILD\n" {
+		t.Fatalf("%s = %q, want no project write for record-less residue", target, got)
+	}
+	if _, err := os.Stat(lockPath(j)); err != nil {
+		t.Fatalf("stat the lock: %v, want record-less residue left as it is", err)
+	}
+}
+
+// transferReadyChain builds a parent, child, and grandchild whose grandchild edited target and handed
+// its journal up, with every writer gone.
+func transferReadyChain(t *testing.T, f *fixture, target string) (parent, child, grandchild *Journal) {
+	t.Helper()
+	parent = f.open(t, target)
+	child = f.openNested(t, parent, target)
+	grandchild = f.openNested(t, child, target)
+	f.childEdit(t, grandchild, target, "ORIGINAL", "GRANDCHILD")
+	if err := grandchild.MarkTransferReady(); err != nil {
+		t.Fatalf("MarkTransferReady grandchild: %v", err)
+	}
+	if err := child.MarkTransferReady(); err != nil {
+		t.Fatalf("MarkTransferReady child: %v", err)
+	}
+	orphan(t, parent)
+	orphan(t, child)
+	orphan(t, grandchild)
+	return parent, child, grandchild
+}
+
+func TestRecover_DefersEveryJournalAboveADescendantAnotherProcessHolds(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	parent, child, grandchild := transferReadyChain(t, f, target)
+	release := holdLock(t, grandchild)
+	before := map[string]string{}
+	for _, j := range []*Journal{parent, child, grandchild} {
+		before[j.Path()] = string(readBytes(t, recordPath(j)))
+	}
+
+	if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		t.Fatalf("report = %+v, want a deferred chain to add nothing", report)
+	}
+	if got := readFile(t, target); got != "GRANDCHILD\n" {
+		t.Fatalf("%s = %q, want no project write while a descendant is held", target, got)
+	}
+	for path, want := range before {
+		if got := string(readBytes(t, filepath.Join(path, journalRecordName))); got != want {
+			t.Fatalf("%s record = %q, want it untouched (%q)", path, got, want)
+		}
+	}
+
+	release()
+	report := Recover(f.home, f.project, nil)
+
+	if got := readFile(t, target); got != "ORIGINAL\n" {
+		t.Fatalf("%s = %q, want the parent's pre-run bytes once the descendant is free", target, got)
+	}
+	assertGone(t, grandchild.Path())
+	assertGone(t, child.Path())
+	assertGone(t, parent.Path())
+	if !slices.Contains(report.Restored, target) || len(report.Retained) != 0 {
+		t.Fatalf("report = %+v, want the later pass to recover the whole chain", report)
+	}
+}
+
+func TestRecover_RetainsEveryJournalAboveADescendantItCannotUse(t *testing.T) {
+	cases := []struct {
+		name        string
+		unavailable func(t *testing.T, j *Journal)
+		leftAlone   bool
+	}{
+		{name: "a descendant record without a lock", leftAlone: true, unavailable: func(t *testing.T, j *Journal) {
+			if err := os.Remove(lockPath(j)); err != nil {
+				t.Fatalf("remove the lock: %v", err)
+			}
+		}},
+		{name: "a malformed descendant record", unavailable: func(t *testing.T, j *Journal) {
+			if err := os.WriteFile(recordPath(j), []byte("{not json"), journalRecordMode); err != nil {
+				t.Fatalf("corrupt the record: %v", err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := f.seed(t, "a.txt", "ORIGINAL\n")
+			parent, child, grandchild := transferReadyChain(t, f, target)
+			tc.unavailable(t, grandchild)
+			before := readBytes(t, recordPath(grandchild))
+
+			report := Recover(f.home, f.project, answer(ChoiceRestore))
+
+			if got := readFile(t, target); got != "GRANDCHILD\n" {
+				t.Fatalf("%s = %q, want no project write while a descendant is unavailable", target, got)
+			}
+			if got := readBytes(t, recordPath(grandchild)); string(got) != string(before) {
+				t.Fatalf("descendant record = %q, want it untouched", got)
+			}
+			assertRecordPresent(t, child)
+			assertRecordPresent(t, parent)
+			if len(report.Restored) > 0 || (len(report.LeftAlone) == 1) != tc.leftAlone {
+				t.Fatalf("report = %+v, want nothing put back and the descendant reported once", report)
+			}
+			for _, j := range []*Journal{child, parent} {
+				i := slices.IndexFunc(report.Retained, func(r RetainedJournal) bool { return r.Path == j.Path() })
+				if i < 0 || !strings.Contains(strings.Join(report.Retained[i].Notes, "\n"), grandchild.Path()+" (") {
+					t.Fatalf("retained = %+v, want %s retained naming the unavailable descendant %s", report.Retained, j.Path(), grandchild.Path())
+				}
+			}
+		})
+	}
+}
+
+func TestRecover_OffersARetainedJournalAgainInTheSameProcess(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	orphan(t, j)
+	if err := os.WriteFile(target, []byte("A HAND EDIT\n"), 0o644); err != nil {
+		t.Fatalf("hand edit: %v", err)
+	}
+
+	for pass := 1; pass <= 2; pass++ {
+		report := Recover(f.home, f.project, nil)
+		if len(report.Retained) != 1 || report.Retained[0].Path != j.Path() {
+			t.Fatalf("pass %d retained = %+v, want the retained journal offered again", pass, report.Retained)
+		}
+	}
+	if got := readFile(t, target); got != "A HAND EDIT\n" {
+		t.Fatalf("%s = %q, want the hand edit left as it is", target, got)
 	}
 }
 
@@ -548,6 +884,7 @@ func TestRecover_ReportsAJournalItCannotRead(t *testing.T) {
 	target := f.seed(t, "a.txt", "ORIGINAL\n")
 	j := f.open(t, target)
 	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	orphan(t, j)
 	if err := os.WriteFile(recordPath(j), []byte("{not json"), journalRecordMode); err != nil {
 		t.Fatalf("corrupt the record: %v", err)
 	}
@@ -579,8 +916,10 @@ func TestRecover_LoadsOnlyARecordFromTheDirectoryItNames(t *testing.T) {
 	if err := os.Mkdir(j.Path(), journalDirMode); err != nil {
 		t.Fatalf("plant a replacement directory: %v", err)
 	}
-	if err := os.Rename(filepath.Join(moved, journalRecordName), filepath.Join(j.Path(), journalRecordName)); err != nil {
-		t.Fatalf("plant the record: %v", err)
+	for _, name := range []string{journalRecordName, journalLockName} {
+		if err := os.Rename(filepath.Join(moved, name), filepath.Join(j.Path(), name)); err != nil {
+			t.Fatalf("plant %s: %v", name, err)
+		}
 	}
 
 	report := Recover(f.home, f.project, nil)
@@ -1100,7 +1439,12 @@ func TestRecover_HoldsTheGroupOfAMoveWhoseSourceSomeoneElseRecreated(t *testing.
 	orphan(t, j)
 	before := captureEntries(t, a, b, c)
 
-	report := Recover(f.home, f.project, answer(ChoiceRestore))
+	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+		if len(u.Moves) > 0 {
+			return ChoiceDefer
+		}
+		return ChoiceRestore
+	})
 
 	assertEntriesUnchanged(t, before)
 	assertRecordPresent(t, j)
@@ -1362,7 +1706,7 @@ func TestRecover_LeavesANewerSchemaJournalAndEveryProjectPathUntouched(t *testin
 	j := f.openScopes(t, nil, []string{target})
 	f.mustDelete(t, j, target)
 	orphan(t, j)
-	rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalMoveSchemaVersion + 1 })
+	rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalAnswerSchemaVersion + 1 })
 
 	report := Recover(f.home, f.project, answer(ChoiceRestore))
 
@@ -1371,7 +1715,7 @@ func TestRecover_LeavesANewerSchemaJournalAndEveryProjectPathUntouched(t *testin
 	if len(report.Retained) != 1 || len(report.Restored) != 0 {
 		t.Fatalf("report = %+v, want the unreadable journal retained and nothing restored", report)
 	}
-	if got := onDiskRecord(t, j).SchemaVersion; got != journalMoveSchemaVersion+1 {
+	if got := onDiskRecord(t, j).SchemaVersion; got != journalAnswerSchemaVersion+1 {
 		t.Fatalf("schema_version = %d, want the record left as it was", got)
 	}
 }
@@ -1590,6 +1934,9 @@ func assertGroupHeld(t *testing.T, f *fixture, lm *linkedMoves, before []entrySn
 	t.Helper()
 	var asked []string
 	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+		if len(u.Moves) > 0 {
+			return ChoiceDefer
+		}
 		asked = append(asked, u.Path)
 		return ChoiceRestore
 	})
@@ -1747,5 +2094,359 @@ func TestRecover_RemovesOnlyTheJournalOfACommittedMoveSurvivor(t *testing.T) {
 	assertGone(t, j.Path())
 	if !report.Empty() {
 		t.Fatalf("report = %+v, want a committed move survivor to report nothing", report)
+	}
+}
+
+func TestRecover_SettlesAnOrphanedChildsDeclaredDirectoriesLikeALiveRollback(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, f *fixture) (*Journal, func(t *testing.T))
+	}{
+		{"a directory and the file declared inside it", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			dir := filepath.Join(f.project, "a")
+			file := filepath.Join(dir, "f.txt")
+			j := f.openConfig(t, JournalConfig{Declared: []string{file}, DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			mustSucceed(t, f.childCreate(t, j, file, "CHILD\n"))
+			return j, func(t *testing.T) { assertGone(t, dir) }
+		}},
+		{"a directory first made as a declared file's parent", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			dir := filepath.Join(f.project, "a")
+			file := filepath.Join(dir, "f.txt")
+			j := f.openConfig(t, JournalConfig{Declared: []string{file}, DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childCreate(t, j, file, "CHILD\n"))
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			return j, func(t *testing.T) { assertGone(t, dir) }
+		}},
+		{"a directory inside a moved entry", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			tree := f.dir(t, "tree", 0o750)
+			f.seedMode(t, "tree/leaf.txt", "LEAF\n", 0o600)
+			before := captureEntries(t, tree)
+			moved := filepath.Join(f.project, "moved")
+			j := f.openConfig(t, JournalConfig{DeclaredMoves: []permissions.MovePair{pairOf(tree, moved)}, DeclaredDirs: []string{filepath.Join(moved, "sub")}})
+			f.mustMove(t, j, tree, moved)
+			mustSucceed(t, f.childMkdir(t, j, filepath.Join(moved, "sub")))
+			return j, func(t *testing.T) {
+				assertEntriesUnchanged(t, before)
+				assertGone(t, moved)
+			}
+		}},
+		{"a directory made where a moved entry left", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			tree := f.dir(t, "tree", 0o750)
+			f.seedMode(t, "tree/leaf.txt", "LEAF\n", 0o600)
+			before := captureEntries(t, tree)
+			moved := filepath.Join(f.project, "moved")
+			j := f.openConfig(t, JournalConfig{DeclaredMoves: []permissions.MovePair{pairOf(tree, moved)}, DeclaredDirs: []string{tree}})
+			f.mustMove(t, j, tree, moved)
+			mustSucceed(t, f.childMkdir(t, j, tree))
+			return j, func(t *testing.T) {
+				assertEntriesUnchanged(t, before)
+				assertGone(t, moved)
+			}
+		}},
+		{"a directory below a deleted then recreated ancestor", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			ancestor := f.dir(t, "d", 0o750)
+			sub := filepath.Join(ancestor, "sub")
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{ancestor}, DeclaredDirs: []string{ancestor, sub}})
+			f.mustDelete(t, j, ancestor)
+			mustSucceed(t, f.childMkdir(t, j, ancestor))
+			mustSucceed(t, f.childMkdir(t, j, sub))
+			return j, func(t *testing.T) {
+				assertDir(t, ancestor, 0o750)
+				assertGone(t, sub)
+			}
+		}},
+		{"a directory recreated after the child deleted it", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			target := filepath.Join(f.project, "d")
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{target}, DeclaredDirs: []string{target}})
+			mustSucceed(t, f.childMkdir(t, j, target))
+			f.mustDelete(t, j, target)
+			mustSucceed(t, f.childMkdir(t, j, target))
+			return j, func(t *testing.T) { assertGone(t, target) }
+		}},
+		{"a pre-existing directory deleted and recreated twice", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			target := f.dir(t, "d", 0o750)
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{target}, DeclaredDirs: []string{target}})
+			for range 2 {
+				f.mustDelete(t, j, target)
+				mustSucceed(t, f.childMkdir(t, j, target))
+			}
+			return j, func(t *testing.T) { assertDir(t, target, 0o750) }
+		}},
+		{"a directory recreated through another declaration", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			j, a, sub := recreateThroughTheNestedDeclaration(t, f)
+			return j, func(t *testing.T) {
+				assertGone(t, sub)
+				assertGone(t, a)
+			}
+		}},
+		{"nested directories", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			target := filepath.Join(f.project, "x", "y", "z")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+			mustSucceed(t, f.childMkdir(t, j, target))
+			return j, func(t *testing.T) { assertGone(t, filepath.Join(f.project, "x")) }
+		}},
+		{"an unused and a pre-existing declaration", func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			existing := f.dir(t, "existing", 0o750)
+			f.seed(t, "existing/keep.txt", "KEEP\n")
+			before := captureEntries(t, existing)
+			unused := filepath.Join(f.project, "unused")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{existing, unused}})
+			mustSucceed(t, f.childMkdir(t, j, existing))
+			return j, func(t *testing.T) {
+				assertEntriesUnchanged(t, before)
+				assertGone(t, unused)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, check := tc.build(t, f)
+			rec := onDiskRecord(t, j)
+			want := journalDirSchemaVersion
+			if len(rec.Moves) > 0 {
+				want = journalAnswerSchemaVersion
+			}
+			if rec.SchemaVersion != want {
+				t.Fatalf("schema_version = %d, want %d for a journal holding a declared directory and %d moves", rec.SchemaVersion, want, len(rec.Moves))
+			}
+			orphan(t, j)
+
+			report := Recover(f.home, f.project, func(u Unresolved) Choice {
+				t.Fatalf("asked about %s, want nothing left to ask", u.Path)
+				return ChoiceDefer
+			})
+
+			if len(report.Retained) != 0 {
+				t.Fatalf("retained = %+v, want the journal fully recovered", report.Retained)
+			}
+			check(t)
+			assertGone(t, j.Path())
+		})
+	}
+}
+
+func TestRecover_ReportsARetainedDirectoryAtEveryLaunchWithoutOfferingIt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, dir string)
+	}{
+		{"holding another writer's file", func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "foreign.txt"), []byte("NOT MINE\n"), 0o644); err != nil {
+				t.Fatalf("seed foreign file: %v", err)
+			}
+		}},
+		{"replaced", func(t *testing.T, dir string) {
+			if err := os.Remove(dir); err != nil {
+				t.Fatalf("remove the created directory: %v", err)
+			}
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatalf("plant a replacement: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			dir := filepath.Join(f.project, "made")
+			edited := f.seed(t, "a.txt", "ORIGINAL\n")
+			j := f.openConfig(t, JournalConfig{Declared: []string{edited}, DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			tc.change(t, dir)
+			if err := os.WriteFile(edited, []byte("A HAND EDIT\n"), 0o644); err != nil {
+				t.Fatalf("hand edit: %v", err)
+			}
+			before := captureEntries(t, dir)
+			orphan(t, j)
+
+			for launch := 1; launch <= 2; launch++ {
+				var asked []string
+				report := Recover(f.home, f.project, func(u Unresolved) Choice {
+					asked = append(asked, u.Path)
+					return ChoiceDefer
+				})
+
+				if !slices.Equal(asked, []string{edited}) {
+					t.Fatalf("launch %d asked about %v, want only the ordinary path %s", launch, asked, edited)
+				}
+				if len(report.Retained) != 1 || !slices.Equal(report.Retained[0].Dirs, []string{dir}) {
+					t.Fatalf("launch %d retained = %+v, want %s listed as a retained directory", launch, report.Retained, dir)
+				}
+				notes := report.Retained[0].Notes
+				if slices.ContainsFunc(notes, func(n string) bool { return strings.HasPrefix(n, dir) }) || !slices.ContainsFunc(notes, func(n string) bool { return strings.HasPrefix(n, edited) }) {
+					t.Fatalf("launch %d notes = %v, want the ordinary path and not the directory", launch, notes)
+				}
+				assertEntriesUnchanged(t, before)
+				assertRecordPresent(t, j)
+			}
+		})
+	}
+}
+
+func TestRecover_KeepsTheChoiceOfADeletePathAlsoDeclaredAsADirectory(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "d", "ORIGINAL\n")
+	j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{target}, DeclaredDirs: []string{target}})
+	f.mustDelete(t, j, target)
+	if err := os.WriteFile(target, []byte("THIRD PARTY\n"), 0o644); err != nil {
+		t.Fatalf("third-party write: %v", err)
+	}
+	orphan(t, j)
+
+	var asked []string
+	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+		asked = append(asked, u.Path)
+		return ChoiceKeep
+	})
+
+	if !slices.Equal(asked, []string{target}) || !slices.Contains(report.Kept, target) {
+		t.Fatalf("asked %v, report %+v, want the delete path offered and kept", asked, report)
+	}
+	assertContent(t, target, "THIRD PARTY\n")
+	assertGone(t, j.Path())
+}
+
+func TestRecover_NeverOffersADirectoryOnlyDeclarationAnotherWriterFilled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fill func(t *testing.T, f *fixture, j *Journal, dir string)
+	}{
+		{"unused, then made by another writer", func(t *testing.T, _ *fixture, _ *Journal, dir string) {
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatalf("plant another writer's directory: %v", err)
+			}
+		}},
+		{"a creation never confirmed", func(t *testing.T, f *fixture, j *Journal, dir string) {
+			crashAt(t, "dir_confirm")
+			if res := f.childMkdir(t, j, dir); res.ExitCode == 0 {
+				t.Fatalf("mkdir = %+v, want the failed confirmation reported", res)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			dir := filepath.Join(f.project, "made")
+			edited := f.seed(t, "a.txt", "ORIGINAL\n")
+			j := f.openConfig(t, JournalConfig{Declared: []string{edited}, DeclaredDirs: []string{dir}})
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			tc.fill(t, f, j, dir)
+			if err := os.WriteFile(edited, []byte("A HAND EDIT\n"), 0o644); err != nil {
+				t.Fatalf("hand edit: %v", err)
+			}
+			before := captureEntries(t, dir)
+			orphan(t, j)
+
+			var asked []string
+			Recover(f.home, f.project, func(u Unresolved) Choice {
+				asked = append(asked, u.Path)
+				return ChoiceRestore
+			})
+
+			if !slices.Equal(asked, []string{edited}) {
+				t.Fatalf("asked about %v, want only the ordinary path %s", asked, edited)
+			}
+			assertContent(t, edited, "ORIGINAL\n")
+			assertEntriesUnchanged(t, before)
+			assertRecordPresent(t, j)
+		})
+	}
+}
+
+func TestRecover_OffersADeletePathWhoseDirectoryCreationIsUnsettled(t *testing.T) {
+	for _, tc := range []struct {
+		choice Choice
+		want   string
+	}{
+		{ChoiceRestore, "ORIGINAL\n"},
+		{ChoiceKeep, "THIRD PARTY\n"},
+	} {
+		t.Run(string(tc.choice), func(t *testing.T) {
+			f := newFixture(t)
+			target := f.seed(t, "d", "ORIGINAL\n")
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{target}, DeclaredDirs: []string{target}})
+			f.mustDelete(t, j, target)
+			mustSucceed(t, f.childMkdir(t, j, target))
+			if err := os.Remove(target); err != nil {
+				t.Fatalf("remove the created directory: %v", err)
+			}
+			if err := os.WriteFile(target, []byte("THIRD PARTY\n"), 0o644); err != nil {
+				t.Fatalf("third-party write: %v", err)
+			}
+			orphan(t, j)
+
+			var asked []string
+			report := Recover(f.home, f.project, func(u Unresolved) Choice {
+				asked = append(asked, u.Path)
+				return tc.choice
+			})
+
+			if !slices.Equal(asked, []string{target}) || len(report.Retained) != 0 {
+				t.Fatalf("asked %v, report %+v, want the delete path offered and the journal recovered", asked, report)
+			}
+			assertContent(t, target, tc.want)
+			assertGone(t, j.Path())
+		})
+	}
+}
+
+func TestRecover_RetainsADirectoryFirstMadeAsADeclaredFilesParent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, dir string) string
+	}{
+		{"holding another writer's file", func(t *testing.T, dir string) string {
+			foreign := filepath.Join(dir, "foreign.txt")
+			if err := os.WriteFile(foreign, []byte("NOT MINE\n"), 0o644); err != nil {
+				t.Fatalf("seed foreign file: %v", err)
+			}
+			return foreign
+		}},
+		{"replaced", func(t *testing.T, dir string) string {
+			if err := os.Rename(dir, dir+"-aside"); err != nil {
+				t.Fatalf("move the created directory aside: %v", err)
+			}
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatalf("plant a replacement: %v", err)
+			}
+			return dir
+		}},
+	} {
+		for _, orphaned := range []bool{false, true} {
+			name := tc.name + "/live"
+			if orphaned {
+				name = tc.name + "/orphaned"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newFixture(t)
+				dir := filepath.Join(f.project, "a")
+				file := filepath.Join(dir, "f.txt")
+				j := f.openConfig(t, JournalConfig{Declared: []string{file}, DeclaredDirs: []string{dir}})
+				mustSucceed(t, f.childCreate(t, j, file, "CHILD\n"))
+				mustSucceed(t, f.childMkdir(t, j, dir))
+				if n := createdDirsAt(onDiskRecord(t, j), dir); n != 1 {
+					t.Fatalf("%d created-directory records for %s, want one", n, dir)
+				}
+				before := captureEntries(t, tc.change(t, dir))
+
+				if !orphaned {
+					outcome := j.Finish(ReasonCancelled)
+					if !slices.Equal(outcome.RetainedDirs, []string{dir}) || outcome.JournalPath == "" {
+						t.Fatalf("outcome = %+v, want %s retained and reported", outcome, dir)
+					}
+				} else {
+					orphan(t, j)
+					report := Recover(f.home, f.project, func(u Unresolved) Choice {
+						t.Fatalf("asked about %s, want nothing offered", u.Path)
+						return ChoiceDefer
+					})
+					if len(report.Retained) != 1 || !slices.Equal(report.Retained[0].Dirs, []string{dir}) ||
+						slices.ContainsFunc(report.Retained[0].Notes, func(n string) bool { return strings.HasPrefix(n, dir+": ") }) {
+						t.Fatalf("retained = %+v, want %s listed in Dirs and not in Notes", report.Retained, dir)
+					}
+				}
+				assertEntriesUnchanged(t, before)
+				assertRecordPresent(t, j)
+			})
+		}
 	}
 }

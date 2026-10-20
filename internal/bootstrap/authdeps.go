@@ -63,8 +63,16 @@ type productionAuthorizer struct {
 	modeActive           *mode.ActiveState
 	declaredCommands     []permissions.DeclaredCommand
 	executionConstrained bool
+	writableFolders      []string
 	blocked              *permissions.BlockedPaths
 	localNotice          sync.Once
+}
+
+func liveWritableFolders(constrained, broken bool, folders []string) []string {
+	if constrained && !broken {
+		return folders
+	}
+	return nil
 }
 
 // promptDisplayData holds the permission-prompt display fields that are fixed for the run —
@@ -111,6 +119,7 @@ func newProductionAuthorizer(app *tui.App, cache *config.Cache, turn *permission
 		notices:          bgNoticeRenderer{app: app},
 		modeActive:       modeActive,
 		declaredCommands: cache.DeclaredCommands(),
+		writableFolders:  cache.WritableFolders(),
 		display: promptDisplayData{
 			projectRoot:             cache.ProjectRoot(),
 			launchDir:               launchDir,
@@ -149,6 +158,7 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 	modeCtx.DeclaredCommands = a.declaredCommands
 	modeCtx.ExecutionConstrained = a.executionConstrained
 	modeCtx.SettingsBroken = a.settingsBroken()
+	modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, modeCtx.SettingsBroken, a.writableFolders)
 
 	store := a.activeStore()
 	if m, ok := callMode(ctx, a.modeActive); ok {
@@ -213,6 +223,7 @@ func (a *productionAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispat
 		modeCtx.DeclaredCommands = a.declaredCommands
 		modeCtx.ExecutionConstrained = a.executionConstrained
 		modeCtx.SettingsBroken = broken
+		modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, broken, a.writableFolders)
 		modeCtx.Mode = activeMode
 		batch[i] = permissions.BatchRequest{Req: r.Req, ModeCtx: modeCtx}
 		modeCtxs[i] = modeCtx
@@ -274,6 +285,7 @@ func (a *productionAuthorizer) AuthorizeIndependent(ctx context.Context, reqs []
 		modeCtx.Mode = activeMode
 		modeCtx.ExecutionConstrained = a.executionConstrained
 		modeCtx.SettingsBroken = broken
+		modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, broken, a.writableFolders)
 		batch[i] = permissions.BatchRequest{Req: r.Req, ModeCtx: modeCtx}
 		displays[i] = a.buildPromptDisplay(markExceptional(r.Display, r.Req, modeCtx), r.Req.PathScope)
 		targets[i] = r.PreparedTarget

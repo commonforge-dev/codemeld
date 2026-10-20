@@ -18,7 +18,6 @@ import (
 	"codemeld.dev/codemeld/internal/filetools"
 	"codemeld.dev/codemeld/internal/fsutil"
 	"codemeld.dev/codemeld/internal/permissions"
-	"codemeld.dev/codemeld/internal/procowner"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/tools"
 )
@@ -214,7 +213,7 @@ func assertGone(t *testing.T, path string) {
 	}
 }
 
-func TestOpenJournal_RecordsIntentAndOwnerBeforeTheChildRuns(t *testing.T) {
+func TestOpenJournal_RecordsIntentAndHoldsItsLockBeforeTheChildRuns(t *testing.T) {
 	f := newFixture(t)
 	existing := f.seed(t, "a.txt", "ORIGINAL\n")
 	missing := filepath.Join(f.project, "new/deep/b.txt")
@@ -225,9 +224,14 @@ func TestOpenJournal_RecordsIntentAndOwnerBeforeTheChildRuns(t *testing.T) {
 	if rec.SchemaVersion != journalSchemaVersion || rec.Lifecycle != lifecycleActive {
 		t.Fatalf("record = %+v, want an active schema-%d record", rec, journalSchemaVersion)
 	}
-	if rec.Owner.PID != os.Getpid() || rec.Owner.SchemaVersion != procowner.SchemaVersion || rec.Owner.StartTime == "" {
-		t.Fatalf("owner = %+v, want this process's captured record", rec.Owner)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(readBytes(t, recordPath(j)), &raw); err != nil {
+		t.Fatalf("decode journal record: %v", err)
 	}
+	if _, ok := raw["owner"]; ok {
+		t.Fatalf("record = %s, want no owner field", readBytes(t, recordPath(j)))
+	}
+	assertLockHeld(t, j)
 	byPath := map[string]pathRecord{}
 	for _, pr := range rec.Paths {
 		byPath[pr.Path] = pr
@@ -271,6 +275,16 @@ func TestOpenJournal_UsesOwnerOnlyModesOnDisk(t *testing.T) {
 	}
 	if recInfo.Mode().Perm() != journalRecordMode {
 		t.Fatalf("journal record mode = %v, want %v", recInfo.Mode().Perm(), journalRecordMode)
+	}
+	lockInfo, err := os.Lstat(lockPath(j))
+	if err != nil {
+		t.Fatalf("stat journal lock: %v", err)
+	}
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("journal lock mode = %v, want a 0600 regular file", lockInfo.Mode())
+	}
+	if flags, err := unix.FcntlInt(uintptr(j.writerLock.fd), unix.F_GETFD, 0); err != nil || flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("writer lock descriptor flags = %#x (err=%v), want close-on-exec", flags, err)
 	}
 
 	var tempModes []os.FileMode
@@ -3160,8 +3174,8 @@ func TestJournalMove_RecoveryUndoesAnOrphanedMoveJournal(t *testing.T) {
 	j := f.openMoves(t, nil, pairOf(source, destination))
 	f.mustMove(t, j, source, destination)
 	rec := onDiskRecord(t, j)
-	if rec.SchemaVersion != journalMoveSchemaVersion {
-		t.Fatalf("schema_version = %d, want %d for a journal holding a move pair", rec.SchemaVersion, journalMoveSchemaVersion)
+	if rec.SchemaVersion != journalAnswerSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d for a journal holding a move with its identity", rec.SchemaVersion, journalAnswerSchemaVersion)
 	}
 	if len(rec.Moves) != 1 || rec.Moves[0].State != moveCompleted {
 		t.Fatalf("journalled moves = %+v, want the completed move recorded", rec.Moves)
@@ -3189,4 +3203,772 @@ func TestJournalMove_RecoveryUndoesAnOrphanedMoveJournal(t *testing.T) {
 			t.Fatalf("%s schema_version = %d, want the unchanged %d for a journal with no move pair", tc.name, got, tc.want)
 		}
 	}
+}
+
+func (f *fixture) openConfig(t *testing.T, cfg JournalConfig) *Journal {
+	t.Helper()
+	cfg.Home, cfg.ProjectRoot, cfg.Invocation = f.home, f.project, f.invocation()
+	j, err := OpenJournal(cfg)
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	t.Cleanup(j.Close)
+	return j
+}
+
+func (f *fixture) childMkdir(t *testing.T, j *Journal, target string) tools.Result {
+	t.Helper()
+	tool := filetools.NewMkdirTool(f.home, f.project, f.project)
+	res, err := tool.InvokeWithResolvedTarget(f.ctx(j), map[string]any{"path": target}, target)
+	if err != nil {
+		t.Fatalf("mkdir %s: %v", target, err)
+	}
+	return res
+}
+
+func pathIn(t *testing.T, rec journalRecord, path string) pathRecord {
+	t.Helper()
+	for _, pr := range rec.Paths {
+		if pr.Path == path {
+			return pr
+		}
+	}
+	t.Fatalf("journal record holds no path %s", path)
+	return pathRecord{}
+}
+
+func createdDirsAt(rec journalRecord, path string) int {
+	n := 0
+	for _, pr := range rec.Paths {
+		for _, d := range pr.Dirs {
+			if d.Created && filepath.Join(pr.Ancestor, filepath.FromSlash(d.Rel)) == path {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func assertCleanOutcome(t *testing.T, j *Journal, outcome JournalOutcome) {
+	t.Helper()
+	if len(outcome.Unrecovered) != 0 || len(outcome.RetainedDirs) != 0 || outcome.JournalPath != "" {
+		t.Fatalf("outcome = %+v, want a clean outcome", outcome)
+	}
+	assertGone(t, j.Path())
+}
+
+func TestJournalMkdir_CommitSettlesTheCreatedDirectoryAndRemovesTheJournal(t *testing.T) {
+	f := newFixture(t)
+	target := filepath.Join(f.project, "made", "deep")
+	j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+
+	mustSucceed(t, f.childMkdir(t, j, target))
+
+	rec := onDiskRecord(t, j)
+	if rec.SchemaVersion != journalDirSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d for a journal holding a declared directory", rec.SchemaVersion, journalDirSchemaVersion)
+	}
+	info := lstatEntry(t, target)
+	dev, ino := identityOf(t, info)
+	pr := pathIn(t, rec, target)
+	if pr.Pending != nil || pr.Pre.Exists || pr.LastKnown.Kind != kindDir || pr.LastKnown.Mode != info.Mode().Perm() || pr.LastKnown.Dev != dev || pr.LastKnown.Ino != ino {
+		t.Fatalf("record = %+v, want an absent pre-state and the created directory settled with its mode and identity", pr)
+	}
+	if len(pr.Dirs) != 2 || !pr.Dirs[0].Mkdir || !pr.Dirs[1].Created || pr.Dirs[1].Ino != ino {
+		t.Fatalf("dirs = %+v, want the intermediate and the target recorded in creation order", pr.Dirs)
+	}
+
+	assertCleanOutcome(t, j, j.Finish(ReasonCompleted))
+	assertDir(t, target, info.Mode().Perm())
+}
+
+func TestJournalMkdir_CrashBeforeConfirmationKeepsTheJournal(t *testing.T) {
+	f := newFixture(t)
+	target := filepath.Join(f.project, "made")
+	j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+	crashAt(t, "dir_confirm")
+
+	if res := f.childMkdir(t, j, target); res.ExitCode == 0 {
+		t.Fatalf("mkdir = %+v, want the failed confirmation reported", res)
+	}
+
+	outcome := j.Finish(ReasonCompleted)
+	if len(outcome.Unrecovered) == 0 || outcome.JournalPath == "" {
+		t.Fatalf("outcome = %+v, want the unconfirmed directory retained with its journal", outcome)
+	}
+	if got := pathIn(t, onDiskRecord(t, j), target); got.LastKnown.Exists {
+		t.Fatalf("record = %+v, want the unconfirmed directory never adopted", got)
+	}
+	if _, err := os.Lstat(target); err != nil {
+		t.Fatalf("%s: %v, want an unconfirmed directory left alone", target, err)
+	}
+}
+
+func TestJournalRollback_RestoresAFileBeforeRemovingTheDeclaredDirectoryHoldingIt(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		steps func(t *testing.T, f *fixture, j *Journal, dir, file string)
+	}{
+		{"mkdir then create", func(t *testing.T, f *fixture, j *Journal, dir, file string) {
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			mustSucceed(t, f.childCreate(t, j, file, "CHILD\n"))
+		}},
+		{"create then mkdir", func(t *testing.T, f *fixture, j *Journal, dir, file string) {
+			mustSucceed(t, f.childCreate(t, j, file, "CHILD\n"))
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			mustSucceed(t, f.childMkdir(t, j, dir))
+		}},
+		{"create only", func(t *testing.T, f *fixture, j *Journal, dir, file string) {
+			mustSucceed(t, f.childCreate(t, j, file, "CHILD\n"))
+		}},
+	} {
+		for _, reason := range []Reason{ReasonCancelled, ReasonCompleted} {
+			t.Run(tc.name+"/"+string(reason), func(t *testing.T) {
+				f := newFixture(t)
+				dir := filepath.Join(f.project, "a")
+				file := filepath.Join(dir, "f.txt")
+				j := f.openConfig(t, JournalConfig{Declared: []string{file}, DeclaredDirs: []string{dir}})
+				tc.steps(t, f, j, dir, file)
+				if n := createdDirsAt(onDiskRecord(t, j), dir); n != 1 {
+					t.Fatalf("%d created-directory records for %s, want its one ownership neither lost nor duplicated", n, dir)
+				}
+
+				assertCleanOutcome(t, j, j.Finish(reason))
+				if reason == ReasonCompleted {
+					assertContent(t, file, "CHILD\n")
+					return
+				}
+				assertGone(t, dir)
+			})
+		}
+	}
+}
+
+func TestJournalRollback_RemovesADeclaredDirectoryInsideAMovedEntryBeforeUndoingTheMove(t *testing.T) {
+	f := newFixture(t)
+	tree := f.dir(t, "tree", 0o750)
+	f.seedMode(t, "tree/leaf.txt", "LEAF\n", 0o600)
+	before := captureEntries(t, tree)
+	moved := filepath.Join(f.project, "moved")
+	sub := filepath.Join(moved, "sub")
+	j := f.openConfig(t, JournalConfig{DeclaredMoves: []permissions.MovePair{pairOf(tree, moved)}, DeclaredDirs: []string{sub}})
+	f.mustMove(t, j, tree, moved)
+	mustSucceed(t, f.childMkdir(t, j, sub))
+
+	assertCleanOutcome(t, j, j.Finish(ReasonCancelled))
+	assertEntriesUnchanged(t, before)
+	assertGone(t, moved)
+}
+
+func TestJournalRollback_RemovesADirectoryCreatedBelowADeletedThenRecreatedAncestor(t *testing.T) {
+	f := newFixture(t)
+	ancestor := f.dir(t, "d", 0o750)
+	sub := filepath.Join(ancestor, "sub")
+	j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{ancestor}, DeclaredDirs: []string{ancestor, sub}})
+	f.mustDelete(t, j, ancestor)
+	mustSucceed(t, f.childMkdir(t, j, ancestor))
+	mustSucceed(t, f.childMkdir(t, j, sub))
+
+	assertCleanOutcome(t, j, j.Finish(ReasonCancelled))
+	assertDir(t, ancestor, 0o750)
+	if names := dirNames(t, ancestor); len(names) != 0 {
+		t.Fatalf("%s holds %v, want the child's directory removed", ancestor, names)
+	}
+}
+
+func TestJournalMkdir_RefusesBelowAnAncestorItDidNotRecreate(t *testing.T) {
+	f := newFixture(t)
+	ancestor := f.dir(t, "d", 0o750)
+	sub := filepath.Join(ancestor, "sub")
+	j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{ancestor}, DeclaredDirs: []string{ancestor, sub}})
+	f.mustDelete(t, j, ancestor)
+	mustSucceed(t, f.childMkdir(t, j, ancestor))
+	if err := os.Rename(ancestor, ancestor+"-child"); err != nil {
+		t.Fatalf("move the recreated directory aside: %v", err)
+	}
+	if err := os.Mkdir(ancestor, 0o750); err != nil {
+		t.Fatalf("plant another writer's directory: %v", err)
+	}
+
+	if res := f.childMkdir(t, j, sub); res.ExitCode == 0 {
+		t.Fatalf("mkdir = %+v, want a directory beneath another writer's ancestor refused", res)
+	}
+	assertGone(t, sub)
+}
+
+func TestJournalRollback_RemovesNestedCreatedDirectoriesDeepestFirst(t *testing.T) {
+	f := newFixture(t)
+	target := filepath.Join(f.project, "x", "y", "z")
+	j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+	mustSucceed(t, f.childMkdir(t, j, target))
+	var order []string
+	beforeJournalStep = func(step string) error {
+		if step == "dir_restoring" {
+			for _, d := range j.rec.Paths[0].Dirs {
+				if d.Progress == rollbackRestoring {
+					order = append(order, d.Rel)
+				}
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+
+	assertCleanOutcome(t, j, j.Finish(ReasonCancelled))
+	if want := []string{"x/y/z", "x/y", "x"}; !slices.Equal(order, want) {
+		t.Fatalf("directories removed in order %v, want %v", order, want)
+	}
+	assertGone(t, filepath.Join(f.project, "x"))
+}
+
+func TestJournalRollback_SettlesUnchangedDeclaredDirectoriesAsCleanNoOps(t *testing.T) {
+	for _, reason := range []Reason{ReasonCancelled, ReasonCompleted} {
+		t.Run(string(reason), func(t *testing.T) {
+			f := newFixture(t)
+			existing := f.dir(t, "existing", 0o750)
+			f.seed(t, "existing/keep.txt", "KEEP\n")
+			before := captureEntries(t, existing)
+			unused := filepath.Join(f.project, "unused")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{existing, unused}})
+
+			res := f.childMkdir(t, j, existing)
+			mustSucceed(t, res)
+			if !strings.Contains(string(res.Stdout), "already exists") {
+				t.Fatalf("mkdir = %+v, want the existing directory reported as already there", res)
+			}
+
+			assertCleanOutcome(t, j, j.Finish(reason))
+			assertEntriesUnchanged(t, before)
+			assertGone(t, unused)
+		})
+	}
+}
+
+func TestJournalRollback_RetainsAndReportsUnsafeCreatedDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target string
+		left   string
+		change func(t *testing.T, left string)
+	}{
+		{"holding another writer's file", "made", "made", func(t *testing.T, left string) {
+			if err := os.WriteFile(filepath.Join(left, "foreign.txt"), []byte("NOT MINE\n"), 0o644); err != nil {
+				t.Fatalf("seed foreign file: %v", err)
+			}
+		}},
+		{"replaced", "made", "made", func(t *testing.T, left string) {
+			if err := os.Remove(left); err != nil {
+				t.Fatalf("remove the created directory: %v", err)
+			}
+			if err := os.Mkdir(left, 0o755); err != nil {
+				t.Fatalf("plant a replacement: %v", err)
+			}
+		}},
+		{"intermediate holding another writer's file", "x/y", "x", func(t *testing.T, left string) {
+			if err := os.WriteFile(filepath.Join(left, "foreign.txt"), []byte("NOT MINE\n"), 0o644); err != nil {
+				t.Fatalf("seed foreign file: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := filepath.Join(f.project, tc.target)
+			left := filepath.Join(f.project, tc.left)
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+			mustSucceed(t, f.childMkdir(t, j, target))
+			tc.change(t, left)
+			kept := left
+			if tc.left != tc.target {
+				kept = filepath.Join(left, "foreign.txt")
+			}
+			before := captureEntries(t, kept)
+
+			outcome := j.Finish(ReasonCancelled)
+
+			if !slices.Equal(outcome.RetainedDirs, []string{left}) || outcome.JournalPath == "" {
+				t.Fatalf("outcome = %+v, want %s retained and reported", outcome, left)
+			}
+			if !slices.ContainsFunc(outcome.Unrecovered, func(note string) bool { return strings.HasPrefix(note, left+": ") }) {
+				t.Fatalf("unrecovered = %v, want %s named", outcome.Unrecovered, left)
+			}
+			assertEntriesUnchanged(t, before)
+			assertRecordPresent(t, j)
+			if tc.left != tc.target {
+				assertGone(t, target)
+			}
+		})
+	}
+}
+
+func TestJournalMkdir_RepeatedMkdirKeepsTheOriginalOwnership(t *testing.T) {
+	f := newFixture(t)
+	target := filepath.Join(f.project, "made")
+	j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+	mustSucceed(t, f.childMkdir(t, j, target))
+	first := pathIn(t, onDiskRecord(t, j), target)
+
+	mustSucceed(t, f.childMkdir(t, j, target))
+
+	if again := pathIn(t, onDiskRecord(t, j), target); !reflect.DeepEqual(again, first) {
+		t.Fatalf("record after a repeated mkdir = %+v, want it unchanged from %+v", again, first)
+	}
+	assertCleanOutcome(t, j, j.Finish(ReasonCancelled))
+	assertGone(t, target)
+}
+
+func TestJournalMkdir_RefusesAnotherWritersDirectoryWithoutAdoptingIt(t *testing.T) {
+	plant := func(t *testing.T, target string) {
+		t.Helper()
+		if err := os.Mkdir(target, 0o755); err != nil {
+			t.Fatalf("plant another writer's directory: %v", err)
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		before func(t *testing.T, j *Journal, target string)
+	}{
+		{"visible before the intent", func(t *testing.T, _ *Journal, target string) { plant(t, target) }},
+		{"racing the create", func(t *testing.T, _ *Journal, target string) {
+			onJournalStep(t, "pending", func() { plant(t, target) })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := filepath.Join(f.project, "made")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{target}})
+			tc.before(t, j, target)
+
+			if res := f.childMkdir(t, j, target); res.ExitCode == 0 {
+				t.Fatalf("mkdir = %+v, want another writer's directory refused", res)
+			}
+			before := captureEntries(t, target)
+			if pr := pathIn(t, onDiskRecord(t, j), target); pr.LastKnown.Exists || createdDirsAt(onDiskRecord(t, j), target) != 0 {
+				t.Fatalf("record = %+v, want another writer's directory never claimed", pr)
+			}
+
+			outcome := j.Finish(ReasonCancelled)
+
+			if outcome.JournalPath == "" || len(outcome.RetainedDirs) != 0 {
+				t.Fatalf("outcome = %+v, want the journal retained without claiming the directory", outcome)
+			}
+			assertEntriesUnchanged(t, before)
+		})
+	}
+}
+
+func TestJournalMkdir_RecreatesADirectoryItDeletedAtTheSamePath(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		for _, reason := range []Reason{ReasonCompleted, ReasonCancelled} {
+			name := "absent/" + string(reason)
+			if existing {
+				name = "pre-existing/" + string(reason)
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newFixture(t)
+				target := filepath.Join(f.project, "d")
+				if existing {
+					f.dir(t, "d", 0o750)
+				}
+				j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{target}, DeclaredDirs: []string{target}})
+				if existing {
+					f.mustDelete(t, j, target)
+				}
+				mustSucceed(t, f.childMkdir(t, j, target))
+				f.mustDelete(t, j, target)
+				mustSucceed(t, f.childMkdir(t, j, target))
+				made := captureEntries(t, target)
+
+				assertCleanOutcome(t, j, j.Finish(reason))
+				switch {
+				case reason == ReasonCompleted:
+					assertEntriesUnchanged(t, made)
+				case existing:
+					assertDir(t, target, 0o750)
+				default:
+					assertGone(t, target)
+				}
+			})
+		}
+	}
+}
+
+// recreateThroughTheNestedDeclaration holds the first a open while deleting it, so its inode number cannot
+// be reused by the second a, which a/sub's declaration creates.
+func recreateThroughTheNestedDeclaration(t *testing.T, f *fixture) (j *Journal, a, sub string) {
+	t.Helper()
+	a = filepath.Join(f.project, "a")
+	sub = filepath.Join(a, "sub")
+	j = f.openConfig(t, JournalConfig{DeclaredDelete: []string{a, sub}, DeclaredDirs: []string{a, sub}})
+	mustSucceed(t, f.childMkdir(t, j, a))
+	mustSucceed(t, f.childMkdir(t, j, sub))
+	first, err := os.Open(a)
+	if err != nil {
+		t.Fatalf("hold the first directory open: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	f.mustDelete(t, j, sub)
+	f.mustDelete(t, j, a)
+	mustSucceed(t, f.childMkdir(t, j, sub))
+	return j, a, sub
+}
+
+func TestJournalMkdir_RemovesADirectoryRecreatedThroughAnotherDeclaration(t *testing.T) {
+	f := newFixture(t)
+	j, a, sub := recreateThroughTheNestedDeclaration(t, f)
+
+	assertCleanOutcome(t, j, j.Finish(ReasonCancelled))
+	assertGone(t, sub)
+	assertGone(t, a)
+}
+
+func TestJournalMkdir_ClaimsNothingWhenRecreatingADirectoryItDeletedFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		arm  func(t *testing.T, target string)
+	}{
+		{"another writer's directory racing the create", func(t *testing.T, target string) {
+			onJournalStep(t, "pending", func() {
+				if err := os.Mkdir(target, 0o755); err != nil {
+					t.Fatalf("plant another writer's directory: %v", err)
+				}
+			})
+		}},
+		{"a confirmation that could not be persisted", func(t *testing.T, _ string) { crashAt(t, "dir_confirm") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := filepath.Join(f.project, "d")
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{target}, DeclaredDirs: []string{target}})
+			mustSucceed(t, f.childMkdir(t, j, target))
+			f.mustDelete(t, j, target)
+			tc.arm(t, target)
+
+			if res := f.childMkdir(t, j, target); res.ExitCode == 0 {
+				t.Fatalf("mkdir = %+v, want the second creation reported as failed", res)
+			}
+			if pr := pathIn(t, onDiskRecord(t, j), target); pr.LastKnown.Exists {
+				t.Fatalf("record = %+v, want the directory never claimed", pr)
+			}
+			before := captureEntries(t, target)
+
+			outcome := j.Finish(ReasonCancelled)
+
+			if outcome.JournalPath == "" || len(outcome.RetainedDirs) != 0 {
+				t.Fatalf("outcome = %+v, want the journal retained without claiming the directory", outcome)
+			}
+			assertEntriesUnchanged(t, before)
+		})
+	}
+}
+
+func journalDirFor(f *fixture, invocation string) string {
+	return filepath.Join(filepath.Dir(sessions.SessionRoot(f.home)), journalsDirName, sessions.FolderDirName(f.project), invocation)
+}
+
+func assertDescriptorClosed(t *testing.T, fd int) {
+	t.Helper()
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("descriptor %d: F_GETFD err = %v, want it closed", fd, err)
+	}
+}
+
+func assertDescriptorOpen(t *testing.T, fd int) {
+	t.Helper()
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
+		t.Fatalf("descriptor %d: F_GETFD err = %v, want it still open", fd, err)
+	}
+}
+
+func TestOpenJournal_ReleasesAFailedLockSetupAndItsStorage(t *testing.T) {
+	recordOpened := func(opened *int) func(int, string, int, uint32) (int, error) {
+		return func(dir int, name string, flags int, mode uint32) (int, error) {
+			fd, err := unix.Openat(dir, name, flags, mode)
+			if err == nil {
+				*opened = fd
+			}
+			return fd, err
+		}
+	}
+	cases := []struct {
+		name   string
+		nested bool
+		arm    func(t *testing.T, opened *int)
+	}{
+		{name: "the lock cannot be created", arm: func(*testing.T, *int) {
+			openJournalLock = func(int, string, int, uint32) (int, error) { return -1, unix.EACCES }
+		}},
+		{name: "the lock cannot be taken", arm: func(t *testing.T, opened *int) {
+			open := recordOpened(opened)
+			openJournalLock = func(dir int, name string, flags int, mode uint32) (int, error) {
+				fd, err := open(dir, name, flags, mode)
+				if err != nil {
+					return fd, err
+				}
+				other, oErr := unix.Openat(dir, name, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+				if oErr != nil {
+					t.Fatalf("open a competing descriptor: %v", oErr)
+				}
+				t.Cleanup(func() { _ = unix.Close(other) })
+				if lErr := unix.Flock(other, unix.LOCK_EX|unix.LOCK_NB); lErr != nil {
+					t.Fatalf("take the competing lock: %v", lErr)
+				}
+				return fd, nil
+			}
+		}},
+		{name: "the parent cannot record the link", nested: true, arm: func(t *testing.T, opened *int) {
+			openJournalLock = recordOpened(opened)
+			crashAt(t, "link_child")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := f.seed(t, "a.txt", "ORIGINAL\n")
+			var parent *Journal
+			if tc.nested {
+				parent = f.open(t, target)
+			}
+			opened := -1
+			tc.arm(t, &opened)
+			t.Cleanup(func() { openJournalLock = unix.Openat })
+			invocation := f.invocation()
+
+			j, err := OpenJournal(JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: invocation, Declared: []string{target}, Parent: parent})
+
+			if err == nil {
+				j.Close()
+				t.Fatal("OpenJournal succeeded, want the failed lock setup refused")
+			}
+			assertGone(t, journalDirFor(f, invocation))
+			if opened >= 0 {
+				assertDescriptorClosed(t, opened)
+			}
+		})
+	}
+}
+
+func TestJournalLock_RepeatedCleanupNeverClosesAReusedDescriptor(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	writer := j.writerLock.fd
+	stand, err := os.Open(f.project)
+	if err != nil {
+		t.Fatalf("open a stand-in descriptor: %v", err)
+	}
+	defer stand.Close() //nolint:errcheck // read-only descriptor
+	recovery, err := unix.Dup(int(stand.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	j.recoveryLock = heldLock{fd: recovery, held: true}
+
+	assertCleanOutcome(t, j, j.Finish(ReasonCompleted))
+	j.Close()
+	assertDescriptorClosed(t, writer)
+	assertDescriptorClosed(t, recovery)
+	for _, fd := range []int{writer, recovery} {
+		if err := unix.Dup3(int(stand.Fd()), fd, unix.O_CLOEXEC); err != nil {
+			t.Fatalf("reuse descriptor %d: %v", fd, err)
+		}
+		t.Cleanup(func() { _ = unix.Close(fd) })
+	}
+
+	j.mu.Lock()
+	err = j.remove()
+	j.mu.Unlock()
+	if err != nil {
+		t.Fatalf("repeated remove: %v", err)
+	}
+	j.writerLock.close()
+	j.Close()
+	j.Close()
+
+	assertDescriptorOpen(t, writer)
+	assertDescriptorOpen(t, recovery)
+}
+
+func TestJournalLock_CloseKeepsARetainedWritersLock(t *testing.T) {
+	t.Run("a retained journal", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		replaceFile(t, target, "A HAND EDIT\n")
+		if outcome := j.Finish(ReasonCancelled); outcome.JournalPath == "" {
+			t.Fatalf("outcome = %+v, want the journal retained", outcome)
+		}
+		j.Close()
+
+		assertLockHeld(t, j)
+		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+			t.Fatalf("report = %+v, want a retained running writer's journal to add nothing", report)
+		}
+		assertContent(t, target, "A HAND EDIT\n")
+		assertRecordPresent(t, j)
+	})
+
+	t.Run("an unabsorbed nested child", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		parent := f.open(t, target)
+		child := f.openNested(t, parent, target)
+		f.childEdit(t, child, target, "ORIGINAL", "CHILD")
+		child.Close()
+		orphan(t, parent)
+
+		assertLockHeld(t, child)
+		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+			t.Fatalf("report = %+v, want the held child and its deferred parent to add nothing", report)
+		}
+		assertContent(t, target, "CHILD\n")
+		assertRecordPresent(t, child)
+		assertRecordPresent(t, parent)
+	})
+}
+
+func TestJournalLock_IsRemovedWithItsJournal(t *testing.T) {
+	finished := func(t *testing.T, j *Journal) {
+		t.Helper()
+		assertGone(t, j.Path())
+		if j.writerLock.held {
+			t.Fatal("writer lock still held after the journal was removed")
+		}
+	}
+
+	t.Run("on commit", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		assertLockHeld(t, j)
+
+		assertCleanOutcome(t, j, j.Finish(ReasonCompleted))
+		finished(t, j)
+	})
+
+	t.Run("on absorption into a parent", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		parent := f.open(t, target)
+		child := f.openNested(t, parent, target)
+		f.childEdit(t, child, target, "ORIGINAL", "CHILD")
+		assertLockHeld(t, child)
+
+		if outcome := child.Finish(ReasonCompleted); outcome.JournalPath != "" {
+			t.Fatalf("outcome = %+v, want the child absorbed", outcome)
+		}
+		finished(t, child)
+		assertLockHeld(t, parent)
+	})
+
+	t.Run("on a full rollback", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+
+		assertCleanOutcome(t, j, j.Finish(ReasonCancelled))
+		finished(t, j)
+		assertContent(t, target, "ORIGINAL\n")
+	})
+}
+
+func TestJournalRemove_KeepsTheLockWhileARecoverableRecordRemains(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	folder := filepath.Dir(j.Path())
+	if err := os.Chmod(folder, 0o600); err != nil {
+		t.Fatalf("remove search permission: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(folder, journalDirMode) })
+
+	outcome := j.Finish(ReasonCompleted)
+	if err := os.Chmod(folder, journalDirMode); err != nil {
+		t.Fatalf("restore search permission: %v", err)
+	}
+
+	if outcome.JournalPath == "" {
+		t.Fatalf("outcome = %+v, want the journal retained", outcome)
+	}
+	assertRecordPresent(t, j)
+	assertLockHeld(t, j)
+	if !j.writerLock.held {
+		t.Fatal("writer lock released while its record remains")
+	}
+}
+
+func TestJournalRemove_NeverRepublishesARecordItAlreadyUnlinked(t *testing.T) {
+	t.Run("the lock cannot be unlinked", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		if err := os.Remove(lockPath(j)); err != nil {
+			t.Fatalf("remove the lock: %v", err)
+		}
+		if err := os.Mkdir(lockPath(j), 0o700); err != nil {
+			t.Fatalf("plant an unremovable lock: %v", err)
+		}
+
+		if outcome := j.Finish(ReasonCompleted); outcome.JournalPath == "" {
+			t.Fatalf("outcome = %+v, want the cleanup failure reported", outcome)
+		}
+
+		assertGone(t, recordPath(j))
+		if _, err := os.Lstat(lockPath(j)); err != nil {
+			t.Fatalf("stat the lock: %v, want it left in place", err)
+		}
+		if !j.writerLock.held {
+			t.Fatal("writer lock released by a failed cleanup")
+		}
+		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+			t.Fatalf("report = %+v, want record-less residue passed over in silence", report)
+		}
+	})
+
+	t.Run("the directory cannot be removed", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		stray := filepath.Join(j.Path(), "stray")
+		if err := os.WriteFile(stray, nil, 0o600); err != nil {
+			t.Fatalf("plant a stray entry: %v", err)
+		}
+
+		if outcome := j.Finish(ReasonCompleted); outcome.JournalPath == "" {
+			t.Fatalf("outcome = %+v, want the cleanup failure reported", outcome)
+		}
+		j.retain("a later error report")
+
+		assertGone(t, recordPath(j))
+		assertGone(t, lockPath(j))
+		if !j.writerLock.held {
+			t.Fatal("writer lock released by a failed cleanup")
+		}
+		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+			t.Fatalf("report = %+v, want record-less residue passed over in silence", report)
+		}
+
+		if err := os.Remove(stray); err != nil {
+			t.Fatalf("remove the stray entry: %v", err)
+		}
+		j.mu.Lock()
+		err := j.remove()
+		j.mu.Unlock()
+		if err != nil {
+			t.Fatalf("retried cleanup: %v", err)
+		}
+		assertGone(t, j.Path())
+		if j.writerLock.held {
+			t.Fatal("writer lock still held after the retried cleanup")
+		}
+	})
 }

@@ -885,6 +885,12 @@ func TestNewClient_OpenRouterAttributionHeadersSent(t *testing.T) {
 	if got := header.Get(attributionTitleHeader); got != "Codemeld" {
 		t.Errorf("%s = %q, want Codemeld", attributionTitleHeader, got)
 	}
+	if got := header.Get("X-OpenRouter-Categories"); got != "cli-agent,programming-app" {
+		t.Errorf("X-OpenRouter-Categories = %q, want cli-agent,programming-app", got)
+	}
+	if got := header.Get("X-OpenRouter-App-Visibility"); got != "" {
+		t.Errorf("X-OpenRouter-App-Visibility = %q, want no header", got)
+	}
 	if got := header.Get("Authorization"); got != "Bearer sk-test" {
 		t.Errorf("Authorization = %q, want the resolved auth value", got)
 	}
@@ -900,6 +906,9 @@ func TestNewClient_OpenRouterAttributionOptOutKeepsRestOfRequest(t *testing.T) {
 	}
 	if got := header.Get(attributionTitleHeader); got != "" {
 		t.Errorf("%s = %q, want no header when attribution is off", attributionTitleHeader, got)
+	}
+	if got := header.Get("X-OpenRouter-Categories"); got != "" {
+		t.Errorf("X-OpenRouter-Categories = %q, want no header when attribution is off", got)
 	}
 	if got := header.Get("Authorization"); got != "Bearer sk-test" {
 		t.Errorf("Authorization = %q, want the auth header unaffected by the opt-out", got)
@@ -925,6 +934,9 @@ func TestNewClient_NonOpenRouterNeverAttributed(t *testing.T) {
 				}
 				if got := header.Get(attributionTitleHeader); got != "" {
 					t.Errorf("%s = %q, want no attribution header for %s", attributionTitleHeader, got, providerName)
+				}
+				if got := header.Get("X-OpenRouter-Categories"); got != "" {
+					t.Errorf("X-OpenRouter-Categories = %q, want no attribution header for %s", got, providerName)
 				}
 			})
 		}

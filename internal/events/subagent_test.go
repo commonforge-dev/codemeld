@@ -703,3 +703,112 @@ func TestChildAgentEnd_RejectsATotalThatBoundedNothing(t *testing.T) {
 		t.Fatal("Append() = nil error, want a written_paths_total that exceeds nothing rejected")
 	}
 }
+
+func TestEmitChildAgentStart_DirectoryOnlyChildRoundTrips(t *testing.T) {
+	sess := newSession()
+	store := sessions.New("unused-in-tests", sess)
+	dirs := childDeclared("build", "build/out")
+	start := validChildStart(ids.NewV7())
+	start.DeclaredPaths = nil
+	start.DeclaredDirs = dirs
+	if err := EmitChildAgentStart(store, childRoot, start); err != nil {
+		t.Fatalf("EmitChildAgentStart() error = %v, want a directory-only child admitted", err)
+	}
+	evs := reloadAll(t, sess)
+	if len(evs) != 1 {
+		t.Fatalf("persisted records = %d, want 1", len(evs))
+	}
+	if err := ValidatePayload(evs[0].Kind, evs[0].Payload); err != nil {
+		t.Fatalf("ValidatePayload() rejected the directory-only start: %v", err)
+	}
+	var got ChildAgentStart
+	mustUnmarshal(t, evs[0].Payload, &got)
+	if strings.Join(got.DeclaredDirs, ",") != strings.Join(dirs, ",") {
+		t.Errorf("declared_dirs = %v, want %v", got.DeclaredDirs, dirs)
+	}
+	if len(got.DeclaredPaths)+len(got.DeclaredDeletePaths)+len(got.DeclaredMovePairs) != 0 {
+		t.Errorf("start carries write/delete/move authority %v / %v / %v, want none", got.DeclaredPaths, got.DeclaredDeletePaths, got.DeclaredMovePairs)
+	}
+}
+
+func TestChildAgentStart_DeclaredDirsValidation(t *testing.T) {
+	paths := func(prefix string, n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = filepath.Join(childRoot, fmt.Sprintf("%s%02d", prefix, i))
+		}
+		return out
+	}
+
+	empty := validChildStart(ids.NewV7())
+	empty.DeclaredPaths = nil
+	_, err := Append(newStore(), empty)
+	if err == nil || !strings.Contains(err.Error(), "declared_delete_paths, declared_move_pairs or declared_dirs") {
+		t.Errorf("Append(no path in any form) error = %v, want a refusal naming all four forms", err)
+	}
+
+	union := validChildStart(ids.NewV7())
+	union.DeclaredPaths, union.DeclaredDirs = paths("f", 31), paths("d", 2)
+	_, err = Append(newStore(), union)
+	if err == nil || !strings.Contains(err.Error(), "declared_paths, declared_delete_paths, declared_move_pairs and declared_dirs exceeds") {
+		t.Errorf("Append(33 distinct paths with directories) error = %v, want the shared cap naming all four forms", err)
+	}
+	union.DeclaredDirs = append(paths("d", 1), union.DeclaredPaths[0])
+	if _, err := Append(newStore(), union); err != nil {
+		t.Errorf("Append(32 distinct paths, a directory equal to a write path) error = %v, want accepted", err)
+	}
+
+	over := validChildStart(ids.NewV7())
+	over.DeclaredPaths, over.DeclaredDirs = nil, paths("d", maxChildDeclaredPaths+1)
+	if _, err := Append(newStore(), over); err == nil {
+		t.Error("Append(over-cap declared_dirs) = nil error, want refused")
+	}
+
+	relative := validChildStart(ids.NewV7())
+	relative.DeclaredDirs = []string{"build"}
+	if _, err := Append(newStore(), relative); err == nil {
+		t.Error("Append(relative declared_dirs) = nil error, want refused")
+	}
+
+	outside := validChildStart(ids.NewV7())
+	outside.DeclaredDirs = []string{childRoot + "-other/build"}
+	if err := EmitChildAgentStart(newStore(), childRoot, outside); err == nil || !strings.Contains(err.Error(), "declared_dirs") {
+		t.Errorf("EmitChildAgentStart(out-of-project directory) error = %v, want declared_dirs refused", err)
+	}
+}
+
+func TestChildAgentStart_ReaderWithoutDeclaredDirs(t *testing.T) {
+	legacy := json.RawMessage(`{"invocation_id":"` + ids.NewV7() + `","provider_id":"openai","model_id":"m","declared_paths":["/home/u/proj/a.txt"],"step_cap":12,"instruction_bytes":4,"instruction_digest":"` + hex64 + `"}`)
+	if err := ValidatePayload(KindChildAgentStart, legacy); err != nil {
+		t.Fatalf("ValidatePayload(start without declared_dirs) error = %v, want accepted", err)
+	}
+
+	mixed := validChildStart(ids.NewV7())
+	mixed.DeclaredDirs = childDeclared("build")
+	dirOnly := validChildStart(ids.NewV7())
+	dirOnly.DeclaredPaths, dirOnly.DeclaredDirs = []string{}, childDeclared("build")
+	for _, tc := range []struct {
+		name    string
+		start   ChildAgentStart
+		wantErr bool
+	}{
+		{"a mixed start keeps its known forms and drops the directories", mixed, false},
+		{"a directory-only start is refused", dirOnly, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidatePayload(KindChildAgentStart, raw); err != nil {
+				t.Fatalf("ValidatePayload() error = %v, want the current reader to accept it", err)
+			}
+			var old ChildAgentStart
+			mustUnmarshal(t, raw, &old)
+			old.DeclaredDirs = nil
+			if err := old.validate(); (err != nil) != tc.wantErr {
+				t.Fatalf("validate() without declared_dirs error = %v, want error: %v", err, tc.wantErr)
+			}
+		})
+	}
+}

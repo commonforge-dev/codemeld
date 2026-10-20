@@ -8,7 +8,9 @@
 - Tool tips
 
 ## Ongoing
-- **0.4.6 Alpha:**
+
+## Completed
+- **0.4.6 Alpha — October 2026:**
   - Auto asks before more forms of delete and history-rewrite commands
   - Child agents are authorized by the operations they declare, and report what was refused
   - Child agents can create the folders they declare
@@ -16,10 +18,8 @@
   - Fixes for the v0.4.5 known issues
   - Launch question for a crashed child agent's file moves that changed after the crash
   - No false "interrupted child agent" warning while another codemeld runs a child agent
-  - Option to let sandboxed commands use the shared temp folder
   - Sandboxed commands can write to your declared writable folders
 
-## Completed
 - **0.4.5 Alpha — October 2026:**
   Permission updates:
   - Blocked paths: a `blocked_paths` setting lists folders codemeld never reads; `~/.codemeld` is always blocked, and changes to the list apply while codemeld runs

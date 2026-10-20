@@ -21,7 +21,7 @@ const (
 )
 
 var seccompDenyAll = []string{
-	"socket", "socketpair", "ptrace", "process_vm_readv", "process_vm_writev",
+	"socket", "ptrace", "process_vm_readv", "process_vm_writev",
 	"shmget", "shmat", "shmctl", "msgget", "msgsnd", "msgrcv", "msgctl",
 	"semget", "semop", "semtimedop", "semctl", "mq_open",
 	"io_uring_setup", "io_uring_enter", "io_uring_register",
@@ -96,8 +96,17 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 	blocks := map[string][]bpf.Instruction{
 		"clone":  {loadArg(0), bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: cloneNewFlags, SkipFalse: 1}, eperm, loadNr},
 		"clone3": {bpf.RetConstant{Val: unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)}},
+		"socketpair": {
+			loadArg(0),
+			bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.AF_UNIX, SkipTrue: 3},
+			loadArg(1),
+			bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: ^uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)},
+			bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.SOCK_STREAM, SkipTrue: 1},
+			eperm,
+			bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW},
+		},
 	}
-	names := append(slices.Clone(seccompDenyAll), "clone", "clone3")
+	names := append(slices.Clone(seccompDenyAll), "clone", "clone3", "socketpair")
 	if p.Mode == ModePlan {
 		names = append(append(names, seccompDenyPlan...), "ioctl")
 		blocks["ioctl"] = []bpf.Instruction{
@@ -109,7 +118,6 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 		}
 	}
 	if network {
-		names = slices.DeleteFunc(names, func(n string) bool { return n == "socketpair" })
 		blocks["socket"] = []bpf.Instruction{
 			loadArg(1),
 			bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: ^uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)},

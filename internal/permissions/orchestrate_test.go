@@ -4512,7 +4512,7 @@ func TestAuthorizeChildScope_MkdirMoveAndDeleteNameTheMissingChildForm(t *testin
 		form string
 	}{
 		{toolNameDelete, "this delegate call did not supply files_delete"},
-		{toolNameMkdir, "no child directories declaration"},
+		{toolNameMkdir, "this delegate call did not supply files_mkdir"},
 		{toolNameMove, "this delegate call did not supply files_move"},
 	}
 	for _, tc := range tests {
@@ -4765,23 +4765,61 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateNeedsASubsetOfTheRunCeiling(t *t
 		assertDeclaredEvent(t, f, outcomeDeny)
 	})
 
-	t.Run("a covered candidate reaches the ordinary path", func(t *testing.T) {
-		f := newFixture(choose(PromptAllowOnce), nil)
+	t.Run("a covered candidate is left to its operations", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
 		mc := topLevelDelegateMode(ceiling, nil, declSet(declTargetA))
 
 		d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
-		if d.Outcome != outcomeOnce {
-			t.Fatalf("decision = %+v, want the ordinary prompt's allow-once", d)
-		}
-		if f.cap.prompts != 1 {
-			t.Fatalf("prompts = %d, want 1 — the ceiling bounds the child but never starts one", f.cap.prompts)
-		}
-		for _, ev := range f.cap.events {
-			if ev.outcomeSource == OutcomeSourceDeclaredScope {
-				t.Fatalf("event %+v took the declared-scope route for a covered candidate", ev)
-			}
-		}
+		assertLeftToLaunchOperations(t, f, d)
 	})
+}
+
+func assertLeftToLaunchOperations(t *testing.T, f *orchFixture, d Decision) {
+	t.Helper()
+	if d.DenyEnvelope != "" || d.Grant != nil {
+		t.Fatalf("decision = %+v, want neither a refusal nor a grant", d)
+	}
+	if f.cap.prompts != 0 {
+		t.Fatalf("prompts = %d, want none under the tool name delegate", f.cap.prompts)
+	}
+	if len(f.cap.events) != 0 {
+		t.Fatalf("events = %+v, want no delegate decision recorded", f.cap.events)
+	}
+}
+
+func TestAuthorizeTopLevelDelegate_NoDelegateApprovalIsConsulted(t *testing.T) {
+	tests := []struct {
+		name  string
+		mode  string
+		setup func(f *orchFixture, req MatchRequest)
+	}{
+		{name: "no approval at all", setup: func(*orchFixture, MatchRequest) {}},
+		{
+			name: "a global delegate grant",
+			setup: func(f *orchFixture, _ MatchRequest) {
+				f.grants.entries = []PermissionEntry{toolGrant(toolNameDelegate, allPathsScope, grantKindGlobal)}
+			},
+		},
+		{
+			name: "a turn-cache deny",
+			setup: func(f *orchFixture, req MatchRequest) {
+				f.cache.hits[turnCacheKeyOf(req)] = outcomeDeny
+			},
+		},
+		{name: "Auto edits", mode: modeAutoEdits, setup: func(*orchFixture, MatchRequest) {}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			req := declReq(toolNameDelegate)
+			tc.setup(f, req)
+			mc := topLevelDelegateMode(nil, nil, declSet(declTargetA))
+			mc.Mode = tc.mode
+
+			d := mustAuthorizeMode(t, req, mc, f.deps)
+			assertLeftToLaunchOperations(t, f, d)
+		})
+	}
 }
 
 func TestAuthorizeDeclaredScope_PlanSkipsTheTopLevelDelegateGate(t *testing.T) {
@@ -4824,14 +4862,12 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateReadsAnAbsentWriteListAsEmpty(t 
 		}
 	})
 
-	t.Run("neither flag leaves delegation unchanged", func(t *testing.T) {
-		f := newFixture(choose(PromptAllowOnce), nil)
+	t.Run("neither flag skips the subset check", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
 		mc := topLevelDelegateMode(nil, nil, declSet(scopeProj+"/c.txt"))
 
 		d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
-		if d.Outcome != outcomeOnce || f.cap.prompts != 1 {
-			t.Fatalf("decision = %+v after %d prompts, want the ordinary prompt path", d, f.cap.prompts)
-		}
+		assertLeftToLaunchOperations(t, f, d)
 	})
 }
 
@@ -4957,9 +4993,9 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateDeleteNeedsASubsetOfTheRunDelete
 		wantDenied                      bool
 		wantReason                      string
 	}{
-		{name: "a delete subset reaches the ordinary path", write: declSet(declTargetA), remove: declSet(declTargetB),
+		{name: "a delete subset is left to its operations", write: declSet(declTargetA), remove: declSet(declTargetB),
 			candidateWrite: declSet(declTargetA), candidateDelete: declSet(declTargetB)},
-		{name: "a delete-only subset reaches the ordinary path", write: declSet(declTargetA), remove: declSet(declTargetB),
+		{name: "a delete-only subset is left to its operations", write: declSet(declTargetA), remove: declSet(declTargetB),
 			candidateDelete: declSet(declTargetB)},
 		{name: "a delete outside the run's delete list is refused", write: declSet(declTargetA), remove: declSet(declTargetB),
 			candidateWrite: declSet(declTargetA), candidateDelete: declSet(declTargetC), wantDenied: true,
@@ -4989,16 +5025,9 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateDeleteNeedsASubsetOfTheRunDelete
 				}
 				return
 			}
-			f := newFixture(choose(PromptAllowOnce), nil)
+			f := newFixture(neverPrompt, nil)
 			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
-			if d.Outcome != outcomeOnce || f.cap.prompts != 1 {
-				t.Fatalf("decision = %+v after %d prompts, want the ordinary prompt path", d, f.cap.prompts)
-			}
-			for _, ev := range f.cap.events {
-				if ev.outcomeSource == OutcomeSourceDeclaredScope {
-					t.Fatalf("event %+v took the declared-scope route for a covered candidate", ev)
-				}
-			}
+			assertLeftToLaunchOperations(t, f, d)
 		})
 	}
 }
@@ -5802,11 +5831,9 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateMovePairsAreRefusedUnderARunCeil
 			mc := topLevelScopesMode(declSet(declTargetA, declTargetB), declSet(declTargetA, declTargetB), tc.candidateWrite, nil)
 			mc.DelegateMoves = tc.moves
 			if !tc.wantDenied {
-				f := newFixture(choose(PromptAllowOnce), nil)
+				f := newFixture(neverPrompt, nil)
 				d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
-				if d.Outcome != outcomeOnce || f.cap.prompts != 1 {
-					t.Fatalf("decision = %+v after %d prompts, want the ordinary prompt path", d, f.cap.prompts)
-				}
+				assertLeftToLaunchOperations(t, f, d)
 				return
 			}
 			f := newFixture(neverPrompt, nil)
@@ -6421,4 +6448,255 @@ func TestAuthorizeBrokenSettingsLeavesUnconstrainedAndBuildUnchanged(t *testing.
 			}
 		}
 	})
+}
+
+const (
+	declDirX  = scopeProj + "/x"
+	declDirXY = scopeProj + "/x/y"
+	declDirXZ = scopeProj + "/x/z"
+)
+
+func childDirMode(target string, dirs map[string]bool) ModeContext {
+	mc := childMode(toolNameMkdir, target, nil)
+	mc.DeclaredDirs = dirs
+	return mc
+}
+
+func TestAuthorizeChildScope_MkdirNeedsTheExactDeclaredDirectory(t *testing.T) {
+	dirs := declSet(declDirXY, declDirXZ)
+	tests := []struct {
+		name      string
+		target    string
+		wantAllow bool
+	}{
+		{"a declared directory", declDirXY, true},
+		{"the other declared directory", declDirXZ, true},
+		{"the missing parent a declared mkdir creates", declDirX, false},
+		{"a directory below a declared one", declDirXY + "/deeper", false},
+		{"an undeclared sibling", scopeProj + "/x/w", false},
+		{"a case variant", scopeProj + "/x/Y", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			d := mustAuthorizeMode(t, declReq(toolNameMkdir), childDirMode(tc.target, dirs), f.deps)
+			if tc.wantAllow {
+				if d.Outcome != outcomeOnce {
+					t.Fatalf("decision = %+v, want the declaration's allow", d)
+				}
+				assertDeclaredEvent(t, f, outcomeOnce)
+				return
+			}
+			if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope || IsModeDenyEnvelope(d.DenyEnvelope) {
+				t.Fatalf("decision = %+v, want a terminal declared-scope denial", d)
+			}
+			if deniedBy, _ := decodeDenyFields(t, d.DenyEnvelope); deniedBy != "user" {
+				t.Fatalf("denied_by = %q, want user", deniedBy)
+			}
+			assertDeclaredEvent(t, f, outcomeDeny)
+		})
+	}
+
+	t.Run("a global grant does not widen it", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
+		f.grants.entries = []PermissionEntry{toolGrant(toolNameMkdir, allPathsScope, grantKindGlobal)}
+		d := mustAuthorizeMode(t, declReq(toolNameMkdir), childDirMode(declDirX, dirs), f.deps)
+		if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
+			t.Fatalf("decision = %+v, want a declared-scope denial ahead of the grant", d)
+		}
+		assertDeclaredEvent(t, f, outcomeDeny)
+	})
+
+	t.Run("Plan stays a mode denial", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
+		mc := childDirMode(declDirXY, dirs)
+		mc.Mode = modePlan
+		d := mustAuthorizeMode(t, declReq(toolNameMkdir), mc, f.deps)
+		if !IsModeDenyEnvelope(d.DenyEnvelope) || lastEvent(t, f).outcomeSource != outcomeSourceModeAuto {
+			t.Fatalf("Plan decision = %+v with event %+v, want a mode denial", d, lastEvent(t, f))
+		}
+	})
+
+	t.Run("a run ceiling authorizes no mkdir whatever directories reach it", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
+		mc := declMode(toolNameMkdir, declDirXY, declSet(declDirXY), declSet(declDirXY))
+		mc.DeclaredDirs = dirs
+		d := mustAuthorizeMode(t, declReq(toolNameMkdir), mc, f.deps)
+		if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
+			t.Fatalf("decision = %+v, want a declared-scope denial", d)
+		}
+		assertDeclaredEvent(t, f, outcomeDeny)
+	})
+}
+
+func TestAuthorizeChildScope_ADeclaredDirectoryGrantsNothingInsideItOrOnIt(t *testing.T) {
+	inside := declDirX + "/f.txt"
+	tests := []struct {
+		name string
+		mc   ModeContext
+	}{
+		{"no create inside it", childMode(toolNameCreate, inside, nil)},
+		{"no edit inside it", childMode(toolNameEdit, inside, nil)},
+		{"no create of the directory path itself", childMode(toolNameCreate, declDirX, nil)},
+		{"no delete inside it", childDeleteMode(inside, nil, nil)},
+		{"no delete of the directory itself", childDeleteMode(declDirX, nil, nil)},
+		{"no move out of it", childMoveMode(inside, declTargetA, nil)},
+		{"no move into it", childMoveMode(declTargetA, inside, nil)},
+		{"no move of the directory itself", childMoveMode(declDirX, declTargetB, nil)},
+		{"no mkdir inside it", childMode(toolNameMkdir, declDirXY, nil)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			mc := tc.mc
+			mc.DeclaredDirs = declSet(declDirX)
+
+			d := mustAuthorizeMode(t, declReq(mc.ToolName), mc, f.deps)
+			if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
+				t.Fatalf("decision = %+v, want a declared-scope denial", d)
+			}
+			assertDeclaredEvent(t, f, outcomeDeny)
+		})
+	}
+}
+
+func TestAuthorizeChildScope_MkdirRefusalNamesTheFilesMkdirForm(t *testing.T) {
+	tests := []struct {
+		name string
+		dirs map[string]bool
+		form string
+	}{
+		{"files_mkdir omitted", nil, "this delegate call did not supply files_mkdir"},
+		{"files_mkdir supplied empty", declSet(), "this delegate call supplied an empty files_mkdir"},
+		{"files_mkdir without this directory", declSet(declDirXZ), "this delegate call's files_mkdir does not list this directory"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			d := mustAuthorizeMode(t, declReq(toolNameMkdir), childDirMode(declDirXY, tc.dirs), f.deps)
+			if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
+				t.Fatalf("decision = %+v, want a declared-scope denial", d)
+			}
+			assertDeclaredEvent(t, f, outcomeDeny)
+
+			reason := envelopeReason(t, d.DenyEnvelope)
+			at := -1
+			for _, want := range []string{"a child agent may touch only the paths its delegate call declared", tc.form, "cannot widen while the child runs"} {
+				idx := strings.Index(reason, want)
+				if idx <= at {
+					t.Fatalf("reason %q is missing %q or has it out of order", reason, want)
+				}
+				at = idx
+			}
+			if !strings.HasSuffix(reason, "target="+strconv.Quote(declDirXY)) {
+				t.Fatalf("reason %q does not end with the canonical target", reason)
+			}
+		})
+	}
+}
+
+func TestAuthorizeChildScope_NestedDirectoriesMustBeASubsetOfTheParentsDirectories(t *testing.T) {
+	tests := []struct {
+		name                   string
+		parentWrite            map[string]bool
+		parent, nested         map[string]bool
+		nestedWrite            map[string]bool
+		wantAllow, wantDirRule bool
+	}{
+		{name: "a proper subset", parent: declSet(declDirXY, declDirXZ), nested: declSet(declDirXY), nestedWrite: declSet(declTargetA), wantAllow: true},
+		{name: "an equal set", parent: declSet(declDirXY, declDirXZ), nested: declSet(declDirXY, declDirXZ), nestedWrite: declSet(declTargetA), wantAllow: true},
+		{name: "a directory-only nested candidate", parent: declSet(declDirXY), nested: declSet(declDirXY), wantAllow: true},
+		{name: "an omitted nested directory form", parent: declSet(declDirXY), nestedWrite: declSet(declTargetA), wantAllow: true},
+		{name: "a supplied empty nested directory form", nested: declSet(), nestedWrite: declSet(declTargetA), wantAllow: true},
+		{name: "an extra directory", parent: declSet(declDirXY), nested: declSet(declDirXY, declDirXZ), nestedWrite: declSet(declTargetA), wantDirRule: true},
+		{name: "any directory under a parent with none", nested: declSet(declDirXY), nestedWrite: declSet(declTargetA), wantDirRule: true},
+		{name: "the missing parent of a declared directory", parent: declSet(declDirXY), nested: declSet(declDirX), nestedWrite: declSet(declTargetA), wantDirRule: true},
+		{name: "a parent write path admits no nested directory", parentWrite: declSet(declTargetA, declDirX), nested: declSet(declDirX), nestedWrite: declSet(declTargetA), wantDirRule: true},
+		{name: "a parent directory admits no nested write inside it", parent: declSet(declDirX), nestedWrite: declSet(declDirX + "/f.txt")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			parentWrite := tc.parentWrite
+			if parentWrite == nil {
+				parentWrite = declSet(declTargetA)
+			}
+			mc := nestedDelegateMode(parentWrite, tc.nestedWrite)
+			mc.DeclaredDirs, mc.DelegateDirs = tc.parent, tc.nested
+
+			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			want := outcomeDeny
+			if tc.wantAllow {
+				want = outcomeOnce
+			}
+			if d.Outcome != want {
+				t.Fatalf("decision = %+v, want %s", d, want)
+			}
+			assertDeclaredEvent(t, f, want)
+			if !tc.wantDirRule {
+				return
+			}
+			reason := envelopeReason(t, d.DenyEnvelope)
+			if !strings.Contains(reason, "a nested delegate call may declare in files_mkdir only directories its own parent already declared") {
+				t.Fatalf("reason %q does not name the nested directory rule", reason)
+			}
+			if !strings.Contains(reason, "undeclared_mkdir=") || strings.Contains(reason, "undeclared=") {
+				t.Fatalf("reason %q should name only the undeclared directories", reason)
+			}
+		})
+	}
+}
+
+func TestAuthorizeDeclaredScope_TopLevelDelegateDirectoriesAreRefusedUnderARunCeiling(t *testing.T) {
+	tests := []struct {
+		name           string
+		ceiling        bool
+		candidateWrite map[string]bool
+		dirs           map[string]bool
+		wantDenied     bool
+	}{
+		{name: "a directory beside a covered write list", ceiling: true, candidateWrite: declSet(declTargetA), dirs: declSet(declDirXY), wantDenied: true},
+		{name: "a directory-only candidate", ceiling: true, dirs: declSet(declDirXY), wantDenied: true},
+		{name: "a supplied empty directory form", ceiling: true, candidateWrite: declSet(declTargetA), dirs: declSet()},
+		{name: "no run ceiling", candidateWrite: declSet(declTargetA), dirs: declSet(declDirXY)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var write, remove map[string]bool
+			if tc.ceiling {
+				write, remove = declSet(declTargetA, declTargetB, declDirXY), declSet(declTargetA, declTargetB)
+			}
+			mc := topLevelScopesMode(write, remove, tc.candidateWrite, nil)
+			mc.DelegateDirs = tc.dirs
+			if !tc.wantDenied {
+				f := newFixture(neverPrompt, nil)
+				d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+				assertLeftToLaunchOperations(t, f, d)
+				return
+			}
+			f := newFixture(neverPrompt, nil)
+			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
+				t.Fatalf("decision = %+v, want a declared-scope denial", d)
+			}
+			assertDeclaredEvent(t, f, outcomeDeny)
+
+			reason := envelopeReason(t, d.DenyEnvelope)
+			at := -1
+			for _, want := range []string{
+				"a declared-scope ceiling is active for this run and a child agent may declare no directories",
+				"neither " + declaredWriteFlag + " nor " + declaredDeleteFlag + " can authorize files_mkdir",
+				"the ceiling cannot widen during the run",
+			} {
+				idx := strings.Index(reason, want)
+				if idx <= at {
+					t.Fatalf("reason %q is missing %q or has it out of order", reason, want)
+				}
+				at = idx
+			}
+			if wantLast := "undeclared_mkdir=" + strconv.Quote(declDirXY); !strings.HasSuffix(reason, wantLast) {
+				t.Fatalf("reason %q does not end with the escaped undeclared directory %q", reason, wantLast)
+			}
+		})
+	}
 }

@@ -70,6 +70,7 @@ type ChildAgentStart struct {
 
 	DeclaredDeletePaths []string        `json:"declared_delete_paths,omitempty"`
 	DeclaredMovePairs   []ChildMovePair `json:"declared_move_pairs,omitempty"`
+	DeclaredDirs        []string        `json:"declared_dirs,omitempty"`
 }
 
 func (ChildAgentStart) Kind() string { return KindChildAgentStart }
@@ -85,8 +86,8 @@ func (p ChildAgentStart) validate() error {
 	if err := required(k, "model_id", p.ModelID); err != nil {
 		return err
 	}
-	if len(p.DeclaredPaths)+len(p.DeclaredDeletePaths)+len(p.DeclaredMovePairs) == 0 {
-		return fmt.Errorf("%s.declared_paths: required field is empty and neither declared_delete_paths nor declared_move_pairs names a path", k)
+	if len(p.DeclaredPaths)+len(p.DeclaredDeletePaths)+len(p.DeclaredMovePairs)+len(p.DeclaredDirs) == 0 {
+		return fmt.Errorf("%s.declared_paths: required field is empty and none of declared_delete_paths, declared_move_pairs or declared_dirs names a path", k)
 	}
 	if err := childPathList(k, "declared_paths", p.DeclaredPaths, maxChildDeclaredPaths); err != nil {
 		return err
@@ -97,8 +98,11 @@ func (p ChildAgentStart) validate() error {
 	if err := childPairList(k, "declared_move_pairs", p.DeclaredMovePairs); err != nil {
 		return err
 	}
-	if n := distinctPaths(p.DeclaredPaths, p.DeclaredDeletePaths, pairEndpoints(p.DeclaredMovePairs)); n > maxChildDeclaredPaths {
-		return fmt.Errorf("%s: %d distinct paths across declared_paths, declared_delete_paths and declared_move_pairs exceeds the limit of %d", k, n, maxChildDeclaredPaths)
+	if err := childPathList(k, "declared_dirs", p.DeclaredDirs, maxChildDeclaredPaths); err != nil {
+		return err
+	}
+	if n := distinctPaths(p.DeclaredPaths, p.DeclaredDeletePaths, pairEndpoints(p.DeclaredMovePairs), p.DeclaredDirs); n > maxChildDeclaredPaths {
+		return fmt.Errorf("%s: %d distinct paths across declared_paths, declared_delete_paths, declared_move_pairs and declared_dirs exceeds the limit of %d", k, n, maxChildDeclaredPaths)
 	}
 	if p.StepCap < 1 {
 		return fmt.Errorf("%s.step_cap: must be >= 1, got %d", k, p.StepCap)
@@ -232,6 +236,9 @@ func EmitChildAgentStart(store *sessions.Store, projectRoot string, payload Chil
 		return err
 	}
 	if err := withinProjectRoot(KindChildAgentStart, "declared_move_pairs", projectRoot, pairEndpoints(payload.DeclaredMovePairs)); err != nil {
+		return err
+	}
+	if err := withinProjectRoot(KindChildAgentStart, "declared_dirs", projectRoot, payload.DeclaredDirs); err != nil {
 		return err
 	}
 	_, err := Append(store, payload)

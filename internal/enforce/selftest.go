@@ -78,7 +78,7 @@ var selfTestLegs = []selfTestLeg{
 	{name: "rlimits", expected: observedAllowed},
 	{name: "socket-unix", expected: observedDenied},
 	{name: "socket-inet", expected: observedDenied},
-	{name: "socketpair", expected: observedDenied},
+	{name: "socketpair", expected: observedAllowed},
 	{name: "io-uring-setup", expected: observedDenied},
 	{name: "shmget", expected: observedDenied},
 	{name: "msgget", expected: observedDenied},

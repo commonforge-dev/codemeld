@@ -212,17 +212,32 @@ func resolveWriteDeclaration(home, launchDir, raw string) (string, string) {
 	if real, err := filepath.EvalSymlinks(abs); err == nil {
 		return real, ""
 	}
-	return anchorUnderExistingAncestor(home, launchDir, abs, "")
+	target, _, reason := anchorUnderExistingAncestor(home, launchDir, abs, "")
+	return target, reason
 }
 
 func resolveDeleteDeclaration(home, launchDir, raw string) (string, string) {
+	target, _, reason := resolveDeleteDeclarationScope(home, launchDir, raw)
+	return target, reason
+}
+
+func ResolveDeleteDeclaration(home, launchDir, raw string) (target string, scope string, err error) {
+	target, scope, reason := resolveDeleteDeclarationScope(home, launchDir, raw)
+	if reason != "" {
+		return "", "", &TargetError{Kind: DeleteToolName, Reason: reason}
+	}
+	return target, scope, nil
+}
+
+func resolveDeleteDeclarationScope(home, launchDir, raw string) (string, string, string) {
 	abs, reason := absDeclaration(home, launchDir, raw)
 	if reason != "" {
-		return "", reason
+		return "", "", reason
 	}
 	parent, leaf := filepath.Dir(abs), filepath.Base(abs)
 	if resolvedParent, err := permissions.CleanAbsResolve(home, launchDir, parent); err == nil {
-		return anchorDeclaration(resolvedParent, nil, leaf)
+		target, reason := anchorDeclaration(resolvedParent, nil, leaf)
+		return target, resolvedParent, reason
 	}
 	return anchorUnderExistingAncestor(home, launchDir, parent, leaf)
 }
@@ -238,16 +253,17 @@ func absDeclaration(home, launchDir, raw string) (string, string) {
 	return filepath.Clean(expanded), ""
 }
 
-func anchorUnderExistingAncestor(home, launchDir, path, leaf string) (string, string) {
+func anchorUnderExistingAncestor(home, launchDir, path, leaf string) (string, string, string) {
 	ancestor, segs, _, reason := splitExistingPrefix(path)
 	if reason != "" {
-		return "", reason
+		return "", "", reason
 	}
 	resolved, err := permissions.CleanAbsResolve(home, launchDir, ancestor)
 	if err != nil {
-		return "", "cannot resolve a safe existing parent directory for the declared path"
+		return "", "", "cannot resolve a safe existing parent directory for the declared path"
 	}
-	return anchorDeclaration(resolved, segs, leaf)
+	target, reason := anchorDeclaration(resolved, segs, leaf)
+	return target, resolved, reason
 }
 
 func anchorDeclaration(ancestor string, segs []string, leaf string) (string, string) {

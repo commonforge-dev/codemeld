@@ -3,11 +3,14 @@
 package dispatch
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
+	"os"
 	"slices"
 
 	"codemeld.dev/codemeld/internal/filetools"
@@ -133,10 +136,10 @@ type authorizedScopeInvoker interface {
 // targetScopedTool's resolution does.
 type preparedDelegateTool interface {
 	// schedulerTargets adds the missing directories the child's authorized creates would make to
-	// the declared write and delete leaves and move endpoints. It is ordering data and never part of the
-	// child's ceiling.
-	PrepareDelegate(args map[string]any) (instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, schedulerTargets []string, err error)
-	InvokeWithPreparedDelegate(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool) (tools.Result, error)
+	// the declared write and delete leaves, move endpoints, and directories. It is ordering data and never
+	// part of the child's ceiling.
+	PrepareDelegate(args map[string]any) (instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, schedulerTargets []string, err error)
+	InvokeWithPreparedDelegate(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error)
 }
 
 // multiScopeFileTool is the package-local seam for a mutating structured file tool whose authorization
@@ -205,6 +208,7 @@ type PreparedTool struct {
 	delegateWrite       map[string]bool
 	delegateDelete      map[string]bool
 	delegateMoves       map[permissions.MovePair]bool
+	delegateDirs        map[string]bool
 	delegateTargets     []string
 	delegateRefusal     error
 
@@ -219,6 +223,11 @@ type PreparedTool struct {
 
 	outOfRootFileWrite bool
 	externalRead       bool
+
+	home       string
+	processCWD string
+	registry   *tools.Registry
+	policy     securitystate.Policy
 }
 
 func (p PreparedTool) Name() string { return p.name }
@@ -256,8 +265,8 @@ func (p PreparedTool) DelegateDeclaredWrite() map[string]bool { return copyDecla
 func (p PreparedTool) DelegateDeclaredDelete() map[string]bool { return copyDeclared(p.delegateDelete) }
 
 // DelegateSchedulerTargets is the path set this call mutates for write-conflict ordering: the
-// declared write and delete leaves and move endpoints plus the missing parents the child's authorized
-// creates would make.
+// declared write and delete leaves, move endpoints, and directories plus the missing parents the
+// child's authorized creates and mkdirs would make.
 // Those parents order the call and grant the child nothing.
 func (p PreparedTool) DelegateSchedulerTargets() []string { return slices.Clone(p.delegateTargets) }
 
@@ -317,10 +326,19 @@ func (p PreparedTool) authorizationInputs() (permissions.MatchRequest, PromptDis
 	modeCtx.DelegateWrite = p.DelegateDeclaredWrite()
 	modeCtx.DelegateDelete = p.DelegateDeclaredDelete()
 	modeCtx.DelegateMoves = copyDeclared(p.delegateMoves)
+	modeCtx.DelegateDirs = copyDeclared(p.delegateDirs)
 	return req, display, modeCtx
 }
 
 func PrepareTool(ctx context.Context, name string, args map[string]any, home string, processCWD string, registry *tools.Registry, guard ...securitystate.Policy) (PreparedTool, error) {
+	policy := guardPolicy(guard)
+	policy.Blocked = policy.Blocked.Current()
+	return prepareTool(ctx, name, args, home, processCWD, registry, policy, false)
+}
+
+// launch prepares one operation a delegate declared rather than a call to run: there is no edit
+// content to preview, and a declared delete may name a target the child has yet to create.
+func prepareTool(ctx context.Context, name string, args map[string]any, home string, processCWD string, registry *tools.Registry, policy securitystate.Policy, launch bool) (PreparedTool, error) {
 	tool, ok := registry.Lookup(name)
 	if !ok {
 		return PreparedTool{}, &NoSuchToolError{Name: name}
@@ -328,8 +346,6 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 
 	// The nominal check must precede the operation-specific resolvers, which would otherwise reject a
 	// protected target as an ordinary preparation error rather than a protected-state refusal.
-	policy := guardPolicy(guard)
-	policy.Blocked = policy.Blocked.Current()
 	if refusal := policy.RefuseNominal(name, args, home, processCWD); refusal != nil {
 		return PreparedTool{}, refusal
 	}
@@ -347,6 +363,10 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 			ToolName:      name,
 			NetworkEgress: isNetworkEgressTool(name),
 		},
+		home:       home,
+		processCWD: processCWD,
+		registry:   registry,
+		policy:     policy,
 	}
 
 	// a multi-scope file tool (the move tool) resolves two endpoints and must authorize each unique
@@ -375,7 +395,13 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 	// other tool resolves its path scope from its effective cwd (or the process cwd), with no mode-auth
 	// target path.
 	if targetTool, ok := tool.(targetScopedTool); ok {
-		target, targetScope, err := targetTool.ResolveTarget(args)
+		resolve := targetTool.ResolveTarget
+		if launch && name == filetools.DeleteToolName {
+			resolve = func(args map[string]any) (string, string, error) {
+				return resolveLaunchDelete(targetTool, args, home, processCWD)
+			}
+		}
+		target, targetScope, err := resolve(args)
 		if err != nil {
 			return PreparedTool{}, err
 		}
@@ -406,7 +432,7 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 		if ext, ok := tool.(externalReadTool); ok {
 			prepared.externalRead = ext.ExternalReadScope(targetScope)
 		}
-		if previewer, ok := tool.(editPreviewTool); ok {
+		if previewer, ok := tool.(editPreviewTool); ok && !launch {
 			prepared.editPatch, prepared.previewRefusal = previewer.Preview(target, args)
 		}
 	} else {
@@ -435,7 +461,7 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 	}
 
 	if delegateTool, ok := tool.(preparedDelegateTool); ok {
-		instruction, write, remove, moves, schedulerTargets, err := delegateTool.PrepareDelegate(args)
+		instruction, write, remove, moves, dirs, schedulerTargets, err := delegateTool.PrepareDelegate(args)
 		if err != nil {
 			// A declaration that does not resolve leaves the call with no candidate, which is an
 			// unbounded child rather than a subset of anything. Whether a ceiling is judging the call is
@@ -450,6 +476,7 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 			prepared.delegateWrite = copyDeclared(write)
 			prepared.delegateDelete = copyDeclared(remove)
 			prepared.delegateMoves = copyDeclared(moves)
+			prepared.delegateDirs = copyDeclared(dirs)
 			prepared.delegateTargets = slices.Clone(schedulerTargets)
 		}
 	}
@@ -458,6 +485,14 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 	prepared.modeCtx.OpenRead = prepared.externalRead && !unknownList
 	prepared.modeCtx.ExternalRead = prepared.externalRead && unknownList
 	return prepared, nil
+}
+
+func resolveLaunchDelete(tool targetScopedTool, args map[string]any, home, processCWD string) (string, string, error) {
+	path := stringArg(args, "path")
+	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+		return filetools.ResolveDeleteDeclaration(home, processCWD, path)
+	}
+	return tool.ResolveTarget(args)
 }
 
 // The zero policy protects nothing, so a call site that supplies no guard is deliberately unguarded.
@@ -487,6 +522,104 @@ func DispatchPreparedTool(ctx context.Context, prepared PreparedTool, authorizer
 	return InvokeDecided(ctx, prepared, decision)
 }
 
+// A top-level call's request under its own name can only refuse it; what starts the child is the
+// approval of every operation it declares, each authorized as the same direct call would be.
+func DispatchPreparedDelegate(ctx context.Context, prepared PreparedTool, authorizer Authorizer, childCeiling bool) (tools.Result, error) {
+	if childCeiling {
+		return DispatchPreparedTool(ctx, prepared, authorizer)
+	}
+	if prepared.delegate == nil {
+		if prepared.delegateRefusal != nil {
+			return tools.Result{}, prepared.delegateRefusal
+		}
+		return tools.Result{}, fmt.Errorf("dispatch: %s is not a prepared delegate call", prepared.name)
+	}
+	ops, err := prepared.launchOperations(ctx)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	req, display, modeCtx := prepared.authorizationInputs()
+	refusal, err := authorizer.Authorize(ctx, req, display, modeCtx)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	if refusal.DenyEnvelope != "" {
+		return tools.Result{}, &DeniedError{Envelope: refusal.DenyEnvelope, WrapUp: refusal.WrapUp}
+	}
+	for _, op := range ops {
+		if err := authorizePrepared(ctx, op, authorizer); err != nil {
+			return tools.Result{}, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return tools.Result{}, err
+	}
+	return prepared.delegate.InvokeWithPreparedDelegate(ctx, prepared.delegateInstruction, prepared.DelegateDeclaredWrite(), prepared.DelegateDeclaredDelete(),
+		copyDeclared(prepared.delegateMoves), copyDeclared(prepared.delegateDirs))
+}
+
+func (p PreparedTool) launchOperations(ctx context.Context) ([]PreparedTool, error) {
+	var ops []PreparedTool
+	add := func(name string, args map[string]any, want ...string) error {
+		op, err := prepareTool(ctx, name, args, p.home, p.processCWD, p.registry, p.policy, true)
+		if err != nil {
+			return err
+		}
+		got := []string{op.resolvedTarget}
+		if op.multi != nil {
+			got = []string{op.resolvedMove.Source, op.resolvedMove.Destination}
+		}
+		if !slices.Equal(got, want) {
+			return &filetools.TargetError{Kind: name, Reason: "the declared path no longer resolves to the target the delegate call was prepared with"}
+		}
+		ops = append(ops, op)
+		return nil
+	}
+	for _, path := range slices.Sorted(maps.Keys(p.delegateWrite)) {
+		name := filetools.EditToolName
+		if _, err := os.Lstat(path); err != nil {
+			name = filetools.CreateToolName
+		}
+		if err := add(name, map[string]any{"path": path}, path); err != nil {
+			return nil, err
+		}
+	}
+	for _, path := range slices.Sorted(maps.Keys(p.delegateDelete)) {
+		if err := add(filetools.DeleteToolName, map[string]any{"path": path}, path); err != nil {
+			return nil, err
+		}
+	}
+	moves := slices.SortedFunc(maps.Keys(p.delegateMoves), func(a, b permissions.MovePair) int {
+		return cmp.Or(cmp.Compare(a.Source, b.Source), cmp.Compare(a.Destination, b.Destination))
+	})
+	for _, pair := range moves {
+		if err := add(filetools.MoveToolName, map[string]any{"source": pair.Source, "destination": pair.Destination}, pair.Source, pair.Destination); err != nil {
+			return nil, err
+		}
+	}
+	for _, dir := range slices.Sorted(maps.Keys(p.delegateDirs)) {
+		if err := add(filetools.MkdirToolName, map[string]any{"path": dir}, dir); err != nil {
+			return nil, err
+		}
+	}
+	return ops, nil
+}
+
+func authorizePrepared(ctx context.Context, prepared PreparedTool, authorizer Authorizer) error {
+	if prepared.multi != nil {
+		return authorizeMoveEndpoints(ctx, prepared, authorizer)
+	}
+	req, display, modeCtx := prepared.authorizationInputs()
+	decision, err := authorizer.Authorize(ctx, req, display, modeCtx)
+	if err != nil {
+		return err
+	}
+	if decision.DenyEnvelope != "" {
+		return &DeniedError{Envelope: decision.DenyEnvelope, WrapUp: decision.WrapUp}
+	}
+	return nil
+}
+
 // InvokeDecided invokes a prepared call whose authorization already completed — the path a group
 // authorized on one prompt takes, so no member re-prompts and every member runs against the exact
 // target its decision covered. A denial returns *DeniedError without invoking anything.
@@ -514,7 +647,7 @@ func InvokeDecided(ctx context.Context, prepared PreparedTool, decision permissi
 
 	if prepared.delegate != nil {
 		return prepared.delegate.InvokeWithPreparedDelegate(ctx, prepared.delegateInstruction, prepared.DelegateDeclaredWrite(), prepared.DelegateDeclaredDelete(),
-			copyDeclared(prepared.delegateMoves))
+			copyDeclared(prepared.delegateMoves), copyDeclared(prepared.delegateDirs))
 	}
 
 	// This assertion runs before the path-only seam below so the four mutating file tools can never fall
@@ -535,6 +668,17 @@ func InvokeDecided(ctx context.Context, prepared PreparedTool, decision permissi
 }
 
 func dispatchPreparedMultiScope(ctx context.Context, prepared PreparedTool, authorizer Authorizer) (tools.Result, error) {
+	if err := authorizeMoveEndpoints(ctx, prepared, authorizer); err != nil {
+		return tools.Result{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return tools.Result{}, err
+	}
+	// every required scope granted: invoke with the endpoints resolved before authorization.
+	return prepared.multi.InvokeWithResolvedMove(ctx, prepared.resolvedMove)
+}
+
+func authorizeMoveEndpoints(ctx context.Context, prepared PreparedTool, authorizer Authorizer) error {
 	// The move prompt shows a plain "Move source -> destination" action over the lexical
 	// endpoints, carried separately from the matching subject (the bare "move" name).
 	display := toolPromptDisplay(prepared.name, prepared.args, "")
@@ -542,8 +686,7 @@ func dispatchPreparedMultiScope(ctx context.Context, prepared PreparedTool, auth
 		display.GrantStoredSubject = capability
 	}
 
-	resolved := prepared.resolvedMove
-	for _, ep := range moveEndpoints(resolved) {
+	for _, ep := range moveEndpoints(prepared.resolvedMove) {
 		req := permissions.MatchRequest{
 			Kind:      "tool",
 			Subject:   prepared.name,
@@ -555,18 +698,13 @@ func dispatchPreparedMultiScope(ctx context.Context, prepared PreparedTool, auth
 		epDisplay.OutOfRootFileWrite = ep.outOfRoot
 		decision, err := authorizer.Authorize(ctx, req, epDisplay, prepared.modeCtx)
 		if err != nil {
-			return tools.Result{}, err
+			return err
 		}
 		if decision.DenyEnvelope != "" {
-			return tools.Result{}, &DeniedError{Envelope: decision.DenyEnvelope, WrapUp: decision.WrapUp}
+			return &DeniedError{Envelope: decision.DenyEnvelope, WrapUp: decision.WrapUp}
 		}
 	}
-
-	if err := ctx.Err(); err != nil {
-		return tools.Result{}, err
-	}
-	// every required scope granted: invoke with the endpoints resolved before authorization.
-	return prepared.multi.InvokeWithResolvedMove(ctx, resolved)
+	return nil
 }
 
 // moveEndpoint is one resolved move endpoint dispatch must authorize: the resolved parent-directory scope

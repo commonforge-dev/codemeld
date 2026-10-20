@@ -80,14 +80,16 @@ func TestUserThreadCountScan(t *testing.T) {
 	uid := uint32(os.Getuid())
 	vanished := &fs.PathError{Op: "open", Path: "x", Err: fs.ErrNotExist}
 	denied := &fs.PathError{Op: "open", Path: "x", Err: syscall.EACCES}
+	exited := &fs.PathError{Op: "open", Path: "/proc/6/task", Err: syscall.ESRCH}
 	dirs := map[string][]os.DirEntry{
-		"/proc":        dirEntries(t, "1", "2", "3", "4", "5", "self"),
+		"/proc":        dirEntries(t, "1", "2", "3", "4", "5", "6", "self"),
 		"/proc/1/task": dirEntries(t, "1", "10", "11"),
 		"/proc/2/task": dirEntries(t, "2"),
 		"/proc/5/task": dirEntries(t, "5", "50"),
+		"/proc/6/task": dirEntries(t, "6", "60"),
 	}
-	owners := map[string]uint32{"/proc/1": uid, "/proc/2": uid + 1, "/proc/4": uid, "/proc/5": uid}
-	stubProcScan(t, dirs, map[string]error{"/proc/4/task": vanished}, owners, map[string]error{"/proc/3": vanished})
+	owners := map[string]uint32{"/proc/1": uid, "/proc/2": uid + 1, "/proc/4": uid, "/proc/5": uid, "/proc/6": uid}
+	stubProcScan(t, dirs, map[string]error{"/proc/4/task": vanished, "/proc/6/task": exited}, owners, map[string]error{"/proc/3": vanished})
 	if n, err := userThreadCount(); err != nil || n != 5 {
 		t.Errorf("userThreadCount() = %d, %v, want 5", n, err)
 	}

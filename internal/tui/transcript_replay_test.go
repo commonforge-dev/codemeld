@@ -810,17 +810,18 @@ func toolResultMsg(toolCallID, content string) sessions.Message {
 
 const storagePrompt = "Where should sessions be stored?"
 
-const askUserStorageArgs = `{"questions":[{"id":"storage","prompt":"` + storagePrompt + `","options":["Local disk","Object store"]}]}`
+const askUserStorageArgs = `{"questions":[{"id":"storage","prompt":"` + storagePrompt + `","options":[{"label":"Local disk"},{"label":"Object store"}]}]}`
 
-const askUserCustomArgs = `{"questions":[{"id":"name","prompt":"What should it be called?","options":["ask"],"allow_custom":true}]}`
+const askUserCustomArgs = `{"questions":[{"id":"name","prompt":"What should it be called?","options":[{"label":"ask"}],"allow_custom":true}]}`
 
 const storageAnswer = `{"id":"storage","prompt":"` + storagePrompt + `","selected":["Object store"]}`
 
-const askUserMultiArgs = `{"questions":[{"id":"pick","prompt":"Which stores?","options":["Local disk","Object store","Both"],"multi_select":true,"allow_custom":true}]}`
+const askUserMultiArgs = `{"questions":[{"id":"pick","prompt":"Which stores?","options":[{"label":"Local disk"},{"label":"Object store"},{"label":"Both"}],"multi_select":true,"allow_custom":true}]}`
 
-const askUserReplayArgs = `{"context":"Sessions are replayed on /resume.","questions":[` +
-	`{"id":"storage","prompt":"Where should sessions be stored?","options":["Local disk","Object store"]},` +
-	`{"id":"name","prompt":"What should it be called?","options":["ask"],"allow_custom":true}]}`
+const askUserReplayArgs = `{"questions":[` +
+	`{"id":"storage","prompt":"Where should sessions be stored?","context":"Sessions are replayed on /resume.\nWhere they live decides what survives.",` +
+	`"options":[{"label":"Local disk","description":"Kept on this machine"},{"label":"Object store"}]},` +
+	`{"id":"name","prompt":"What should it be called?","options":[{"label":"ask"}],"allow_custom":true}]}`
 
 const askUserReplayResult = `{"answers":[` +
 	`{"id":"storage","prompt":"Where should sessions be stored?","selected":["Object store"]},` +
@@ -839,7 +840,7 @@ func TestReplaySessionRecords_RebuildsTheAnsweredQuestionRecord(t *testing.T) {
 
 	want := "▌ where should sessions live?\n\n" +
 		"I need to know where sessions go." + visibleResponseLine + "\n\n" +
-		"Answered:\n" +
+		"Answered (ask_user):\n" +
 		"  Where should sessions be stored? — Object store\n" +
 		"  What should it be called? — codemeld ask\n\n" +
 		"stored on the object store" + visibleResponseLine
@@ -847,9 +848,9 @@ func TestReplaySessionRecords_RebuildsTheAnsweredQuestionRecord(t *testing.T) {
 	if got != want {
 		t.Fatalf("replayed transcript =\n%q\nwant\n%q", got, want)
 	}
-	for _, leaked := range []string{provider.AskUserToolName, `{"answers"`, "c1", "storage"} {
-		if strings.Contains(got, leaked) {
-			t.Errorf("replayed transcript = %q, leaked the tool plumbing %q", got, leaked)
+	for _, leaked := range []string{provider.AskUserToolName, `{"answers"`, "c1", "storage", "Sessions are replayed", "Kept on this machine"} {
+		if strings.Contains(strings.ReplaceAll(got, "("+provider.AskUserToolName+"):", ""), leaked) {
+			t.Errorf("replayed transcript = %q, leaked %q beyond the named record heading", got, leaked)
 		}
 	}
 }
@@ -864,7 +865,7 @@ func TestReplaySessionRecords_RebuildsTheClarificationRecord(t *testing.T) {
 	a := New(nil)
 	a.ReplaySessionRecords(records)
 
-	want := "Asked for clarification:\n  what is an object store?\n\nIt is a remote blob service." + visibleResponseLine
+	want := "Asked for clarification (ask_user):\n  what is an object store?\n\nIt is a remote blob service." + visibleResponseLine
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("replayed transcript =\n%q\nwant\n%q", got, want)
 	}
@@ -1097,7 +1098,7 @@ func TestReplaySessionRecords_RejectsAnAmbiguousToolCallID(t *testing.T) {
 // saved call whose own text carries U+FFFD the repaired id, prompt and selection all compare
 // equal and a result no form emitted would otherwise render.
 func TestReplaySessionRecords_RejectsMalformedUnicodeThatWouldBeRepairedIntoAMatch(t *testing.T) {
-	args := `{"questions":[{"id":"store�","prompt":"Where�?","options":["Local� disk"]}]}`
+	args := `{"questions":[{"id":"store�","prompt":"Where�?","options":[{"label":"Local� disk"}]}]}`
 	if _, err := provider.DecodeAskUserRequest(args); err != nil {
 		t.Fatalf("DecodeAskUserRequest(%q) error = %v, want dispatch to accept text that carries U+FFFD as itself", args, err)
 	}
@@ -1120,24 +1121,27 @@ func TestReplaySessionRecords_RejectsASavedCallDispatchWouldRefuse(t *testing.T)
 		name string
 		args string
 	}{
-		{"unknown question field", `{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"],"style":"grid"}]}`},
-		{"unknown root field", `{"extra":true,"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"wrong-case questions", `{"Questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"blank context", `{"context":"  ","questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"context with a newline", `{"context":"why\nit matters","questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"over-long context", `{"context":"` + strings.Repeat("x", provider.MaxAskUserContextRunes+1) + `","questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"duplicate question id", `{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]},{"id":"storage","prompt":"Again?","options":["Object store"]}]}`},
-		{"duplicate option", `{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk","Local disk"]}]}`},
-		{"blank prompt", `{"questions":[{"id":"storage","prompt":"","options":["Local disk"]}]}`},
-		{"over-long prompt", `{"questions":[{"id":"storage","prompt":"` + strings.Repeat("x", provider.MaxAskUserTextRunes+1) + `","options":["Local disk"]}]}`},
+		{"unknown question field", `{"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}],"style":"grid"}]}`},
+		{"unknown root field", `{"extra":true,"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}]}]}`},
+		{"wrong-case questions", `{"Questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}]}]}`},
+		{"the old shape with a shared context and string options", `{"context":"why","questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
+		{"a request-level context", `{"context":"why","questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}]}]}`},
+		{"string options", `{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
+		{"blank context", `{"questions":[{"id":"storage","prompt":"Where?","context":"  ","options":[{"label":"Local disk"}]}]}`},
+		{"context with a tab", `{"questions":[{"id":"storage","prompt":"Where?","context":"why\tit matters","options":[{"label":"Local disk"}]}]}`},
+		{"over-long context", `{"questions":[{"id":"storage","prompt":"Where?","context":"` + strings.Repeat("x", provider.MaxAskUserContextRunes+1) + `","options":[{"label":"Local disk"}]}]}`},
+		{"duplicate question id", `{"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}]},{"id":"storage","prompt":"Again?","options":[{"label":"Object store"}]}]}`},
+		{"duplicate option", `{"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"},{"label":"Local disk"}]}]}`},
+		{"blank prompt", `{"questions":[{"id":"storage","prompt":"","options":[{"label":"Local disk"}]}]}`},
+		{"over-long prompt", `{"questions":[{"id":"storage","prompt":"` + strings.Repeat("x", provider.MaxAskUserTextRunes+1) + `","options":[{"label":"Local disk"}]}]}`},
 		{"no options", `{"questions":[{"id":"storage","prompt":"Where?","options":[]}]}`},
-		{"non-boolean flag", `{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"],"multi_select":"yes"}]}`},
-		{"malformed Unicode prompt", `{"questions":[{"id":"storage","prompt":"\ud800","options":["Local disk"]}]}`},
+		{"non-boolean flag", `{"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}],"multi_select":"yes"}]}`},
+		{"malformed Unicode prompt", `{"questions":[{"id":"storage","prompt":"\ud800","options":[{"label":"Local disk"}]}]}`},
 		{"trailing content", askUserStorageArgs + ` {"extra":true}`},
-		{"a repeated questions member", `{"questions":[],"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"a repeated context member", `{"context":"first","context":"second","questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`},
-		{"a repeated question member", `{"questions":[{"id":"storage","id":"exfil","prompt":"Where?","options":["Local disk"]}]}`},
-		{"a repeated flag member", `{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"],"multi_select":false,"multi_select":true}]}`},
+		{"a repeated questions member", `{"questions":[],"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}]}]}`},
+		{"a repeated context member", `{"questions":[{"id":"storage","prompt":"Where?","context":"first","context":"second","options":[{"label":"Local disk"}]}]}`},
+		{"a repeated question member", `{"questions":[{"id":"storage","id":"exfil","prompt":"Where?","options":[{"label":"Local disk"}]}]}`},
+		{"a repeated flag member", `{"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}],"multi_select":false,"multi_select":true}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := provider.DecodeAskUserRequest(tc.args); err == nil {
@@ -1173,9 +1177,9 @@ func TestReplaySessionRecords_PairsEachAskUserCallInsideItsOwnResponseGroup(t *t
 	a.ReplaySessionRecords(records)
 
 	want := "WebSearch object stores\n\n" +
-		"Answered:\n  Where should sessions be stored? — Local disk\n\n" +
+		"Answered (ask_user):\n  Where should sessions be stored? — Local disk\n\n" +
 		"asking again" + visibleResponseLine + "\n\n" +
-		"Answered:\n  Where should sessions be stored? — Object store"
+		"Answered (ask_user):\n  Where should sessions be stored? — Object store"
 	got := a.TranscriptText()
 	if got != want {
 		t.Fatalf("replayed transcript =\n%q\nwant\n%q", got, want)

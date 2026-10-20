@@ -318,6 +318,7 @@ const (
 	childAgentDeclaredHeading = "may write:"
 	childAgentDeleteHeading   = "may delete:"
 	childAgentMoveHeading     = "may move:"
+	childAgentDirsHeading     = "may create directories:"
 	childAgentNoFilesLine     = "changed no files"
 	childAgentRunningHeading  = "⋯ Child agent running"
 	childAgentUnclosedHeading = "⚠ Child agent — no outcome was recorded"
@@ -338,6 +339,7 @@ func childAgentBlockText(start events.ChildAgentStart, calls []string, end *even
 	lines = append(lines, childAgentDeclaredLines(childAgentDeclaredHeading, start.DeclaredPaths)...)
 	lines = append(lines, childAgentDeclaredLines(childAgentDeleteHeading, start.DeclaredDeletePaths)...)
 	lines = append(lines, childAgentDeclaredLines(childAgentMoveHeading, childAgentPairLines(start.DeclaredMovePairs))...)
+	lines = append(lines, childAgentDeclaredLines(childAgentDirsHeading, start.DeclaredDirs)...)
 	for _, call := range calls {
 		lines = append(lines, childAgentIndent+call)
 	}

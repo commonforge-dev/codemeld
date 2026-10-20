@@ -1,6 +1,9 @@
 package permissions
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -79,6 +82,23 @@ func TestExceptionalAuthority(t *testing.T) {
 		{"find . -name -delete", authorityFileDeletion},
 		{"git log rebase", authorityHistoryRewrite},
 		{"git commit -m --amend", authorityHistoryRewrite},
+		{"hg ci --amend", authorityHistoryRewrite},
+		{"hg commit --amen", authorityHistoryRewrite},
+		{"hg ci --am", authorityHistoryRewrite},
+		{"hg ci --ame", authorityHistoryRewrite},
+		{"git commit --amen", authorityHistoryRewrite},
+		{"git commit --ame", authorityHistoryRewrite},
+		{"git commit --am", authorityHistoryRewrite},
+		{"git commit -m --amen", authorityHistoryRewrite},
+		{"hg ci -m x", ""},
+		{"git ci --amend", ""},
+		{"git commit --a", ""},
+		{"git commit --amfoo", ""},
+		{"git commit --amed", ""},
+		{"git commit --amend-ish", ""},
+		{"hg commit --amfoo", ""},
+		{"hg ci --amed", ""},
+		{"hg ci --amend-ish", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.cmd, func(t *testing.T) {
@@ -115,6 +135,17 @@ func TestClassifyExceptional(t *testing.T) {
 		{shell: "git commit -m x", wantClassifiable: true},
 		{shell: "find . -name x -print", wantClassifiable: true},
 		{shell: `find . -exec git status \;`, wantClassifiable: true},
+		{shell: `sh -c 'hg ci --am -m x'`, wantAuthority: authorityHistoryRewrite, wantClassifiable: true},
+		{shell: `sh -c 'exec git clean -fd'`, wantClassifiable: false},
+		{shell: `sh -c 'eval git clean -fd'`, wantClassifiable: false},
+		{shell: `sh -c '. ./env.sh'`, wantClassifiable: false},
+		{shell: `sh -c 'source ./env.sh'`, wantClassifiable: false},
+		{shell: `sh -c 'builtin cd scratch'`, wantClassifiable: false},
+		{
+			name:             "builtin in a later literal stage",
+			req:              MatchRequest{Kind: subjectKindLiteral, Subject: `ls && exec git clean -fd`},
+			wantClassifiable: false,
+		},
 		{
 			name:             "control syntax literal",
 			req:              MatchRequest{Kind: subjectKindLiteral, Subject: `sh -c 'if true; then curl x; fi'`},
@@ -212,6 +243,48 @@ func TestClassifyExceptional(t *testing.T) {
 			authority, classifiable := ClassifyExceptional(req, mc)
 			if authority != tc.wantAuthority || classifiable != tc.wantClassifiable {
 				t.Fatalf("ClassifyExceptional = (%q, %v), want (%q, %v)", authority, classifiable, tc.wantAuthority, tc.wantClassifiable)
+			}
+		})
+	}
+}
+
+func TestExceptionalPathQualifiedFindDeleter(t *testing.T) {
+	writeRm := func(dir string) string {
+		path := filepath.Join(dir, "rm")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Setenv("PATH", filepath.Dir(writeRm(t.TempDir())))
+	outside := writeRm(t.TempDir())
+	rm, err := exec.LookPath("rm")
+	if err != nil {
+		t.Fatalf("LookPath(rm) under the test PATH: %v", err)
+	}
+	if !filepath.IsAbs(rm) {
+		t.Fatalf("LookPath(rm) = %q, want an absolute path", rm)
+	}
+	cases := []struct {
+		tokens []string
+		want   string
+	}{
+		{[]string{"find", ".", "-exec", rm, "{}", ";"}, authorityFileDeletion},
+		{[]string{"find", ".", "-execdir", rm, "{}", "+"}, authorityFileDeletion},
+		{[]string{"find", ".", "-exec", outside, "{}", ";"}, ""},
+		{[]string{"find", ".", "-execdir", outside, "{}", "+"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.tokens, " "), func(t *testing.T) {
+			got, ok := ExceptionalAuthority(tc.tokens)
+			if got != tc.want || ok != (tc.want != "") {
+				t.Fatalf("ExceptionalAuthority = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.want != "")
+			}
+			req := MatchRequest{Kind: subjectKindDirect, Subject: strings.Join(tc.tokens, " ")}
+			mc := ModeContext{Stages: []StageNormalization{{Route: RouteDirect, Tokens: tc.tokens}}}
+			authority, classifiable := ClassifyExceptional(req, mc)
+			if authority != tc.want || !classifiable {
+				t.Fatalf("ClassifyExceptional = (%q, %v), want (%q, true)", authority, classifiable, tc.want)
 			}
 		})
 	}

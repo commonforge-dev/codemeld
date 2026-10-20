@@ -73,7 +73,7 @@ const composedSource = "composed config"
 // methods are visible to subsequent reads immediately but are not persisted to
 // disk by those methods, and there is no general reload API.
 //
-// ToggleFavorite, SetAttribution, and SetSharedTempFolders are the exceptions: they durably write the
+// ToggleFavorite and SetAttribution are the exceptions: they durably write the
 // global settings layer through the locked writer and replace the cached value
 // only from that write's confirmed result.
 type Cache struct {
@@ -91,7 +91,6 @@ type Cache struct {
 	modeConfigured         bool
 	attribution            bool
 	programLookup          string
-	sharedTempFolders      string
 
 	retry RetrySettings
 
@@ -166,7 +165,6 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		webResearch:            resolveWebResearch(composed),
 		webResearchAPIKey:      nestedStringOr(composed, "web_research", "api_key", ""),
 		programLookup:          nestedStringOr(composed, "confinement", "program_lookup", "friendly"),
-		sharedTempFolders:      nestedStringOr(composed, "confinement", "shared_temp_folders", ""),
 		declaredCommands:       declaredCommands,
 		writableFolders:        parseWritableFolders(composed, projectRoot, home),
 	}
@@ -266,6 +264,8 @@ func discoveredChatGPTStoreModels(layerPaths []string) []provider.ChatGPTStoreMo
 // ProjectRoot returns the resolved project root used for this session.
 func (c *Cache) ProjectRoot() string { return c.projectRoot }
 
+func (c *Cache) WritableFolders() []string { return slices.Clone(c.writableFolders) }
+
 // LayerPaths returns a copy of the ordered settings-layer paths that composed
 // the session config; mutating it does not change the cache.
 func (c *Cache) LayerPaths() []string { return slices.Clone(c.layerPaths) }
@@ -335,33 +335,6 @@ func (c *Cache) SetAttribution(on bool) (PersistReason, fserrors.Category, error
 }
 
 func (c *Cache) ProgramLookup() string { return c.programLookup }
-
-func (c *Cache) SharedTempFolders() (allowed, answered bool) {
-	switch c.sharedTempFolders {
-	case "allow":
-		return true, true
-	case "deny":
-		return false, true
-	default:
-		return false, false
-	}
-}
-
-func (c *Cache) SetSharedTempFolders(allow bool) (PersistReason, fserrors.Category, error) {
-	if len(c.layerPaths) == 0 || c.layerPaths[0] == "" {
-		return ReasonRereadParseError, "", fmt.Errorf("config.SetSharedTempFolders: no global settings layer path configured")
-	}
-	value := "deny"
-	if allow {
-		value = "allow"
-	}
-	reason, cat, err := Persist(c.layerPaths[0], KeySharedTempFolders, value)
-	if reason != ReasonNone || err != nil {
-		return reason, cat, err
-	}
-	c.sharedTempFolders = value
-	return ReasonNone, "", nil
-}
 
 func (c *Cache) OpenRouterDataCollection() string {
 	c.mu.RLock()
@@ -697,7 +670,6 @@ func parseWritableFolders(composed map[string]any, projectRoot string, home []st
 		return nil
 	}
 	if len(home) == 0 || home[0] == "" {
-		fmt.Fprintln(os.Stderr, "codemeld: writable_folders: no home directory was supplied, so no writable folders apply")
 		return nil
 	}
 	folders, notices, err := permissions.ParseWritableFolders(raw, home[0], projectRoot)

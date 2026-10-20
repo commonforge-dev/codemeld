@@ -1,5 +1,5 @@
-// Package subagenttool registers the delegate tool, the production caller that hands one
-// bounded piece of work to a child agent confined to caller-declared write, delete, and move scopes.
+// Package subagenttool registers the delegate tool, the production caller that hands one bounded
+// piece of work to a child agent confined to caller-declared write, delete, move, and directory scopes.
 package subagenttool
 
 import (
@@ -34,6 +34,7 @@ const (
 	filesArg        = "files"
 	filesDeleteArg  = "files_delete"
 	filesMoveArg    = "files_move"
+	filesMkdirArg   = "files_mkdir"
 	sourceKey       = "source"
 	destinationKey  = "destination"
 )
@@ -94,24 +95,27 @@ func (t *Tool) Advertise() tools.Metadata {
 		Description: "Hand one self-contained piece of work to a child agent running in this process. " +
 			"The instructions are delivered to the child as text with no shell in the path, so backticks, " +
 			"$( ), quotes and newlines reach it byte for byte. The child may create or edit only the paths " +
-			"listed in files, delete only the paths listed in files_delete, and move only the source and " +
-			"destination pairs listed in files_move, and reports back a single summary of what it did.",
+			"listed in files, delete only the paths listed in files_delete, move only the source and " +
+			"destination pairs listed in files_move, and create only the exact directories listed in files_mkdir, " +
+			"which grant nothing inside them. It reports back a single summary of what it did, followed by a list of the operations the child was refused. " +
+			"codemeld appends one fixed sentence to the instructions asking the child to name each refused operation and its impact in its reply. " +
+			"At least one of files, files_delete, files_move, or files_mkdir must name a path.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				instructionsArg: map[string]any{
 					"type":        "string",
-					"description": "What the child agent should do, in plain text. Passed through verbatim; no shell interprets it.",
+					"description": "What the child agent should do, in plain text. Passed through verbatim; no shell interprets it. codemeld appends one fixed sentence after a blank line, asking the child to report any refused operation and its impact.",
 				},
 				filesArg: map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Paths, relative to the launch directory and inside the project, that the child may create or edit. Absolute and ~-prefixed paths are refused. Optional when files_delete or files_move names a path.",
+					"description": "Paths, relative to the launch directory and inside the project, that the child may create or edit. Absolute and ~-prefixed paths are refused. Optional when files_delete, files_move, or files_mkdir names a path.",
 				},
 				filesDeleteArg: map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Paths inside the project that the child may delete: a file, a symlink (removed as the link itself), or an empty directory. Relative, absolute, ~ and ~/ paths are accepted. A path listed only here may not be created or edited; list it in files as well for that. Optional when files or files_move names a path.",
+					"description": "Paths inside the project that the child may delete: a file, a symlink (removed as the link itself), or an empty directory. Relative, absolute, ~ and ~/ paths are accepted. A path listed only here may not be created or edited; list it in files as well for that. Optional when files, files_move, or files_mkdir names a path.",
 				},
 				filesMoveArg: map[string]any{
 					"type": "array",
@@ -124,7 +128,12 @@ func (t *Tool) Advertise() tools.Metadata {
 						"required":             []string{sourceKey, destinationKey},
 						"additionalProperties": false,
 					},
-					"description": "Moves inside the project that the child may make. Each pair names an existing source (a file or directory, not a symlink) and a destination that does not exist yet under an existing parent directory. A pair authorizes exactly that one move: not a move of its source anywhere else, not a write to its destination, and not a delete of its source. No path may be the source of one pair and the destination of another. Relative, absolute, ~ and ~/ paths are accepted. Optional when files or files_delete names a path.",
+					"description": "Moves inside the project that the child may make. Each pair names an existing source (a file or directory, not a symlink) and a destination that does not exist yet under an existing parent directory. A pair authorizes exactly that one move: not a move of its source anywhere else, not a write to its destination, and not a delete of its source. No path may be the source of one pair and the destination of another. Relative, absolute, ~ and ~/ paths are accepted. Optional when files, files_delete, or files_mkdir names a path.",
+				},
+				filesMkdirArg: map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Directories inside the project, below its root, that the child may create with mkdir, along with any missing parent directories that mkdir makes on the way. A listed directory authorizes nothing inside it: a file beneath it still has to be listed in files. Relative, absolute, ~ and ~/ paths are accepted. Optional when files, files_delete, or files_move names a path.",
 				},
 			},
 			"required":             []string{instructionsArg},
@@ -145,60 +154,62 @@ func (e *PreparationError) Error() string { return ToolName + ": " + e.Reason }
 func (e *PreparationError) Result() tools.Result { return failResult(e.Reason) }
 
 func (t *Tool) Invoke(ctx context.Context, args map[string]any) (tools.Result, error) {
-	instruction, write, remove, moves, refusal := t.prepare(args)
+	instruction, write, remove, moves, dirs, refusal := t.prepare(args)
 	if refusal != nil {
 		return refusal.Result(), nil
 	}
-	return t.InvokeWithPreparedDelegate(ctx, instruction, write, remove, moves)
+	return t.InvokeWithPreparedDelegate(ctx, instruction, write, remove, moves, dirs)
 }
 
-func (t *Tool) PrepareDelegate(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, []string, error) {
-	instruction, write, remove, moves, refusal := t.prepare(args)
+func (t *Tool) PrepareDelegate(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, []string, error) {
+	instruction, write, remove, moves, dirs, refusal := t.prepare(args)
 	if refusal != nil {
-		return "", nil, nil, nil, nil, refusal
+		return "", nil, nil, nil, nil, nil, refusal
 	}
-	return instruction, write, remove, moves, schedulerTargets(write, remove, moves), nil
+	return instruction, write, remove, moves, dirs, schedulerTargets(write, remove, moves, dirs), nil
 }
 
-// schedulerTargets names every path this child may mutate. An authorized create also makes each
-// missing directory between its declared leaf and the deepest existing ancestor, so leaf-disjoint
+// schedulerTargets names every path this child may mutate. An authorized create or mkdir also makes
+// each missing directory between its declared leaf and the deepest existing ancestor, so leaf-disjoint
 // declarations under a shared missing parent still collide. Those parents are ordering data only —
-// the declared leaves alone stay the child's write ceiling.
-func schedulerTargets(write, remove map[string]bool, moves map[permissions.MovePair]bool) []string {
-	targets := make(map[string]bool, len(write)+len(remove)+2*len(moves))
+// the declared leaves alone stay the child's ceiling.
+func schedulerTargets(write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) []string {
+	targets := make(map[string]bool, len(write)+len(remove)+2*len(moves)+len(dirs))
 	for leaf := range remove {
 		targets[leaf] = true
 	}
 	for pair := range moves {
 		targets[pair.Source], targets[pair.Destination] = true, true
 	}
-	for leaf := range write {
-		targets[leaf] = true
-		for dir := filepath.Dir(leaf); ; {
-			// A directory that cannot be stated at all is treated as one the child may create.
-			if _, err := os.Lstat(dir); err == nil {
-				break
+	for _, created := range []map[string]bool{write, dirs} {
+		for leaf := range created {
+			targets[leaf] = true
+			for dir := filepath.Dir(leaf); ; {
+				// A directory that cannot be stated at all is treated as one the child may create.
+				if _, err := os.Lstat(dir); err == nil {
+					break
+				}
+				targets[dir] = true
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+				dir = parent
 			}
-			targets[dir] = true
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
 		}
 	}
 	return sortedPaths(targets)
 }
 
-func (t *Tool) prepare(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, *PreparationError) {
-	instruction, write, remove, moves, err := t.validate(args)
+func (t *Tool) prepare(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, *PreparationError) {
+	instruction, write, remove, moves, dirs, err := t.validate(args)
 	if err != nil {
-		return "", nil, nil, nil, &PreparationError{Reason: err.Error()}
+		return "", nil, nil, nil, nil, &PreparationError{Reason: err.Error()}
 	}
-	return instruction, write, remove, moves, nil
+	return instruction, write, remove, moves, dirs, nil
 }
 
-func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool) (tools.Result, error) {
+func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error) {
 	snap, ok := t.deps.Snapshot()
 	if !ok {
 		return failResult("no model is resolvable, so no child agent can start"), nil
@@ -211,6 +222,7 @@ func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction strin
 		DeclaredWrite:     write,
 		DeclaredDelete:    remove,
 		DeclaredMoves:     moves,
+		DeclaredDirs:      dirs,
 	})
 	if dispatcher == nil {
 		return failResult("child agent dispatch is unavailable"), nil
@@ -224,14 +236,14 @@ func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction strin
 		return failResult("the child agent could not be recorded in the session, so no child agent started: " + serr.Error()), nil
 	}
 
-	journal, jerr := t.openJournal(ctx, write, remove, moves)
+	journal, jerr := t.openJournal(ctx, write, remove, moves, dirs)
 	if jerr != nil {
 		return failResult("the child agent's changes could not be made undoable, so no child agent started: " + jerr.Error()), nil
 	}
 
 	// A failed start record stops the child, so the journal opened above has to be resolved by
 	// hand here: subagent.Run, which normally does it, is never reached.
-	start := childStartPayload(invocation, instruction, write, remove, moves, snap)
+	start := childStartPayload(invocation, instruction, write, remove, moves, dirs, snap)
 	if err := events.EmitChildAgentStart(store, t.deps.ProjectRoot, start); err != nil {
 		journal.Finish(subagent.ReasonFailed)
 		journal.Close()
@@ -254,7 +266,7 @@ func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction strin
 		Dispatcher: &confinedDispatcher{
 			inner:     dispatcher,
 			permitted: permitted,
-			nested:    t.nestedDelegate(snap.Mode, write, remove, moves, invocation),
+			nested:    t.nestedDelegate(snap.Mode, write, remove, moves, dirs, invocation),
 		},
 		StepCap:      subagent.DefaultStepCap,
 		Journal:      journal,
@@ -282,7 +294,7 @@ func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction strin
 	return out, nil
 }
 
-func childStartPayload(invocation, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, snap Snapshot) events.ChildAgentStart {
+func childStartPayload(invocation, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, snap Snapshot) events.ChildAgentStart {
 	start := events.ChildAgentStart{
 		InvocationID:      invocation,
 		ProviderID:        snap.Model.Provider,
@@ -297,6 +309,9 @@ func childStartPayload(invocation, instruction string, write, remove map[string]
 	}
 	if len(moves) > 0 {
 		start.DeclaredMovePairs = recordedMovePairs(moves)
+	}
+	if len(dirs) > 0 {
+		start.DeclaredDirs = sortedPaths(dirs)
 	}
 	return start
 }
@@ -397,7 +412,7 @@ func sortedPaths(declared map[string]bool) []string {
 
 // openJournal snapshots the declared scope before the child is dispatched, linking a nested delegate's
 // journal to the one bound to ctx so the parent can absorb it deepest-first.
-func (t *Tool) openJournal(ctx context.Context, write, remove map[string]bool, moves map[permissions.MovePair]bool) (*subagent.Journal, error) {
+func (t *Tool) openJournal(ctx context.Context, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (*subagent.Journal, error) {
 	parent, _ := filetools.WriteJournalFromContext(ctx).(*subagent.Journal)
 	return subagent.OpenJournal(subagent.JournalConfig{
 		Home:           t.deps.Home,
@@ -406,6 +421,7 @@ func (t *Tool) openJournal(ctx context.Context, write, remove map[string]bool, m
 		Declared:       sortedPaths(write),
 		DeclaredDelete: sortedPaths(remove),
 		DeclaredMoves:  sortedPairs(moves),
+		DeclaredDirs:   sortedPaths(dirs),
 		Parent:         parent,
 	})
 }
@@ -420,65 +436,78 @@ func sortedPairs(declared map[permissions.MovePair]bool) []permissions.MovePair 
 
 // At least one path is required across the forms: the nested containment check reads a
 // candidate with no path in any form as a declaration that did not resolve.
-func (t *Tool) validate(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, error) {
+func (t *Tool) validate(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, error) {
 	if err := rejectUnknownArgs(args); err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	instruction, err := requireString(args, instructionsArg)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	if strings.TrimSpace(instruction) == "" {
-		return "", nil, nil, nil, fmt.Errorf("argument %q must not be empty", instructionsArg)
+		return "", nil, nil, nil, nil, fmt.Errorf("argument %q must not be empty", instructionsArg)
 	}
 	files, filesGiven, err := optionalStringSlice(args, filesArg)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	deletes, deletesGiven, err := optionalStringSlice(args, filesDeleteArg)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	pairs, pairsGiven, err := optionalMovePairs(args)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
-	if len(files)+len(deletes)+len(pairs) == 0 {
-		return "", nil, nil, nil, fmt.Errorf("arguments %q, %q and %q must name at least one path between them", filesArg, filesDeleteArg, filesMoveArg)
+	mkdirs, mkdirsGiven, err := optionalStringSlice(args, filesMkdirArg)
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+	if len(files)+len(deletes)+len(pairs)+len(mkdirs) == 0 {
+		return "", nil, nil, nil, nil, fmt.Errorf("arguments %q, %q, %q and %q must name at least one path between them", filesArg, filesDeleteArg, filesMoveArg, filesMkdirArg)
 	}
 	for i, raw := range files {
 		switch {
 		case strings.TrimSpace(raw) == "":
-			return "", nil, nil, nil, fmt.Errorf("argument %q[%d] must not be empty", filesArg, i)
+			return "", nil, nil, nil, nil, fmt.Errorf("argument %q[%d] must not be empty", filesArg, i)
 		case filepath.IsAbs(raw):
-			return "", nil, nil, nil, fmt.Errorf("argument %q[%d] %q must be relative to the launch directory", filesArg, i, raw)
+			return "", nil, nil, nil, nil, fmt.Errorf("argument %q[%d] %q must be relative to the launch directory", filesArg, i, raw)
 		case strings.HasPrefix(raw, "~"):
-			return "", nil, nil, nil, fmt.Errorf("argument %q[%d] %q must not be home-relative", filesArg, i, raw)
+			return "", nil, nil, nil, nil, fmt.Errorf("argument %q[%d] %q must not be home-relative", filesArg, i, raw)
 		}
 	}
 	for i, raw := range deletes {
 		switch {
 		case strings.TrimSpace(raw) == "":
-			return "", nil, nil, nil, fmt.Errorf("argument %q[%d] must not be empty", filesDeleteArg, i)
+			return "", nil, nil, nil, nil, fmt.Errorf("argument %q[%d] must not be empty", filesDeleteArg, i)
 		case strings.HasPrefix(raw, "~") && raw != "~" && !strings.HasPrefix(raw, "~/"):
-			return "", nil, nil, nil, fmt.Errorf("argument %q[%d] %q uses the unsupported ~user form; only ~ and ~/<subpath> are supported", filesDeleteArg, i, raw)
+			return "", nil, nil, nil, nil, fmt.Errorf("argument %q[%d] %q uses the unsupported ~user form; only ~ and ~/<subpath> are supported", filesDeleteArg, i, raw)
+		}
+	}
+	for i, raw := range mkdirs {
+		if strings.TrimSpace(raw) == "" {
+			return "", nil, nil, nil, nil, fmt.Errorf("argument %q[%d] must not be empty", filesMkdirArg, i)
 		}
 	}
 	write, remove, err := filetools.ResolveDeclaredScopes(t.deps.Home, t.deps.LaunchDir, files, deletes)
 	if err != nil {
-		return "", nil, nil, nil, fmt.Errorf("arguments %q and %q: %w", filesArg, filesDeleteArg, err)
+		return "", nil, nil, nil, nil, fmt.Errorf("arguments %q and %q: %w", filesArg, filesDeleteArg, err)
 	}
 	if err := t.confine(filesArg, write); err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	if err := t.confine(filesDeleteArg, remove); err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
 	moves, err := t.resolveMoves(pairs, pairsGiven)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, nil, err
 	}
-	return instruction, suppliedSet(write, filesGiven), suppliedSet(remove, deletesGiven), moves, nil
+	dirs, err := t.resolveDirs(mkdirs, mkdirsGiven)
+	if err != nil {
+		return "", nil, nil, nil, nil, err
+	}
+	return instruction, suppliedSet(write, filesGiven), suppliedSet(remove, deletesGiven), moves, dirs, nil
 }
 
 func (t *Tool) confine(arg string, declared map[string]bool) error {
@@ -509,6 +538,25 @@ func (t *Tool) resolveMoves(pairs []permissions.MovePair, given bool) (map[permi
 		moves[permissions.MovePair{Source: resolved.Source, Destination: resolved.Destination}] = true
 	}
 	return moves, nil
+}
+
+func (t *Tool) resolveDirs(raw []string, given bool) (map[string]bool, error) {
+	if !given {
+		return nil, nil
+	}
+	mkdir := filetools.NewMkdirTool(t.deps.Home, t.deps.LaunchDir, t.deps.ProjectRoot)
+	dirs := make(map[string]bool, len(raw))
+	for i, path := range raw {
+		target, _, err := mkdir.ResolveTarget(map[string]any{"path": path})
+		if err != nil {
+			return nil, fmt.Errorf("argument %q[%d]: %w", filesMkdirArg, i, err)
+		}
+		if target == t.deps.ProjectRoot || !permissions.IsDescendantOrEqual(target, t.deps.ProjectRoot) {
+			return nil, fmt.Errorf("argument %q[%d] resolves %q, which is not inside the project below its root", filesMkdirArg, i, target)
+		}
+		dirs[target] = true
+	}
+	return dirs, nil
 }
 
 // A supplied list stays a non-nil set even when it names nothing, which is how authorization tells a
@@ -656,9 +704,9 @@ func (d *confinedDispatcher) Dispatch(ctx context.Context, call turn.AssembledTo
 	return d.inner.Dispatch(ctx, call)
 }
 
-func (t *Tool) nestedDelegate(mode string, write, remove map[string]bool, moves map[permissions.MovePair]bool, invocation string) func(context.Context, turn.AssembledToolCall) (turn.ToolResult, error) {
+func (t *Tool) nestedDelegate(mode string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, invocation string) func(context.Context, turn.AssembledToolCall) (turn.ToolResult, error) {
 	return func(ctx context.Context, call turn.AssembledToolCall) (turn.ToolResult, error) {
-		nestedWrite, nestedDelete, nestedMoves := t.nestedDeclaration(call.Arguments)
+		nestedWrite, nestedDelete, nestedMoves, nestedDirs := t.nestedDeclaration(call.Arguments)
 		dispatcher := t.deps.NewDispatcher(permissions.ModeContext{
 			Mode:              mode,
 			ChildAgent:        true,
@@ -666,9 +714,11 @@ func (t *Tool) nestedDelegate(mode string, write, remove map[string]bool, moves 
 			DeclaredWrite:     write,
 			DeclaredDelete:    remove,
 			DeclaredMoves:     moves,
+			DeclaredDirs:      dirs,
 			DelegateWrite:     nestedWrite,
 			DelegateDelete:    nestedDelete,
 			DelegateMoves:     nestedMoves,
+			DelegateDirs:      nestedDirs,
 		})
 		if dispatcher == nil {
 			return turn.ToolResult{Content: ToolName + ": child agent dispatch is unavailable"}, nil
@@ -679,16 +729,16 @@ func (t *Tool) nestedDelegate(mode string, write, remove map[string]bool, moves 
 
 // A nested declaration that does not parse or does not validate resolves to the empty set, which
 // the containment check refuses.
-func (t *Tool) nestedDeclaration(arguments string) (write, remove map[string]bool, moves map[permissions.MovePair]bool) {
+func (t *Tool) nestedDeclaration(arguments string) (write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
-	_, write, remove, moves, err := t.validate(args)
+	_, write, remove, moves, dirs, err := t.validate(args)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
-	return write, remove, moves
+	return write, remove, moves, dirs
 }
 
 // A refusal is an in-band tool error, not a deny envelope: the call was never a permission
@@ -707,6 +757,16 @@ func render(res subagent.Result) tools.Result {
 	}
 	if reply := strings.TrimRight(res.Reply, "\n"); reply != "" {
 		b.WriteString(reply + "\n")
+	}
+	if res.RefusalTotal > 0 {
+		b.WriteString("refused operations: targets are shown as the child gave them, not as resolved paths; " +
+			"a refusal grants nothing, so retry one only through ordinary authorization, and a guard refusal cannot be approved\n")
+		for _, refusal := range res.Refusals {
+			b.WriteString("  " + refusal.Line() + "\n")
+		}
+		if more := res.RefusalTotal - len(res.Refusals); more > 0 {
+			fmt.Fprintf(&b, "  and %d more\n", more)
+		}
 	}
 	if res.Reason != subagent.ReasonCompleted && len(res.RestoredPaths) > 0 {
 		b.WriteString("the child agent did not complete, so its changes were undone; restored:\n")
@@ -731,12 +791,12 @@ func failResult(msg string) tools.Result {
 	return tools.Result{ExitCode: 1, Stderr: []byte(ToolName + ": " + msg + "\n")}
 }
 
-var allowedArgs = map[string]struct{}{instructionsArg: {}, filesArg: {}, filesDeleteArg: {}, filesMoveArg: {}}
+var allowedArgs = map[string]struct{}{instructionsArg: {}, filesArg: {}, filesDeleteArg: {}, filesMoveArg: {}, filesMkdirArg: {}}
 
 func rejectUnknownArgs(args map[string]any) error {
 	for key := range args {
 		if _, ok := allowedArgs[key]; !ok {
-			return fmt.Errorf("unexpected argument %q; only %s, %s, %s and %s are accepted", key, instructionsArg, filesArg, filesDeleteArg, filesMoveArg)
+			return fmt.Errorf("unexpected argument %q; only %s, %s, %s, %s and %s are accepted", key, instructionsArg, filesArg, filesDeleteArg, filesMoveArg, filesMkdirArg)
 		}
 	}
 	return nil

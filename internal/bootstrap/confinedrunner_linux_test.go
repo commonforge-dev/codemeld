@@ -186,3 +186,193 @@ func TestConfinedRunner_AutoProjectSymlinkExclusionsThroughTheRealHelper(t *test
 		}
 	}
 }
+
+func TestConfinedRunner_AutoWritableFolderThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if _, err := runner.ResolveOnPath("sh", runner.FixedPATH); err != nil {
+		t.Fatalf("sh absent from %s: %v", runner.FixedPATH, err)
+	}
+	base := filepath.Dir(project)
+	writable, sibling, tmpDir := filepath.Join(base, "writable"), filepath.Join(base, "sibling"), filepath.Join(base, "tmp")
+	for _, dir := range []string{writable, sibling, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache, err := config.NewCache(map[string]any{
+		"confinement":      map[string]any{"program_lookup": "strict"},
+		"writable_folders": []any{writable},
+	}, project, nil, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	conf := launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)})
+	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+	write := func(t *testing.T, dir string) (runner.RunResult, string) {
+		t.Helper()
+		target := filepath.Join(dir, "f")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", "echo hi > " + target}, Cwd: project})
+		if err != nil || ctx.Err() != nil {
+			t.Fatalf("confined write to %s: %v, %v; result %+v", target, err, ctx.Err(), res)
+		}
+		return res, target
+	}
+
+	if res, target := write(t, writable); res.ExitCode != 0 {
+		t.Fatalf("write into the writable folder: exit %d stderr %q, want 0", res.ExitCode, res.Stderr)
+	} else if b, err := os.ReadFile(target); err != nil || string(b) != "hi\n" {
+		t.Fatalf("%s = %q, %v; want the written line", target, b, err)
+	}
+	res, target := write(t, sibling)
+	if _, err := os.Lstat(target); res.ExitCode == 0 || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("write into the sibling: exit %d stderr %q, stat %v; want a failure leaving %s absent", res.ExitCode, res.Stderr, err, target)
+	}
+}
+
+func TestConfinedRunner_AutoNestedWriteRootsThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if _, err := runner.ResolveOnPath("sh", runner.FixedPATH); err != nil {
+		t.Fatalf("sh absent from %s: %v", runner.FixedPATH, err)
+	}
+	base, err := filepath.EvalSymlinks(filepath.Dir(project))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, outside, declared := filepath.Join(base, "shared"), filepath.Join(base, "outside"), filepath.Join(base, "declared")
+	inShared := filepath.Join(shared, "declared")
+	for _, dir := range []string{inShared, outside, declared} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outside, "keep"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(shared, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", alias)
+	private, err := newSessionTempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(private) != shared {
+		t.Fatalf("private temp folder %q, want it stored resolved inside %q", private, shared)
+	}
+	cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project, nil, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	conf := launchConfinement(resolution, private, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)})
+	conf.writeRoots = []string{declared, inShared, shared}
+	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+	run := func(t *testing.T, script string, args ...string) runner.RunResult {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: append([]string{"sh", "-c", script, "sh"}, args...), Cwd: project})
+		if err != nil || ctx.Err() != nil {
+			t.Fatalf("confined %q %q: %v, %v; result %+v", script, args, err, ctx.Err(), res)
+		}
+		return res
+	}
+	const write = `printf x > "$1/f"`
+	const swap = `mv "$1" "$1.moved" && ln -s "$2" "$1"`
+	outsideNames := func() []string {
+		entries, err := os.ReadDir(outside)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+
+	for _, dir := range []string{private, inShared, declared} {
+		if res := run(t, write, dir); res.ExitCode != 0 {
+			t.Fatalf("write into %s: exit %d stderr %q, want 0", dir, res.ExitCode, res.Stderr)
+		}
+	}
+	if err := os.RemoveAll(declared); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(declared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if res := run(t, write, declared); res.ExitCode != 0 {
+		t.Fatalf("write into the re-created %s: exit %d stderr %q, want 0", declared, res.ExitCode, res.Stderr)
+	}
+
+	for _, dir := range []string{private, inShared} {
+		if res := run(t, swap, dir, outside); res.ExitCode != 0 {
+			t.Fatalf("swap %s for a symlink: exit %d stderr %q, want 0", dir, res.ExitCode, res.Stderr)
+		}
+		res := run(t, write, dir)
+		if got := outsideNames(); res.ExitCode == 0 || !slices.Equal(got, []string{"keep"}) {
+			t.Fatalf("write through the swapped %s: exit %d stderr %q, outside holds %q; want a failure leaving it unchanged", dir, res.ExitCode, res.Stderr, got)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(outside, "keep")); err != nil || string(b) != "outside" {
+		t.Fatalf("outside/keep = %q, %v; want it unchanged", b, err)
+	}
+}
+
+func TestConfinedRunner_SavedAllowLaunchWritesOnlyThePrivateTempFolderThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	base, err := filepath.EvalSymlinks(filepath.Dir(project))
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchTmp := filepath.Join(base, "launchtmp")
+	if err := os.Mkdir(launchTmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(launchTmp, "keep")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", launchTmp)
+	writeGlobalSettings(t, home, "confinement:\n  shared_temp_folders: allow\n", 0o600)
+
+	inspected := false
+	runConfinedLaunch(t, confinedLaunchResult(t, home, project, savedGlobalConfig(t, home)), func(conf *confinement) {
+		confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+		run := func(target string) runner.RunResult {
+			t.Helper()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", `printf x > "$1"`, "sh", target}, Cwd: project})
+			if err != nil || ctx.Err() != nil {
+				t.Fatalf("confined write to %s: %v, %v; result %+v", target, err, ctx.Err(), res)
+			}
+			return res
+		}
+
+		if res := run(victim); res.ExitCode == 0 {
+			t.Fatalf("write to %s under the launch TMPDIR: exit 0, want a failure", victim)
+		}
+		if b, err := os.ReadFile(victim); err != nil || string(b) != "keep" {
+			t.Fatalf("%s = %q, %v; want it unchanged", victim, b, err)
+		}
+		inside := filepath.Join(conf.tmpDir, "f")
+		if res := run(inside); res.ExitCode != 0 {
+			t.Fatalf("write inside the private temp folder: exit %d stderr %q, want 0", res.ExitCode, res.Stderr)
+		}
+		if b, err := os.ReadFile(inside); err != nil || string(b) != "x" {
+			t.Fatalf("%s = %q, %v; want the written byte", inside, b, err)
+		}
+		inspected = true
+	})
+	if !inspected {
+		t.Fatal("the launch confinement was never inspected")
+	}
+}

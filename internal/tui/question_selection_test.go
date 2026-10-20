@@ -203,6 +203,52 @@ func TestQuestionSelection_DragCopiesSourceTextNotDrawnRows(t *testing.T) {
 	})
 }
 
+func TestQuestionSelection_DescriptionRowsCopyTheirSource(t *testing.T) {
+	const prompt = "Where should sessions be stored?"
+	const label = "Local disk"
+	const description = "[red]Fast[-] but every session is lost with the machine when it is replaced"
+	spec := QuestionSpec{ID: "q", Prompt: prompt, Options: []string{label, "Object store"}, OptionDescriptions: []string{description, ""}}
+
+	t.Run("a drag ending on a wrapped description row copies the description bytes", func(t *testing.T) {
+		a, o, captured := qsOpen(t, spec, 34, 30)
+		first, last := o.starts[0]+1, o.lastLineOf(0)
+		if last <= first {
+			t.Fatalf("description rendered on %d row(s); the wrapped case is not covered", last-first+1)
+		}
+		x1, y1 := qsAt(o, first, 0)
+		x2, y2 := qsRowEnd(o, last)
+		qsDrag(a, x1, y1, x2, y2)
+		qsCopied(t, a, captured, description)
+		if a.questionForm.blocks[0].chosen[0] {
+			t.Fatal("the drag chose the option it selected text from")
+		}
+	})
+
+	t.Run("label through description copies both with one newline", func(t *testing.T) {
+		a, o, captured := qsOpen(t, spec, 34, 30)
+		x1, y1 := qsAt(o, o.starts[0], 0)
+		x2, y2 := qsRowEnd(o, o.lastLineOf(0))
+		qsDrag(a, x1, y1, x2, y2)
+		qsCopied(t, a, captured, label+"\n"+description)
+		if strings.Contains(a.input.lastCopied, singleOpenMark) || strings.Contains(a.input.lastCopied, "    ") {
+			t.Fatalf("copied %q, want no row mark or indentation", a.input.lastCopied)
+		}
+	})
+
+	t.Run("a rebuild during the drag copies nothing", func(t *testing.T) {
+		a, o, captured := qsOpen(t, spec, 34, 30)
+		x1, y1 := qsAt(o, o.starts[0]+1, 0)
+		x2, y2 := qsRowEnd(o, o.lastLineOf(0))
+		qsPress(a, x1, y1)
+		qsMove(a, x2, y2)
+		o.render(o.width)
+		qsRelease(a, nil)
+		if len(*captured) != 0 {
+			t.Fatalf("copied %q from rows a rebuild replaced", a.input.lastCopied)
+		}
+	})
+}
+
 // A newline the provider wrote is source text, so a drag that meets it at a row edge has
 // to copy it. The break the renderer inserts to wrap a long line is not in the source and
 // still must not appear, which is why the two edges are asserted separately.

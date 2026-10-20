@@ -11,6 +11,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"codemeld.dev/codemeld/internal/provider"
 )
 
 const questionFormPage = "question-form"
@@ -48,15 +50,16 @@ var (
 )
 
 type QuestionSpec struct {
-	ID          string
-	Prompt      string
-	Options     []string
-	MultiSelect bool
-	AllowCustom bool
+	ID                 string
+	Prompt             string
+	Context            string
+	Options            []string
+	OptionDescriptions []string
+	MultiSelect        bool
+	AllowCustom        bool
 }
 
 type QuestionRequest struct {
-	Context   string
 	Questions []QuestionSpec
 }
 
@@ -117,6 +120,9 @@ type questionForm struct {
 	stage        *questionStage
 	body         *tview.Flex
 	context      *tview.TextView
+	contextRow   *tview.Flex
+	buttons      *tview.Flex
+	hint         *tview.TextView
 	prev         *tview.Button
 	next         *tview.Button
 	clarify      *tview.Button
@@ -126,6 +132,8 @@ type questionForm struct {
 	resultCh     chan QuestionResult
 
 	clarifyOn     bool
+	contextShown  bool
+	contextText   string
 	contextWidth  int
 	contextHeight int
 
@@ -310,6 +318,13 @@ func (o *questionOptions) label(index int) string {
 	return customAnswerRowLabel
 }
 
+func (o *questionOptions) description(index int) string {
+	if index < len(o.block.spec.OptionDescriptions) {
+		return o.block.spec.OptionDescriptions[index]
+	}
+	return ""
+}
+
 func (o *questionOptions) marked(index int) bool {
 	if index < len(o.block.chosen) {
 		return o.block.chosen[index]
@@ -338,7 +353,7 @@ func (o *questionOptions) render(width int) {
 	o.starts = make([]int, o.GetItemCount())
 	promptLines, promptOffsets := wrapSource(o.block.spec.Prompt, width)
 	for i, line := range promptLines {
-		text.WriteString(line + "\n")
+		text.WriteString("[::b]" + line + "[::-]\n")
 		o.owner = append(o.owner, -1)
 		o.offsets = append(o.offsets, promptOffsets[i])
 	}
@@ -363,6 +378,14 @@ func (o *questionOptions) render(width int) {
 			text.WriteString(row + "\n")
 			o.owner = append(o.owner, i)
 			o.offsets = append(o.offsets, lineOffsets[j])
+		}
+		if description := o.description(i); description != "" {
+			descLines, descOffsets := wrapSource(description, body)
+			for j, line := range descLines {
+				text.WriteString(strings.Repeat(" ", questionRowMarkWidth) + "[::d]" + line + "[::-]\n")
+				o.owner = append(o.owner, i)
+				o.offsets = append(o.offsets, len(label)+1+descOffsets[j])
+			}
 		}
 	}
 	o.SetText(strings.TrimSuffix(text.String(), "\n"))
@@ -660,27 +683,80 @@ func (f *questionForm) build() (tview.Primitive, tview.Primitive) {
 	// top of the terminal instead of the question stretching to fill it.
 	f.stage.AddItem(nil, 0, 1, false)
 
-	buttons := buttonRow(f.submit, "Submit", f.cancel, "Cancel")
+	f.buttons = buttonRow(f.submit, "Submit", f.cancel, "Cancel")
 
-	hint := tview.NewTextView()
-	hint.SetDynamicColors(false)
-	hint.SetText("↑↓ move · enter choose · tab or → next · ← prev · pgup/pgdn scroll · wheel scroll · ctrl-s submit · esc cancel")
+	f.hint = tview.NewTextView()
+	f.hint.SetDynamicColors(false)
+	f.hint.SetText("↑↓ move · enter choose · tab or → next · ← prev · pgup/pgdn scroll · wheel scroll · ctrl-s submit · esc cancel")
 
 	f.body = tview.NewFlex().SetDirection(tview.FlexRow)
-	if f.req.Context != "" {
-		f.context = f.buildContext()
-		f.body.AddItem(f.context, 1, 0, false)
+	for _, b := range f.blocks {
+		if b.spec.Context != "" {
+			f.context = f.buildContext()
+			f.contextRow = tview.NewFlex().AddItem(nil, 1, 0, false).AddItem(f.context, 0, 1, false)
+			break
+		}
 	}
-	f.body.AddItem(f.stage, 0, 1, true)
-	f.body.AddItem(f.clarify, 1, 0, false)
-	f.body.AddItem(f.clarifyField, 0, 0, false)
-	f.body.AddItem(buttons, 1, 0, false)
-	f.body.AddItem(hint, 1, 0, false)
 	f.body.SetBorder(true)
 	f.body.SetTitle(" questions ")
 	f.focused = f.blocks[0]
 	f.active = f.blocks[0].options
+	f.showContext()
 	return &questionOverlay{Flex: f.body, form: f}, f.active
+}
+
+// fillBody rebuilds the form's rows because a tview.Flex can only append, and the context
+// section has to sit above the stage when it is shown and be out of the flex when it is not.
+func (f *questionForm) fillBody() {
+	f.body.Clear()
+	if f.contextShown {
+		f.body.AddItem(f.contextRow, 1, 0, false)
+		f.body.AddItem(nil, 1, 0, false)
+	}
+	clarifyHeight := 0
+	if f.clarifyOn {
+		clarifyHeight = 1
+	}
+	f.body.AddItem(f.stage, 0, 1, true)
+	f.body.AddItem(f.clarify, 1, 0, false)
+	f.body.AddItem(f.clarifyField, clarifyHeight, 0, false)
+	f.body.AddItem(f.buttons, 1, 0, false)
+	f.body.AddItem(f.hint, 1, 0, false)
+}
+
+// showContext must not call SetFocus when reached from trackFocus, which tview runs inside
+// SetFocus; there the newly focused primitive is never the context view, so the repair below
+// cannot fire.
+func (f *questionForm) showContext() {
+	if f.context == nil {
+		f.fillBody()
+		return
+	}
+	f.contextText = contextParagraphs(f.focused.spec.Context)
+	f.contextShown = f.contextText != ""
+	f.context.SetText(f.contextText)
+	f.context.ScrollToBeginning()
+	f.contextWidth, f.contextHeight = 0, 0
+	f.fillBody()
+	if f.contextShown {
+		return
+	}
+	if f.active == tview.Primitive(f.context) {
+		f.active = f.focused.options
+	}
+	if f.app.app.GetFocus() == tview.Primitive(f.context) {
+		f.focus(f.focused.options)
+	}
+}
+
+func contextParagraphs(context string) string {
+	var paragraphs []string
+	for _, piece := range strings.Split(context, "\n") {
+		if provider.AskUserTextRenderable(piece) {
+			paragraphs = append(paragraphs, piece)
+		}
+	}
+	return strings.Join(paragraphs, "\n\n")
 }
 
 // Dynamic colors stay off so provider text renders literally without an escaping pass.
@@ -690,7 +766,6 @@ func (f *questionForm) buildContext() *tview.TextView {
 	view.SetWrap(true)
 	view.SetWordWrap(true)
 	view.SetScrollable(true)
-	view.SetText(f.req.Context)
 	view.SetFocusFunc(func() { f.trackFocus(view) })
 	view.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		switch ev.Key() {
@@ -712,18 +787,20 @@ func (f *questionForm) buildContext() *tview.TextView {
 // The third-of-the-form cap leaves the question and its options on screen; the section
 // scrolls whatever does not fit.
 func (f *questionForm) sizeContext(width, height int) {
-	if f.context == nil || width <= 0 || (width == f.contextWidth && height == f.contextHeight) {
+	if !f.contextShown || width <= 0 || (width == f.contextWidth && height == f.contextHeight) {
 		return
 	}
 	f.contextWidth, f.contextHeight = width, height
-	rows := len(tview.WordWrap(f.req.Context, width))
-	if max := height / 3; rows > max {
-		rows = max
+	viewWidth := max(min(width-1, 100), 1)
+	rows := len(tview.WordWrap(f.contextText, viewWidth))
+	if limit := height / 3; rows > limit {
+		rows = limit
 	}
 	if rows < 1 {
 		rows = 1
 	}
-	f.body.ResizeItem(f.context, rows, 0)
+	f.contextRow.ResizeItem(f.context, viewWidth, 0)
+	f.body.ResizeItem(f.contextRow, rows, 0)
 }
 
 func (f *questionForm) buildClarifyField() *tview.InputField {
@@ -952,7 +1029,10 @@ func (b *questionBlock) handleListKey(ev *tcell.EventKey) *tcell.EventKey {
 }
 
 func (b *questionBlock) choose(index int) {
-	b.form.focused = b
+	if b.form.focused != b {
+		b.form.focused = b
+		b.form.showContext()
+	}
 	custom := b.spec.AllowCustom && index == len(b.spec.Options)
 	switch {
 	case custom && b.customOn:
@@ -1054,7 +1134,7 @@ func (b *questionBlock) layout(width, max int) int {
 
 func (f *questionForm) focusRing() []tview.Primitive {
 	ring := make([]tview.Primitive, 0, 2*len(f.blocks)+5)
-	if f.context != nil {
+	if f.contextShown {
 		ring = append(ring, f.context)
 	}
 	for _, b := range f.blocks {
@@ -1104,8 +1184,9 @@ func (f *questionForm) trackFocus(p tview.Primitive) {
 			// The question being left is not re-rendered, so render's own invalidation never
 			// runs for it and a held drag would keep copying from its source map.
 			f.app.discardQuestionDrag()
+			f.focused = b
+			f.showContext()
 		}
-		f.focused = b
 		f.stage.invalidate()
 		return
 	}
@@ -1137,7 +1218,7 @@ func (f *questionForm) owns(p tview.Primitive) bool {
 			return true
 		}
 	}
-	if f.context != nil && p == tview.Primitive(f.context) {
+	if f.contextShown && p == tview.Primitive(f.context) {
 		return true
 	}
 	return p == tview.Primitive(f.prev) || p == tview.Primitive(f.next) ||
@@ -1248,10 +1329,10 @@ func (a *App) AnswerQuestionCustomForTest(question int, text string) bool {
 }
 
 func (a *App) QuestionContextForTest() string {
-	if !a.questionFormOpen || a.questionForm == nil || a.questionForm.context == nil {
+	if !a.questionFormOpen || a.questionForm == nil || !a.questionForm.contextShown {
 		return ""
 	}
-	return a.questionForm.context.GetText(true)
+	return a.questionForm.focused.spec.Context
 }
 
 func (a *App) AskClarificationForTest(text string) bool {

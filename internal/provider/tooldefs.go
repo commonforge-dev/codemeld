@@ -71,7 +71,9 @@ const (
 // unclosed class. Those three are the only ones:
 // TestAskUserTextPattern_DivergesOnlyWhereAPatternCannotFollow sweeps every remaining code
 // point for agreement between the layers.
-const askUserTextBlocked = "\u0001-\u001f\u007f-\u00a0\u00ad" +
+const askUserTextBlocked = "\u0001-\u001f" + askUserTextBlockedAboveASCIIControls
+
+const askUserTextBlockedAboveASCIIControls = "\u007f-\u00a0\u00ad" +
 	"\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u115f-\u1160\u1680\u180e" +
 	"\u2000-\u200f\u2028-\u202f\u205f\u2060-\u2064\u2066-\u206f\u2800\u3000\u3164" +
 	"\ue000-\uf8ff\ufeff\uffa0\ufff9-\ufffb"
@@ -115,6 +117,14 @@ func AskUserTextRenderable(s string) bool {
 	return visible
 }
 
+const askUserContextBlocked = "\u0001-\u0009\u000b-\u001f" + askUserTextBlockedAboveASCIIControls
+
+const AskUserContextPattern = "^[^" + askUserContextBlocked + "]*[^" + askUserContextBlocked + " \n][^" + askUserContextBlocked + "]*$"
+
+func AskUserContextRenderable(s string) bool {
+	return AskUserTextRenderable(strings.ReplaceAll(s, "\n", " "))
+}
+
 func AskUserToolDefinition() ToolDefinition {
 	return ToolDefinition{
 		Name: AskUserToolName,
@@ -122,19 +132,14 @@ func AskUserToolDefinition() ToolDefinition {
 			"Whenever this tool is advertised it is the required way to ask the user for a decision, a preference, or a missing detail: ask through it instead of writing the questions as prose and asking the user to type a reply. " +
 			"Send every open question in one call — they are shown together in a single form — and never guess, infer, or pre-pick an answer you have not been given. " +
 			"Each question needs a stable `id`, the `prompt` to show, and the `options` to choose from; set `multi_select` when more than one option may be chosen, and `allow_custom` when a typed answer instead of the listed options makes sense. " +
-			"Every id, prompt and option label is shown in a terminal, so each must contain visible text: a value that is blank, or that carries a control or zero-width character, is refused. " +
-			"Set `context` whenever a reasonable person could need to know why you are asking, what the choice affects, or what a technical term in it means — it is the shared background shown above the questions, and without it the user is deciding blind. Leave it out only for a choice that explains itself. " +
+			"Every id, prompt, option label and option description is shown in a terminal, so each must contain visible text: a value that is blank, or that carries a control or zero-width character, is refused. " +
+			"Set a question's `context` whenever a reasonable person could need to know why you are asking it, what the choice affects, or what a technical term in it means — without it the user is deciding blind. Each question's `context` is shown only on that question's screen, so it explains that question alone; never put background for another question in it. Leave it out only for a question that explains itself. " +
+			"Put the trade-offs between choices in each option's `description` rather than in the context, so the user reads each consequence beside the choice it belongs to. " +
 			"The result reports each question's selected options and custom text; a question the user left unanswered comes back empty, and a dismissed form comes back cancelled, so read what you were actually given before continuing. " +
-			"Instead of answering, the user may ask you a question of their own: the result is then exactly {\"clarification\":\"...\"} with no answers at all. Reply to it, then call this tool again with the same questions and your reply restated as `context` — the form covers the screen when it opens, so an explanation left only in your reply is not what the user is reading.",
+			"Instead of answering, the user may ask you a question of their own: the result is then exactly {\"clarification\":\"...\"} with no answers at all. Reply to it, then call this tool again with the same questions and your reply restated in the `context` of the question or questions it concerns — the form covers the screen when it opens, so an explanation left only in your reply is not what the user is reading.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"context": map[string]any{
-					"type":        "string",
-					"description": "Plain-language background shared by every question in this call, shown in a scrollable section above them. Written for the user, not for you: say why the decision is needed, what it affects, and what any technical term in it means. It is displayed literally, so it is not markdown, and it is one paragraph — no line breaks or tabs.",
-					"pattern":     AskUserTextPattern,
-					"maxLength":   MaxAskUserContextRunes,
-				},
 				"questions": map[string]any{
 					"type":        "array",
 					"description": "Every question to show in one form, in the order they should be read.",
@@ -155,16 +160,36 @@ func AskUserToolDefinition() ToolDefinition {
 								"pattern":     AskUserTextPattern,
 								"maxLength":   MaxAskUserTextRunes,
 							},
+							"context": map[string]any{
+								"type":        "string",
+								"description": "Plain-language background for this question only, shown in a scrollable section on this question's screen and on no other. Written for the user, not for you: say why this decision is needed, what it affects, and what any technical term in it means; explain only this question. It is displayed literally, so it is not markdown. Separate paragraphs with a line feed (\\n); tabs and other control characters are refused.",
+								"pattern":     AskUserContextPattern,
+								"maxLength":   MaxAskUserContextRunes,
+							},
 							"options": map[string]any{
 								"type":        "array",
-								"description": "The selectable answers for this question, each label distinct.",
+								"description": "The selectable answers for this question. Every option's label must differ from every other option's label in the question, even when their descriptions differ.",
 								"minItems":    1,
 								"maxItems":    MaxAskUserOptions,
 								"uniqueItems": true,
 								"items": map[string]any{
-									"type":      "string",
-									"pattern":   AskUserTextPattern,
-									"maxLength": MaxAskUserTextRunes,
+									"type": "object",
+									"properties": map[string]any{
+										"label": map[string]any{
+											"type":        "string",
+											"description": "The answer shown as the option's row and returned in `selected` when chosen.",
+											"pattern":     AskUserTextPattern,
+											"maxLength":   MaxAskUserTextRunes,
+										},
+										"description": map[string]any{
+											"type":        "string",
+											"description": "Optional explanation shown under the label: what choosing this option means and what it trades off against the others.",
+											"pattern":     AskUserTextPattern,
+											"maxLength":   MaxAskUserTextRunes,
+										},
+									},
+									"required":             []string{"label"},
+									"additionalProperties": false,
 								},
 							},
 							"multi_select": map[string]any{
@@ -255,8 +280,9 @@ func BashToolDefinition() ToolDefinition {
 // DisallowUnknownFields set, so decoding through raw key maps is what keeps `"Questions"` or
 // `"ID"` — which the schema rejects — from mounting a form.
 var (
-	askUserTopKeys      = []string{"questions", "context"}
-	askUserQuestionKeys = []string{"id", "prompt", "options", "multi_select", "allow_custom"}
+	askUserTopKeys      = []string{"questions"}
+	askUserQuestionKeys = []string{"id", "prompt", "context", "options", "multi_select", "allow_custom"}
+	askUserOptionKeys   = []string{"label", "description"}
 )
 
 // AskUserQuestion and AskUserRequest are one accepted `ask_user` call. They are the single
@@ -264,15 +290,16 @@ var (
 // TUI form, and /resume replay runs a saved call's raw arguments back through the same
 // checker, so a call the live form would refuse can never render on replay.
 type AskUserQuestion struct {
-	ID          string
-	Prompt      string
-	Options     []string
-	MultiSelect bool
-	AllowCustom bool
+	ID                 string
+	Prompt             string
+	Context            string
+	Options            []string
+	OptionDescriptions []string
+	MultiSelect        bool
+	AllowCustom        bool
 }
 
 type AskUserRequest struct {
-	Context   string
 	Questions []AskUserQuestion
 }
 
@@ -290,8 +317,6 @@ func DecodeAskUserRequest(arguments string) (AskUserRequest, error) {
 	}
 	var faults askUserFaults
 	faults.collect(askUserExactKeys(root, askUserTopKeys, ""))
-	sharedContext, err := askUserContext(root["context"])
-	faults.collect(err)
 	var decoded []json.RawMessage
 	if raw, ok := root["questions"]; ok {
 		if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -306,7 +331,7 @@ func DecodeAskUserRequest(arguments string) (AskUserRequest, error) {
 	if len(decoded) > MaxAskUserQuestions {
 		faults.add(askUserAt(MaxAskUserQuestions), "%q has %d entries, at most %d allowed", "questions", len(decoded), MaxAskUserQuestions)
 	}
-	req := AskUserRequest{Context: sharedContext, Questions: make([]AskUserQuestion, 0, len(decoded))}
+	req := AskUserRequest{Questions: make([]AskUserQuestion, 0, len(decoded))}
 	ids := make(map[string]int, len(decoded))
 	for index, rawQuestion := range decoded {
 		before := len(faults)
@@ -329,20 +354,24 @@ func DecodeAskUserRequest(arguments string) (AskUserRequest, error) {
 		faults.collect(askUserExactKeys(q, askUserQuestionKeys, at))
 		prompt, err := askUserText(q["prompt"], at, "prompt")
 		faults.collect(err)
+		questionContext, err := askUserContext(q["context"], at)
+		faults.collect(err)
 		multiSelect, err := askUserFlag(q["multi_select"], at, "multi_select")
 		faults.collect(err)
 		allowCustom, err := askUserFlag(q["allow_custom"], at, "allow_custom")
 		faults.collect(err)
-		options := askUserOptions(q["options"], at, &faults)
+		options, descriptions := askUserOptions(q["options"], at, &faults)
 		if len(faults) != before {
 			continue
 		}
 		req.Questions = append(req.Questions, AskUserQuestion{
-			ID:          id,
-			Prompt:      prompt,
-			Options:     options,
-			MultiSelect: multiSelect,
-			AllowCustom: allowCustom,
+			ID:                 id,
+			Prompt:             prompt,
+			Context:            questionContext,
+			Options:            options,
+			OptionDescriptions: descriptions,
+			MultiSelect:        multiSelect,
+			AllowCustom:        allowCustom,
 		})
 	}
 	if err := faults.err(); err != nil {
@@ -351,37 +380,52 @@ func DecodeAskUserRequest(arguments string) (AskUserRequest, error) {
 	return req, nil
 }
 
-func askUserOptions(raw json.RawMessage, at string, faults *askUserFaults) []string {
+func askUserOptions(raw json.RawMessage, at string, faults *askUserFaults) ([]string, []string) {
 	var rawOptions []json.RawMessage
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &rawOptions); err != nil {
-			faults.add(at, "%q must be an array of strings", "options")
-			return nil
+			faults.add(at, "%q must be an array of option objects", "options")
+			return nil, nil
 		}
 	}
 	switch {
 	case len(rawOptions) == 0:
 		faults.add(at, "%q is empty", "options")
-		return nil
+		return nil, nil
 	case len(rawOptions) > MaxAskUserOptions:
 		faults.add(askUserOptionAt(at, MaxAskUserOptions), "%q has %d entries, at most %d allowed", "options", len(rawOptions), MaxAskUserOptions)
 	}
-	options := make([]string, 0, len(rawOptions))
+	labels := make([]string, 0, len(rawOptions))
+	descriptions := make([]string, 0, len(rawOptions))
 	seen := make(map[string]int, len(rawOptions))
 	for index, rawOption := range rawOptions {
-		option, err := askUserText(rawOption, askUserOptionAt(at, index), "option")
-		if err != nil {
+		optionAt := askUserOptionAt(at, index)
+		var option map[string]json.RawMessage
+		if err := json.Unmarshal(rawOption, &option); err != nil || option == nil {
+			faults.add(optionAt, "must be an object with a %q", "label")
+			continue
+		}
+		before := len(*faults)
+		faults.collect(askUserExactKeys(option, askUserOptionKeys, optionAt))
+		label, err := askUserText(option["label"], optionAt, "label")
+		faults.collect(err)
+		description := ""
+		if rawDescription, ok := option["description"]; ok {
+			description, err = askUserText(rawDescription, optionAt, "description")
 			faults.collect(err)
+		}
+		if len(*faults) != before {
 			continue
 		}
-		if first, dup := seen[option]; dup {
-			faults.add(askUserOptionAt(at, index), "repeats option %d", first)
+		if first, dup := seen[label]; dup {
+			faults.add(optionAt, "repeats the label of option %d", first)
 			continue
 		}
-		seen[option] = index
-		options = append(options, option)
+		seen[label] = index
+		labels = append(labels, label)
+		descriptions = append(descriptions, description)
 	}
-	return options
+	return labels, descriptions
 }
 
 // askUserFaults reports every independently detectable failure in one refusal: stopping at
@@ -501,8 +545,7 @@ func askUserEscapedRune(raw []byte) (rune, bool) {
 // checkAskUserText bounds the raw string the model sent and refuses one the form cannot
 // display, then returns that string unchanged: an id is the key the answer comes back
 // under, so rewriting accepted text here would hand the model a different identifier
-// than it sent, and the schema's uniqueItems compares the same untouched values these
-// duplicate checks do.
+// than it sent.
 func checkAskUserText(raw, at, field string) (string, error) {
 	if measured := utf8.RuneCountInString(raw); measured > MaxAskUserTextRunes {
 		return "", askUserFault(at, "%q is longer than %d characters (%d sent)", field, MaxAskUserTextRunes, measured)
@@ -513,26 +556,24 @@ func checkAskUserText(raw, at, field string) (string, error) {
 	return raw, nil
 }
 
-// This cannot go through checkAskUserText, whose bound is the 200 runes every question field
-// keeps; only the length differs, so the same renderability rule still applies. An absent key
-// is the ordinary call with no context, while a present but blank one is refused rather than
-// silently dropped.
-func askUserContext(raw json.RawMessage) (string, error) {
+// An absent key is the ordinary question with no context, while a present but blank one is
+// refused rather than silently dropped.
+func askUserContext(raw json.RawMessage, at string) (string, error) {
 	if len(raw) == 0 {
 		return "", nil
 	}
 	if !AskUserDecodesUnchanged(raw) {
-		return "", askUserFault("", "%q carries malformed Unicode", "context")
+		return "", askUserFault(at, "%q carries malformed Unicode", "context")
 	}
 	var text string
 	if err := json.Unmarshal(raw, &text); err != nil {
-		return "", askUserFault("", "%q must be a string", "context")
+		return "", askUserFault(at, "%q must be a string", "context")
 	}
 	if measured := utf8.RuneCountInString(text); measured > MaxAskUserContextRunes {
-		return "", askUserFault("", "%q is longer than %d characters (%d sent)", "context", MaxAskUserContextRunes, measured)
+		return "", askUserFault(at, "%q is longer than %d characters (%d sent)", "context", MaxAskUserContextRunes, measured)
 	}
-	if !AskUserTextRenderable(text) {
-		return "", askUserFault("", "%q has no text the form can display", "context")
+	if !AskUserContextRenderable(text) {
+		return "", askUserFault(at, "%q has no text the form can display", "context")
 	}
 	return text, nil
 }

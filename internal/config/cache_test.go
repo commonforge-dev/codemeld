@@ -580,12 +580,6 @@ func TestNewCache_WritableFoldersAbsentNeedsNoHome(t *testing.T) {
 }
 
 func TestNewCache_WritableFoldersUseOnlyTheSuppliedHome(t *testing.T) {
-	composed := map[string]any{writableFoldersKey: []any{"~/w", "~/.codemeld"}}
-	c, out := writableCache(t, composed, "/proj")
-	if len(c.writableFolders) != 0 || strings.Count(out, "codemeld: writable_folders:") != 1 {
-		t.Fatalf("writableFolders = %q, stderr = %q; want none and one key-prefixed notice", c.writableFolders, out)
-	}
-
 	home, ambient := resolvedTempDir(t), resolvedTempDir(t)
 	for _, h := range []string{home, ambient} {
 		if err := os.MkdirAll(filepath.Join(h, "w"), 0o755); err != nil {
@@ -596,12 +590,38 @@ func TestNewCache_WritableFoldersUseOnlyTheSuppliedHome(t *testing.T) {
 		}
 	}
 	t.Setenv("HOME", ambient)
-	c, out = writableCache(t, composed, "/proj", home)
-	if !reflect.DeepEqual(c.writableFolders, []string{filepath.Join(home, "w")}) {
-		t.Fatalf("writableFolders = %q, want only the supplied home's w", c.writableFolders)
+	composed, err := Compose(nil, map[string]any{writableFoldersKey: []any{"~/w", "~/", "~/.codemeld", "relative"}})
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
 	}
-	if !strings.Contains(out, filepath.Join(home, ".codemeld")) || strings.Contains(out, ambient) {
-		t.Fatalf("stderr = %q, want the supplied home's floor named and the ambient home never", out)
+	for _, omitted := range [][]string{nil, {""}} {
+		c, out := writableCache(t, composed, "/proj", omitted...)
+		if len(c.WritableFolders()) != 0 || strings.Contains(out, "writable_folders") {
+			t.Fatalf("home %q: writableFolders = %q, stderr = %q; want none and no notice", omitted, c.WritableFolders(), out)
+		}
+	}
+
+	c, out := writableCache(t, composed, "/proj", home)
+	if want := []string{filepath.Join(home, "w"), home}; !reflect.DeepEqual(c.WritableFolders(), want) {
+		t.Fatalf("writableFolders = %q, want only the supplied home's %q", c.WritableFolders(), want)
+	}
+	if strings.Count(out, "codemeld: writable_folders:") != 3 || !strings.Contains(out, `"~/": confined Auto commands`) ||
+		!strings.Contains(out, filepath.Join(home, ".codemeld")) || !strings.Contains(out, `"relative": must be an absolute path`) || strings.Contains(out, ambient) {
+		t.Fatalf("stderr = %q, want the home-impact, protected-path and malformed-entry notices for the supplied home and the ambient home never", out)
+	}
+}
+
+func TestCache_WritableFoldersReturnsACopy(t *testing.T) {
+	folder := resolvedTempDir(t)
+	composed, err := Compose(nil, map[string]any{writableFoldersKey: []any{folder}})
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	c, _ := writableCache(t, composed, resolvedTempDir(t), resolvedTempDir(t))
+	got := c.WritableFolders()
+	got[0] = "/mutated"
+	if again := c.WritableFolders(); !reflect.DeepEqual(again, []string{folder}) {
+		t.Fatalf("WritableFolders() after mutating a returned slice = %q, want %q", again, []string{folder})
 	}
 }
 
@@ -1240,23 +1260,18 @@ func TestCacheSetAttribution_WriteFailureLeavesDiskAndSessionUnchanged(t *testin
 
 func TestCacheConfinementAccessors(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		composed     map[string]any
-		wantLookup   string
-		wantAllowed  bool
-		wantAnswered bool
+		name       string
+		composed   map[string]any
+		wantLookup string
 	}{
-		{"absent", map[string]any{}, "friendly", false, false},
-		{"strict and allow", map[string]any{"confinement": map[string]any{"program_lookup": "strict", "shared_temp_folders": "allow"}}, "strict", true, true},
-		{"friendly and deny", map[string]any{"confinement": map[string]any{"program_lookup": "friendly", "shared_temp_folders": "deny"}}, "friendly", false, true},
+		{"absent", map[string]any{}, "friendly"},
+		{"strict", map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, "strict"},
+		{"friendly", map[string]any{"confinement": map[string]any{"program_lookup": "friendly"}}, "friendly"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newCacheOrFatal(t, tc.composed, "/r", nil)
 			if got := c.ProgramLookup(); got != tc.wantLookup {
 				t.Errorf("ProgramLookup() = %q, want %q", got, tc.wantLookup)
-			}
-			if allowed, answered := c.SharedTempFolders(); allowed != tc.wantAllowed || answered != tc.wantAnswered {
-				t.Errorf("SharedTempFolders() = (%v, %v), want (%v, %v)", allowed, answered, tc.wantAllowed, tc.wantAnswered)
 			}
 		})
 	}
@@ -1272,92 +1287,6 @@ func TestCacheConfinement_FromGlobalFile(t *testing.T) {
 	c := newCacheOrFatal(t, raw, "/r", []string{global})
 	if got := c.ProgramLookup(); got != "strict" {
 		t.Errorf("ProgramLookup() = %q, want strict", got)
-	}
-}
-
-func TestCacheSetSharedTempFolders_WritesGlobalLayerAndPublishesToSession(t *testing.T) {
-	dir := t.TempDir()
-	global := filepath.Join(dir, "global", "settings.yaml")
-	project := filepath.Join(dir, "project-settings.yaml")
-	writeAt(t, project, "model:\n  active:\n    provider: openai\n    id: gpt-5\n")
-	projectBefore := readAt(t, project)
-
-	c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global, project})
-
-	if reason, cat, err := c.SetSharedTempFolders(true); reason != ReasonNone || cat != "" || err != nil {
-		t.Fatalf("SetSharedTempFolders(true) = (%q, %q, %v), want success", reason, cat, err)
-	}
-	if allowed, answered := c.SharedTempFolders(); !allowed || !answered {
-		t.Errorf("SharedTempFolders() = (%v, %v) after allow, want (true, true)", allowed, answered)
-	}
-	if got := readAt(t, global); got != "confinement:\n  shared_temp_folders: allow\n" {
-		t.Errorf("global settings = %q, want the saved allow", got)
-	}
-	if after := readAt(t, project); after != projectBefore {
-		t.Errorf("project layer changed by a global-only write:\n%q\nwant\n%q", after, projectBefore)
-	}
-
-	if reason, cat, err := c.SetSharedTempFolders(false); reason != ReasonNone || cat != "" || err != nil {
-		t.Fatalf("SetSharedTempFolders(false) = (%q, %q, %v), want success", reason, cat, err)
-	}
-	if allowed, answered := c.SharedTempFolders(); allowed || !answered {
-		t.Errorf("SharedTempFolders() = (%v, %v) after deny, want (false, true)", allowed, answered)
-	}
-	if got := readAt(t, global); got != "confinement:\n  shared_temp_folders: deny\n" {
-		t.Errorf("global settings = %q, want the saved deny", got)
-	}
-}
-
-func TestCacheSetSharedTempFolders_FlowRootStaysValid(t *testing.T) {
-	global := filepath.Join(t.TempDir(), "settings.yaml")
-	writeAt(t, global, "{attribution: true}\n")
-	c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global})
-
-	if reason, cat, err := c.SetSharedTempFolders(true); reason != ReasonNone || cat != "" || err != nil {
-		t.Fatalf("SetSharedTempFolders(true) = (%q, %q, %v), want success", reason, cat, err)
-	}
-	got := readAt(t, global)
-	if got != "{attribution: true, confinement: {shared_temp_folders: allow}}\n" {
-		t.Fatalf("global settings = %q, want the flow root extended", got)
-	}
-	if _, cat, err := ValidateGlobalSettingsBytes([]byte(got), global); err != nil {
-		t.Fatalf("written settings do not validate: (%q, %v)", cat, err)
-	}
-}
-
-func TestCacheSetSharedTempFolders_NoGlobalLayerFailsClosed(t *testing.T) {
-	c := newCacheOrFatal(t, map[string]any{}, "/r", nil)
-	reason, cat, err := c.SetSharedTempFolders(true)
-	if reason != ReasonRereadParseError || cat != "" || err == nil {
-		t.Fatalf("= (%q, %q, %v), want (reread_parse_error, \"\", error)", reason, cat, err)
-	}
-	if allowed, answered := c.SharedTempFolders(); allowed || answered {
-		t.Errorf("session value changed on a fail-closed write: (%v, %v)", allowed, answered)
-	}
-}
-
-func TestCacheSetSharedTempFolders_WriteFailureLeavesDiskAndSessionUnchanged(t *testing.T) {
-	global := filepath.Join(t.TempDir(), "settings.yaml")
-	const seed = "# keep me\nconfinement:\n  shared_temp_folders: deny\n"
-	writeAt(t, global, seed)
-
-	c := newCacheOrFatal(t, map[string]any{"confinement": map[string]any{"shared_temp_folders": "deny"}}, "/r", []string{global})
-
-	sentinel := errors.New("forced temp-file sync failure")
-	restore := fsutil.SetSyncFileForTest(func(*os.File) error { return sentinel })
-	t.Cleanup(restore)
-
-	reason, cat, err := c.SetSharedTempFolders(true)
-	if reason != ReasonWriteError || cat != fserrors.IOError || !errors.Is(err, sentinel) {
-		t.Fatalf("= (%q, %q, %v), want (write_error, io_error, wrap of sentinel)", reason, cat, err)
-	}
-	restore()
-
-	if allowed, answered := c.SharedTempFolders(); allowed || !answered {
-		t.Errorf("session value changed on a failed write: (%v, %v), want (false, true)", allowed, answered)
-	}
-	if after := readAt(t, global); after != seed {
-		t.Errorf("failed write changed bytes:\n%q\nwant\n%q", after, seed)
 	}
 }
 

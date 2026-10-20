@@ -34,7 +34,6 @@ const (
 	// to set it, or the AuthDelete sentinel to remove it (logout).
 	KeyAuthOpenAIChatGPT = "auth.openai-chatgpt"
 	KeyAttribution       = "attribution"
-	KeySharedTempFolders = "confinement.shared_temp_folders"
 	KeyRetentionDays     = "sessions.retention_days"
 	keyModelFavorites    = "model.favorites"
 )
@@ -219,12 +218,6 @@ func rewriteKey(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWrit
 			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires a bool payload, got %T", key, newValue)
 		}
 		return setAttribution(r, on)
-	case KeySharedTempFolders:
-		v, ok := newValue.(string)
-		if !ok || (v != "allow" && v != "deny") {
-			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires \"allow\" or \"deny\", got %T %v", key, newValue, newValue)
-		}
-		return setNestedScalar(r, "confinement", "shared_temp_folders", v)
 	case KeyRetentionDays:
 		days, ok := newValue.(int)
 		if !ok || days < 1 {

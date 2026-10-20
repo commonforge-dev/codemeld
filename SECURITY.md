@@ -40,10 +40,29 @@ safely.
     run inside a mandatory boundary (Landlock ABI 3 or newer, seccomp,
     `no_new_privs`, resource limits, a fixed environment) with no ordinary
     command prompt. No setting turns it off. Plan may write nothing except
-    `/dev/null` and open no sockets. Auto edits may write the project's top-level
+    `/dev/null` and open no sockets that reach another process; the only socket
+    either mode may create is a Unix stream socketpair, whose two ends stay
+    connected only to each other. Auto edits may write the project's top-level
     files and folders, except `.codemeld` and any entry that is a symlink to the
     project root, to protected state, or to somewhere outside the project, plus a
-    private temp folder for the session. Blocked paths are carved out of both. No
+    private temp folder for the session, plus each folder declared in
+    `writable_folders`. While no settings file is broken, codemeld's own edit,
+    create and make-folder tools may also write inside a declared folder in Auto
+    edits without a prompt; delete and move gain no authority from a declared
+    folder. Commands see the session's private temp folder as `TMPDIR`, and
+    codemeld adds no other temporary write grant: `/tmp` and the `$TMPDIR`
+    codemeld was launched with are writable only through an effective declared
+    `writable_folders` entry covering their resolved location, or when that
+    location is within a granted top-level project entry (the project grant
+    never covers the project root itself, `.codemeld`, or an entry resolving
+    outside the project). Blocked paths and the protected
+    `.codemeld` folders are carved out of every one of these, and `/dev/shm`
+    itself is never writable. A write folder that the grant of another write
+    folder already covers (for example, a private temp folder inside a declared
+    writable folder) is never granted on its own, so replacing it with a symlink
+    gives commands no access to the symlink's target. A declared folder under
+    `/dev/shm` is not covered by `/dev` or `/dev/shm`, since `/dev/shm` is carved
+    out of them, so it keeps its own grant; its parent stays unwritable. No
     confined command can read `~/.codemeld` or write `~/.codemeld` or
     `<project>/.codemeld`. In Auto edits, a recognized network, deletion or
     history-rewrite command asks (allow once or deny); deletion or history
@@ -51,7 +70,7 @@ safely.
     command codemeld cannot split into stages gets an ordinary prompt. Approving
     network access adds internet sockets for that one command. The status bar
     shows `sandbox: on`.
-  - **Self-test passed, then a settings file's blocked-path list breaks.** Plan and
+  - <a id="broken-settings"></a>**Self-test passed, then a settings file's blocked-path list breaks.** Plan and
     Auto edits commands stay confined, and every shell command asks until the
     file is fixed, except one you already denied this turn; version-control tool
     calls do not ask. The status bar shows `sandbox: unavailable`; `/status` and
@@ -116,6 +135,12 @@ further than described here are still welcome.
   inherits that reach.
 - **Authorized writes can still corrupt.** A command can empty or garble any
   file it may write.
+- **Subfolder swaps around a carved-out path.** When a write folder holds a
+  blocked or no-write path, codemeld grants that folder's subfolders one by
+  one, by name. A program left running from an earlier command could, with
+  exact timing, replace one of those subfolders with a symlink between the
+  check and the grant, and the command being started would then get write
+  access to the symlink's target.
 
 Outside the boundary — Build mode, or any host where the self-test did not pass
 — a shell command has your account's full authority once it is allowed to run.

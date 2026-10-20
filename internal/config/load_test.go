@@ -429,6 +429,19 @@ func TestValidateGlobalSettingsBytes_KeepsNonHostPermissions(t *testing.T) {
 	}
 }
 
+func TestValidateGlobalSettingsBytes_AcceptsLegacyConfinementKey(t *testing.T) {
+	const content = "confinement:\n  shared_temp_folders: allow\n"
+	path := writeFile(t, content, 0o600)
+
+	if _, _, cat, err := LoadYAML(path); cat != LoadOK || err != nil {
+		t.Fatalf("LoadYAML cat = %q, err = %v; want LoadOK and nil", cat, err)
+	}
+	raw, cat, err := ValidateGlobalSettingsBytes([]byte(content), path)
+	if cat != LoadOK || err != nil || raw == nil {
+		t.Fatalf("cat = %q, err = %v, raw = %v; want LoadOK and the decoded map", cat, err, raw)
+	}
+}
+
 // A schema-valid entry ParseEntry refuses must be rejected at its own layer. Composition can
 // drop such an entry behind an equivalent one from another layer, so a check that runs only
 // over the composed list lets the invalid source layer through.

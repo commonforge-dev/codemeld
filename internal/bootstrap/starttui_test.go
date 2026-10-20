@@ -3463,8 +3463,8 @@ func assertAskUserDefinition(t *testing.T, defs []provider.ToolDefinition) {
 
 const (
 	askUserQuestionsArgs = `{"questions":[` +
-		`{"id":"storage","prompt":"Where should sessions be stored?","options":["Local disk","Object store"]},` +
-		`{"id":"name","prompt":"What should it be called?","options":["run","go"],"allow_custom":true}]}`
+		`{"id":"storage","prompt":"Where should sessions be stored?","options":[{"label":"Local disk","description":"Kept on this machine"},{"label":"Object store"}]},` +
+		`{"id":"name","prompt":"What should it be called?","context":"The name is the command users type.","options":[{"label":"run"},{"label":"go"}],"allow_custom":true}]}`
 	askUserFinalAnswer = "stored on the object store"
 )
 
@@ -3648,12 +3648,14 @@ const (
 	askUserFirstContext  = "Sessions are replayed on /resume, so where they live decides what survives a restart."
 	askUserSecondContext = "An object store is a remote blob service; local disk keeps everything on this machine."
 	askUserExplanation   = "It is a remote blob service."
+	askUserNameContext   = "The name is the command users type."
 	askUserClarification = "what is an object store?"
-	askUserContextArgs   = `{"context":"` + askUserFirstContext + `","questions":[` +
-		`{"id":"storage","prompt":"Where should sessions be stored?","options":["Local disk","Object store"]}]}`
-	askUserSecondArgs = `{"context":"` + askUserSecondContext + `","questions":[` +
-		`{"id":"storage","prompt":"Where should sessions be stored?","options":["Local disk","Object store"]},` +
-		`{"id":"name","prompt":"What should it be called?","options":["run","go"],"allow_custom":true}]}`
+	askUserContextArgs   = `{"questions":[` +
+		`{"id":"storage","prompt":"Where should sessions be stored?","context":"` + askUserFirstContext + `","options":[{"label":"Local disk"},{"label":"Object store"}]}]}`
+	askUserSecondArgs = `{"questions":[` +
+		`{"id":"storage","prompt":"Where should sessions be stored?","context":"` + askUserSecondContext + `",` +
+		`"options":[{"label":"Local disk","description":"Kept on this machine"},{"label":"Object store","description":"A remote blob service"}]},` +
+		`{"id":"name","prompt":"What should it be called?","context":"` + askUserNameContext + `","options":[{"label":"run"},{"label":"go"}],"allow_custom":true}]}`
 )
 
 func TestStartTUI_AskUserContextClarificationAndRecordSurviveTheWholeTurn(t *testing.T) {
@@ -3738,6 +3740,9 @@ func TestStartTUI_AskUserContextClarificationAndRecordSurviveTheWholeTurn(t *tes
 	if !ran.AnswerQuestionCustomForTest(1, "codemeld ask") {
 		t.Fatal("could not enter a custom answer for the second question")
 	}
+	if got := ran.QuestionContextForTest(); got != askUserNameContext {
+		t.Fatalf("second question's context = %q, want only its own %q", got, askUserNameContext)
+	}
 	ran.SubmitQuestionFormForTest()
 	turns.Wait()
 
@@ -3770,23 +3775,28 @@ func TestStartTUI_AskUserContextClarificationAndRecordSurviveTheWholeTurn(t *tes
 	}
 
 	wantLive := "I need to know where sessions go." + responseCopyLine + "\n\n" +
-		"Asked for clarification:\n  " + askUserClarification + "\n\n" +
+		"Asked for clarification (ask_user):\n  " + askUserClarification + "\n\n" +
 		askUserExplanation + responseCopyLine + "\n\n" +
-		"Answered:\n" +
+		"Answered (ask_user):\n" +
 		"  Where should sessions be stored? — Object store\n" +
 		"  What should it be called? — codemeld ask"
 	live := ran.TranscriptText()
 	if !strings.Contains(live, wantLive) {
 		t.Fatalf("live transcript =\n%q\nwant it to carry\n%q", live, wantLive)
 	}
-	if strings.Contains(live, provider.AskUserToolName) {
-		t.Errorf("live transcript = %q, still prints a generic ask_user activity line", live)
+	withoutHeadings := strings.ReplaceAll(live, "("+provider.AskUserToolName+"):", "")
+	if strings.Contains(withoutHeadings, provider.AskUserToolName) {
+		t.Errorf("live transcript = %q, still prints a generic ask_user activity line beside the named records", live)
 	}
 
 	replayed := tui.New(nil)
 	replayed.ReplaySessionRecords(durable.Records())
-	if got := replayed.TranscriptText(); !strings.Contains(got, wantLive) {
+	got := replayed.TranscriptText()
+	if !strings.Contains(got, wantLive) {
 		t.Fatalf("replayed transcript =\n%q\nwant it to carry the same records as live\n%q", got, wantLive)
+	}
+	if strings.Contains(strings.ReplaceAll(got, "("+provider.AskUserToolName+"):", ""), provider.AskUserToolName) {
+		t.Errorf("replayed transcript = %q, prints a generic ask_user activity line beside the named records", got)
 	}
 }
 
@@ -6637,5 +6647,133 @@ func TestStartTUI_BlockedAddInAnAdmittedProjectWithNoSettingsFilesOffersProjectD
 	})
 	if want := "/etc/secrets  (" + shared + ")"; !strings.Contains(overlay, want) {
 		t.Fatalf("/blocked =\n%s\nwant the row %q", overlay, want)
+	}
+}
+
+func swapLaunchStdio(t *testing.T, input string, terminal bool) (*os.File, func() string) {
+	t.Helper()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "stdin")
+	if err := os.WriteFile(in, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := os.Open(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := os.Create(filepath.Join(dir, "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevStdin, prevStderr, prevTerminal := os.Stdin, os.Stderr, stdinIsTerminal
+	os.Stdin, os.Stderr, stdinIsTerminal = stdin, stderr, func(io.Reader) bool { return terminal }
+	t.Cleanup(func() {
+		os.Stdin, os.Stderr, stdinIsTerminal = prevStdin, prevStderr, prevTerminal
+		_ = stdin.Close()
+		_ = stderr.Close()
+	})
+	return stdin, func() string {
+		data, err := os.ReadFile(stderr.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+}
+
+func requireStdinUnread(t *testing.T, stdin *os.File) {
+	t.Helper()
+	if offset, err := stdin.Seek(0, io.SeekCurrent); err != nil || offset != 0 {
+		t.Fatalf("stdin offset = %d (%v), want nothing read", offset, err)
+	}
+}
+
+func settingsBytes(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return ""
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func savedGlobalConfig(t *testing.T, home string) map[string]any {
+	t.Helper()
+	global, err := defaultLoadGlobalSettings(home)
+	if err != nil {
+		t.Fatalf("defaultLoadGlobalSettings: %v", err)
+	}
+	composition, err := defaultComposeConfig(global, "")
+	if err != nil {
+		t.Fatalf("defaultComposeConfig: %v", err)
+	}
+	return composition.Config
+}
+
+func confinedLaunchResult(t *testing.T, home, project string, composed map[string]any) *BootstrapResult {
+	t.Helper()
+	return &BootstrapResult{Home: home, LaunchDir: project, ProjectRoot: project, Session: mkStore(t), Config: composed,
+		ConfigLayerPaths: []string{SettingsPath(home)}, Mode: mode.NewActiveState(mode.AutoEdits, mode.SourceDefault)}
+}
+
+func runConfinedLaunch(t *testing.T, result *BootstrapResult, inspect func(*confinement)) {
+	t.Helper()
+	var conf *confinement
+	build := newResumeDeps
+	defer swapNewResumeDeps(func(c context.Context, app *tui.App, r *BootstrapResult, lock *resumeLockHolder, cache *config.Cache, active *model.ActiveState, recorder *capabilityRecorder, launched *confinement) tui.ResumeDeps {
+		conf = launched
+		return build(c, app, r, lock, cache, active, recorder, launched)
+	})()
+	defer swapRunApp(func(*tui.App) error {
+		if conf == nil {
+			return errors.New("the event loop ran before the launch confinement was built")
+		}
+		inspect(conf)
+		return nil
+	})()
+	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+}
+
+func TestStartTUI_ConstrainedLaunchAsksNoTempQuestionAndGrantsOnlyThePrivateFolder(t *testing.T) {
+	swapResolveExecutionCapability(t, constrainedLaunch)
+	for _, tc := range []struct {
+		name, saved string
+	}{
+		{"absent", ""},
+		{"saved allow", "confinement:\n  shared_temp_folders: allow\n"},
+		{"saved deny", "confinement:\n  shared_temp_folders: deny\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, project, launchTmp := canonicalTempDir(t), canonicalTempDir(t), canonicalTempDir(t)
+			t.Setenv("TMPDIR", launchTmp)
+			composed := map[string]any{}
+			if tc.saved != "" {
+				writeGlobalSettings(t, home, tc.saved, 0o600)
+				composed = savedGlobalConfig(t, home)
+			}
+			stdin, stderr := swapLaunchStdio(t, "yes\n", true)
+
+			inspected := false
+			runConfinedLaunch(t, confinedLaunchResult(t, home, project, composed), func(conf *confinement) {
+				requirePrivateTempOnly(t, conf, project, launchTmp)
+				inspected = true
+			})
+
+			if !inspected {
+				t.Fatal("the launch confinement was never inspected")
+			}
+			if got := stderr(); strings.Contains(got, "Allow the shared temp folders?") {
+				t.Fatalf("stderr = %q, want no shared temp question", got)
+			}
+			requireStdinUnread(t, stdin)
+			if got := settingsBytes(t, SettingsPath(home)); got != tc.saved {
+				t.Fatalf("global settings = %q, want %q unchanged", got, tc.saved)
+			}
+		})
 	}
 }

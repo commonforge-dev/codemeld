@@ -2842,7 +2842,7 @@ func TestQuestionPrompt_PasteAfterLostTerminalFocusNeverReachesTheDraft(t *testi
 
 func contextQuestionFixture(context string) QuestionRequest {
 	req := questionFixture()
-	req.Context = context
+	req.Questions[0].Context = context
 	return req
 }
 
@@ -3114,6 +3114,326 @@ func TestQuestionPrompt_NoContextMountsNoContextSurface(t *testing.T) {
 	drawPrimitive(t, a.pages, 120, 30)
 }
 
+func screenRows(s tcell.SimulationScreen) []string {
+	cells, width, height := s.GetContents()
+	rows := make([]string, height)
+	for row := 0; row < height; row++ {
+		var b strings.Builder
+		for col := 0; col < width; col++ {
+			if runes := cells[row*width+col].Runes; len(runes) > 0 {
+				b.WriteString(string(runes))
+			} else {
+				b.WriteRune(' ')
+			}
+		}
+		rows[row] = b.String()
+	}
+	return rows
+}
+
+func rowContaining(rows []string, text string) int {
+	for i, row := range rows {
+		if strings.Contains(row, text) {
+			return i
+		}
+	}
+	return -1
+}
+
+func columnOf(row, text string) int {
+	i := strings.Index(row, text)
+	if i < 0 {
+		return -1
+	}
+	return utf8.RuneCountInString(row[:i])
+}
+
+func bodyHolds(f *questionForm, p tview.Primitive) bool {
+	for i := 0; i < f.body.GetItemCount(); i++ {
+		if f.body.GetItem(i) == p {
+			return true
+		}
+	}
+	return false
+}
+
+func TestQuestionPrompt_EachQuestionShowsOnlyItsOwnContext(t *testing.T) {
+	a := New(nil)
+	req := questionFixture()
+	contexts := []string{"Alpha background about storage.", "Bravo background about platforms.", "Charlie background about naming."}
+	for i := range req.Questions {
+		req.Questions[i].Context = contexts[i]
+	}
+	openQuestions(t, a, req)
+	form := a.questionForm
+
+	assertShown := func(step string, want int) {
+		t.Helper()
+		text := screenText(drawPrimitive(t, a.pages, 120, 30))
+		for i, context := range contexts {
+			if drawn := strings.Contains(text, context); drawn != (i == want) {
+				t.Errorf("%s: context of question %d drawn = %v, want only question %d's context on screen:\n%s", step, i, drawn, want, text)
+			}
+		}
+		if got := a.QuestionContextForTest(); got != contexts[want] {
+			t.Errorf("%s: QuestionContextForTest = %q, want %q", step, got, contexts[want])
+		}
+	}
+
+	assertShown("opened", 0)
+	tabFromFocus(t, a)
+	assertShown("after Tab", 1)
+	form.showAdjacent(1)
+	assertShown("after Next", 2)
+	form.showAdjacent(-1)
+	assertShown("after Prev", 1)
+	pressList(form.blocks[1].options, tcell.KeyLeft)
+	assertShown("after ←", 0)
+	pressList(form.blocks[0].options, tcell.KeyRight)
+	assertShown("after →", 1)
+}
+
+func TestQuestionPrompt_ContextSectionFollowsTheShownQuestion(t *testing.T) {
+	a := New(nil)
+	const short = "A short note."
+	long := maxRuneText("background", provider.MaxAskUserContextRunes)
+	openQuestions(t, a, QuestionRequest{Questions: []QuestionSpec{
+		{ID: "none", Prompt: "First, without context?", Options: []string{"yes"}},
+		{ID: "short", Prompt: "Second, briefly explained?", Context: short, Options: []string{"yes"}},
+		{ID: "long", Prompt: "Third, explained at length?", Context: long, Options: []string{"yes"}},
+		{ID: "last", Prompt: "Fourth, without context again?", Options: []string{"yes"}},
+	}})
+	form := a.questionForm
+	const width, height = 80, 24
+
+	assertHidden := func(step string) {
+		t.Helper()
+		drawPrimitive(t, a.pages, width, height)
+		if bodyHolds(form, form.contextRow) {
+			t.Errorf("%s: the context section is still in the form body for a question without context", step)
+		}
+		if slices.Contains(form.focusRing(), tview.Primitive(form.context)) {
+			t.Errorf("%s: the focus ring stops on a hidden context section", step)
+		}
+		if form.owns(form.context) {
+			t.Errorf("%s: the form still claims the hidden context view", step)
+		}
+		if got := a.QuestionContextForTest(); got != "" {
+			t.Errorf("%s: QuestionContextForTest = %q, want empty", step, got)
+		}
+	}
+	shownRows := func(step, want string) int {
+		t.Helper()
+		drawPrimitive(t, a.pages, width, height)
+		if !bodyHolds(form, form.contextRow) {
+			t.Fatalf("%s: the context section is missing from the form body", step)
+		}
+		if ring := form.focusRing(); ring[0] != tview.Primitive(form.context) {
+			t.Errorf("%s: focus ring starts at %s, want the shown context", step, controlName(form, ring[0]))
+		}
+		if got := form.context.GetText(true); got != want {
+			t.Errorf("%s: context view text = %q, want the shown question's %q", step, got, want)
+		}
+		if got := a.QuestionContextForTest(); got != want {
+			t.Errorf("%s: QuestionContextForTest = %q, want %q", step, got, want)
+		}
+		_, _, _, rows := form.context.GetRect()
+		return rows
+	}
+
+	if form.context == nil {
+		t.Fatal("a call whose later questions carry context mounted no context view")
+	}
+	assertHidden("first question")
+
+	form.showAdjacent(1)
+	if rows := shownRows("short context", short); rows != 1 {
+		t.Errorf("short context took %d rows, want 1", rows)
+	}
+
+	form.showAdjacent(1)
+	longRows := shownRows("long context", long)
+	if longRows <= 1 {
+		t.Errorf("long context took %d rows at the same terminal size, want its height recomputed", longRows)
+	}
+	form.focus(form.context)
+	for i := 0; i < 3; i++ {
+		pressKey(form.context, tcell.KeyDown)
+	}
+	drawPrimitive(t, a.pages, width, height)
+	if row, _ := form.context.GetScrollOffset(); row == 0 {
+		t.Fatal("setup: the long context did not scroll")
+	}
+
+	form.showAdjacent(-1)
+	if rows := shownRows("back to short context", short); rows != 1 {
+		t.Errorf("short context took %d rows after the long one, want 1", rows)
+	}
+	if row, _ := form.context.GetScrollOffset(); row != 0 {
+		t.Errorf("context scroll offset = %d after switching question, want it reset to 0", row)
+	}
+
+	form.showAdjacent(1)
+	shownRows("long context again", long)
+	form.focus(form.context)
+	if !a.AnswerQuestionForTest(3, 0) {
+		t.Fatal("could not answer the last question")
+	}
+	assertHidden("last question")
+	if got := a.app.GetFocus(); got != tview.Primitive(form.blocks[3].options) {
+		t.Errorf("focus = %s, want the shown question's options once its context section hid", controlName(form, got))
+	}
+	a.app.SetFocus(a.input)
+	form.restoreFocus()
+	if got := a.app.GetFocus(); got != tview.Primitive(form.blocks[3].options) {
+		t.Errorf("focus repair landed on %s, want the shown question's options, not the hidden context", controlName(form, got))
+	}
+}
+
+func TestQuestionPrompt_ContextParagraphsAndLayout(t *testing.T) {
+	a := New(nil)
+	openQuestions(t, a, contextQuestionFixture("First paragraph.\n \nSecond paragraph."))
+
+	rows := screenRows(drawPrimitive(t, a.pages, 120, 30))
+
+	first, second := rowContaining(rows, "First paragraph."), rowContaining(rows, "Second paragraph.")
+	if first < 0 || second < 0 {
+		t.Fatalf("a paragraph is missing:\n%s", strings.Join(rows, "\n"))
+	}
+	if second != first+2 || strings.TrimSpace(strings.Trim(rows[first+1], "│")) != "" {
+		t.Errorf("paragraphs at rows %d and %d, want exactly one blank row between them (a blank piece is dropped):\n%s", first, second, strings.Join(rows, "\n"))
+	}
+	if col := columnOf(rows[first], "First paragraph."); col != 2 {
+		t.Errorf("context starts at column %d, want 2: the border, then a one-column margin", col)
+	}
+	counter := rowContaining(rows, "Question 1 of 3")
+	if counter != second+2 || strings.TrimSpace(strings.Trim(rows[second+1], "│")) != "" {
+		t.Errorf("counter at row %d after context ending at row %d, want one blank row between them", counter, second)
+	}
+}
+
+func TestQuestionPrompt_PromptRendersBold(t *testing.T) {
+	a := New(nil)
+	openQuestions(t, a, questionFixture())
+	screen := drawPrimitive(t, a.pages, 120, 30)
+	rows := screenRows(screen)
+
+	row := rowContaining(rows, "Where should sessions be stored?")
+	if row < 0 {
+		t.Fatal("the prompt was not drawn")
+	}
+	cells, width, _ := screen.GetContents()
+	col := columnOf(rows[row], "Where")
+	if _, _, attrs := cells[row*width+col].Style.Decompose(); attrs&tcell.AttrBold == 0 {
+		t.Error("the question prompt is not bold")
+	}
+	option := rowContaining(rows, "Local disk")
+	col = columnOf(rows[option], "Local disk")
+	if _, _, attrs := cells[option*width+col].Style.Decompose(); attrs&tcell.AttrBold != 0 {
+		t.Error("an option label is bold; only the prompt is")
+	}
+}
+
+func TestQuestionPrompt_ContextWrapsAtOneHundredColumns(t *testing.T) {
+	a := New(nil)
+	openQuestions(t, a, contextQuestionFixture(maxRuneText("background", 400)))
+
+	rows := screenRows(drawPrimitive(t, a.pages, 160, 40))
+
+	widest := 0
+	for _, row := range rows {
+		if !strings.Contains(row, "background") {
+			continue
+		}
+		if w := utf8.RuneCountInString(strings.TrimRight(strings.Trim(row, "│"), " ")) - 1; w > widest {
+			widest = w
+		}
+	}
+	if widest > 100 || widest < 90 {
+		t.Errorf("widest context line = %d columns on a 160-column screen, want it wrapped at 100:\n%s", widest, strings.Join(rows, "\n"))
+	}
+}
+
+func describedQuestion() QuestionRequest {
+	return QuestionRequest{Questions: []QuestionSpec{{
+		ID: "storage", Prompt: "Where should sessions be stored?",
+		Options:            []string{"Local disk", "Object store"},
+		OptionDescriptions: []string{"[red]Fast[-], lost with the machine", "Survives the machine"},
+	}}}
+}
+
+func TestQuestionPrompt_OptionDescriptionRendersDimUnderItsLabel(t *testing.T) {
+	a := New(nil)
+	openQuestions(t, a, describedQuestion())
+	screen := drawPrimitive(t, a.pages, 120, 30)
+	rows := screenRows(screen)
+
+	label, description := rowContaining(rows, "Local disk"), rowContaining(rows, "[red]Fast[-], lost with the machine")
+	if label < 0 || description < 0 {
+		t.Fatalf("the label or its markup-shaped description was not drawn literally:\n%s", strings.Join(rows, "\n"))
+	}
+	if description != label+1 {
+		t.Errorf("description at row %d, want it on the row under its label at %d", description, label)
+	}
+	if lc, dc := columnOf(rows[label], "Local disk"), columnOf(rows[description], "[red]"); lc != dc {
+		t.Errorf("description starts at column %d, want it indented to the label text at %d", dc, lc)
+	}
+	cells, width, _ := screen.GetContents()
+	col := columnOf(rows[description], "[red]")
+	if _, _, attrs := cells[description*width+col].Style.Decompose(); attrs&tcell.AttrDim == 0 {
+		t.Error("the option description is not dimmed")
+	}
+	if _, _, attrs := cells[label*width+columnOf(rows[label], "Local disk")].Style.Decompose(); attrs&tcell.AttrDim != 0 {
+		t.Error("the option label is dimmed; only its description is")
+	}
+}
+
+func TestQuestionPrompt_ClickingADescriptionRowChoosesItsOption(t *testing.T) {
+	a := New(nil)
+	results := openQuestions(t, a, describedQuestion())
+	o := a.questionForm.blocks[0].options
+	showList(t, a, o)
+
+	ix, iy, _, _ := o.GetInnerRect()
+	offset, _ := o.GetScrollOffset()
+	clickAt(t, a, ix+6, iy+o.lastLineOf(1)-offset)
+
+	if b := a.questionForm.blocks[0]; !b.chosen[1] || b.chosen[0] {
+		t.Fatalf("chosen = %v, want the option whose description row was clicked", b.chosen)
+	}
+	a.submitQuestionForm()
+	if got := waitResult(t, results).Answers[0].Selected; !slices.Equal(got, []string{"Object store"}) {
+		t.Errorf("selected = %q, want the label only", got)
+	}
+}
+
+func TestQuestionPrompt_DescribedOptionsAllScrollIntoViewAtTheSmallLayout(t *testing.T) {
+	a := New(nil)
+	spec := QuestionSpec{ID: "q", Prompt: "Which one?"}
+	for i := 0; i < provider.MaxAskUserOptions; i++ {
+		spec.Options = append(spec.Options, fmt.Sprintf("Choice %d", i))
+		spec.OptionDescriptions = append(spec.OptionDescriptions, fmt.Sprintf("Detail %d ", i)+maxRuneText("explains", 120))
+	}
+	openQuestions(t, a, QuestionRequest{Questions: []QuestionSpec{spec}})
+	o := a.questionForm.blocks[0].options
+	drawPrimitive(t, a.pages, 80, 24)
+	if o.contentHeight() <= 24 {
+		t.Fatalf("setup: %d content rows fit an 80x24 terminal, so nothing has to scroll", o.contentHeight())
+	}
+
+	for i := 0; i < provider.MaxAskUserOptions; i++ {
+		if i > 0 {
+			pressList(o, tcell.KeyDown)
+		}
+		text := screenText(drawPrimitive(t, a.pages, 80, 24))
+		for _, want := range []string{fmt.Sprintf("Choice %d", i), fmt.Sprintf("Detail %d", i)} {
+			if !strings.Contains(text, want) {
+				t.Errorf("option %d: %q is not on screen once the cursor reaches it", i, want)
+			}
+		}
+	}
+}
+
 func TestQuestionPrompt_SubmittedFormSealsThePreambleThenRecordsTheAnswer(t *testing.T) {
 	a := New(nil)
 	a.AppendStreamDelta("I need to know where sessions go.")
@@ -3131,7 +3451,7 @@ func TestQuestionPrompt_SubmittedFormSealsThePreambleThenRecordsTheAnswer(t *tes
 	a.AppendStreamDelta("Object store it is.")
 
 	want := "I need to know where sessions go." + visibleResponseLine + "\n\n" +
-		"Answered:\n" +
+		"Answered (ask_user):\n" +
 		"  Where should sessions be stored? — Object store\n" +
 		"  Which platforms must ship first? — Linux, Windows\n" +
 		"  What should the command be called? — codemeld ask\n\n" +
@@ -3152,7 +3472,7 @@ func TestQuestionPrompt_ClarificationRecordIsDistinctAndKeepsTheLaterAnswerSepar
 	a.AppendStreamDelta("It is a remote blob service.")
 
 	want := "Picking a store now." + visibleResponseLine + "\n\n" +
-		"Asked for clarification:\n" +
+		"Asked for clarification (ask_user):\n" +
 		"  what is an object store?\n\n" +
 		"It is a remote blob service."
 	if got := a.TranscriptText(); got != want {
@@ -3191,7 +3511,7 @@ func TestQuestionPrompt_RecordsNoAnswerForAnUntouchedQuestionAndNothingForACance
 	a.cancelQuestionForm()
 	waitResult(t, cancelled)
 
-	want := "Answered:\n  Where should sessions be stored? — (no answer)"
+	want := "Answered (ask_user):\n  Where should sessions be stored? — (no answer)"
 	if submitted != want {
 		t.Errorf("transcript =\n%q\nwant\n%q", submitted, want)
 	}
@@ -3214,9 +3534,12 @@ func TestQuestionPrompt_RecordKeepsTagShapedTextLiteralAndHidesTheToolPlumbing(t
 	if !strings.Contains(got, "[red]Which store?[-] — [::b]Object store") {
 		t.Errorf("transcript = %q, want the tag-shaped text drawn literally", got)
 	}
+	if !strings.HasPrefix(got, "Answered (ask_user):\n") {
+		t.Errorf("transcript = %q, want the record heading to name the tool", got)
+	}
 	for _, leaked := range []string{"ask_user", `{"answers"`, "call_1"} {
-		if strings.Contains(got, leaked) {
-			t.Errorf("transcript = %q, leaked the tool plumbing %q", got, leaked)
+		if strings.Contains(strings.TrimPrefix(got, "Answered (ask_user):\n"), leaked) {
+			t.Errorf("transcript = %q, leaked the tool plumbing %q into the record body", got, leaked)
 		}
 	}
 	if raw := a.transcript.view.GetText(false); !strings.Contains(raw, "[red[]Which store?") {

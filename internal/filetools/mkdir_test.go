@@ -11,10 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"codemeld.dev/codemeld/internal/fsutil"
+	"codemeld.dev/codemeld/internal/tools"
 )
 
 // newMkdirToolIn builds a mkdir tool whose project root and relative-path base are root, with a separate
@@ -815,5 +818,136 @@ func TestMkdirTool_IntermediateDirectoryAppearingWhilePendingStillCreates(t *tes
 	info, serr := os.Stat(target)
 	if serr != nil || !info.IsDir() {
 		t.Fatalf("Stat(target) = (%v, %v), want the created directory", info, serr)
+	}
+}
+
+type fakeMkdirJournal struct {
+	*fakeJournal
+	declared   bool
+	create     bool
+	begin      error
+	resolveErr error
+}
+
+func (j *fakeMkdirJournal) BeginMkdir(target, _ string) (bool, *fsutil.DirLifecycle, error) {
+	_, err := os.Lstat(target)
+	j.events = append(j.events, "begin_mkdir:"+target+":"+strconv.FormatBool(err == nil))
+	if j.begin != nil || !j.create {
+		return j.declared, nil, j.begin
+	}
+	lc := j.DirLifecycle(target, "")
+	return j.declared, &lc, nil
+}
+
+func (j *fakeMkdirJournal) ResolveMkdir(target string) error {
+	_, err := os.Lstat(target)
+	j.events = append(j.events, "resolve_mkdir:"+target+":"+strconv.FormatBool(err == nil))
+	return j.resolveErr
+}
+
+func invokeMkdirUnder(t *testing.T, journal WriteJournal, root, rel string) (tools.Result, string) {
+	t.Helper()
+	tool := newMkdirToolIn(t, root)
+	target := filepath.Join(root, rel)
+	res, err := tool.InvokeWithResolvedTarget(WithWriteJournal(context.Background(), journal), map[string]any{"path": rel}, target)
+	if err != nil {
+		t.Fatalf("InvokeWithResolvedTarget: %v", err)
+	}
+	return res, target
+}
+
+func TestMkdirTool_JournalsADeclaredDirectoryAroundTheCreate(t *testing.T) {
+	root := eval(t, t.TempDir())
+	journal := &fakeMkdirJournal{fakeJournal: newFakeJournal(), declared: true, create: true}
+
+	res, target := invokeMkdirUnder(t, journal, root, "made/deep")
+
+	if res.ExitCode != 0 {
+		t.Fatalf("mkdir = %+v, want success", res)
+	}
+	if want := []string{"begin_mkdir:" + target + ":false", "resolve_mkdir:" + target + ":true"}; !reflect.DeepEqual(journal.events, want) {
+		t.Fatalf("events = %v, want %v", journal.events, want)
+	}
+	if want := []string{"made", "made/deep"}; !reflect.DeepEqual(journal.dirIntent, want) || len(journal.dirDone) != 2 || !journal.dirDone[1].Created {
+		t.Fatalf("intents %v, confirmations %+v, want both created segments journalled", journal.dirIntent, journal.dirDone)
+	}
+}
+
+func TestMkdirTool_ConsultsTheJournalBeforeReportingAnExistingDirectory(t *testing.T) {
+	root := eval(t, t.TempDir())
+	existing := filepath.Join(root, "exists")
+	if err := os.Mkdir(existing, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	refusing := &fakeMkdirJournal{fakeJournal: newFakeJournal(), declared: true, begin: errors.New("exists changed outside the child agent")}
+	if res, _ := invokeMkdirUnder(t, refusing, root, "exists"); res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "changed outside") {
+		t.Fatalf("mkdir = %+v, want another writer's directory refused before the exists shortcut", res)
+	}
+
+	unchanged := &fakeMkdirJournal{fakeJournal: newFakeJournal(), declared: true}
+	if res, _ := invokeMkdirUnder(t, unchanged, root, "exists"); res.ExitCode != 0 || !strings.Contains(string(res.Stdout), "already exists") {
+		t.Fatalf("mkdir = %+v, want an unchanged declared directory reported as existing", res)
+	}
+
+	racing := &fakeMkdirJournal{fakeJournal: newFakeJournal(), declared: true, create: true}
+	if res, target := invokeMkdirUnder(t, racing, root, "exists"); res.ExitCode == 0 || !slices.Contains(racing.events, "resolve_mkdir:"+target+":true") {
+		t.Fatalf("mkdir = %+v, events %v, want a directory appearing after the intent refused and resolved", res, racing.events)
+	}
+}
+
+func TestMkdirTool_CreatesAsBeforeWithoutADeclaredDirectoryJournal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		journal WriteJournal
+	}{
+		{"a journal without the directory lifecycle", newFakeJournal()},
+		{"a target the journal does not declare", &fakeMkdirJournal{fakeJournal: newFakeJournal()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := eval(t, t.TempDir())
+
+			res, target := invokeMkdirUnder(t, tc.journal, root, "made")
+
+			if res.ExitCode != 0 {
+				t.Fatalf("mkdir = %+v, want success", res)
+			}
+			if info, err := os.Stat(target); err != nil || !info.IsDir() {
+				t.Fatalf("stat %s = %v, %v, want a directory", target, info, err)
+			}
+			if fj, ok := tc.journal.(*fakeMkdirJournal); ok && len(fj.dirIntent)+len(fj.events) != 1 {
+				t.Fatalf("events %v, intents %v, want only the declaration lookup", fj.events, fj.dirIntent)
+			}
+		})
+	}
+}
+
+func TestMkdirTool_ReportsAFailedResolutionAsAFailedCreate(t *testing.T) {
+	root := eval(t, t.TempDir())
+	journal := &fakeMkdirJournal{fakeJournal: newFakeJournal(), declared: true, create: true, resolveErr: errors.New("made is not a directory the child agent created")}
+
+	res, _ := invokeMkdirUnder(t, journal, root, "made")
+
+	if res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "not a directory the child agent created") {
+		t.Fatalf("mkdir = %+v, want the unresolved creation reported", res)
+	}
+}
+
+func TestMkdirTool_ResolveTargetGivesEquivalentSpellingsOneCanonicalTarget(t *testing.T) {
+	root := eval(t, t.TempDir())
+	tool := newMkdirToolIn(t, root)
+	if err := os.Mkdir(filepath.Join(root, "real"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "alias")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	want := filepath.Join(root, "real", "new", "sub")
+	for _, spelling := range []string{"real/new/sub", "real/new/sub/", "./real/./new/sub", "real/x/../new/sub", "alias/new/sub", want + "/"} {
+		target, _, err := tool.ResolveTarget(map[string]any{"path": spelling})
+		if err != nil || target != want {
+			t.Fatalf("ResolveTarget(%q) = %q, %v; want %q", spelling, target, err, want)
+		}
 	}
 }

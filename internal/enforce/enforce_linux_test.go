@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,7 @@ func init() {
 	}
 	probes["m-core"] = probe{0, mxCoreProbe}
 	probes["m-sockets"] = probe{0, mxSocketsProbe}
+	probes["m-pair-isolation"] = probe{4, mxPairIsolationProbe}
 	probes["m-clone"] = probe{0, mxCloneProbe}
 	probes["m-meta"] = probe{1, mxMetaProbe}
 	probes["m-x32"] = probe{0, mxX32Probe}
@@ -191,12 +193,111 @@ func mxSocketsProbe([]string) int {
 		}
 		mxEmit(c.name, mxErrno(err))
 	}
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	mxEmit("socketpair", mxErrno(err))
 	if err == nil {
+		mxEmit("socketpair-exchange", mxErrno(mxExchange(fds[0], fds[1])))
 		_ = unix.Close(fds[0])
 		_ = unix.Close(fds[1])
 	}
-	mxEmit("socketpair", mxErrno(err))
+	for _, c := range mxPairTypeCases() {
+		fds, err := unix.Socketpair(c.domain, c.typ|unix.SOCK_CLOEXEC, 0)
+		if err == nil {
+			_ = unix.Close(fds[0])
+			_ = unix.Close(fds[1])
+		}
+		mxEmit(c.name, mxErrno(err))
+	}
+	return probeAllowed
+}
+
+func mxPairTypeCases() []mxSocketCase {
+	return []mxSocketCase{
+		{"socketpair-dgram", unix.AF_UNIX, unix.SOCK_DGRAM},
+		{"socketpair-seqpacket", unix.AF_UNIX, unix.SOCK_SEQPACKET},
+	}
+}
+
+func mxExchange(a, b int) error {
+	for _, dir := range [][2]int{{a, b}, {b, a}} {
+		if _, err := unix.Write(dir[0], []byte("ping")); err != nil {
+			return err
+		}
+		buf := make([]byte, 8)
+		n, err := unix.Read(dir[1], buf)
+		if err != nil {
+			return err
+		}
+		if string(buf[:n]) != "ping" {
+			return unix.EIO
+		}
+	}
+	return nil
+}
+
+type mxPairCase struct {
+	end         int
+	state, kind string
+}
+
+func (c mxPairCase) label() string { return fmt.Sprintf("e%d-%s-%s", c.end, c.state, c.kind) }
+
+func mxPairCases() []mxPairCase {
+	var out []mxPairCase
+	for end := range 2 {
+		for _, state := range []string{"open", "shutdown", "closed"} {
+			for _, kind := range []string{"path", "abstract"} {
+				out = append(out, mxPairCase{end, state, kind})
+			}
+		}
+	}
+	return out
+}
+
+func mxPairIsolationProbe(a []string) int {
+	outsidePath, outsideAbstract, bindDir, abstractPrefix := a[0], a[1], a[2], a[3]
+	for _, c := range mxPairCases() {
+		label := c.label()
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			mxEmit(label+"-pair", mxErrno(err))
+			continue
+		}
+		e, peer := fds[c.end], fds[1-c.end]
+		switch c.state {
+		case "shutdown":
+			_ = unix.Shutdown(peer, unix.SHUT_RDWR)
+		case "closed":
+			_ = unix.Close(peer)
+		}
+		var unspec [16]byte
+		_, _, errno := unix.Syscall(unix.SYS_CONNECT, uintptr(e), uintptr(unsafe.Pointer(&unspec)), uintptr(len(unspec)))
+		mxEmit(label+"-unspec", errno)
+		mxEmit(label+"-connect-path", mxErrno(unix.Connect(e, &unix.SockaddrUnix{Name: outsidePath})))
+		mxEmit(label+"-connect-abstract", mxErrno(unix.Connect(e, &unix.SockaddrUnix{Name: "@" + outsideAbstract})))
+		name := filepath.Join(bindDir, label)
+		if c.kind == "abstract" {
+			name = "@" + abstractPrefix + label
+		}
+		err = unix.Bind(e, &unix.SockaddrUnix{Name: name})
+		mxEmit(label+"-bind", mxErrno(err))
+		mxEmit(label+"-listen", mxErrno(unix.Listen(e, 1)))
+		if err == nil {
+			fmt.Printf("await=%s %s\n", label, name)
+			if _, err := os.Stdin.Read(make([]byte, 1)); err != nil {
+				return probeFailed
+			}
+		}
+		nfd, _, err := unix.Accept4(e, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		if err == nil {
+			_ = unix.Close(nfd)
+		}
+		mxEmit(label+"-accept", mxErrno(err))
+		_ = unix.Close(e)
+		if c.state != "closed" {
+			_ = unix.Close(peer)
+		}
+	}
 	return probeAllowed
 }
 
@@ -1078,6 +1179,111 @@ func TestEnforceAutoEdits(t *testing.T) {
 	}
 }
 
+func TestEnforceAutoEditsWritableFolders(t *testing.T) {
+	mxRequire(t)
+	bin := mxBinary(t)
+	for _, v := range mxAutoNet {
+		t.Run(v.name, func(t *testing.T) {
+			f := mxSetup(t)
+			above := f.mkdir(t, "above")
+			proj := f.mkdir(t, "above", "proj")
+			projCodemeld := f.mkdir(t, "above", "proj", ".codemeld")
+			codemeldFile := f.writeFile(t, "above", "proj", ".codemeld", "settings.yaml")
+			src := f.mkdir(t, "above", "proj", "src")
+			neighborFile := f.writeFile(t, "above", "proj", "file.txt")
+			outside := f.mkdir(t, "outside")
+			link := filepath.Join(proj, "link-outside")
+			if err := os.Symlink(outside, link); err != nil {
+				t.Fatal(err)
+			}
+			tmp := f.mkdir(t, "tmp")
+			env := f.env(t, f.base, tmp)
+			projectRoots := []string{neighborFile, src}
+			noWrite := []string{projCodemeld}
+
+			for _, c := range []struct {
+				name     string
+				writable []string
+				args     []string
+				want     unix.Errno
+			}{
+				{"link-to-writable-folder", []string{outside}, []string{"m-open-write", filepath.Join(link, "granted")}, 0},
+				{"link-to-undeclared-folder", nil, []string{"m-open-write", filepath.Join(link, "denied")}, unix.EACCES},
+				{"above-project-codemeld-new", []string{above}, []string{"m-open-write", filepath.Join(projCodemeld, "x")}, unix.EACCES},
+				{"above-project-codemeld-existing", []string{above}, []string{"m-write-existing", codemeldFile}, unix.EACCES},
+				{"above-project-neighbor-dir", []string{above}, []string{"m-open-write", filepath.Join(src, "new")}, 0},
+				{"above-project-neighbor-file", []string{above}, []string{"m-write-existing", neighborFile}, 0},
+			} {
+				auto := f.policy(v, append(slices.Clone(projectRoots), c.writable...), noWrite, tmp)
+				res := mxRun(t, bin, ProbeArg, auto, f.base, env, c.args...)
+				mxWant(t, v.name+"/"+c.name, res, "result", c.want)
+			}
+			for _, p := range []string{filepath.Join(outside, "denied"), filepath.Join(projCodemeld, "x")} {
+				if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("%s: denied write left %s behind (%v)", v.name, p, err)
+				}
+			}
+			if b, err := os.ReadFile(codemeldFile); err != nil || string(b) != "content" {
+				t.Errorf("%s: %s = %q, %v; want it unchanged", v.name, codemeldFile, b, err)
+			}
+		})
+	}
+}
+
+func TestEnforceAutoEditsProjectInsideOuterWriteRoot(t *testing.T) {
+	mxRequire(t)
+	bin := mxBinary(t)
+	for _, v := range mxAutoNet {
+		t.Run(v.name, func(t *testing.T) {
+			f := mxSetup(t)
+			outer := f.mkdir(t, "outer")
+			other := f.mkdir(t, "outer", "other")
+			projCodemeld := f.mkdir(t, "outer", "proj", ".codemeld")
+			codemeldFile := f.writeFile(t, "outer", "proj", ".codemeld", "settings.yaml")
+			src := f.mkdir(t, "outer", "proj", "src")
+			neighborFile := f.writeFile(t, "outer", "proj", "file.txt")
+			secret := f.writeFile(t, "outer", "proj", "secret")
+			tmp := f.mkdir(t, "tmp")
+			env := f.env(t, f.base, tmp)
+			auto := Policy{
+				Mode:                 ModeAutoEdits,
+				ExceptionalAuthority: v.authority,
+				BlockedPaths:         []string{filepath.Join(f.home, ".codemeld"), secret},
+				NoWritePaths:         []string{projCodemeld},
+				TmpDir:               tmp,
+				WriteRoots:           []string{outer},
+			}
+
+			for _, c := range []struct {
+				name string
+				args []string
+				want unix.Errno
+			}{
+				{"project-codemeld-new", []string{"m-open-write", filepath.Join(projCodemeld, "x")}, unix.EACCES},
+				{"project-codemeld-existing", []string{"m-write-existing", codemeldFile}, unix.EACCES},
+				{"blocked-neighbor", []string{"m-write-existing", secret}, unix.EACCES},
+				{"neighbor-dir", []string{"m-open-write", filepath.Join(src, "new")}, 0},
+				{"neighbor-file", []string{"m-write-existing", neighborFile}, 0},
+				{"outer-root-neighbor-of-project", []string{"m-open-write", filepath.Join(other, "new")}, 0},
+				{"outer-root-holding-the-project", []string{"m-open-write", filepath.Join(outer, "new")}, unix.EACCES},
+			} {
+				res := mxRun(t, bin, ProbeArg, auto, f.base, env, c.args...)
+				mxWant(t, v.name+"/"+c.name, res, "result", c.want)
+			}
+			for _, p := range []string{filepath.Join(projCodemeld, "x"), filepath.Join(outer, "new")} {
+				if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("%s: denied write left %s behind (%v)", v.name, p, err)
+				}
+			}
+			for _, p := range []string{codemeldFile, secret} {
+				if b, err := os.ReadFile(p); err != nil || string(b) != "content" {
+					t.Errorf("%s: %s = %q, %v; want it unchanged", v.name, p, b, err)
+				}
+			}
+		})
+	}
+}
+
 func TestEnforceDevShm(t *testing.T) {
 	mxRequire(t)
 	if info, err := os.Stat("/dev/shm"); err != nil || !info.IsDir() {
@@ -1300,28 +1506,38 @@ func TestEnforceSockets(t *testing.T) {
 	for _, c := range mxSocketCases() {
 		names = append(names, c.name)
 	}
-	names = append(names, "socketpair")
+	denied := slices.Clone(names)
+	for _, c := range mxPairTypeCases() {
+		denied = append(denied, c.name)
+	}
+	names = append(slices.Clone(denied), "socketpair", "socketpair-exchange")
 
 	control := mxRun(t, bin, ControlArg, mxPlan(f), f.base, f.env(t, f.base, ""), "m-sockets")
 	mxComplete(t, "control", control, names...)
 
-	deniedAll := func(label string, res mxResult) {
-		for _, n := range names {
-			mxWant(t, label+"/"+n, res, n, unix.EPERM)
+	streamPairAllowed := func(label string, res mxResult) {
+		mxWant(t, label+"/socketpair", res, "socketpair", 0)
+		mxWant(t, label+"/socketpair-exchange", res, "socketpair-exchange", 0)
+		for _, c := range mxPairTypeCases() {
+			mxWant(t, label+"/"+c.name, res, c.name, unix.EPERM)
 		}
 	}
 	plan := mxRun(t, bin, ProbeArg, mxPlan(f), f.base, f.env(t, f.base, ""), "m-sockets")
 	mxComplete(t, "plan", plan, names...)
-	deniedAll("plan", plan)
 	auto := mxRun(t, bin, ProbeArg, mxAuto(f, []string{wr}, nil, tmp, ""), f.base, f.env(t, f.base, tmp), "m-sockets")
 	mxComplete(t, "auto", auto, names...)
-	deniedAll("auto", auto)
+	for label, res := range map[string]mxResult{"plan": plan, "auto": auto} {
+		for _, n := range denied {
+			mxWant(t, label+"/"+n, res, n, unix.EPERM)
+		}
+		streamPairAllowed(label, res)
+	}
 
 	net := mxRun(t, bin, ProbeArg, mxAuto(f, []string{wr}, nil, tmp, NetworkAccessAuthority), f.base, f.env(t, f.base, tmp), "m-sockets")
 	mxComplete(t, "net", net, names...)
 	mxWant(t, "net/inet", net, "inet", 0)
 	mxWant(t, "net/inet6", net, "inet6", 0)
-	mxWant(t, "net/socketpair", net, "socketpair", 0)
+	streamPairAllowed("net", net)
 	for _, name := range []string{"unix", "netlink", "packet", "inet-raw", "inet6-raw"} {
 		mxWant(t, "net/"+name, net, name, unix.EPERM)
 	}
@@ -1340,6 +1556,180 @@ func TestEnforceSockets(t *testing.T) {
 	t.Logf("sockets demonstrated (socket succeeds unconfined): %v", demonstrated)
 	t.Logf("sockets host-held (unconfined socket also EPERM): %v", hostHeld)
 	t.Logf("sockets host errors (unconfined socket fails otherwise): %v", hostErr)
+}
+
+type mxOutsidePeer struct {
+	ln   *net.UnixListener
+	addr string
+}
+
+func mxListenOutside(t *testing.T, addr string) mxOutsidePeer {
+	t.Helper()
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: addr, Net: "unix"})
+	if err != nil {
+		t.Fatalf("outside listener %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	p := mxOutsidePeer{ln, addr}
+	if foreign := p.drain(t); len(foreign) != 0 {
+		t.Fatalf("outside listener %s: unexpected connections from pids %v", addr, foreign)
+	}
+	return p
+}
+
+func (p mxOutsidePeer) drain(t *testing.T) (foreign []int32) {
+	t.Helper()
+	c, err := net.DialTimeout("unix", p.addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("outside listener %s not live: %v", p.addr, err)
+	}
+	defer func() { _ = c.Close() }()
+	if err := p.ln.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		conn, err := p.ln.AcceptUnix()
+		if err != nil {
+			t.Fatalf("outside listener %s: accept: %v", p.addr, err)
+		}
+		raw, err := conn.SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cred *unix.Ucred
+		var credErr error
+		if err := raw.Control(func(fd uintptr) { cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED) }); err != nil || credErr != nil {
+			t.Fatalf("outside listener %s: peer credentials: %v %v", p.addr, err, credErr)
+		}
+		_ = conn.Close()
+		if cred.Pid == int32(os.Getpid()) {
+			return foreign
+		}
+		foreign = append(foreign, cred.Pid)
+	}
+}
+
+func mxRunAwaiting(t *testing.T, bin string, p Policy, dir string, env []string, onAwait func(label, name string), args ...string) mxResult {
+	t.Helper()
+	var frame bytes.Buffer
+	if err := WritePolicyFrame(&frame, p); err != nil {
+		t.Fatal(err)
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = inW.Close(); _ = outR.Close() }()
+	cmd := exec.Command(bin, append([]string{HelperCommand, ProbeArg}, args...)...)
+	var errb bytes.Buffer
+	cmd.Env, cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = env, dir, inR, outW, &errb
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = time.Second
+	err = cmd.Start()
+	_ = inR.Close()
+	_ = outW.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }()
+	if _, err := inW.Write(frame.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := outR.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	res := mxResult{code: -1, lines: map[string]int{}}
+	var stdout strings.Builder
+	sc := bufio.NewScanner(outR)
+	for sc.Scan() {
+		ln := sc.Text()
+		stdout.WriteString(ln + "\n")
+		if rest, ok := strings.CutPrefix(ln, "await="); ok {
+			label, name, _ := strings.Cut(rest, " ")
+			onAwait(label, name)
+			if _, err := inW.Write([]byte{'\n'}); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if k, v, ok := strings.Cut(ln, "="); ok {
+			if n, e := strconv.Atoi(v); e == nil {
+				res.lines[k] = n
+			}
+		}
+	}
+	if res.timedOut = errors.Is(sc.Err(), os.ErrDeadlineExceeded); res.timedOut {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	err = cmd.Wait()
+	res.stdout, res.stderr = stdout.String(), errb.String()
+	var ee *exec.ExitError
+	switch {
+	case res.timedOut:
+	case err == nil:
+		res.code = 0
+	case errors.As(err, &ee):
+		res.code = ee.ExitCode()
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			res.signal = ws.Signal()
+		}
+	default:
+		t.Fatalf("run %v: %v", args, err)
+	}
+	return res
+}
+
+func TestEnforceSocketpairIsolation(t *testing.T) {
+	mxRequire(t)
+	bin := mxBinary(t)
+	f := mxSetup(t)
+	abstract := filepath.Base(f.base)
+	outsides := []mxOutsidePeer{
+		mxListenOutside(t, filepath.Join(f.mkdir(t, "outside"), "l.sock")),
+		mxListenOutside(t, "@"+abstract+"-listener"),
+	}
+	wr := f.mkdir(t, "wr")
+	for _, v := range mxPlanAutoNet {
+		tmp := f.tmpFor(t, v)
+		bindDir := f.mkdir(t, "wr", v.name)
+		var bound []string
+		res := mxRunAwaiting(t, bin, f.policy(v, []string{wr}, nil, tmp), f.base, f.env(t, f.base, tmp), func(label, name string) {
+			bound = append(bound, label)
+			c, err := net.DialTimeout("unix", name, 2*time.Second)
+			if err == nil {
+				_ = c.Close()
+				t.Errorf("%s/%s: outside client connected to the confined endpoint bound at %q", v.name, label, name)
+				return
+			}
+			if !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Errorf("%s/%s: outside client dial %q: %v, want ECONNREFUSED from a bound endpoint that is not listening", v.name, label, name, err)
+			}
+		}, "m-pair-isolation", outsides[0].addr, abstract+"-listener", bindDir, abstract+"-"+v.name+"-")
+		var keys []string
+		for _, c := range mxPairCases() {
+			for _, op := range []string{"unspec", "connect-path", "connect-abstract", "bind", "listen", "accept"} {
+				keys = append(keys, c.label()+"-"+op)
+			}
+		}
+		mxComplete(t, v.name, res, keys...)
+		for _, c := range mxPairCases() {
+			for _, op := range []string{"connect-path", "connect-abstract", "accept"} {
+				if k := c.label() + "-" + op; res.lines[k] == 0 {
+					t.Errorf("%s: %s succeeded on a stream socketpair endpoint", v.name, k)
+				}
+			}
+		}
+		for _, o := range outsides {
+			if foreign := o.drain(t); len(foreign) != 0 {
+				t.Errorf("%s: outside listener %s accepted connections from pids %v", v.name, o.addr, foreign)
+			}
+		}
+		t.Logf("%s: endpoints bound and refused to an outside client: %v", v.name, bound)
+	}
 }
 
 func TestEnforceNonNativeArchitecture(t *testing.T) {

@@ -2,6 +2,7 @@
 package bootstrap
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1951,14 +1952,16 @@ func TestRunFresh_TrustedLaunchWithVCSTemplatesStillComposesItsProjectLayer(t *t
 	}
 }
 
+const childJournalInvocation = "01890000-0000-7000-8000-00000000abcd"
+
 // childJournal drives the production child-agent journal through the real edit tool, leaving the
-// record this process owns on disk.
+// record and lock this process holds on disk.
 func childJournal(t *testing.T, home, project, target string) string {
 	t.Helper()
 	j, err := subagent.OpenJournal(subagent.JournalConfig{
 		Home:        home,
 		ProjectRoot: project,
-		Invocation:  "01890000-0000-7000-8000-00000000abcd",
+		Invocation:  childJournalInvocation,
 		Declared:    []string{target},
 	})
 	if err != nil {
@@ -1976,36 +1979,38 @@ func childJournal(t *testing.T, home, project, target string) string {
 	return j.Path()
 }
 
-// killedChildJournal rewrites a child-agent journal's owner to a process that has exited, which is
-// the state a killed codemeld leaves on disk for step 2.6 to find.
+const killedChildJournalEnv = "CODEMELD_TEST_KILLED_CHILD_JOURNAL"
+
+// TestKilledChildJournalHelper is not a test: run as a separate process by killedChildJournal, it
+// leaves a child-agent journal behind and exits without finishing it.
+func TestKilledChildJournalHelper(t *testing.T) {
+	spec := os.Getenv(killedChildJournalEnv)
+	if spec == "" {
+		t.Skip("runs only as the killed child-agent journal writer")
+	}
+	var args [3]string
+	if err := json.Unmarshal([]byte(spec), &args); err != nil {
+		t.Fatalf("decode %s: %v", killedChildJournalEnv, err)
+	}
+	childJournal(t, args[0], args[1], args[2])
+}
+
+// killedChildJournal has a separate process write a child-agent journal and exit, which is the state
+// a killed codemeld leaves on disk for step 2.6 to find.
 func killedChildJournal(t *testing.T, home, project, target string) string {
 	t.Helper()
-	path := childJournal(t, home, project, target)
-
-	record := filepath.Join(path, "journal.json")
-	data, err := os.ReadFile(record)
+	spec, err := json.Marshal([3]string{home, project, target})
 	if err != nil {
-		t.Fatalf("read journal record: %v", err)
+		t.Fatalf("encode the writer's arguments: %v", err)
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("decode journal record: %v", err)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestKilledChildJournalHelper$")
+	cmd.Env = append(os.Environ(), killedChildJournalEnv+"="+string(spec))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run the child-agent journal writer: %v\n%s", err, out)
 	}
-	owner, ok := raw["owner"].(map[string]any)
-	if !ok {
-		t.Fatalf("journal record has no owner: %s", data)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("run a short-lived process: %v", err)
-	}
-	owner["pid"] = cmd.ProcessState.Pid()
-	patched, err := json.Marshal(raw)
-	if err != nil {
-		t.Fatalf("encode journal record: %v", err)
-	}
-	if err := os.WriteFile(record, patched, 0o600); err != nil {
-		t.Fatalf("write journal record: %v", err)
+	path := filepath.Join(filepath.Dir(sessions.SessionRoot(home)), "journals", sessions.FolderDirName(project), childJournalInvocation)
+	if _, err := os.Stat(filepath.Join(path, "journal.json")); err != nil {
+		t.Fatalf("stat the killed writer's record: %v", err)
 	}
 	return path
 }
@@ -2082,7 +2087,7 @@ func TestRecoverChildJournals_AsksOnlyWhenTheLaunchCanReachTheUser(t *testing.T)
 		if got, err := os.ReadFile(target); err != nil || string(got) != "A HAND EDIT\n" {
 			t.Fatalf("%s = %q (err=%v), want a deferred path left alone", target, got, err)
 		}
-		if !strings.Contains(stderr.String(), "not put back: "+target) ||
+		if !strings.Contains(stderr.String(), "not put back: \""+target) ||
 			!strings.Contains(stderr.String(), "the next time you start it here") {
 			t.Fatalf("stderr = %q, want the file named and the next step stated", stderr.String())
 		}
@@ -2092,6 +2097,7 @@ func TestRecoverChildJournals_AsksOnlyWhenTheLaunchCanReachTheUser(t *testing.T)
 func TestReportJournalRecovery_PromisesAQuestionOnlyForOrdinaryUnresolvedPaths(t *testing.T) {
 	const record = "journals/run"
 	const question = "codemeld asks what to do with these files the next time you start it here"
+	const moveQuestion = "codemeld asks what to do with these moves the next time you start it here interactively"
 	render := func(retained subagent.RetainedJournal) string {
 		var stderr strings.Builder
 		reportJournalRecovery(&stderr, subagent.Report{Retained: []subagent.RetainedJournal{retained}})
@@ -2101,7 +2107,7 @@ func TestReportJournalRecovery_PromisesAQuestionOnlyForOrdinaryUnresolvedPaths(t
 	t.Run("an ordinary unresolved path", func(t *testing.T) {
 		got := render(subagent.RetainedJournal{Path: record, Notes: []string{"a.txt: it was changed outside the child agent's journalled writes"}})
 
-		if !strings.Contains(got, "not put back: a.txt") || !strings.Contains(got, question+"; its record of the run is "+record) {
+		if !strings.Contains(got, `not put back: "a.txt`) || !strings.Contains(got, question+"; its record of the run is "+record) {
 			t.Fatalf("stderr = %q, want the path named and the next-launch question promised", got)
 		}
 	})
@@ -2109,11 +2115,11 @@ func TestReportJournalRecovery_PromisesAQuestionOnlyForOrdinaryUnresolvedPaths(t
 	t.Run("a held move", func(t *testing.T) {
 		got := render(subagent.RetainedJournal{Path: record, Moves: []subagent.HeldMove{{Source: "a.txt", Destination: "b.txt", Reason: "an endpoint was changed outside the child agent's journalled writes"}}})
 
-		if !strings.Contains(got, "a.txt -> b.txt (an endpoint was changed outside") || !strings.Contains(got, "fix them by hand") {
-			t.Fatalf("stderr = %q, want the held move and its reason named as work to fix by hand", got)
+		if !strings.Contains(got, "a.txt -> b.txt (an endpoint was changed outside") || !strings.Contains(got, moveQuestion) {
+			t.Fatalf("stderr = %q, want the held move and its reason named with the next interactive launch's question", got)
 		}
-		if strings.Contains(got, "asks what to do") || strings.Contains(got, "next time you start it here") || !strings.Contains(got, record) {
-			t.Fatalf("stderr = %q, want the record named without promising a later question or retry", got)
+		if strings.Contains(got, "fix them by hand") || strings.Contains(got, question) || strings.Contains(got, "tries again") || !strings.Contains(got, record) {
+			t.Fatalf("stderr = %q, want the record named without a manual fix, a path question, or a retry", got)
 		}
 	})
 
@@ -2135,10 +2141,29 @@ func TestReportJournalRecovery_PromisesAQuestionOnlyForOrdinaryUnresolvedPaths(t
 			Moves: []subagent.HeldMove{{Source: "c.txt", Destination: "d.txt", Reason: "an endpoint was changed outside the child agent's journalled writes"}},
 		})
 
-		path, asks := strings.Index(got, "not put back: a.txt"), strings.Index(got, question)
-		move, byHand := strings.Index(got, "c.txt -> d.txt"), strings.Index(got, "fix them by hand")
-		if path < 0 || asks < path || move < asks || byHand < move || !strings.Contains(got, "its record of the run is "+record) {
-			t.Fatalf("stderr = %q, want the question right after the path it covers and the manual fix after the held move", got)
+		path, asks := strings.Index(got, `not put back: "a.txt`), strings.Index(got, question)
+		move, asksMove := strings.Index(got, "c.txt -> d.txt"), strings.Index(got, moveQuestion)
+		if path < 0 || asks < path || move < asks || asksMove < move || !strings.Contains(got, "its record of the run is "+record) {
+			t.Fatalf("stderr = %q, want the question right after the path it covers and the move question after the held move", got)
+		}
+	})
+
+	t.Run("a directory left in place", func(t *testing.T) {
+		got := render(subagent.RetainedJournal{Path: record, Dirs: []string{"made"}})
+
+		if !strings.Contains(got, "left in place: made (codemeld does not delete") || !strings.Contains(got, "its record of the run is "+record) {
+			t.Fatalf("stderr = %q, want the directory named with why it stays and the record named", got)
+		}
+		if strings.Contains(got, "asks what to do") || strings.Contains(got, "not put back") {
+			t.Fatalf("stderr = %q, want no question promised for a directory", got)
+		}
+	})
+
+	t.Run("an ordinary unresolved path beside a directory left in place", func(t *testing.T) {
+		got := render(subagent.RetainedJournal{Path: record, Notes: []string{"a.txt: it was changed outside the child agent's journalled writes"}, Dirs: []string{"made"}})
+
+		if !strings.Contains(got, `not put back: "a.txt`) || !strings.Contains(got, "left in place: made") || !strings.Contains(got, question) {
+			t.Fatalf("stderr = %q, want the path, the directory, and the question for the path", got)
 		}
 	})
 
@@ -2148,42 +2173,207 @@ func TestReportJournalRecovery_PromisesAQuestionOnlyForOrdinaryUnresolvedPaths(t
 			{Source: "a.txt", Destination: "b.txt", Reason: "an endpoint was changed outside the child agent's journalled writes"},
 		}})
 
-		held, byHand := strings.Index(got, "a.txt -> b.txt"), strings.Index(got, "fix them by hand")
+		held, asksMove := strings.Index(got, "a.txt -> b.txt"), strings.Index(got, moveQuestion)
 		resumed, retry := strings.Index(got, "c.txt -> d.txt"), strings.Index(got, "tries again to finish undoing")
-		if held < 0 || byHand < held || resumed < byHand || retry < resumed || strings.Contains(got, "asks what to do") {
-			t.Fatalf("stderr = %q, want each move group followed by only its own instruction and no question", got)
+		if held < 0 || asksMove < held || resumed < asksMove || retry < resumed || strings.Contains(got, question) {
+			t.Fatalf("stderr = %q, want each move group followed by only its own instruction and no path question", got)
 		}
 	})
 }
 
+func TestJournalRecovery_EscapesTheValuesItPrints(t *testing.T) {
+	long := strings.Repeat("n", 130)
+	cases := []struct{ name, value, want string }{
+		{"plain name", "a.txt", "a.txt"},
+		{"spaces", "my notes.txt", "my notes.txt"},
+		{"non-ASCII letters", "café/日本語.txt", "café/日本語.txt"},
+		{"long plain name", long, long},
+		{"carriage return", "a\rb", `"a\rb"`},
+		{"newline", "a\nb", `"a\nb"`},
+		{"tab", "a\tb", `"a\tb"`},
+		{"erase line escape", "a\x1b[2Kb", `"a\x1b[2Kb"`},
+		{"delete", "a\x7fb", `"a\x7fb"`},
+		{"C1 control", "a\u0085b", `"a\u0085b"`},
+		{"invalid UTF-8", "a\xffb", `"a\xffb"`},
+		{"right-to-left override", "a\u202eb", `"a\u202eb"`},
+		{"zero width joiner", "a\u200db", `"a\u200db"`},
+		{"soft hyphen", "a\u00adb", `"a\u00adb"`},
+		{"line separator", "a\u2028b", `"a\u2028b"`},
+		{"paragraph separator", "a\u2029b", `"a\u2029b"`},
+		{"move arrow", "a.txt -> b.txt", `"a.txt -> b.txt"`},
+		{"colon space", "a: b", `"a: b"`},
+		{"space parenthesis", "a (b", `"a (b"`},
+		{"closing parenthesis colon", "a): b", `"a): b"`},
+		{"double quote", `a"b`, `"a\"b"`},
+		{"backslash", `a\b`, `"a\\b"`},
+	}
+	ask := func(u subagent.Unresolved) string {
+		var stderr strings.Builder
+		askJournalChoice(bufio.NewReader(strings.NewReader("d\n")), &stderr, u)
+		return stderr.String()
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, w := tc.value, tc.want
+			moves := []subagent.UnresolvedMove{{Source: v, Destination: v}, {Source: v, Destination: v, Pending: true}}
+			groupHead := "codemeld: these moves by an interrupted child agent run changed afterwards, so codemeld will not undo them on its own:\n" +
+				"  move: " + w + " -> " + w + "\n" +
+				"  attempted move, outcome unknown: " + w + " -> " + w + "\n" +
+				"  [k] keep every path named above as it is now\n"
+
+			if got, want := ask(subagent.Unresolved{Path: v}), "codemeld: "+w+" changed after the child agent run that was interrupted, so codemeld will not put it back on its own.\n"+
+				"  [k] keep the file as it is now\n  [r] put back the version from before the child agent ran\n  [d] decide later (default)\nKeep, put back, or decide later? [k/r/d] "; got != want {
+				t.Fatalf("single-path prompt = %q, want %q", got, want)
+			}
+			if got, want := ask(subagent.Unresolved{Moves: moves, Choices: []subagent.Choice{subagent.ChoiceKeep, subagent.ChoiceRestore, subagent.ChoiceDefer}}), groupHead+
+				"  [r] put every path named above back to how it was before the child agent ran\n  [d] decide later (default)\nKeep, put back, or decide later? [k/r/d] "; got != want {
+				t.Fatalf("group prompt = %q, want %q", got, want)
+			}
+			if got, want := ask(subagent.Unresolved{Moves: moves, Choices: []subagent.Choice{subagent.ChoiceKeep, subagent.ChoiceDefer}, RestoreRefusal: v}), groupHead+
+				"  [d] decide later (default)\n  put back is not available: "+w+"\nKeep or decide later? [k/d] "; got != want {
+				t.Fatalf("group prompt without put back = %q, want %q", got, want)
+			}
+
+			var stderr strings.Builder
+			reportJournalRecovery(&stderr, subagent.Report{
+				LeftAlone: []subagent.LeftAloneJournal{{Path: v, Reason: v}},
+				Restored:  []string{v},
+				Kept:      []string{v},
+				Retained: []subagent.RetainedJournal{
+					{Path: v, Notes: []string{v}},
+					{Path: v, Notes: []string{v}, Dirs: []string{v}, Moves: []subagent.HeldMove{
+						{Source: v, Destination: v, Reason: v},
+						{Source: v, Destination: v, Reason: v, Resumes: true},
+					}},
+				},
+			})
+			want := strings.Join([]string{
+				"codemeld: could not tell whether a child agent run recorded here has ended, so its files were left as they are.",
+				"  left alone: " + w + " (" + w + ")",
+				"codemeld: a previous session ended while a child agent was still writing files.",
+				"  put back: " + w,
+				"  kept as it is now, as you asked: " + w,
+				"  not put back: " + w,
+				"  codemeld asks what to do with these files the next time you start it here; its record of the run is " + w,
+				"  not put back: " + w,
+				"  left in place: " + w + " (codemeld does not delete a directory a child agent created once it holds other entries or was replaced)",
+				"  codemeld asks what to do with these files the next time you start it here",
+				"  move not undone: " + w + " -> " + w + " (" + w + ")",
+				"  codemeld asks what to do with these moves the next time you start it here interactively",
+				"  move not undone: " + w + " -> " + w + " (" + w + ")",
+				"  codemeld tries again to finish undoing these interrupted moves the next time you start it here; it does not ask about them",
+				"  its record of the run is " + w,
+				"",
+			}, "\n")
+			if got := stderr.String(); got != want {
+				t.Fatalf("report = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // TestDefaultFreshSteps_RecoverJournals_NamesAJournalItLeftAlone pins the launch report for a
-// journal recovery must not touch: the record belongs to a process that is still running, so the
-// launch names it and says why instead of passing over it in silence.
+// journal recovery cannot tell has ended: the launch names it and says why instead of passing over it
+// in silence.
 func TestDefaultFreshSteps_RecoverJournals_NamesAJournalItLeftAlone(t *testing.T) {
-	home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
-	target := filepath.Join(project, "a.txt")
-	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
-		t.Fatalf("seed: %v", err)
+	cases := []struct {
+		name   string
+		lock   func(t *testing.T, lock string)
+		reason string
+	}{
+		{
+			name:   "a record without a lock",
+			lock:   func(*testing.T, string) {},
+			reason: "(written by an earlier codemeld version that cannot show whether its run has ended)",
+		},
+		{
+			name: "a symlink in place of the lock",
+			lock: func(t *testing.T, lock string) {
+				if err := os.Symlink(filepath.Join(t.TempDir(), "elsewhere"), lock); err != nil {
+					t.Fatalf("plant the symlink: %v", err)
+				}
+			},
+			reason: `("its lock could not be checked: `,
+		},
 	}
-	journal := childJournal(t, home, project, target)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+			target := filepath.Join(project, "a.txt")
+			if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			journal := childJournal(t, home, project, target)
+			lock := filepath.Join(journal, "journal.lock")
+			if err := os.Remove(lock); err != nil {
+				t.Fatalf("remove the lock: %v", err)
+			}
+			tc.lock(t, lock)
 
-	var stderr strings.Builder
-	DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project)
+			var stderr strings.Builder
+			DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project)
 
-	if !strings.Contains(stderr.String(), "left alone: "+journal) {
-		t.Fatalf("stderr = %q, want the untouched journal named", stderr.String())
+			if !strings.HasPrefix(stderr.String(), "codemeld: could not tell whether a child agent run recorded here has ended, so its files were left as they are.\n") {
+				t.Fatalf("stderr = %q, want the could-not-tell header", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "  left alone: "+journal+" "+tc.reason) {
+				t.Fatalf("stderr = %q, want the untouched journal named with reason %q", stderr.String(), tc.reason)
+			}
+			if strings.Contains(stderr.String(), "put back") {
+				t.Fatalf("stderr = %q, want nothing reported as recovered", stderr.String())
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != "CHILD\n" {
+				t.Fatalf("%s = %q (err=%v), want the file left as it is", target, got, err)
+			}
+			if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
+				t.Fatalf("stat the journal record: %v, want it retained", err)
+			}
+		})
 	}
-	if !strings.Contains(stderr.String(), "another codemeld may still be running") {
-		t.Fatalf("stderr = %q, want a plain reason it was left alone", stderr.String())
+}
+
+// TestDefaultFreshSteps_RecoverJournals_SaysNothingAboutARunningWriter pins the silent skip: a
+// journal whose writer still holds its lock is not read, changed, or mentioned, whatever its record
+// holds.
+func TestDefaultFreshSteps_RecoverJournals_SaysNothingAboutARunningWriter(t *testing.T) {
+	cases := []struct {
+		name   string
+		record func(t *testing.T, record string)
+	}{
+		{name: "an active record", record: func(*testing.T, string) {}},
+		{name: "a malformed record", record: func(t *testing.T, record string) {
+			if err := os.WriteFile(record, []byte("{not json"), 0o600); err != nil {
+				t.Fatalf("corrupt the record: %v", err)
+			}
+		}},
 	}
-	if strings.Contains(stderr.String(), "put back") {
-		t.Fatalf("stderr = %q, want nothing reported as recovered", stderr.String())
-	}
-	if got, err := os.ReadFile(target); err != nil || string(got) != "CHILD\n" {
-		t.Fatalf("%s = %q (err=%v), want the other codemeld's file untouched", target, got, err)
-	}
-	if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
-		t.Fatalf("stat the journal record: %v, want it retained", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+			target := filepath.Join(project, "a.txt")
+			if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			record := filepath.Join(childJournal(t, home, project, target), "journal.json")
+			tc.record(t, record)
+			before, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatalf("read the record: %v", err)
+			}
+
+			var stderr strings.Builder
+			DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project)
+
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want nothing printed for a running writer", stderr.String())
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != "CHILD\n" {
+				t.Fatalf("%s = %q (err=%v), want the running writer's file untouched", target, got, err)
+			}
+			if after, err := os.ReadFile(record); err != nil || string(after) != string(before) {
+				t.Fatalf("record = %q (err=%v), want it untouched", after, err)
+			}
+		})
 	}
 }
 

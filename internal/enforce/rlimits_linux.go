@@ -69,7 +69,7 @@ func userThreadCount() (uint64, error) {
 			continue
 		}
 		tasks, err := procReadDir(filepath.Join(dir, "task"))
-		if errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 			continue
 		}
 		if err != nil {

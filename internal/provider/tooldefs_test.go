@@ -122,10 +122,12 @@ func TestAskUserToolDefinition_NameAndSchema(t *testing.T) {
 		{"Send every open question in one call", "every open question goes into one form"},
 		{"never guess, infer, or pre-pick an answer", "answers are never inferred"},
 		{"control or zero-width character, is refused", "displayed text must be text a terminal can show"},
-		{"Set `context` whenever a reasonable person could need to know why you are asking", "context is expected for a decision the user cannot judge unaided"},
-		{"Leave it out only for a choice that explains itself", "a simple question stays valid without context"},
+		{"Set a question's `context` whenever a reasonable person could need to know why you are asking it", "context is expected for a decision the user cannot judge unaided"},
+		{"shown only on that question's screen, so it explains that question alone", "each question's context belongs to that question only"},
+		{"Leave it out only for a question that explains itself", "a simple question stays valid without context"},
+		{"trade-offs between choices in each option's `description`", "trade-offs belong in option descriptions"},
 		{`{"clarification":"..."} with no answers at all`, "the clarification result is mutually exclusive with answers"},
-		{"your reply restated as `context`", "the explanation must come back as the next call's context"},
+		{"your reply restated in the `context` of the question or questions it concerns", "the explanation must come back in the concerned question's context"},
 	} {
 		if !strings.Contains(d.Description, tc.phrase) {
 			t.Errorf("Description does not state that %s (missing %q)", tc.want, tc.phrase)
@@ -144,29 +146,8 @@ func TestAskUserToolDefinition_NameAndSchema(t *testing.T) {
 	if !ok {
 		t.Fatalf("Parameters[properties] = %T, want map[string]any", d.Parameters["properties"])
 	}
-	if got := slices.Sorted(maps.Keys(props)); !reflect.DeepEqual(got, []string{"context", "questions"}) {
-		t.Fatalf("Parameters[properties] keys = %v, want exactly [context questions]", got)
-	}
-	sharedContext, ok := props["context"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties[context] missing or wrong type: %T", props["context"])
-	}
-	if sharedContext["type"] != "string" {
-		t.Fatalf("context.type = %v, want string", sharedContext["type"])
-	}
-	if sharedContext["maxLength"] != MaxAskUserContextRunes {
-		t.Fatalf("context.maxLength = %v, want %d (its own bound, not the displayed-field one)", sharedContext["maxLength"], MaxAskUserContextRunes)
-	}
-	if MaxAskUserContextRunes <= MaxAskUserTextRunes {
-		t.Fatalf("MaxAskUserContextRunes = %d, want more room than a displayed field's %d", MaxAskUserContextRunes, MaxAskUserTextRunes)
-	}
-	if sharedContext["pattern"] != AskUserTextPattern {
-		t.Fatalf("context.pattern = %v, want %q (context is displayed text under the same character rules)", sharedContext["pattern"], AskUserTextPattern)
-	}
-	for _, phrase := range []string{"no line breaks or tabs", "not markdown"} {
-		if got := sharedContext["description"].(string); !strings.Contains(got, phrase) {
-			t.Errorf("context description = %q, want it to state %q", got, phrase)
-		}
+	if got := slices.Sorted(maps.Keys(props)); !reflect.DeepEqual(got, []string{"questions"}) {
+		t.Fatalf("Parameters[properties] keys = %v, want exactly [questions] (context is per question)", got)
 	}
 	questions, ok := props["questions"].(map[string]any)
 	if !ok {
@@ -198,13 +179,14 @@ func TestAskUserToolDefinition_NameAndSchema(t *testing.T) {
 	if !ok {
 		t.Fatalf("question properties = %T, want map[string]any", item["properties"])
 	}
-	wantFields := []string{"allow_custom", "id", "multi_select", "options", "prompt"}
+	wantFields := []string{"allow_custom", "context", "id", "multi_select", "options", "prompt"}
 	if got := slices.Sorted(maps.Keys(fields)); !reflect.DeepEqual(got, wantFields) {
 		t.Fatalf("question properties keys = %v, want exactly %v", got, wantFields)
 	}
 	for name, wantType := range map[string]string{
 		"id":           "string",
 		"prompt":       "string",
+		"context":      "string",
 		"options":      "array",
 		"multi_select": "boolean",
 		"allow_custom": "boolean",
@@ -217,6 +199,21 @@ func TestAskUserToolDefinition_NameAndSchema(t *testing.T) {
 			t.Fatalf("%s.type = %v, want %s", name, field["type"], wantType)
 		}
 	}
+	questionContext := fields["context"].(map[string]any)
+	if questionContext["maxLength"] != MaxAskUserContextRunes {
+		t.Fatalf("context.maxLength = %v, want %d (its own bound, not the displayed-field one)", questionContext["maxLength"], MaxAskUserContextRunes)
+	}
+	if MaxAskUserContextRunes <= MaxAskUserTextRunes {
+		t.Fatalf("MaxAskUserContextRunes = %d, want more room than a displayed field's %d", MaxAskUserContextRunes, MaxAskUserTextRunes)
+	}
+	if questionContext["pattern"] != AskUserContextPattern {
+		t.Fatalf("context.pattern = %v, want %q (the paragraph-break rule)", questionContext["pattern"], AskUserContextPattern)
+	}
+	for _, phrase := range []string{"on this question's screen and on no other", "explain only this question", "not markdown", "line feed"} {
+		if got := questionContext["description"].(string); !strings.Contains(got, phrase) {
+			t.Errorf("context description = %q, want it to state %q", got, phrase)
+		}
+	}
 	options := fields["options"].(map[string]any)
 	if options["minItems"] != 1 {
 		t.Fatalf("options.minItems = %v, want 1 (a question with nothing to choose is refused)", options["minItems"])
@@ -225,16 +222,31 @@ func TestAskUserToolDefinition_NameAndSchema(t *testing.T) {
 		t.Fatalf("options.maxItems = %v, want %d", options["maxItems"], MaxAskUserOptions)
 	}
 	if options["uniqueItems"] != true {
-		t.Fatalf("options.uniqueItems = %v, want true (the decoder refuses a repeated label)", options["uniqueItems"])
+		t.Fatalf("options.uniqueItems = %v, want true (it refuses identical option objects only; distinct labels are the decoder's check)", options["uniqueItems"])
 	}
-	label, ok := options["items"].(map[string]any)
+	if got := options["description"].(string); !strings.Contains(got, "must differ from every other option's label") {
+		t.Errorf("options description = %q, want it to state that labels must be distinct", got)
+	}
+	option, ok := options["items"].(map[string]any)
 	if !ok {
 		t.Fatalf("options.items missing or wrong type: %T", options["items"])
 	}
-	if label["type"] != "string" || label["maxLength"] != MaxAskUserTextRunes {
-		t.Fatalf("options.items = %v, want a string bounded to %d characters", label, MaxAskUserTextRunes)
+	if option["type"] != "object" || option["additionalProperties"] != false {
+		t.Fatalf("options.items = %v, want a closed object", option)
 	}
-	for _, text := range []map[string]any{fields["id"].(map[string]any), fields["prompt"].(map[string]any), label} {
+	if req, ok := option["required"].([]string); !ok || !reflect.DeepEqual(req, []string{"label"}) {
+		t.Fatalf("option required = %v, want [label]", option["required"])
+	}
+	optionFields := option["properties"].(map[string]any)
+	if got := slices.Sorted(maps.Keys(optionFields)); !reflect.DeepEqual(got, []string{"description", "label"}) {
+		t.Fatalf("option properties keys = %v, want exactly [description label]", got)
+	}
+	label := optionFields["label"].(map[string]any)
+	description := optionFields["description"].(map[string]any)
+	for _, text := range []map[string]any{fields["id"].(map[string]any), fields["prompt"].(map[string]any), label, description} {
+		if text["type"] != "string" {
+			t.Fatalf("%v type = %v, want string", text["description"], text["type"])
+		}
 		if text["maxLength"] != MaxAskUserTextRunes {
 			t.Fatalf("%v maxLength = %v, want %d", text["description"], text["maxLength"], MaxAskUserTextRunes)
 		}
@@ -284,12 +296,52 @@ func TestAskUserTextPattern_StaysLooserThanTheRenderableRule(t *testing.T) {
 // shared table. A newly assigned BMP format character fails this rather than quietly
 // reopening the gap.
 func TestAskUserTextPattern_DivergesOnlyWhereAPatternCannotFollow(t *testing.T) {
-	re, err := regexp.Compile(AskUserTextPattern)
-	if err != nil {
-		t.Fatalf("AskUserTextPattern does not compile: %v", err)
+	assertPatternFollowsRenderable(t, AskUserTextPattern, AskUserTextRenderable)
+}
+
+func TestAskUserContextPattern_DivergesOnlyWhereAPatternCannotFollow(t *testing.T) {
+	assertPatternFollowsRenderable(t, AskUserContextPattern, AskUserContextRenderable)
+}
+
+func TestAskUserContextPattern_AddsOnlyTheLineFeed(t *testing.T) {
+	contextRe := regexp.MustCompile(AskUserContextPattern)
+	textRe := regexp.MustCompile(AskUserTextPattern)
+	for _, tc := range []struct {
+		text           string
+		pattern, valid bool
+	}{
+		{"why it matters\nwhat it affects", true, true},
+		{"one\n\ntwo", true, true},
+		{"visible\n  \nstill visible", true, true},
+		{"\nleading and trailing\n", true, true},
+		{" \n \n", false, false},
+		{"\n", false, false},
+		{"\u0301\n\u0301", true, false},
+		{"why\tit matters", false, false},
+		{"why\r\nit matters", false, false},
+		{"why\u200bit matters", false, false},
+		{"why\u2028it matters", false, false},
+	} {
+		if got := contextRe.MatchString(tc.text); got != tc.pattern {
+			t.Errorf("AskUserContextPattern matched %q = %v, want %v", tc.text, got, tc.pattern)
+		}
+		if got := AskUserContextRenderable(tc.text); got != tc.valid {
+			t.Errorf("AskUserContextRenderable(%q) = %v, want %v", tc.text, got, tc.valid)
+		}
+		if strings.Contains(tc.text, "\n") && (textRe.MatchString(tc.text) || AskUserTextRenderable(tc.text)) {
+			t.Errorf("%q has a line feed, but the displayed-field rule accepts it", tc.text)
+		}
 	}
-	if strings.ContainsRune(AskUserTextPattern, 0) {
-		t.Fatalf("AskUserTextPattern contains U+0000, which some provider regex engines read as the end of the pattern")
+}
+
+func assertPatternFollowsRenderable(t *testing.T, pattern string, renderable func(string) bool) {
+	t.Helper()
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("pattern does not compile: %v", err)
+	}
+	if strings.ContainsRune(pattern, 0) {
+		t.Fatalf("pattern contains U+0000, which some provider regex engines read as the end of the pattern")
 	}
 	// Not unicode.C: that table is the complement of the graphic categories, so it carries
 	// every unassigned code point too. The four concrete "other" categories are the assigned
@@ -306,15 +358,15 @@ func TestAskUserTextPattern_DivergesOnlyWhereAPatternCannotFollow(t *testing.T) 
 		// The leading "a" satisfies the one rule the pattern cannot express, so what is left
 		// to compare is the character class itself.
 		text := "a" + string(r)
-		matched, renderable := re.MatchString(text), AskUserTextRenderable(text)
-		strict.track(r, renderable && !matched)
-		loose.track(r, matched && !renderable && r != 0 && r <= 0xFFFF && unicode.In(r, assigned...))
+		matched, shown := re.MatchString(text), renderable(text)
+		strict.track(r, shown && !matched)
+		loose.track(r, matched && !shown && r != 0 && r <= 0xFFFF && unicode.In(r, assigned...))
 	}
 	if got := strict.done(); len(got) > 0 {
 		t.Errorf("the advertised pattern refuses renderable characters, so the model is told to send what it cannot: %s", strings.Join(got, " "))
 	}
 	if got := loose.done(); len(got) > 0 {
-		t.Errorf("the advertised pattern accepts assigned characters the decoder refuses in band; add them to askUserTextBlocked: %s", strings.Join(got, " "))
+		t.Errorf("the advertised pattern accepts assigned characters the decoder refuses in band; add them to the blocked class: %s", strings.Join(got, " "))
 	}
 }
 
@@ -390,18 +442,19 @@ func TestSuggestFollowupToolDefinition_ReturnsFreshSchema(t *testing.T) {
 // The accepted request is what both production dispatch and /resume replay build on, so the
 // checker has to hand back exactly the text the model sent, not a normalized copy of it.
 func TestDecodeAskUserRequest_ReturnsTheAcceptedCallVerbatim(t *testing.T) {
-	req, err := DecodeAskUserRequest(`{"context":"Sessions are replayed on /resume.","questions":[` +
-		`{"id":"storage","prompt":"Where should sessions be stored?","options":["Local disk","Object store"],"multi_select":true},` +
-		`{"id":"name","prompt":"What should it be called?","options":["ask"],"allow_custom":true}]}`)
+	req, err := DecodeAskUserRequest(`{"questions":[` +
+		`{"id":"storage","prompt":"Where should sessions be stored?","context":"Sessions are replayed on /resume.\n\nWhere they live decides what survives.",` +
+		`"options":[{"label":"Local disk","description":"Fast, lost with the machine"},{"label":"Object store"}],"multi_select":true},` +
+		`{"id":"name","prompt":"What should it be called?","options":[{"label":"ask"}],"allow_custom":true}]}`)
 
 	if err != nil {
 		t.Fatalf("DecodeAskUserRequest error = %v, want nil", err)
 	}
 	want := AskUserRequest{
-		Context: "Sessions are replayed on /resume.",
 		Questions: []AskUserQuestion{
-			{ID: "storage", Prompt: "Where should sessions be stored?", Options: []string{"Local disk", "Object store"}, MultiSelect: true},
-			{ID: "name", Prompt: "What should it be called?", Options: []string{"ask"}, AllowCustom: true},
+			{ID: "storage", Prompt: "Where should sessions be stored?", Context: "Sessions are replayed on /resume.\n\nWhere they live decides what survives.",
+				Options: []string{"Local disk", "Object store"}, OptionDescriptions: []string{"Fast, lost with the machine", ""}, MultiSelect: true},
+			{ID: "name", Prompt: "What should it be called?", Options: []string{"ask"}, OptionDescriptions: []string{""}, AllowCustom: true},
 		},
 	}
 	if !reflect.DeepEqual(req, want) {
@@ -410,13 +463,13 @@ func TestDecodeAskUserRequest_ReturnsTheAcceptedCallVerbatim(t *testing.T) {
 }
 
 func TestDecodeAskUserRequest_AcceptsACallWithoutContext(t *testing.T) {
-	req, err := DecodeAskUserRequest(`{"questions":[{"id":"storage","prompt":"Where?","options":["Local disk"]}]}`)
+	req, err := DecodeAskUserRequest(`{"questions":[{"id":"storage","prompt":"Where?","options":[{"label":"Local disk"}]}]}`)
 
 	if err != nil {
 		t.Fatalf("DecodeAskUserRequest error = %v, want nil (context is optional)", err)
 	}
-	if req.Context != "" {
-		t.Errorf("context = %q, want empty", req.Context)
+	if got := req.Questions[0].Context; got != "" {
+		t.Errorf("context = %q, want empty", got)
 	}
 }
 
@@ -428,14 +481,16 @@ func TestDecodeAskUserRequest_RefusesARepeatedMember(t *testing.T) {
 		name string
 		args string
 	}{
-		{"questions at the root", `{"questions":[],"questions":[{"id":"a","prompt":"p","options":["x"]}]}`},
-		{"context at the root", `{"context":"one","context":"two","questions":[{"id":"a","prompt":"p","options":["x"]}]}`},
-		{"id in a question", `{"questions":[{"id":"a","id":"b","prompt":"p","options":["x"]}]}`},
-		{"prompt in a question", `{"questions":[{"id":"a","prompt":"p","prompt":"q","options":["x"]}]}`},
-		{"options in a question", `{"questions":[{"id":"a","prompt":"p","options":["x"],"options":["y"]}]}`},
-		{"multi_select in a question", `{"questions":[{"id":"a","prompt":"p","options":["x"],"multi_select":false,"multi_select":true}]}`},
-		{"allow_custom in a question", `{"questions":[{"id":"a","prompt":"p","options":["x"],"allow_custom":false,"allow_custom":true}]}`},
-		{"a member of the second question", `{"questions":[{"id":"a","prompt":"p","options":["x"]},{"id":"b","prompt":"q","prompt":"r","options":["y"]}]}`},
+		{"questions at the root", `{"questions":[],"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}`},
+		{"id in a question", `{"questions":[{"id":"a","id":"b","prompt":"p","options":[{"label":"x"}]}]}`},
+		{"prompt in a question", `{"questions":[{"id":"a","prompt":"p","prompt":"q","options":[{"label":"x"}]}]}`},
+		{"context in a question", `{"questions":[{"id":"a","prompt":"p","context":"one","context":"two","options":[{"label":"x"}]}]}`},
+		{"options in a question", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"options":[{"label":"y"}]}]}`},
+		{"label in an option", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","label":"y"}]}]}`},
+		{"description in an option", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","description":"d","description":"e"}]}]}`},
+		{"multi_select in a question", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"multi_select":false,"multi_select":true}]}`},
+		{"allow_custom in a question", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"allow_custom":false,"allow_custom":true}]}`},
+		{"a member of the second question", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]},{"id":"b","prompt":"q","prompt":"r","options":[{"label":"y"}]}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := DecodeAskUserRequest(tc.args); err == nil {

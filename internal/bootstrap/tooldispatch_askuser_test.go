@@ -108,11 +108,13 @@ func TestProductionDispatcher_AskUserContextIsOptionalAndCarriesItsOwnBound(t *t
 		args string
 		want string
 	}{
-		{"omitted", askUserValidArgs, ""},
-		{"one line", `{"context":"Sessions are replayed on /resume.","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, "Sessions are replayed on /resume."},
-		{"past the question-field bound", `{"context":"` + pastQuestionBound + `","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, pastQuestionBound},
-		{"at the maximum", `{"context":"` + atBound + `","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, atBound},
-		{"padded and tag-shaped", `{"context":" [red]not a tag[-] ","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, " [red]not a tag[-] "},
+		{"omitted", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}`, ""},
+		{"one line", `{"questions":[{"id":"a","prompt":"p","context":"Sessions are replayed on /resume.","options":[{"label":"x"}]}]}`, "Sessions are replayed on /resume."},
+		{"paragraphs", `{"questions":[{"id":"a","prompt":"p","context":"Sessions are replayed.\n\nWhere they live decides what survives.","options":[{"label":"x"}]}]}`, "Sessions are replayed.\n\nWhere they live decides what survives."},
+		{"a blank paragraph beside visible ones", `{"questions":[{"id":"a","prompt":"p","context":"one\n \ntwo","options":[{"label":"x"}]}]}`, "one\n \ntwo"},
+		{"past the question-field bound", `{"questions":[{"id":"a","prompt":"p","context":"` + pastQuestionBound + `","options":[{"label":"x"}]}]}`, pastQuestionBound},
+		{"at the maximum", `{"questions":[{"id":"a","prompt":"p","context":"` + atBound + `","options":[{"label":"x"}]}]}`, atBound},
+		{"padded and tag-shaped", `{"questions":[{"id":"a","prompt":"p","context":" [red]not a tag[-] ","options":[{"label":"x"}]}]}`, " [red]not a tag[-] "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			asker := &fakeQuestionAsker{}
@@ -126,11 +128,11 @@ func TestProductionDispatcher_AskUserContextIsOptionalAndCarriesItsOwnBound(t *t
 			if asker.callCount() != 1 {
 				t.Fatalf("form mounts = %d, want 1", asker.callCount())
 			}
-			if asker.req.Context != tc.want {
-				t.Errorf("decoded context = %q, want %q exactly as sent", asker.req.Context, tc.want)
+			if len(asker.req.Questions) != 1 {
+				t.Fatalf("decoded questions = %d, want 1", len(asker.req.Questions))
 			}
-			if len(asker.req.Questions) == 0 {
-				t.Error("context decoding dropped the questions")
+			if got := asker.req.Questions[0].Context; got != tc.want {
+				t.Errorf("decoded context = %q, want %q exactly as sent", got, tc.want)
 			}
 		})
 	}
@@ -138,7 +140,7 @@ func TestProductionDispatcher_AskUserContextIsOptionalAndCarriesItsOwnBound(t *t
 
 func TestProductionDispatcher_AskUserKeepsAcceptedTextExactlyAsSent(t *testing.T) {
 	multibyte := strings.Repeat("é", provider.MaxAskUserTextRunes)
-	args := `{"questions":[{"id":" q ","prompt":"` + multibyte + `","options":["a"," a","a "]}]}`
+	args := `{"questions":[{"id":" q ","prompt":"` + multibyte + `","options":[{"label":"a"},{"label":" a"},{"label":"a "}]}]}`
 
 	asker := &fakeQuestionAsker{}
 	d := dispatcherFor(t, tools.NewRegistry(), &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()})
@@ -171,15 +173,17 @@ func TestProductionDispatcher_AskUserKeepsAcceptedTextExactlyAsSent(t *testing.T
 // rule the decoder actually applies cannot drift apart again.
 func TestProductionDispatcher_AskUserAppliesTheRenderableTextRule(t *testing.T) {
 	for _, tc := range testsupport.AskUserTextCases {
-		for _, field := range []string{"id", "prompt", "option"} {
-			args := `{"questions":[{"id":"q","prompt":"p","options":["x"]}]}`
+		for _, field := range []string{"id", "prompt", "option", "description"} {
+			args := `{"questions":[{"id":"q","prompt":"p","options":[{"label":"x"}]}]}`
 			switch field {
 			case "id":
-				args = `{"questions":[{"id":` + mustJSON(t, tc.Text) + `,"prompt":"p","options":["x"]}]}`
+				args = `{"questions":[{"id":` + mustJSON(t, tc.Text) + `,"prompt":"p","options":[{"label":"x"}]}]}`
 			case "prompt":
-				args = `{"questions":[{"id":"q","prompt":` + mustJSON(t, tc.Text) + `,"options":["x"]}]}`
+				args = `{"questions":[{"id":"q","prompt":` + mustJSON(t, tc.Text) + `,"options":[{"label":"x"}]}]}`
 			case "option":
-				args = `{"questions":[{"id":"q","prompt":"p","options":[` + mustJSON(t, tc.Text) + `]}]}`
+				args = `{"questions":[{"id":"q","prompt":"p","options":[{"label":` + mustJSON(t, tc.Text) + `}]}]}`
+			case "description":
+				args = `{"questions":[{"id":"q","prompt":"p","options":[{"label":"x","description":` + mustJSON(t, tc.Text) + `}]}]}`
 			}
 
 			asker := &fakeQuestionAsker{}
@@ -211,19 +215,19 @@ func TestProductionDispatcher_AskUserRefusesTextThatWouldMountBlank(t *testing.T
 		payload string
 		mounts  bool
 	}{
-		{"bom-only", `{"questions":[{"id":"q","prompt":"\uFEFF","options":["Yes"]}]}`, false},
-		{"nel-only", `{"questions":[{"id":"q","prompt":"\u0085","options":["Yes"]}]}`, false},
-		{"nul-only", `{"questions":[{"id":"q","prompt":"\u0000","options":["Yes"]}]}`, false},
-		{"zero-width-option", `{"questions":[{"id":"q","prompt":"p","options":["\u200b"]}]}`, false},
-		{"nul-inside-label", `{"questions":[{"id":"q","prompt":"p","options":["Ye\u0000s"]}]}`, false},
+		{"bom-only", `{"questions":[{"id":"q","prompt":"\uFEFF","options":[{"label":"Yes"}]}]}`, false},
+		{"nel-only", `{"questions":[{"id":"q","prompt":"\u0085","options":[{"label":"Yes"}]}]}`, false},
+		{"nul-only", `{"questions":[{"id":"q","prompt":"\u0000","options":[{"label":"Yes"}]}]}`, false},
+		{"zero-width-option", `{"questions":[{"id":"q","prompt":"p","options":[{"label":"\u200b"}]}]}`, false},
+		{"nul-inside-label", `{"questions":[{"id":"q","prompt":"p","options":[{"label":"Ye\u0000s"}]}]}`, false},
 		// Graphic characters that draw no ink: two options that are distinct values and both
 		// mount as blank rows, and one hidden beside text. The code point next to the braille
 		// blank does draw, so the rule stays on the characters that are actually blank.
-		{"two-blank-options", `{"questions":[{"id":"q","prompt":"p","options":["\u2800","\u3164"]}]}`, false},
-		{"hangul-filler-prompt", `{"questions":[{"id":"q","prompt":"\u115f","options":["Yes"]}]}`, false},
-		{"blank-beside-text", `{"questions":[{"id":"q","prompt":"p","options":["Ye\u2800s"]}]}`, false},
-		{"braille-with-a-dot", `{"questions":[{"id":"q","prompt":"p","options":["\u2801"]}]}`, true},
-		{"boundary-wide-prompt", `{"questions":[{"id":"q","prompt":"` + strings.Repeat(string(rune(0x754C)), provider.MaxAskUserTextRunes) + `","options":["Yes"]}]}`, true},
+		{"two-blank-options", `{"questions":[{"id":"q","prompt":"p","options":[{"label":"\u2800"},{"label":"\u3164"}]}]}`, false},
+		{"hangul-filler-prompt", `{"questions":[{"id":"q","prompt":"\u115f","options":[{"label":"Yes"}]}]}`, false},
+		{"blank-beside-text", `{"questions":[{"id":"q","prompt":"p","options":[{"label":"Ye\u2800s"}]}]}`, false},
+		{"braille-with-a-dot", `{"questions":[{"id":"q","prompt":"p","options":[{"label":"\u2801"}]}]}`, true},
+		{"boundary-wide-prompt", `{"questions":[{"id":"q","prompt":"` + strings.Repeat(string(rune(0x754C)), provider.MaxAskUserTextRunes) + `","options":[{"label":"Yes"}]}]}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			asker := &fakeQuestionAsker{}
@@ -279,14 +283,14 @@ func TestProductionDispatcher_AskUserRefusesMalformedUnicodeRatherThanRepairingI
 	} {
 		for _, field := range []string{"id", "prompt", "option"} {
 			t.Run(tc.name+"/"+field, func(t *testing.T) {
-				args := `{"questions":[{"id":"q","prompt":"p","options":["x"]}]}`
+				args := `{"questions":[{"id":"q","prompt":"p","options":[{"label":"x"}]}]}`
 				switch field {
 				case "id":
-					args = `{"questions":[{"id":` + tc.token + `,"prompt":"p","options":["x"]}]}`
+					args = `{"questions":[{"id":` + tc.token + `,"prompt":"p","options":[{"label":"x"}]}]}`
 				case "prompt":
-					args = `{"questions":[{"id":"q","prompt":` + tc.token + `,"options":["x"]}]}`
+					args = `{"questions":[{"id":"q","prompt":` + tc.token + `,"options":[{"label":"x"}]}]}`
 				case "option":
-					args = `{"questions":[{"id":"q","prompt":"p","options":[` + tc.token + `]}]}`
+					args = `{"questions":[{"id":"q","prompt":"p","options":[{"label":` + tc.token + `}]}]}`
 				}
 
 				asker := &fakeQuestionAsker{}
@@ -324,7 +328,7 @@ func TestProductionDispatcher_AskUserRefusesMalformedUnicodeRatherThanRepairingI
 // an escape of their own.
 func TestProductionDispatcher_AskUserAcceptsEveryValidStringEscape(t *testing.T) {
 	args := `{"questions":[{"id":"a\"b\\c\/d","prompt":"p\"q\\r\/s",` +
-		`"options":["o\"p\\q\/r","\\ud800 is text, not a lone surrogate"]}]}`
+		`"options":[{"label":"o\"p\\q\/r"},{"label":"\\ud800 is text, not a lone surrogate"}]}]}`
 
 	asker := &fakeQuestionAsker{}
 	d := dispatcherFor(t, tools.NewRegistry(), &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()})
@@ -402,7 +406,7 @@ func TestProductionDispatcher_AskUserWaitsOnTheTurnsOwnContext(t *testing.T) {
 }
 
 func TestProductionDispatcher_AskUserKeepsExplicitlyFalseResponseModes(t *testing.T) {
-	args := `{"questions":[{"id":"a","prompt":"p","options":["x"],"multi_select":false,"allow_custom":false}]}`
+	args := `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"multi_select":false,"allow_custom":false}]}`
 
 	asker := &fakeQuestionAsker{}
 	d := dispatcherFor(t, tools.NewRegistry(), &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()})
@@ -433,11 +437,11 @@ func TestProductionDispatcher_AskUserInvalidPayloadsNeverMountTheForm(t *testing
 	atBound := strings.Repeat("x", provider.MaxAskUserTextRunes)
 	tooManyQuestions := make([]string, 0, provider.MaxAskUserQuestions+1)
 	for i := 0; i <= provider.MaxAskUserQuestions; i++ {
-		tooManyQuestions = append(tooManyQuestions, fmt.Sprintf(`{"id":"q%d","prompt":"p","options":["a"]}`, i))
+		tooManyQuestions = append(tooManyQuestions, fmt.Sprintf(`{"id":"q%d","prompt":"p","options":[{"label":"a"}]}`, i))
 	}
 	tooManyOptions := make([]string, 0, provider.MaxAskUserOptions+1)
 	for i := 0; i <= provider.MaxAskUserOptions; i++ {
-		tooManyOptions = append(tooManyOptions, fmt.Sprintf(`"o%d"`, i))
+		tooManyOptions = append(tooManyOptions, fmt.Sprintf(`{"label":"o%d"}`, i))
 	}
 
 	for _, tc := range []struct {
@@ -446,19 +450,19 @@ func TestProductionDispatcher_AskUserInvalidPayloadsNeverMountTheForm(t *testing
 		want string
 	}{
 		{"malformed JSON", `{"questions":`, "invalid ask_user arguments"},
-		{"repeated questions member", `{"questions":[],"questions":[{"id":"a","prompt":"p","options":["x"]}]}`, "an object repeats a member name"},
-		{"repeated context member", `{"context":"one","context":"two","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, "an object repeats a member name"},
-		{"repeated id member", `{"questions":[{"id":"a","id":"b","prompt":"p","options":["x"]}]}`, "an object repeats a member name"},
-		{"repeated options member", `{"questions":[{"id":"a","prompt":"p","options":["x"],"options":["y"]}]}`, "an object repeats a member name"},
-		{"repeated multi_select member", `{"questions":[{"id":"a","prompt":"p","options":["x"],"multi_select":false,"multi_select":true}]}`, "an object repeats a member name"},
-		{"repeated allow_custom member", `{"questions":[{"id":"a","prompt":"p","options":["x"],"allow_custom":false,"allow_custom":true}]}`, "an object repeats a member name"},
-		{"unknown field", `{"questions":[{"id":"a","prompt":"p","options":["x"],"style":"grid"}]}`, `question "a": unknown fields: 1`},
-		{"wrong-case questions", `{"Questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `unknown fields: 1 (allowed: questions, context)`},
-		{"wrong-case id", `{"questions":[{"ID":"a","prompt":"p","options":["x"]}]}`, `question 0: unknown fields: 1`},
-		{"wrong-case prompt", `{"questions":[{"id":"a","Prompt":"p","options":["x"]}]}`, `question "a": unknown fields: 1`},
+		{"repeated questions member", `{"questions":[],"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}`, "an object repeats a member name"},
+		{"repeated context member", `{"context":"one","context":"two","questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}`, "an object repeats a member name"},
+		{"repeated id member", `{"questions":[{"id":"a","id":"b","prompt":"p","options":[{"label":"x"}]}]}`, "an object repeats a member name"},
+		{"repeated options member", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"options":[{"label":"y"}]}]}`, "an object repeats a member name"},
+		{"repeated multi_select member", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"multi_select":false,"multi_select":true}]}`, "an object repeats a member name"},
+		{"repeated allow_custom member", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"allow_custom":false,"allow_custom":true}]}`, "an object repeats a member name"},
+		{"unknown field", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"style":"grid"}]}`, `question "a": unknown fields: 1`},
+		{"wrong-case questions", `{"Questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}`, `unknown fields: 1 (allowed: questions)`},
+		{"wrong-case id", `{"questions":[{"ID":"a","prompt":"p","options":[{"label":"x"}]}]}`, `question 0: unknown fields: 1`},
+		{"wrong-case prompt", `{"questions":[{"id":"a","Prompt":"p","options":[{"label":"x"}]}]}`, `question "a": unknown fields: 1`},
 		{"wrong-case options", `{"questions":[{"id":"a","prompt":"p","Options":["x"]}]}`, `question "a": unknown fields: 1`},
-		{"wrong-case multi_select", `{"questions":[{"id":"a","prompt":"p","options":["x"],"Multi_Select":true}]}`, `question "a": unknown fields: 1`},
-		{"wrong-case allow_custom", `{"questions":[{"id":"a","prompt":"p","options":["x"],"Allow_Custom":true}]}`, `question "a": unknown fields: 1`},
+		{"wrong-case multi_select", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"Multi_Select":true}]}`, `question "a": unknown fields: 1`},
+		{"wrong-case allow_custom", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"Allow_Custom":true}]}`, `question "a": unknown fields: 1`},
 		{"no questions", `{"questions":[]}`, `missing "questions"`},
 		{"missing questions key", `{}`, `missing "questions"`},
 		// null takes its own conversion path per target type: into a map or slice it leaves
@@ -467,46 +471,58 @@ func TestProductionDispatcher_AskUserInvalidPayloadsNeverMountTheForm(t *testing
 		{"null root", `null`, `missing "questions"`},
 		{"null questions", `{"questions":null}`, `missing "questions"`},
 		{"null question", `{"questions":[null]}`, `question 0: "id" has no text the form can display`},
-		{"null id", `{"questions":[{"id":null,"prompt":"p","options":["x"]}]}`, `question 0: "id" has no text the form can display`},
-		{"null prompt", `{"questions":[{"id":"a","prompt":null,"options":["x"]}]}`, `question "a": "prompt" has no text the form can display`},
+		{"null id", `{"questions":[{"id":null,"prompt":"p","options":[{"label":"x"}]}]}`, `question 0: "id" has no text the form can display`},
+		{"null prompt", `{"questions":[{"id":"a","prompt":null,"options":[{"label":"x"}]}]}`, `question "a": "prompt" has no text the form can display`},
 		{"null options", `{"questions":[{"id":"a","prompt":"p","options":null}]}`, `question "a": "options" is empty`},
-		{"null option element", `{"questions":[{"id":"a","prompt":"p","options":["x",null]}]}`, `question "a" option 1: "option" has no text the form can display`},
+		{"null option element", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"},null]}]}`, `question "a" option 1: must be an object with a "label"`},
 		{"too many questions", `{"questions":[` + strings.Join(tooManyQuestions, ",") + `]}`, `question 5: "questions" has 6 entries, at most 5 allowed`},
-		{"blank id", `{"questions":[{"id":"  ","prompt":"p","options":["x"]}]}`, `question 0: "id" has no text the form can display`},
-		{"duplicate id", `{"questions":[{"id":"a","prompt":"p","options":["x"]},{"id":"a","prompt":"q","options":["y"]}]}`, `question 1: "id" duplicates the id of question 0`},
-		{"blank prompt", `{"questions":[{"id":"a","prompt":"","options":["x"]}]}`, `question "a": "prompt" has no text the form can display`},
-		{"over-long prompt", `{"questions":[{"id":"a","prompt":"` + longText + `","options":["x"]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent)`},
+		{"blank id", `{"questions":[{"id":"  ","prompt":"p","options":[{"label":"x"}]}]}`, `question 0: "id" has no text the form can display`},
+		{"duplicate id", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]},{"id":"a","prompt":"q","options":[{"label":"y"}]}]}`, `question 1: "id" duplicates the id of question 0`},
+		{"blank prompt", `{"questions":[{"id":"a","prompt":"","options":[{"label":"x"}]}]}`, `question "a": "prompt" has no text the form can display`},
+		{"over-long prompt", `{"questions":[{"id":"a","prompt":"` + longText + `","options":[{"label":"x"}]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent)`},
 		{"no options", `{"questions":[{"id":"a","prompt":"p","options":[]}]}`, `question "a": "options" is empty`},
 		{"too many options", `{"questions":[{"id":"a","prompt":"p","options":[` + strings.Join(tooManyOptions, ",") + `]}]}`, `question "a" option 8: "options" has 9 entries, at most 8 allowed`},
-		{"blank option", `{"questions":[{"id":"a","prompt":"p","options":["x","  "]}]}`, `question "a" option 1: "option" has no text the form can display`},
-		{"duplicate option", `{"questions":[{"id":"a","prompt":"p","options":["x","x"]}]}`, `question "a" option 1: repeats option 0`},
-		{"trailing JSON value", `{"questions":[{"id":"a","prompt":"p","options":["x"]}]}{"extra":true}`, "trailing content"},
-		{"trailing garbage", `{"questions":[{"id":"a","prompt":"p","options":["x"]}]} nope`, "trailing content"},
-		{"null multi_select", `{"questions":[{"id":"a","prompt":"p","options":["x"],"multi_select":null}]}`, `question "a": "multi_select" must be true or false`},
-		{"string multi_select", `{"questions":[{"id":"a","prompt":"p","options":["x"],"multi_select":"true"}]}`, `question "a": "multi_select" must be true or false`},
-		{"null allow_custom", `{"questions":[{"id":"a","prompt":"p","options":["x"],"allow_custom":null}]}`, `question "a": "allow_custom" must be true or false`},
-		{"numeric allow_custom", `{"questions":[{"id":"a","prompt":"p","options":["x"],"allow_custom":1}]}`, `question "a": "allow_custom" must be true or false`},
+		{"blank option", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"},{"label":"  "}]}]}`, `question "a" option 1: "label" has no text the form can display`},
+		{"duplicate option", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"},{"label":"x"}]}]}`, `question "a" option 1: repeats the label of option 0`},
+		{"trailing JSON value", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}{"extra":true}`, "trailing content"},
+		{"trailing garbage", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]} nope`, "trailing content"},
+		{"null multi_select", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"multi_select":null}]}`, `question "a": "multi_select" must be true or false`},
+		{"string multi_select", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"multi_select":"true"}]}`, `question "a": "multi_select" must be true or false`},
+		{"null allow_custom", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"allow_custom":null}]}`, `question "a": "allow_custom" must be true or false`},
+		{"numeric allow_custom", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}],"allow_custom":1}]}`, `question "a": "allow_custom" must be true or false`},
 		{"questions is not an array", `{"questions":{"id":"a"}}`, `"questions" must be an array of question objects`},
 		{"question is not an object", `{"questions":["a"]}`, `question 0: must be a JSON object`},
-		{"id is not a string", `{"questions":[{"id":5,"prompt":"p","options":["x"]}]}`, `question 0: "id" must be a string`},
-		{"options is not an array", `{"questions":[{"id":"a","prompt":"p","options":"x"}]}`, `question "a": "options" must be an array of strings`},
-		{"option is not a string", `{"questions":[{"id":"a","prompt":"p","options":[1]}]}`, `question "a" option 0: "option" must be a string`},
-		{"over-long multibyte prompt", `{"questions":[{"id":"a","prompt":"` + strings.Repeat("é", provider.MaxAskUserTextRunes+1) + `","options":["x"]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent)`},
-		{"over-long id padded to fit", `{"questions":[{"id":"` + atBound + ` ","prompt":"p","options":["x"]}]}`, `question 0: "id" is longer than 200 characters (201 sent)`},
-		{"over-long prompt padded to fit", `{"questions":[{"id":"a","prompt":" ` + atBound + `","options":["x"]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent)`},
-		{"over-long option padded to fit", `{"questions":[{"id":"a","prompt":"p","options":["` + atBound + ` "]}]}`, `question "a" option 0: "option" is longer than 200 characters (201 sent)`},
-		{"over-limit option and prompt at once", `{"questions":[{"id":"a","prompt":"` + longText + `","options":["` + longText + `"]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent); question "a" option 0: "option" is longer than 200 characters (201 sent)`},
-		{"over-long context", `{"context":"` + strings.Repeat("x", provider.MaxAskUserContextRunes+1) + `","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" is longer than 2000 characters (2001 sent)`},
-		{"over-long multibyte context", `{"context":"` + strings.Repeat("é", provider.MaxAskUserContextRunes+1) + `","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" is longer than 2000 characters (2001 sent)`},
-		{"blank context", `{"context":"  ","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" has no text the form can display`},
-		{"empty context", `{"context":"","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" has no text the form can display`},
-		{"context with a newline", `{"context":"why it matters\nand what it affects","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" has no text the form can display`},
-		{"context with a tab", `{"context":"why\tit matters","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" has no text the form can display`},
-		{"null context", `{"context":null,"questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" has no text the form can display`},
-		{"context is not a string", `{"context":5,"questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" must be a string`},
-		{"wrong-case context", `{"Context":"why","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `unknown fields: 1 (allowed: questions, context)`},
-		{"malformed Unicode context", `{"context":"` + askUserEscapes(0xD800) + `","questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `"context" carries malformed Unicode`},
-		{"bad context does not hide a question fault", `{"context":"","questions":[{"id":"a","prompt":"","options":["x"]}]}`, `"context" has no text the form can display; question "a": "prompt" has no text the form can display`},
+		{"id is not a string", `{"questions":[{"id":5,"prompt":"p","options":[{"label":"x"}]}]}`, `question 0: "id" must be a string`},
+		{"options is not an array", `{"questions":[{"id":"a","prompt":"p","options":"x"}]}`, `question "a": "options" must be an array of option objects`},
+		{"option is a number", `{"questions":[{"id":"a","prompt":"p","options":[1]}]}`, `question "a" option 0: must be an object with a "label"`},
+		{"option is a bare string", `{"questions":[{"id":"a","prompt":"p","options":["x"]}]}`, `question "a" option 0: must be an object with a "label"`},
+		{"option without a label", `{"questions":[{"id":"a","prompt":"p","options":[{"description":"d"}]}]}`, `question "a" option 0: "label" has no text the form can display`},
+		{"option with an unknown key", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","hint":"h"}]}]}`, `question "a" option 0: unknown fields: 1 (allowed: label, description)`},
+		{"label is not a string", `{"questions":[{"id":"a","prompt":"p","options":[{"label":1}]}]}`, `question "a" option 0: "label" must be a string`},
+		{"blank description", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","description":" "}]}]}`, `question "a" option 0: "description" has no text the form can display`},
+		{"description with a newline", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","description":"one\ntwo"}]}]}`, `question "a" option 0: "description" has no text the form can display`},
+		{"over-long description", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","description":"` + longText + `"}]}]}`, `question "a" option 0: "description" is longer than 200 characters (201 sent)`},
+		{"equal labels with different descriptions", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"x","description":"one"},{"label":"x","description":"two"}]}]}`, `question "a" option 1: repeats the label of option 0`},
+		{"over-long multibyte prompt", `{"questions":[{"id":"a","prompt":"` + strings.Repeat("é", provider.MaxAskUserTextRunes+1) + `","options":[{"label":"x"}]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent)`},
+		{"over-long id padded to fit", `{"questions":[{"id":"` + atBound + ` ","prompt":"p","options":[{"label":"x"}]}]}`, `question 0: "id" is longer than 200 characters (201 sent)`},
+		{"over-long prompt padded to fit", `{"questions":[{"id":"a","prompt":" ` + atBound + `","options":[{"label":"x"}]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent)`},
+		{"over-long option padded to fit", `{"questions":[{"id":"a","prompt":"p","options":[{"label":"` + atBound + ` "}]}]}`, `question "a" option 0: "label" is longer than 200 characters (201 sent)`},
+		{"over-limit option and prompt at once", `{"questions":[{"id":"a","prompt":"` + longText + `","options":[{"label":"` + longText + `"}]}]}`, `question "a": "prompt" is longer than 200 characters (201 sent); question "a" option 0: "label" is longer than 200 characters (201 sent)`},
+		{"over-long context", `{"questions":[{"id":"a","prompt":"p","context":"` + strings.Repeat("x", provider.MaxAskUserContextRunes+1) + `","options":[{"label":"x"}]}]}`, `question "a": "context" is longer than 2000 characters (2001 sent)`},
+		{"over-long multibyte context", `{"questions":[{"id":"a","prompt":"p","context":"` + strings.Repeat("é", provider.MaxAskUserContextRunes+1) + `","options":[{"label":"x"}]}]}`, `question "a": "context" is longer than 2000 characters (2001 sent)`},
+		{"blank context", `{"questions":[{"id":"a","prompt":"p","context":"  ","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"empty context", `{"questions":[{"id":"a","prompt":"p","context":"","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"context of only spaces and line feeds", `{"questions":[{"id":"a","prompt":"p","context":" \n\n ","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"context of only combining marks across paragraphs", `{"questions":[{"id":"a","prompt":"p","context":"\u0301\n\u0301","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"context with a tab", `{"questions":[{"id":"a","prompt":"p","context":"why\tit matters","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"context with a carriage return", `{"questions":[{"id":"a","prompt":"p","context":"why\r\nit matters","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"context with a zero-width character", `{"questions":[{"id":"a","prompt":"p","context":"why\u200bit matters","options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"null context", `{"questions":[{"id":"a","prompt":"p","context":null,"options":[{"label":"x"}]}]}`, `question "a": "context" has no text the form can display`},
+		{"context is not a string", `{"questions":[{"id":"a","prompt":"p","context":5,"options":[{"label":"x"}]}]}`, `question "a": "context" must be a string`},
+		{"top-level context", `{"context":"why","questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]}]}`, `unknown fields: 1 (allowed: questions)`},
+		{"wrong-case context", `{"questions":[{"id":"a","prompt":"p","Context":"why","options":[{"label":"x"}]}]}`, `question "a": unknown fields: 1`},
+		{"malformed Unicode context", `{"questions":[{"id":"a","prompt":"p","context":"` + askUserEscapes(0xD800) + `","options":[{"label":"x"}]}]}`, `question "a": "context" carries malformed Unicode`},
+		{"bad context does not hide another field's fault", `{"questions":[{"id":"a","prompt":"","context":"","options":[{"label":"x"}]}]}`, `question "a": "prompt" has no text the form can display; question "a": "context" has no text the form can display`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			auth := &recordingAuthorizer{decision: allow()}
@@ -538,23 +554,23 @@ func TestDecodeAskUserRequest_ArgumentErrorsLocateEveryViolation(t *testing.T) {
 	idText := "id-sentinel" + strings.Repeat("i", 229)
 	excessQuestions := make([]string, 0, provider.MaxAskUserQuestions+1)
 	for i := 0; i < provider.MaxAskUserQuestions; i++ {
-		excessQuestions = append(excessQuestions, fmt.Sprintf(`{"id":"q%d","prompt":"p","options":["a"]}`, i))
+		excessQuestions = append(excessQuestions, fmt.Sprintf(`{"id":"q%d","prompt":"p","options":[{"label":"a"}]}`, i))
 	}
-	excessQuestions = append(excessQuestions, `{"id":"q5","prompt":"`+promptText+`","options":["yes"]}`)
-	excessOptions := []string{`"` + optionText + `"`}
+	excessQuestions = append(excessQuestions, `{"id":"q5","prompt":"`+promptText+`","options":[{"label":"yes"}]}`)
+	excessOptions := []string{`{"label":"` + optionText + `"}`}
 	for i := 1; i <= provider.MaxAskUserOptions; i++ {
-		excessOptions = append(excessOptions, fmt.Sprintf(`"o%d"`, i))
+		excessOptions = append(excessOptions, fmt.Sprintf(`{"label":"o%d"}`, i))
 	}
 	trailingQuestions := make([]string, 0, provider.MaxAskUserQuestions+2)
 	for i := 0; i <= provider.MaxAskUserQuestions; i++ {
-		trailingQuestions = append(trailingQuestions, fmt.Sprintf(`{"id":"q%d","prompt":"p","options":["a"]}`, i))
+		trailingQuestions = append(trailingQuestions, fmt.Sprintf(`{"id":"q%d","prompt":"p","options":[{"label":"a"}]}`, i))
 	}
-	trailingQuestions = append(trailingQuestions, `{"id":"q6","prompt":"`+promptText+`","options":["yes"]}`)
+	trailingQuestions = append(trailingQuestions, `{"id":"q6","prompt":"`+promptText+`","options":[{"label":"yes"}]}`)
 	trailingOptions := make([]string, 0, provider.MaxAskUserOptions+2)
 	for i := 0; i <= provider.MaxAskUserOptions; i++ {
-		trailingOptions = append(trailingOptions, fmt.Sprintf(`"o%d"`, i))
+		trailingOptions = append(trailingOptions, fmt.Sprintf(`{"label":"o%d"}`, i))
 	}
-	trailingOptions = append(trailingOptions, `"`+optionText+`"`)
+	trailingOptions = append(trailingOptions, `{"label":"`+optionText+`"}`)
 
 	for _, tc := range []struct {
 		name string
@@ -563,39 +579,39 @@ func TestDecodeAskUserRequest_ArgumentErrorsLocateEveryViolation(t *testing.T) {
 	}{
 		{
 			"over-limit option and prompt in different questions",
-			`{"questions":[{"id":"q1","prompt":"pick one","options":["short","` + optionText + `"]},` +
-				`{"id":"q4","prompt":"` + promptText + `","options":["yes"]}]}`,
-			`invalid ask_user arguments: question "q1" option 1: "option" is longer than 200 characters (224 sent); ` +
+			`{"questions":[{"id":"q1","prompt":"pick one","options":[{"label":"short"},{"label":"` + optionText + `"}]},` +
+				`{"id":"q4","prompt":"` + promptText + `","options":[{"label":"yes"}]}]}`,
+			`invalid ask_user arguments: question "q1" option 1: "label" is longer than 200 characters (224 sent); ` +
 				`question "q4": "prompt" is longer than 200 characters (256 sent)`,
 		},
 		{
 			"an over-limit id falls back to the question index",
-			`{"questions":[{"id":"` + idText + `","prompt":"` + promptText + `","options":["yes"]}]}`,
+			`{"questions":[{"id":"` + idText + `","prompt":"` + promptText + `","options":[{"label":"yes"}]}]}`,
 			`invalid ask_user arguments: question 0: "id" is longer than 200 characters (240 sent); ` +
 				`question 0: "prompt" is longer than 200 characters (256 sent)`,
 		},
 		{
 			"a duplicate id falls back to the question index",
-			`{"questions":[{"id":"a","prompt":"p","options":["x"]},{"id":"a","prompt":"","options":["y"]}]}`,
+			`{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"}]},{"id":"a","prompt":"","options":[{"label":"y"}]}]}`,
 			`invalid ask_user arguments: question 1: "id" duplicates the id of question 0; ` +
 				`question 1: "prompt" has no text the form can display`,
 		},
 		{
 			"unknown field, bad flag and repeated option in one question",
-			`{"questions":[{"id":"a","prompt":"p","options":["x","x"],"multi_select":"yes","style":"grid"}]}`,
+			`{"questions":[{"id":"a","prompt":"p","options":[{"label":"x"},{"label":"x"}],"multi_select":"yes","style":"grid"}]}`,
 			`invalid ask_user arguments: question "a": unknown fields: 1 ` +
-				`(allowed: id, prompt, options, multi_select, allow_custom); ` +
-				`question "a": "multi_select" must be true or false; question "a" option 1: repeats option 0`,
+				`(allowed: id, prompt, context, options, multi_select, allow_custom); ` +
+				`question "a": "multi_select" must be true or false; question "a" option 1: repeats the label of option 0`,
 		},
 		{
 			"an unknown root field does not hide a nested violation",
-			`{"extra":true,"questions":[{"id":"a","prompt":"` + promptText + `","options":["yes"]}]}`,
-			`invalid ask_user arguments: unknown fields: 1 (allowed: questions, context); ` +
+			`{"extra":true,"questions":[{"id":"a","prompt":"` + promptText + `","options":[{"label":"yes"}]}]}`,
+			`invalid ask_user arguments: unknown fields: 1 (allowed: questions); ` +
 				`question "a": "prompt" is longer than 200 characters (256 sent)`,
 		},
 		{
 			"a failing question does not hide the questions after it",
-			`{"questions":[{"id":"a","prompt":"","options":["x"]},{"id":"b","prompt":"p","options":[]}]}`,
+			`{"questions":[{"id":"a","prompt":"","options":[{"label":"x"}]},{"id":"b","prompt":"p","options":[]}]}`,
 			`invalid ask_user arguments: question "a": "prompt" has no text the form can display; ` +
 				`question "b": "options" is empty`,
 		},
@@ -609,7 +625,7 @@ func TestDecodeAskUserRequest_ArgumentErrorsLocateEveryViolation(t *testing.T) {
 			"too many options does not hide an over-limit option label",
 			`{"questions":[{"id":"a","prompt":"p","options":[` + strings.Join(excessOptions, ",") + `]}]}`,
 			`invalid ask_user arguments: question "a" option 8: "options" has 9 entries, at most 8 allowed; ` +
-				`question "a" option 0: "option" is longer than 200 characters (224 sent)`,
+				`question "a" option 0: "label" is longer than 200 characters (224 sent)`,
 		},
 		{
 			"too many questions does not hide a violation past the first excess question",
@@ -621,7 +637,7 @@ func TestDecodeAskUserRequest_ArgumentErrorsLocateEveryViolation(t *testing.T) {
 			"too many options does not hide a violation past the first excess option",
 			`{"questions":[{"id":"a","prompt":"p","options":[` + strings.Join(trailingOptions, ",") + `]}]}`,
 			`invalid ask_user arguments: question "a" option 8: "options" has 10 entries, at most 8 allowed; ` +
-				`question "a" option 9: "option" is longer than 200 characters (224 sent)`,
+				`question "a" option 9: "label" is longer than 200 characters (224 sent)`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -647,9 +663,9 @@ func TestProductionDispatcher_AskUserAcceptsTheAdvertisedMaxima(t *testing.T) {
 	atBound := strings.Repeat("x", provider.MaxAskUserTextRunes)
 	options := make([]string, 0, provider.MaxAskUserOptions)
 	for i := 0; i < provider.MaxAskUserOptions; i++ {
-		options = append(options, fmt.Sprintf(`"o%d"`, i))
+		options = append(options, fmt.Sprintf(`{"label":"o%d"}`, i))
 	}
-	options[0] = `"` + atBound + `"`
+	options[0] = `{"label":"` + atBound + `"}`
 	questions := make([]string, 0, provider.MaxAskUserQuestions)
 	for i := 0; i < provider.MaxAskUserQuestions; i++ {
 		questions = append(questions, fmt.Sprintf(`{"id":"q%d","prompt":"p%d","options":[%s]}`, i, i, strings.Join(options, ",")))

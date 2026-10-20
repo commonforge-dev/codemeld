@@ -3,8 +3,13 @@ package bootstrap
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"slices"
+
+	"golang.org/x/sys/unix"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/fsutil"
@@ -146,17 +151,40 @@ func knownSettingsLayer(kind securitystate.LayerKind) bool {
 }
 
 func (r *blockedReread) rereadProject(file *blockedSettingsFile, validate settingsValidator) {
-	release, _, _ := locks.TryAcquire(file.path + ".lock")
+	dir, name := filepath.Dir(file.path), filepath.Base(file.path)
+	parent, err := openSettingsDir(dir)
+	switch {
+	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ENOENT):
+		before, beforeErr := os.Lstat(file.path)
+		data, found, ok := fsutil.ReadSettingsBytes(file.path)
+		after, afterErr := os.Lstat(file.path)
+		if !sameSettingsStat(before, beforeErr, after, afterErr) {
+			return
+		}
+		r.store(file, data, found, ok, validate)
+		file.record(before, beforeErr)
+		return
+	case err != nil:
+		return
+	}
+	defer func() { _ = parent.Close() }()
+	release, _, err := locks.AcquireAt(parent, name+".lock", 0)
 	if release == nil {
+		if unsafeSettingsLock(err) {
+			file.problem = "has an unsafe settings lock file"
+		}
 		return
 	}
 	defer release()
-	before, beforeErr := os.Lstat(file.path)
-	data, found, ok := fsutil.ReadSettingsBytes(file.path)
-	after, afterErr := os.Lstat(file.path)
-	if !sameSettingsStat(before, beforeErr, after, afterErr) {
+	data, info, err := readHeldSettings(parent, name)
+	if errors.Is(err, errSettingsChanged) || !sameSettingsDir(parent, dir) {
 		return
 	}
+	r.store(file, data, err == nil, err == nil || errors.Is(err, fs.ErrNotExist), validate)
+	file.record(info, err)
+}
+
+func (r *blockedReread) store(file *blockedSettingsFile, data []byte, found, ok bool, validate settingsValidator) {
 	switch {
 	case ok && !found:
 		file.problem = ""
@@ -166,7 +194,95 @@ func (r *blockedReread) rereadProject(file *blockedSettingsFile, validate settin
 	default:
 		r.apply(file, data, found, ok, validate)
 	}
-	file.record(before, beforeErr)
+}
+
+func unsafeSettingsLock(err error) bool {
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		return false
+	}
+	switch pathErr.Op {
+	case "openat":
+		return slices.ContainsFunc([]error{unix.ELOOP, unix.EISDIR, unix.ENXIO, unix.ENODEV}, func(target error) bool { return errors.Is(pathErr.Err, target) })
+	case "fstat":
+		return errors.Is(pathErr.Err, unix.EINVAL)
+	}
+	return false
+}
+
+func openSettingsDir(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+func sameSettingsDir(held *os.File, path string) bool {
+	again, err := openSettingsDir(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = again.Close() }()
+	heldInfo, heldErr := held.Stat()
+	againInfo, againErr := again.Stat()
+	return heldErr == nil && againErr == nil && os.SameFile(heldInfo, againInfo)
+}
+
+const maxSettingsBytes = 64 * 1024
+
+var (
+	errSettingsChanged    = errors.New("settings file changed during the read")
+	errSettingsUnreadable = errors.New("settings file is not a bounded regular file")
+
+	readHeldSettings  = readSettingsAt
+	readSettingsBytes = func(f *os.File, limit int64) ([]byte, error) {
+		return io.ReadAll(io.LimitReader(f, limit))
+	}
+)
+
+func openSettingsAt(dir *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: name, Err: err}
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func readSettingsAt(dir *os.File, name string) ([]byte, fs.FileInfo, error) {
+	f, err := openSettingsAt(dir, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = f.Close() }()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !opened.Mode().IsRegular() || opened.Size() > maxSettingsBytes {
+		return nil, nil, errSettingsUnreadable
+	}
+	data, err := readSettingsBytes(f, opened.Size()+1)
+	if err != nil {
+		return nil, nil, err
+	}
+	settled, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if int64(len(data)) != opened.Size() || settled.Size() != opened.Size() || !settled.ModTime().Equal(opened.ModTime()) {
+		return nil, nil, errSettingsChanged
+	}
+	again, err := openSettingsAt(dir, name)
+	if err != nil {
+		return nil, nil, errSettingsChanged
+	}
+	defer func() { _ = again.Close() }()
+	current, err := again.Stat()
+	if err != nil || !os.SameFile(current, settled) {
+		return nil, nil, errSettingsChanged
+	}
+	return data, settled, nil
 }
 
 type settingsValidator func(b []byte, path string) (map[string]any, config.LoadFailure, error)

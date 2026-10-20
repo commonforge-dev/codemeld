@@ -54,6 +54,12 @@ var subcommandAuthorities = map[string]map[string]string{
 
 var findExecActions = []string{"-exec", "-execdir", "-ok", "-okdir"}
 
+var shellCommandRunningBuiltins = []string{"exec", "eval", ".", "source", "builtin"}
+
+func isAmendOption(tok string) bool {
+	return len(tok) >= len("--am") && strings.HasPrefix("--amend", tok)
+}
+
 func isShellReservedWord(tok string) bool {
 	return isReservedWord(tok) || tok == "{" || tok == "}" || tok == "!"
 }
@@ -71,10 +77,10 @@ func ExceptionalAuthority(tokens []string) (authority string, ok bool) {
 		rest := tokens[i+2:]
 		switch {
 		case tokens[0] == "git" && tok == "reset" && slices.Contains(rest, "--hard"),
-			(tokens[0] == "git" || tokens[0] == "hg") && tok == "commit" && slices.Contains(rest, "--amend"):
+			(tokens[0] == "git" && tok == "commit" || tokens[0] == "hg" && (tok == "commit" || tok == "ci")) && slices.ContainsFunc(rest, isAmendOption):
 			a = authorityHistoryRewrite
 		case tokens[0] == "find" && (tok == "-delete" ||
-			slices.Contains(findExecActions, tok) && len(rest) > 0 && programAuthorities[rest[0]] == authorityFileDeletion):
+			slices.Contains(findExecActions, tok) && len(rest) > 0 && programAuthorities[canonicalProgram(rest[0])] == authorityFileDeletion):
 			a = authorityFileDeletion
 		}
 		authority = higherAuthority(authority, a)
@@ -97,6 +103,9 @@ func ClassifyExceptional(req MatchRequest, mc ModeContext) (authority string, cl
 		}
 		for _, s := range split {
 			if len(s.Tokens) > 0 && isShellReservedWord(s.Tokens[0]) {
+				return "", false
+			}
+			if len(s.Tokens) > 0 && slices.Contains(shellCommandRunningBuiltins, s.Tokens[0]) {
 				return "", false
 			}
 			if slices.ContainsFunc(s.Tokens, func(tok string) bool { return strings.Contains(tok, "\n") }) {

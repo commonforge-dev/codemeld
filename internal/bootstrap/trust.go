@@ -17,10 +17,6 @@ import (
 	"codemeld.dev/codemeld/internal/trust"
 )
 
-const trustPrompt = `codemeld: %s has not been approved yet.
-Until you approve it, codemeld ignores %s.
-Approve this project? [y/N] `
-
 type WithheldCategory string
 
 const (
@@ -93,7 +89,7 @@ func headlessTrustGate(stderr io.Writer) func(home, projectRoot, launchDir strin
 }
 
 func askTrust(stdin io.Reader, stderr io.Writer, projectRoot string, present []string) bool {
-	_, _ = fmt.Fprintf(stderr, trustPrompt, projectRoot, coveredInputs(projectRoot, present))
+	_, _ = fmt.Fprint(stderr, trustPrompt(projectRoot, present))
 	line, _ := bufio.NewReader(stdin).ReadString('\n')
 	answer := strings.ToLower(strings.TrimSpace(line))
 	return answer == "y" || answer == "yes"
@@ -117,19 +113,16 @@ func protectedStatePolicy(home, projectRoot string, layers []securitystate.Layer
 	}, nil
 }
 
-// coveredInputs describes VCS templates as commands because approving them approves argv the
-// launch executes, which the word "templates" alone does not disclose.
-func coveredInputs(projectRoot string, present []string) string {
-	vcsDir := projectVCSTemplateDir(projectRoot)
-	settings := slices.DeleteFunc(slices.Clone(present), func(path string) bool { return path == vcsDir })
-	var parts []string
-	if len(settings) > 0 {
-		parts = append(parts, fmt.Sprintf("its project settings (%s)", strings.Join(settings, " and ")))
+func trustPrompt(projectRoot string, present []string) string {
+	vcs := slices.Contains(present, projectVCSTemplateDir(projectRoot))
+	body := "has its own codemeld settings, which can let commands run and files be changed without asking you.\nIf you say no, codemeld still runs but ignores those settings."
+	switch {
+	case vcs && len(present) == 1:
+		body = "has its own version-control commands for codemeld, which can let commands run without asking you.\nIf you say no, codemeld still runs but ignores those commands."
+	case vcs:
+		body = "has its own codemeld settings and version-control commands, which can let commands run and files be changed without asking you.\nIf you say no, codemeld still runs but ignores those settings and commands."
 	}
-	if len(settings) < len(present) {
-		parts = append(parts, fmt.Sprintf("its VCS command templates (%s), which supply the commands codemeld runs for version control", vcsDir))
-	}
-	return strings.Join(parts, " and ")
+	return fmt.Sprintf("Do you trust %s?\nThis folder %s\nTrust this folder? [y/N] ", projectRoot, body)
 }
 
 // withheldInputs is the run-fixed record of what a degraded launch did not load. Both the

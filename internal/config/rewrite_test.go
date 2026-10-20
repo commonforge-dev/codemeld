@@ -2604,132 +2604,6 @@ func TestRewriteKey_Attribution_RejectsNonBoolPayloadAndValue(t *testing.T) {
 	}
 }
 
-func TestRewriteKey_SharedTempFolders_Shapes(t *testing.T) {
-	for _, tc := range []rewriteCase{
-		{
-			name:  "absent file is created with only the key",
-			input: "",
-			value: "allow",
-			want:  "confinement:\n  shared_temp_folders: allow\n",
-		},
-		{
-			name:  "absent container is appended",
-			input: "# top\nattribution: true # keep\n",
-			value: "deny",
-			want:  "# top\nattribution: true # keep\nconfinement:\n  shared_temp_folders: deny\n",
-		},
-		{
-			name:  "block container gains the key after its siblings",
-			input: "confinement:\n    program_lookup: strict # keep\nattribution: false\n",
-			value: "allow",
-			want:  "confinement:\n    program_lookup: strict # keep\n    shared_temp_folders: allow\nattribution: false\n",
-		},
-		{
-			name:  "block value replaced in place",
-			input: "confinement:\n  shared_temp_folders: deny # saved answer\n  program_lookup: strict\n",
-			value: "allow",
-			want:  "confinement:\n  shared_temp_folders: allow # saved answer\n  program_lookup: strict\n",
-		},
-		{
-			name:  "null container becomes a block mapping",
-			input: "confinement:\nattribution: true\n",
-			value: "deny",
-			want:  "confinement:\n  shared_temp_folders: deny\nattribution: true\n",
-		},
-		{
-			name:  "empty flow container",
-			input: "confinement: {}\nattribution: true\n",
-			value: "allow",
-			want:  "confinement: {shared_temp_folders: allow}\nattribution: true\n",
-		},
-		{
-			name:  "flow container gains the key",
-			input: "confinement: {program_lookup: strict}\n",
-			value: "allow",
-			want:  "confinement: {program_lookup: strict, shared_temp_folders: allow}\n",
-		},
-		{
-			name:  "flow value replaced in place",
-			input: "confinement: {shared_temp_folders: allow, program_lookup: strict}\n",
-			value: "deny",
-			want:  "confinement: {shared_temp_folders: deny, program_lookup: strict}\n",
-		},
-	} {
-		tc.key = KeySharedTempFolders
-		t.Run(tc.name, func(t *testing.T) { tc.run(t) })
-	}
-}
-
-func TestRewriteKey_SharedTempFolders_AbsentContainerKeepsRootValid(t *testing.T) {
-	for _, tc := range []rewriteCase{
-		{
-			name:  "flow root",
-			input: "{attribution: true}\n",
-			value: "allow",
-			want:  "{attribution: true, confinement: {shared_temp_folders: allow}}\n",
-		},
-		{
-			name:  "empty flow root",
-			input: "{} # keep\n",
-			value: "deny",
-			want:  "{confinement: {shared_temp_folders: deny}} # keep\n",
-		},
-		{
-			name:  "block root ending in a document-end marker",
-			input: "attribution: true\n...\n# after\n",
-			value: "allow",
-			want:  "attribution: true\nconfinement:\n  shared_temp_folders: allow\n...\n# after\n",
-		},
-		{
-			name:  "empty document ending in a document-end marker",
-			input: "---\n...\n",
-			value: "deny",
-			want:  "---\nconfinement:\n  shared_temp_folders: deny\n...\n",
-		},
-	} {
-		tc.key = KeySharedTempFolders
-		t.Run(tc.name, func(t *testing.T) {
-			tc.run(t)
-			raw, cat, err := ValidateGlobalSettingsBytes([]byte(tc.want), "settings.yaml")
-			if err != nil {
-				t.Fatalf("written settings do not validate: (%q, %v)", cat, err)
-			}
-			confinement, _ := raw["confinement"].(map[string]any)
-			if got := confinement["shared_temp_folders"]; got != tc.value {
-				t.Fatalf("confinement.shared_temp_folders = %v, want %v", got, tc.value)
-			}
-		})
-	}
-}
-
-func TestRewriteKey_SharedTempFolders_RejectsBadPayloadAndShape(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		input string
-		value any
-	}{
-		{"bool payload", "attribution: true\n", true},
-		{"value outside the enum", "attribution: true\n", "ask"},
-		{"container is a scalar", "confinement: strict\n", "allow"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			target := filepath.Join(t.TempDir(), "settings.yaml")
-			writeAt(t, target, tc.input)
-
-			step, _, err := RewriteKey(target, KeySharedTempFolders, tc.value)
-			if err == nil {
-				t.Fatalf("RewriteKey accepted %v", tc.value)
-			}
-			if step != fsutil.LoadStep {
-				t.Fatalf("step = %q, want %q", step, fsutil.LoadStep)
-			}
-			if got := readAt(t, target); got != tc.input {
-				t.Fatalf("rejected write changed bytes:\n%q\nwant\n%q", got, tc.input)
-			}
-		})
-	}
-}
-
 func TestRewriteKey_RetentionDays_Shapes(t *testing.T) {
 	for _, tc := range []rewriteCase{
 		{
@@ -2834,6 +2708,70 @@ func TestRewriteKey_RetentionDays_NullContainerKeepsSurroundings(t *testing.T) {
 				t.Fatalf("attribution = %v, want true", got)
 			}
 		})
+	}
+}
+
+func TestRewriteKey_RetentionDays_AbsentContainerKeepsRootValid(t *testing.T) {
+	for _, tc := range []rewriteCase{
+		{
+			name:  "flow root",
+			input: "{attribution: true}\n",
+			value: 14,
+			want:  "{attribution: true, sessions: {retention_days: 14}}\n",
+		},
+		{
+			name:  "empty flow root",
+			input: "{} # keep\n",
+			value: 7,
+			want:  "{sessions: {retention_days: 7}} # keep\n",
+		},
+		{
+			name:  "block root ending in a document-end marker",
+			input: "attribution: true\n...\n# after\n",
+			value: 30,
+			want:  "attribution: true\nsessions:\n  retention_days: 30\n...\n# after\n",
+		},
+		{
+			name:  "empty document ending in a document-end marker",
+			input: "---\n...\n",
+			value: 60,
+			want:  "---\nsessions:\n  retention_days: 60\n...\n",
+		},
+	} {
+		tc.key = KeyRetentionDays
+		t.Run(tc.name, func(t *testing.T) {
+			tc.run(t)
+			raw, cat, err := ValidateGlobalSettingsBytes([]byte(tc.want), "settings.yaml")
+			if err != nil {
+				t.Fatalf("written settings do not validate: (%q, %v)", cat, err)
+			}
+			sessions, _ := raw["sessions"].(map[string]any)
+			if got, want := fmt.Sprint(sessions["retention_days"]), fmt.Sprint(tc.value); got != want {
+				t.Fatalf("sessions.retention_days = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestPersist_KeepsLegacyConfinementKey(t *testing.T) {
+	const seed = "# top\nconfinement:\n  shared_temp_folders: allow # legacy\n  program_lookup: strict\nattribution: true # keep\n"
+	target := filepath.Join(t.TempDir(), "settings.yaml")
+	writeAt(t, target, seed)
+
+	if reason, cat, err := Persist(target, KeyRetentionDays, 30); reason != ReasonNone || cat != "" || err != nil {
+		t.Fatalf("Persist = (%q, %q, %v), want success", reason, cat, err)
+	}
+	got := readAt(t, target)
+	if want := seed + "sessions:\n  retention_days: 30\n"; got != want {
+		t.Fatalf("output mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	raw, cat, err := ValidateGlobalSettingsBytes([]byte(got), target)
+	if err != nil {
+		t.Fatalf("written settings do not validate: (%q, %v)", cat, err)
+	}
+	sessions, _ := raw["sessions"].(map[string]any)
+	if got := fmt.Sprint(sessions["retention_days"]); got != "30" {
+		t.Fatalf("sessions.retention_days = %v, want 30", got)
 	}
 }
 

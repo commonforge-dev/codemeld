@@ -12,14 +12,33 @@ import (
 
 const sessionTempDirPrefix = "codemeld-confine-"
 
+var (
+	beforeSessionTempDirChmod func(created string)
+	afterSessionTempDirChmod  func(created string)
+)
+
 func newSessionTempDir() (string, error) {
-	dir, err := os.MkdirTemp("", fmt.Sprintf("%s%d-*", sessionTempDirPrefix, os.Getpid()))
+	parent, err := filepath.Abs(os.TempDir())
 	if err != nil {
 		return "", err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	parent, err = filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp(parent, fmt.Sprintf("%s%d-*", sessionTempDirPrefix, os.Getpid()))
+	if err != nil {
+		return "", err
+	}
+	if beforeSessionTempDirChmod != nil {
+		beforeSessionTempDirChmod(dir)
+	}
+	if err := chmodPrivateNoFollow(dir); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", err
+	}
+	if afterSessionTempDirChmod != nil {
+		afterSessionTempDirChmod(dir)
 	}
 	return dir, nil
 }

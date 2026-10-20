@@ -144,7 +144,7 @@ func TestResolveExpectedLegsResolveConstrained(t *testing.T) {
 		{Name: "read-protected", Observed: "denied"}, {Name: "read-read-root", Observed: "allowed"},
 		{Name: "write-tmp", Observed: "allowed"}, {Name: "rlimits", Observed: "allowed"},
 		{Name: "socket-unix", Observed: "denied"}, {Name: "socket-inet", Observed: "denied"},
-		{Name: "socketpair", Observed: "denied"}, {Name: "io-uring-setup", Observed: "denied"},
+		{Name: "socketpair", Observed: "allowed"}, {Name: "io-uring-setup", Observed: "denied"},
 		{Name: "shmget", Observed: "denied"}, {Name: "msgget", Observed: "denied"}, {Name: "semget", Observed: "denied"},
 		{Name: "mq-open", Observed: "denied"}, {Name: "shm-open", Observed: "denied"},
 		{Name: "ptrace-parent", Observed: "denied"}, {Name: "environ-parent", Observed: "denied"},
@@ -185,6 +185,25 @@ func TestResolveRefusesAnyFlippedLeg(t *testing.T) {
 			if got.Capability != Refused || got.Reason != want {
 				t.Errorf("%s exit %d: Resolve() = %+v, want reason %q", leg.name, code, got, want)
 			}
+		}
+	}
+}
+
+func TestResolveRefusesHostDeniedSocketpair(t *testing.T) {
+	withArch(t, "amd64")
+	calls := stubStarter(t, func(mode, leg string) helperExit {
+		if leg == "socketpair" {
+			return helperExit{code: probeDenied}
+		}
+		return expectedExit(mode, leg)
+	})
+	got := resolveFor("linux", ResolveInput{Home: homeWithCodemeld(t)})
+	if got.Capability != Refused || got.Reason != "linux: self-test leg socketpair observed denied" {
+		t.Errorf("Resolve() = %+v, want refused naming the socketpair leg", got)
+	}
+	for _, c := range *calls {
+		if c.leg == "socketpair" && c.mode != ProbeArg {
+			t.Errorf("socketpair leg started a %s run", c.mode)
 		}
 	}
 }

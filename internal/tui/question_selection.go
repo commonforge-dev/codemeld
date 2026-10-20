@@ -202,6 +202,9 @@ func (o *questionOptions) sourceOf(item int) string {
 	if item < 0 {
 		return o.block.spec.Prompt
 	}
+	if description := o.description(item); description != "" {
+		return o.label(item) + "\n" + description
+	}
 	return o.label(item)
 }
 

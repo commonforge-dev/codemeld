@@ -1,8 +1,11 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/events"
@@ -926,4 +931,448 @@ func TestBlockedPathsReread_DeletedLocalFileDropsOnlyItsEntries(t *testing.T) {
 	requireBlockedEntries(t, blocked, f.fromGlobal("g1"), f.fromProject("p1"))
 	requireBlockedEntries(t, blocked, f.fromGlobal("g1"), f.fromProject("p1"))
 	requireDegraded(t, blocked, notices, false)
+}
+
+func within(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s did not return within the deadline", what)
+	}
+}
+
+func checkWithin(t *testing.T, blocked *permissions.BlockedPaths) {
+	t.Helper()
+	within(t, "the blocked-paths reread", func() { blocked.Current() })
+}
+
+func mkfifo(t *testing.T, path string) {
+	t.Helper()
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("Mkfifo %s: %v", path, err)
+	}
+}
+
+func dirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		names[i] = entry.Name()
+	}
+	return names
+}
+
+func TestBlockedPathsReread_UnsafeSettingsLockFileDegradesUntilRepaired(t *testing.T) {
+	layers := []struct {
+		name  string
+		file  func(f rereadFixture) string
+		write func(t *testing.T, f rereadFixture, names ...string)
+		from  func(f rereadFixture, names ...string) []permissions.BlockedEntry
+	}{
+		{"project", func(f rereadFixture) string { return f.projectFile }, func(t *testing.T, f rereadFixture, names ...string) { f.writeProject(t, names...) }, rereadFixture.fromProject},
+		{"local", func(f rereadFixture) string { return f.localFile }, func(t *testing.T, f rereadFixture, names ...string) { f.writeLocal(t, names...) }, rereadFixture.fromLocal},
+	}
+	sidecars := map[string]func(t *testing.T, f rereadFixture, lock string){
+		"FIFO": func(t *testing.T, _ rereadFixture, lock string) { mkfifo(t, lock) },
+		"symlink to a FIFO": func(t *testing.T, f rereadFixture, lock string) {
+			target := filepath.Join(f.outside, "fifo")
+			mkfifo(t, target)
+			if err := os.Symlink(target, lock); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+		},
+		"directory": func(t *testing.T, _ rereadFixture, lock string) {
+			if err := os.Mkdir(lock, 0o700); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+		},
+	}
+	for _, layer := range layers {
+		for name, makeSidecar := range sidecars {
+			t.Run(layer.name+"/"+name, func(t *testing.T) {
+				f := newRereadFixture(t)
+				f.writeGlobal(t)
+				layer.write(t, f, "a")
+				blocked := f.blocked(t, true)
+				notices := recordNotices(blocked)
+				requireBlockedEntries(t, blocked, layer.from(f, "a"))
+
+				file := layer.file(f)
+				lock := file + ".lock"
+				if err := os.Remove(lock); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+				makeSidecar(t, f, lock)
+				rewriteSettings(t, file, blockedYAML(f.paths([]string{"a", "b"})...))
+				edited, err := os.ReadFile(file)
+				if err != nil {
+					t.Fatalf("ReadFile: %v", err)
+				}
+
+				checkWithin(t, blocked)
+				requireBlockedEntries(t, blocked, layer.from(f, "a"))
+				requireDegraded(t, blocked, notices, true, problemNotice(file, "has an unsafe settings lock file"))
+				checkWithin(t, blocked)
+				requireDegraded(t, blocked, notices, true)
+				if got, err := os.ReadFile(file); err != nil || !bytes.Equal(got, edited) {
+					t.Fatalf("settings after the refused reread = %q, %v; want it unchanged", got, err)
+				}
+
+				if err := os.Remove(lock); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+				if err := os.WriteFile(lock, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				requireBlockedEntries(t, blocked, layer.from(f, "a", "b"))
+				requireDegraded(t, blocked, notices, false, fixedNotice(file))
+			})
+		}
+	}
+}
+
+func TestBlockedPathsReread_OtherSettingsLockErrorsDeferWithoutChangingTheProblem(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens a mode 000 file")
+	}
+	f := newRereadFixture(t)
+	f.writeGlobal(t)
+	f.writeProject(t, "p1")
+	blocked := f.blocked(t, true)
+	notices := recordNotices(blocked)
+	requireBlockedEntries(t, blocked, f.fromProject("p1"))
+
+	rewriteSettings(t, f.projectFile, "blocked_paths: [\n")
+	requireBlockedEntries(t, blocked, f.fromProject("p1"))
+	requireDegraded(t, blocked, notices, true, problemNotice(f.projectFile, "is not valid YAML"))
+
+	lock := f.projectFile + ".lock"
+	if err := os.Chmod(lock, 0o000); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(lock, 0o600) })
+	f.editProject(t, "p2")
+	requireBlockedEntries(t, blocked, f.fromProject("p1"))
+	requireDegraded(t, blocked, notices, true)
+
+	if err := os.Chmod(lock, 0o600); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	requireBlockedEntries(t, blocked, f.fromProject("p2"))
+	requireDegraded(t, blocked, notices, false, fixedNotice(f.projectFile))
+}
+
+func TestUnsafeSettingsLock(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{&os.PathError{Op: "openat", Err: unix.ELOOP}, true},
+		{&os.PathError{Op: "openat", Err: unix.EISDIR}, true},
+		{&os.PathError{Op: "openat", Err: unix.ENXIO}, true},
+		{&os.PathError{Op: "openat", Err: unix.ENODEV}, true},
+		{&os.PathError{Op: "fstat", Err: unix.EINVAL}, true},
+		{&os.PathError{Op: "openat", Err: unix.EACCES}, false},
+		{&os.PathError{Op: "openat", Err: unix.ENOENT}, false},
+		{&os.PathError{Op: "fstat", Err: unix.EIO}, false},
+		{&os.PathError{Op: "flock", Err: unix.EINVAL}, false},
+		{context.DeadlineExceeded, false},
+		{nil, false},
+	}
+	for _, tc := range cases {
+		if got := unsafeSettingsLock(tc.err); got != tc.want {
+			t.Errorf("unsafeSettingsLock(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestBlockedPathsReread_HeldSidecarDefersPromptlyAndExcludesPersist(t *testing.T) {
+	f := newRereadFixture(t)
+	f.writeGlobal(t)
+	f.writeProject(t, "p1")
+	blocked := f.blocked(t, true)
+	notices := recordNotices(blocked)
+	requireBlockedEntries(t, blocked, f.fromProject("p1"))
+
+	release, reason, err := locks.TryAcquire(f.projectFile + ".lock")
+	if release == nil {
+		t.Fatalf("TryAcquire = %q, %v; want the lock", reason, err)
+	}
+	f.editProject(t, "p1", "p2")
+	checkWithin(t, blocked)
+	requireBlockedEntries(t, blocked, f.fromProject("p1"))
+	requireDegraded(t, blocked, notices, false)
+	if reason, _, err := config.Persist(f.projectFile, "blocked_paths", []any{}); reason != config.ReasonLockTimeout {
+		t.Fatalf("Persist with the sidecar held = %q, %v; want %q", reason, err, config.ReasonLockTimeout)
+	}
+
+	release()
+	requireBlockedEntries(t, blocked, f.fromProject("p1", "p2"))
+	requireDegraded(t, blocked, notices, false)
+}
+
+func TestBlockedPathsReread_HeldSidecarExcludesPersistWhileReading(t *testing.T) {
+	cases := map[string]struct {
+		file   func(rereadFixture) string
+		edit   func(rereadFixture, *testing.T)
+		after  func(rereadFixture) [][]permissions.BlockedEntry
+	}{
+		"project": {
+			file: func(f rereadFixture) string { return f.projectFile },
+			edit: func(f rereadFixture, t *testing.T) { f.editProject(t, "p1", "p2") },
+			after: func(f rereadFixture) [][]permissions.BlockedEntry {
+				return [][]permissions.BlockedEntry{f.fromProject("p1", "p2"), f.fromLocal("l1")}
+			},
+		},
+		"local": {
+			file: func(f rereadFixture) string { return f.localFile },
+			edit: func(f rereadFixture, t *testing.T) { f.editLocal(t, "l1", "l2") },
+			after: func(f rereadFixture) [][]permissions.BlockedEntry {
+				return [][]permissions.BlockedEntry{f.fromProject("p1"), f.fromLocal("l1", "l2")}
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRereadFixture(t)
+			f.writeGlobal(t)
+			f.writeProject(t, "p1")
+			f.writeLocal(t, "l1")
+			blocked := f.blocked(t, true)
+			notices := recordNotices(blocked)
+			requireBlockedEntries(t, blocked, f.fromProject("p1"), f.fromLocal("l1"))
+
+			target := tc.file(f)
+			read := false
+			real := readHeldSettings
+			readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+				if name == filepath.Base(target) {
+					read = true
+					if reason, _, err := config.Persist(target, "blocked_paths", []any{}); reason != config.ReasonLockTimeout {
+						t.Errorf("Persist inside the reread = %q, %v; want %q", reason, err, config.ReasonLockTimeout)
+					}
+				}
+				return real(parent, name)
+			}
+			t.Cleanup(func() { readHeldSettings = real })
+
+			tc.edit(f, t)
+			requireBlockedEntries(t, blocked, tc.after(f)...)
+			requireDegraded(t, blocked, notices, false)
+			if !read {
+				t.Fatal("the reread never read the changed file under the sidecar")
+			}
+			readHeldSettings = real
+			if reason, _, err := config.Persist(target, "blocked_paths", config.BlockedPathAdd(f.home, f.paths([]string{"x"})[0], "")); reason != config.ReasonNone || err != nil {
+				t.Fatalf("Persist after the reread = %q, %v; want %q", reason, err, config.ReasonNone)
+			}
+		})
+	}
+}
+
+func TestBlockedPathsReread_SymlinkedSettingsFolderCreatesNothingInItsTarget(t *testing.T) {
+	f := newRereadFixture(t)
+	target := declaredScopeDir(t)
+	if err := os.Symlink(target, filepath.Join(f.project, ".codemeld")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	f.writeGlobal(t)
+	f.writeProject(t, "p1")
+	f.writeLocal(t, "l1")
+	blocked := f.blocked(t, true)
+	notices := recordNotices(blocked)
+	listing := dirNames(t, target)
+	requireBlockedEntries(t, blocked, f.fromProject("p1"), f.fromLocal("l1"))
+
+	f.editProject(t, "p1", "p2")
+	requireBlockedEntries(t, blocked, f.fromProject("p1", "p2"), f.fromLocal("l1"))
+	f.editLocal(t, "l2")
+	requireBlockedEntries(t, blocked, f.fromProject("p1", "p2"), f.fromLocal("l2"))
+	requireDegraded(t, blocked, notices, false)
+	if got := dirNames(t, target); !slices.Equal(got, listing) {
+		t.Fatalf("link target listing = %q, want %q", got, listing)
+	}
+}
+
+func TestBlockedPathsReread_MissingOrNonDirectorySettingsFolderCreatesNothing(t *testing.T) {
+	cases := map[string]func(t *testing.T, codemeld string){
+		"missing": func(*testing.T, string) {},
+		"regular file": func(t *testing.T, codemeld string) {
+			if err := os.WriteFile(codemeld, []byte("x"), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRereadFixture(t)
+			f.writeGlobal(t, "g1")
+			setup(t, filepath.Join(f.project, ".codemeld"))
+			blocked := f.blocked(t, true)
+			notices := recordNotices(blocked)
+			listing := dirNames(t, f.project)
+			requireBlockedEntries(t, blocked, f.fromGlobal("g1"))
+
+			f.editGlobal(t, "g2")
+			requireBlockedEntries(t, blocked, f.fromGlobal("g2"))
+			requireDegraded(t, blocked, notices, false)
+			if got := dirNames(t, f.project); !slices.Equal(got, listing) {
+				t.Fatalf("project listing = %q, want %q", got, listing)
+			}
+			if info, err := os.Lstat(filepath.Join(f.project, ".codemeld")); err == nil && info.IsDir() {
+				t.Fatal("the reread created a .codemeld folder")
+			}
+		})
+	}
+}
+
+func TestBlockedPathsReread_ReplacedSettingsFolderIsNeverReadUnderTheHeldSidecar(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(map[bool]string{false: "replaced", true: "swapped and restored"}[restore], func(t *testing.T) {
+			f := newRereadFixture(t)
+			f.writeGlobal(t)
+			f.writeProject(t, "p1")
+			blocked := f.blocked(t, true)
+			requireBlockedEntries(t, blocked, f.fromProject("p1"))
+
+			dir := filepath.Dir(f.projectFile)
+			original, replacement := filepath.Join(f.project, "original"), filepath.Join(f.project, "replacement")
+			if err := os.Mkdir(replacement, 0o700); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(replacement, "settings.yaml"), []byte(blockedYAML(f.paths([]string{"r"})...)), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			f.editProject(t, "p1", "p2")
+
+			rename := func(from, to string) {
+				if err := os.Rename(from, to); err != nil {
+					t.Errorf("Rename %s: %v", from, err)
+				}
+			}
+			swapped := false
+			real := readHeldSettings
+			readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+				if swapped {
+					return real(parent, name)
+				}
+				swapped = true
+				rename(dir, original)
+				rename(replacement, dir)
+				data, info, err := real(parent, name)
+				if restore {
+					rename(dir, replacement)
+					rename(original, dir)
+				}
+				return data, info, err
+			}
+			t.Cleanup(func() { readHeldSettings = real })
+
+			if !restore {
+				requireBlockedEntries(t, blocked, f.fromProject("p1"))
+				requireBlockedEntries(t, blocked, f.fromProject("r"))
+				return
+			}
+			requireBlockedEntries(t, blocked, f.fromProject("p1", "p2"))
+			if !swapped {
+				t.Fatal("the reread never read the held folder")
+			}
+		})
+	}
+}
+
+func TestReadSettingsAt(t *testing.T) {
+	dir := declaredScopeDir(t)
+	parent, err := openSettingsDir(dir)
+	if err != nil {
+		t.Fatalf("openSettingsDir: %v", err)
+	}
+	t.Cleanup(func() { _ = parent.Close() })
+	write := func(name string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	read := func(name string) (data []byte, info fs.FileInfo, err error) {
+		t.Helper()
+		within(t, "readSettingsAt", func() { data, info, err = readSettingsAt(parent, name) })
+		return data, info, err
+	}
+
+	write("valid", []byte("blocked_paths: []\n"))
+	if data, info, err := read("valid"); err != nil || string(data) != "blocked_paths: []\n" || info.Size() != int64(len(data)) {
+		t.Fatalf("valid = %q, %v, %v", data, info, err)
+	}
+	if _, _, err := read("absent"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("absent err = %v, want not-exist", err)
+	}
+	mkfifo(t, filepath.Join(dir, "fifo"))
+	if _, _, err := read("fifo"); !errors.Is(err, errSettingsUnreadable) {
+		t.Fatalf("FIFO err = %v, want %v", err, errSettingsUnreadable)
+	}
+	if err := os.Symlink(filepath.Join(dir, "valid"), filepath.Join(dir, "link")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if data, _, err := read("link"); err == nil || errors.Is(err, fs.ErrNotExist) || data != nil {
+		t.Fatalf("symlink = %q, %v; want a read failure", data, err)
+	}
+	write("oversized", bytes.Repeat([]byte("#"), maxSettingsBytes+1))
+	if _, _, err := read("oversized"); !errors.Is(err, errSettingsUnreadable) {
+		t.Fatalf("oversized err = %v, want %v", err, errSettingsUnreadable)
+	}
+	if os.Geteuid() != 0 {
+		write("unreadable", nil)
+		if err := os.Chmod(filepath.Join(dir, "unreadable"), 0o000); err != nil {
+			t.Fatalf("Chmod: %v", err)
+		}
+		if _, _, err := read("unreadable"); err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, errSettingsChanged) {
+			t.Fatalf("unreadable err = %v, want a read failure", err)
+		}
+	}
+
+	mid := func(during func()) {
+		real := readSettingsBytes
+		readSettingsBytes = func(f *os.File, limit int64) ([]byte, error) {
+			during()
+			return real(f, limit)
+		}
+		t.Cleanup(func() { readSettingsBytes = real })
+	}
+	write("grows", []byte("blocked_paths: []\n"))
+	mid(func() {
+		file, err := os.OpenFile(filepath.Join(dir, "grows"), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("OpenFile: %v", err)
+			return
+		}
+		defer func() { _ = file.Close() }()
+		if _, err := file.WriteString("\n"); err != nil {
+			t.Errorf("WriteString: %v", err)
+		}
+	})
+	if data, _, err := read("grows"); !errors.Is(err, errSettingsChanged) || data != nil {
+		t.Fatalf("growing file = %q, %v; want %v", data, err, errSettingsChanged)
+	}
+
+	write("replaced", []byte("blocked_paths: []\n"))
+	write("replacement", []byte("blocked_paths: [x]"))
+	mid(func() {
+		if err := os.Rename(filepath.Join(dir, "replacement"), filepath.Join(dir, "replaced")); err != nil {
+			t.Errorf("Rename: %v", err)
+		}
+	})
+	if data, _, err := read("replaced"); !errors.Is(err, errSettingsChanged) || data != nil {
+		t.Fatalf("atomically replaced file = %q, %v; want %v", data, err, errSettingsChanged)
+	}
 }

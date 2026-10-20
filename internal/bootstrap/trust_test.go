@@ -19,7 +19,7 @@ import (
 	"codemeld.dev/codemeld/internal/trust"
 )
 
-const approvePrompt = "Approve this project?"
+const approvePrompt = "Trust this folder?"
 
 func writeProjectSettings(t *testing.T, root, content string) {
 	t.Helper()
@@ -105,8 +105,8 @@ func TestGateTrust_TerminalAnswers(t *testing.T) {
 			if !strings.Contains(stderr.String(), approvePrompt) || !strings.Contains(stderr.String(), "[y/N]") {
 				t.Fatalf("stderr = %q, want the two-way approval prompt", stderr.String())
 			}
-			if !strings.Contains(stderr.String(), root) || !strings.Contains(stderr.String(), projectSettingsPath(root)) {
-				t.Fatalf("prompt = %q, want it to name the project root and the settings file", stderr.String())
+			if !strings.Contains(stderr.String(), "Do you trust "+root+"?") {
+				t.Fatalf("prompt = %q, want it to ask about the project root", stderr.String())
 			}
 			if strings.Contains(stderr.String(), agentinstr.FileName) || strings.Contains(stderr.String(), " 0 ") {
 				t.Fatalf("stderr = %q, want no instruction file mention and no zero count", stderr.String())
@@ -566,19 +566,25 @@ func writeLocalProjectSettings(t *testing.T, root, content string) {
 	}
 }
 
-func TestAskTrust_NamesExactlyThePresentGatedPaths(t *testing.T) {
+func TestAskTrust_PromptMatchesThePresentGatedInputs(t *testing.T) {
+	settingsOnly := "This folder has its own codemeld settings, which can let commands run and files be changed without asking you.\n" +
+		"If you say no, codemeld still runs but ignores those settings.\n"
+	vcsOnly := "This folder has its own version-control commands for codemeld, which can let commands run without asking you.\n" +
+		"If you say no, codemeld still runs but ignores those commands.\n"
+	both := "This folder has its own codemeld settings and version-control commands, which can let commands run and files be changed without asking you.\n" +
+		"If you say no, codemeld still runs but ignores those settings and commands.\n"
 	cases := []struct {
 		name               string
 		shared, local, vcs bool
+		body               string
 	}{
-		{"shared settings only", true, false, false},
-		{"local settings only", false, true, false},
-		{"vcs only", false, false, true},
-		{"all three", true, true, true},
+		{"shared settings only", true, false, false, settingsOnly},
+		{"local settings only", false, true, false, settingsOnly},
+		{"vcs only", false, false, true, vcsOnly},
+		{"all three", true, true, true, both},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
 			root := t.TempDir()
 			if tc.shared {
 				writeProjectSettings(t, root, "model: {}\n")
@@ -589,28 +595,17 @@ func TestAskTrust_NamesExactlyThePresentGatedPaths(t *testing.T) {
 			if tc.vcs {
 				mkdirAll(t, projectVCSTemplateDir(root))
 			}
-
-			var stderr strings.Builder
-			gateTrust(home, root, root, strings.NewReader("n\n"), &stderr, true)
-			prompt, _, found := strings.Cut(stderr.String(), approvePrompt)
-			if !found {
-				t.Fatalf("stderr = %q, want the approval prompt", stderr.String())
+			present, determinate := presentGatedPaths(root)
+			if !determinate {
+				t.Fatalf("presentGatedPaths(%s) is indeterminate", root)
 			}
 
-			for _, check := range []struct {
-				text    string
-				present bool
-			}{
-				{projectSettingsPath(root), tc.shared},
-				{config.LocalSettingsPath(root), tc.local},
-				{projectVCSTemplateDir(root), tc.vcs},
-				{"VCS command templates", tc.vcs},
-				{"commands codemeld runs", tc.vcs},
-				{"project settings", tc.shared || tc.local},
-			} {
-				if strings.Contains(prompt, check.text) != check.present {
-					t.Fatalf("prompt = %q, want %q named = %v", prompt, check.text, check.present)
-				}
+			var stderr strings.Builder
+			askTrust(strings.NewReader("n\n"), &stderr, root, present)
+
+			want := "Do you trust " + root + "?\n" + tc.body + "Trust this folder? [y/N] "
+			if stderr.String() != want {
+				t.Fatalf("prompt = %q, want %q", stderr.String(), want)
 			}
 		})
 	}

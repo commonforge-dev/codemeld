@@ -16,7 +16,7 @@ func TestNewSessionTempDir_CreatesPrivateFolderNamedForThisProcess(t *testing.T)
 	if runtime.GOOS == "windows" {
 		t.Skip("session temp folders are created only where the confinement runs")
 	}
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	t.Setenv("TMPDIR", tmp)
 
 	first, err := newSessionTempDir()
@@ -44,6 +44,37 @@ func TestNewSessionTempDir_CreatesPrivateFolderNamedForThisProcess(t *testing.T)
 	}
 	if second == first {
 		t.Fatalf("two calls both returned %q", first)
+	}
+}
+
+func TestNewSessionTempDir_StoresTheResolvedFolderUnderASymlinkedTMPDIR(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("session temp folders are created only where the confinement runs")
+	}
+	target := canonicalTempDir(t)
+	alias := filepath.Join(canonicalTempDir(t), "alias")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", alias)
+
+	first, err := newSessionTempDir()
+	if err != nil {
+		t.Fatalf("newSessionTempDir: %v", err)
+	}
+	conf := &confinement{tmpDir: first}
+	replacement, rollback, err := conf.prepareReplacement()
+	if err != nil {
+		t.Fatalf("prepareReplacement: %v", err)
+	}
+	t.Cleanup(func() { _ = rollback() })
+	for _, dir := range []string{first, replacement} {
+		if got := filepath.Dir(dir); got != target {
+			t.Fatalf("folder %q is in %q, want the resolved %q", dir, got, target)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("write into %q: %v", dir, err)
+		}
 	}
 }
 
@@ -190,4 +221,180 @@ func TestNewSessionTempDir_IsPrivateUnderOwnerMaskingUmask(t *testing.T) {
 	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("folder %q has mode %v, want 0700", dir, info.Mode().Perm())
 	}
+}
+
+func TestNewSessionTempDir_UnderOwnerReadMaskingUmaskEndsPrivate(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the no-follow mode correction is exercised only on linux")
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	prev := syscall.Umask(0o477)
+	t.Cleanup(func() { syscall.Umask(prev) })
+
+	dir, err := newSessionTempDir()
+	syscall.Umask(prev)
+	if err != nil {
+		t.Fatalf("newSessionTempDir: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat %q: %v", dir, err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("folder %q has mode %v, want 0700", dir, info.Mode().Perm())
+	}
+}
+
+func TestNewSessionTempDir_RelativeTMPDIRYieldsAnAbsolutePathInTheResolvedParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("session temp folders are created only where the confinement runs")
+	}
+	base := canonicalTempDir(t)
+	if err := os.Mkdir(filepath.Join(base, "rel"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(base)
+	t.Setenv("TMPDIR", "rel")
+
+	dir, err := newSessionTempDir()
+	if err != nil {
+		t.Fatalf("newSessionTempDir: %v", err)
+	}
+	if !filepath.IsAbs(dir) {
+		t.Fatalf("folder %q is not absolute", dir)
+	}
+	if got, want := filepath.Dir(dir), filepath.Join(base, "rel"); got != want {
+		t.Fatalf("folder %q is in %q, want %q", dir, got, want)
+	}
+}
+
+func TestNewSessionTempDir_UnresolvableParentFailsBeforeCreation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("session temp folders are created only where the confinement runs")
+	}
+	base := canonicalTempDir(t)
+	missing := filepath.Join(base, "missing")
+	t.Setenv("TMPDIR", missing)
+
+	dir, err := newSessionTempDir()
+	if err == nil {
+		t.Fatalf("newSessionTempDir = %q, want an error", dir)
+	}
+	if dir != "" {
+		t.Fatalf("newSessionTempDir returned %q with its error", dir)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("%q holds %d entries after the failure, want none", base, len(entries))
+	}
+}
+
+type swappedTempDir struct {
+	created   string
+	original  string
+	outside   string
+	keep      string
+	parentDir string
+}
+
+func swapSessionTempDirAt(t *testing.T, seam *func(string)) *swappedTempDir {
+	t.Helper()
+	s := &swappedTempDir{parentDir: canonicalTempDir(t), outside: canonicalTempDir(t)}
+	t.Setenv("TMPDIR", s.parentDir)
+	s.keep = filepath.Join(s.outside, "keep")
+	if err := os.WriteFile(s.keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(s.outside, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	prev := *seam
+	*seam = func(created string) {
+		s.created = created
+		s.original = created + ".original"
+		if err := os.Rename(created, s.original); err != nil {
+			t.Errorf("rename %q: %v", created, err)
+			return
+		}
+		if err := os.Symlink(s.outside, created); err != nil {
+			t.Errorf("symlink %q: %v", created, err)
+		}
+	}
+	t.Cleanup(func() {
+		*seam = prev
+		if s.original != "" {
+			_ = removeSessionTempDir(s.original)
+		}
+	})
+	return s
+}
+
+func (s *swappedTempDir) requireOutsideUnchanged(t *testing.T) {
+	t.Helper()
+	info, err := os.Stat(s.outside)
+	if err != nil {
+		t.Fatalf("stat outside folder: %v", err)
+	}
+	if info.Mode().Perm() != 0o750 {
+		t.Fatalf("outside folder mode %v, want 0750", info.Mode().Perm())
+	}
+	data, err := os.ReadFile(s.keep)
+	if err != nil || string(data) != "keep" {
+		t.Fatalf("outside file = %q, %v; want it unchanged", data, err)
+	}
+}
+
+func (s *swappedTempDir) requireLinkGone(t *testing.T) {
+	t.Helper()
+	if _, err := os.Lstat(s.created); !os.IsNotExist(err) {
+		t.Fatalf("substituted link %q still present (err %v)", s.created, err)
+	}
+}
+
+func TestNewSessionTempDir_SwapBeforeTheModeOpenFailsSafely(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the no-follow mode correction is exercised only on linux")
+	}
+	s := swapSessionTempDirAt(t, &beforeSessionTempDirChmod)
+
+	dir, err := newSessionTempDir()
+	if err == nil {
+		t.Fatalf("newSessionTempDir = %q, want an error after the swap", dir)
+	}
+	if dir != "" {
+		t.Fatalf("newSessionTempDir returned %q with its error", dir)
+	}
+	if s.created == "" {
+		t.Fatal("the seam before the mode open was not called")
+	}
+	s.requireOutsideUnchanged(t)
+	s.requireLinkGone(t)
+}
+
+func TestNewSessionTempDir_SwapAfterModeCorrectionReturnsTheCreatedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("session temp folders are created only where the confinement runs")
+	}
+	s := swapSessionTempDirAt(t, &afterSessionTempDirChmod)
+
+	dir, err := newSessionTempDir()
+	if err != nil {
+		t.Fatalf("newSessionTempDir: %v", err)
+	}
+	if dir != s.created {
+		t.Fatalf("newSessionTempDir = %q, want the created path %q", dir, s.created)
+	}
+	if got := filepath.Dir(dir); got != s.parentDir {
+		t.Fatalf("folder %q is in %q, want %q", dir, got, s.parentDir)
+	}
+	s.requireOutsideUnchanged(t)
+
+	if err := removeSessionTempDir(dir); err != nil {
+		t.Fatalf("removeSessionTempDir: %v", err)
+	}
+	s.requireLinkGone(t)
+	s.requireOutsideUnchanged(t)
 }

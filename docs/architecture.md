@@ -117,7 +117,8 @@ a filtered copy of codemeld's own.
   resolves `refused`. The ruleset is always the ABI-3 one, never go-landlock's best-effort mode,
   which succeeds without restricting anything on a kernel lacking Landlock. Reads are allowed
   everywhere except the blocked paths, which always include `~/.codemeld`.
-- **seccomp.** In both modes the filter denies `socket` and `socketpair`, `ptrace` and
+- **seccomp.** In both modes the filter denies `socket`, every `socketpair` except a Unix stream
+  pair (`AF_UNIX`, `SOCK_STREAM`, optionally non-blocking or close-on-exec), `ptrace` and
   `process_vm_readv`/`process_vm_writev`, System V shared memory, message queues and semaphores,
   `mq_open`, the io_uring calls, `unshare`, `setns`, mount and the new mount API, `pivot_root`,
   `chroot`, `bpf`, and namespace-creating `clone` flags. `clone3` fails with `ENOSYS`. Plan also denies the `chmod`, `chown`, extended-attribute and timestamp calls
@@ -127,21 +128,37 @@ a filtered copy of codemeld's own.
   grants each canonical top-level entry of the project except `.codemeld`, skipping entries that
   resolve to the project root itself, into `.codemeld`, or outside the project, plus the session's private temp folder
   (mode `0700`, under `$TMPDIR`, removed when the session ends). Blocked paths are carved out of
-  every write root, and `/dev/shm` itself is never writable. Declared `writable_folders` and shared
-  temp folders are not policy write roots today.
-- **Network.** Confined commands cannot create sockets of any family. In Auto edits, an approved
-  network-access action runs with a filter variant that permits non-raw `AF_INET`/`AF_INET6` sockets
-  and `socketpair` for that one command. Every other deny stays, including Unix sockets and io_uring.
+  every write root, and `/dev/shm` itself is never writable. Auto edits also grants each effective
+  declared `writable_folders` entry, still subject to blocked paths and the protected `.codemeld`
+  folders. In Auto edits on a constrained launch whose settings files are not broken, these folders
+  also let codemeld's own `edit`, `create` and `mkdir` tools write inside them without a prompt;
+  they add no authority for `delete` or `move`. Commands see the session's private temp folder as
+  `TMPDIR`; codemeld adds no separate temp grant beyond it, so `/tmp` or the launch `$TMPDIR` is
+  writable only through an effective declared `writable_folders` entry covering its resolved
+  location, or when that location is within a granted canonical project top-level entry (never the
+  project root itself, `.codemeld`, or an entry resolving outside the project). Blocked paths, the protected `.codemeld` folders and `/dev/shm` itself are carved
+  out of every write root, including declared folders and the private temp folder, so a folder that
+  holds a carved-out path is not writable itself; only its other existing entries are.
+- **Network.** Apart from a network command the user approves in Auto edits (terms under
+  [Execution capability](#execution-capability)), confined commands cannot create sockets that
+  reach another process, of any family.
+  The one socket they may create is a Unix stream socketpair: its two ends are connected only to each
+  other and can never connect to, or accept, an outside peer. Tokio and Python asyncio create one at
+  startup. In Auto edits, an approved network-access action runs with a filter variant that permits
+  non-raw `AF_INET`/`AF_INET6` sockets for that one command. Every other deny stays, including Unix
+  sockets, datagram and seqpacket socketpairs, and io_uring.
 
 ### The self-test gate
 
 Before resolving `constrained`, startup runs the helper against a scratch fixture and observes each
 property from inside a real helper process: writes and truncation outside the write roots, reading
-protected state, creating a Unix stream socket, an IPv4 stream socket, and a socketpair, System V
+protected state, creating a Unix stream socket and an IPv4 stream socket (denied) and a Unix stream
+socketpair (allowed), System V
 and POSIX IPC, `ptrace` and reading another process's
 environment, user namespaces, mount, `chroot`, metadata changes, `no_new_privs`, the fixed
 environment, and foreign-architecture system calls. A denied case runs first as an unrestricted
-control, so a host that already denies it is told apart from a broken boundary. Any unexpected
+control, so a host that already denies it is told apart from a broken boundary. An allowed case
+has no control, so a host that denies the socketpair resolves `refused`. Any unexpected
 result resolves `refused` with a reason naming the leg. A kernel version alone therefore never
 makes a host `constrained`.
 
@@ -236,7 +253,7 @@ Host names resolve through Go's standard resolver inside the dialer; codemeld do
 own. Provider, ChatGPT, and Exa requests use Go's default transport, so they honor the standard
 proxy environment variables; `web_fetch` never uses a proxy. Shell commands are separate: an
 unconfined command has the account's ordinary network access, while a confined one cannot create
-sockets (see [Execution capability](#execution-capability)).
+sockets that reach another process (see [Execution capability](#execution-capability)).
 
 Any other network call codemeld makes itself is a bug. That is enforced by code review. The
 no-network tests cover two scenarios only: an idle startup with web research enabled makes no

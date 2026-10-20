@@ -65,15 +65,11 @@ func railWrapText(text string, width int) string {
 }
 
 const (
-	answeredRecordHeading      = "Answered:"
-	clarificationRecordHeading = "Asked for clarification:"
+	answeredRecordHeading      = "Answered (ask_user):"
+	clarificationRecordHeading = "Asked for clarification (ask_user):"
 	unansweredRecordText       = "(no answer)"
 )
 
-// This is a display projection shared by the live transcript and /resume; the role-tool
-// result stays the model's copy, so nothing here carries an id, a tool name or JSON. The
-// clarification field is what tells the two apart, never an empty answers list — a submitted
-// form nobody answered has one of those too.
 func questionRecordBlock(res QuestionResult) string {
 	var heading string
 	var body []string

@@ -10,9 +10,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 
@@ -570,10 +574,14 @@ func recoverChildJournals(home, projectRoot string, stdin io.Reader, stderr io.W
 }
 
 func askJournalChoice(reader *bufio.Reader, stderr io.Writer, u subagent.Unresolved) subagent.Choice {
-	_, _ = fmt.Fprintf(stderr, journalRecoveryPrompt, u.Path)
+	if len(u.Moves) > 0 {
+		writeMoveGroupPrompt(stderr, u)
+	} else {
+		_, _ = fmt.Fprintf(stderr, journalRecoveryPrompt, shown(u.Path))
+	}
 	line, err := reader.ReadString('\n')
 	answer := strings.ToLower(strings.TrimSpace(line))
-	if err != nil && answer == "" {
+	if err != nil && (answer == "" || len(u.Moves) > 0) {
 		return subagent.ChoiceDefer
 	}
 	switch answer {
@@ -586,38 +594,62 @@ func askJournalChoice(reader *bufio.Reader, stderr io.Writer, u subagent.Unresol
 	}
 }
 
+func writeMoveGroupPrompt(stderr io.Writer, u subagent.Unresolved) {
+	_, _ = fmt.Fprintln(stderr, "codemeld: these moves by an interrupted child agent run changed afterwards, so codemeld will not undo them on its own:")
+	for _, move := range u.Moves {
+		label := "move"
+		if move.Pending {
+			label = "attempted move, outcome unknown"
+		}
+		_, _ = fmt.Fprintf(stderr, "  %s: %s -> %s\n", label, shown(move.Source), shown(move.Destination))
+	}
+	_, _ = fmt.Fprintln(stderr, "  [k] keep every path named above as it is now")
+	if slices.Contains(u.Choices, subagent.ChoiceRestore) {
+		_, _ = fmt.Fprintln(stderr, "  [r] put every path named above back to how it was before the child agent ran")
+		_, _ = fmt.Fprintln(stderr, "  [d] decide later (default)")
+		_, _ = fmt.Fprint(stderr, "Keep, put back, or decide later? [k/r/d] ")
+		return
+	}
+	_, _ = fmt.Fprintln(stderr, "  [d] decide later (default)")
+	_, _ = fmt.Fprintf(stderr, "  put back is not available: %s\n", shown(u.RestoreRefusal))
+	_, _ = fmt.Fprint(stderr, "Keep or decide later? [k/d] ")
+}
+
 func reportJournalRecovery(stderr io.Writer, report subagent.Report) {
 	if report.Empty() {
 		return
 	}
 	if len(report.LeftAlone) > 0 {
-		_, _ = fmt.Fprintln(stderr, "codemeld: a record of an interrupted child agent run was left untouched.")
+		_, _ = fmt.Fprintln(stderr, "codemeld: could not tell whether a child agent run recorded here has ended, so its files were left as they are.")
 		for _, left := range report.LeftAlone {
-			_, _ = fmt.Fprintf(stderr, "  left alone: %s (%s)\n", left.Path, left.Reason)
+			_, _ = fmt.Fprintf(stderr, "  left alone: %s (%s)\n", shown(left.Path), shown(left.Reason))
 		}
 	}
 	if len(report.Restored) > 0 || len(report.Kept) > 0 || len(report.Retained) > 0 {
 		_, _ = fmt.Fprintln(stderr, "codemeld: a previous session ended while a child agent was still writing files.")
 		for _, path := range report.Restored {
-			_, _ = fmt.Fprintf(stderr, "  put back: %s\n", path)
+			_, _ = fmt.Fprintf(stderr, "  put back: %s\n", shown(path))
 		}
 		for _, path := range report.Kept {
-			_, _ = fmt.Fprintf(stderr, "  kept as it is now, as you asked: %s\n", path)
+			_, _ = fmt.Fprintf(stderr, "  kept as it is now, as you asked: %s\n", shown(path))
 		}
 		for _, retained := range report.Retained {
 			for _, note := range retained.Notes {
-				_, _ = fmt.Fprintf(stderr, "  not put back: %s\n", note)
+				_, _ = fmt.Fprintf(stderr, "  not put back: %s\n", shown(note))
 			}
-			if len(retained.Moves) == 0 {
-				_, _ = fmt.Fprintf(stderr, "  codemeld asks what to do with these files the next time you start it here; its record of the run is %s\n", retained.Path)
+			for _, dir := range retained.Dirs {
+				_, _ = fmt.Fprintf(stderr, "  left in place: %s (codemeld does not delete a directory a child agent created once it holds other entries or was replaced)\n", shown(dir))
+			}
+			if len(retained.Moves) == 0 && len(retained.Dirs) == 0 {
+				_, _ = fmt.Fprintf(stderr, "  codemeld asks what to do with these files the next time you start it here; its record of the run is %s\n", shown(retained.Path))
 				continue
 			}
 			if len(retained.Notes) > 0 {
 				_, _ = fmt.Fprintln(stderr, "  codemeld asks what to do with these files the next time you start it here")
 			}
-			reportHeldMoves(stderr, retained.Moves, false, "  codemeld cannot undo these moves on its own and will not ask about them; fix them by hand")
-			reportHeldMoves(stderr, retained.Moves, true, "  codemeld tries again to finish undoing the interrupted moves the next time you start it here")
-			_, _ = fmt.Fprintf(stderr, "  its record of the run is %s\n", retained.Path)
+			reportHeldMoves(stderr, retained.Moves, false, "  codemeld asks what to do with these moves the next time you start it here interactively")
+			reportHeldMoves(stderr, retained.Moves, true, "  codemeld tries again to finish undoing these interrupted moves the next time you start it here; it does not ask about them")
+			_, _ = fmt.Fprintf(stderr, "  its record of the run is %s\n", shown(retained.Path))
 		}
 	}
 }
@@ -628,12 +660,20 @@ func reportHeldMoves(stderr io.Writer, moves []subagent.HeldMove, resumes bool, 
 		if move.Resumes != resumes {
 			continue
 		}
-		_, _ = fmt.Fprintf(stderr, "  move not undone: %s -> %s (%s)\n", move.Source, move.Destination, move.Reason)
+		_, _ = fmt.Fprintf(stderr, "  move not undone: %s -> %s (%s)\n", shown(move.Source), shown(move.Destination), shown(move.Reason))
 		listed = true
 	}
 	if listed {
 		_, _ = fmt.Fprintln(stderr, instruction)
 	}
+}
+
+func shown(s string) string {
+	if utf8.ValidString(s) && !strings.ContainsAny(s, `"\`) && !strings.Contains(s, " -> ") && !strings.Contains(s, ": ") &&
+		!strings.Contains(s, " (") && !strings.ContainsFunc(s, func(r rune) bool { return !unicode.IsGraphic(r) }) {
+		return s
+	}
+	return strconv.QuoteToGraphic(s)
 }
 
 // errUnsafeSettingsRead names no distinguishing detail on purpose: the refused path is

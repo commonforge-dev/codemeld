@@ -44,7 +44,7 @@
     },
     "attribution": {
       "type": "boolean",
-      "description": "Whether outbound OpenRouter chat-completion requests identify codemeld via the HTTP-Referer and X-Title headers. Defaults to true when omitted, is global-only (a per-project settings file carrying it fails to load), and affects no other provider. The settings tab of the /permissions overlay toggles it."
+      "description": "Whether outbound OpenRouter chat-completion requests identify codemeld via the HTTP-Referer, X-Title, and X-OpenRouter-Categories headers. Defaults to true when omitted, is global-only (a per-project settings file carrying it fails to load), and affects no other provider. The /settings overlay toggles it."
     },
     "mode": {
       "type": "object",
@@ -98,7 +98,7 @@
     "writable_folders": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
-      "description": "Project-settings-only list of declared folder strings. Entries are parsed and validated as absolute folders (including expanded ~-relative paths), and invalid paths are skipped with notices, but the entries do not yet widen what Auto may write. Rejected in the global settings file."
+      "description": "Project-settings-only list of declared folder strings. Entries are parsed and validated as absolute folders (including expanded ~-relative paths), and invalid paths are skipped with notices. Each effective folder widens the write area of commands Auto runs inside the confinement boundary, still subject to blocked paths and the protected codemeld folders; the folders do not yet authorize codemeld's own in-process file writes. Rejected in the global settings file."
     },
     "web_research": {
       "type": "object",
@@ -114,7 +114,7 @@
     "confinement": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Global-only confinement settings: any occurrence in a per-project settings file is rejected at load. program_lookup chooses where confined programs are found (friendly, the default, uses the PATH codemeld launched with; strict uses only the fixed system PATH). shared_temp_folders is the saved answer to whether confined commands may write to the shared temp folders; absent means not yet answered.",
+      "description": "Global-only confinement settings: any occurrence in a per-project settings file is rejected at load. program_lookup chooses where confined programs are found (friendly, the default, uses the PATH codemeld launched with; strict uses only the fixed system PATH). shared_temp_folders is kept for compatibility: allow and deny remain valid but the key has no effect.",
       "properties": {
         "program_lookup": { "enum": ["friendly", "strict"] },
         "shared_temp_folders": { "enum": ["allow", "deny"] }

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -105,7 +106,7 @@ func landlockRules(p Policy, view fsView) ([]pathRule, error) {
 	if b.shm, err = b.withResolved([]string{devShm}); err != nil {
 		return nil, err
 	}
-	for _, root := range append(append([]string{}, p.WriteRoots...), p.TmpDir) {
+	for _, root := range b.outerRoots(append(append([]string{}, p.WriteRoots...), p.TmpDir)) {
 		t, isDir, ok, err := b.resolve(root)
 		if err != nil {
 			return nil, err
@@ -118,6 +119,32 @@ func landlockRules(p Policy, view fsView) ([]pathRule, error) {
 		}
 	}
 	return b.rules, nil
+}
+
+func (b *ruleBuilder) outerRoots(roots []string) []string {
+	var unique []string
+	for _, r := range roots {
+		if !slices.Contains(unique, r) {
+			unique = append(unique, r)
+		}
+	}
+	var out []string
+	for _, r := range unique {
+		if !slices.ContainsFunc(unique, func(o string) bool { return o != r && b.covers(o, r) }) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (b *ruleBuilder) covers(outer, inner string) bool {
+	if !within(inner, outer) {
+		return false
+	}
+	if !coveredBy(inner, b.shm) {
+		return true
+	}
+	return slices.ContainsFunc(b.shm, func(s string) bool { return outer != s && within(outer, s) })
 }
 
 func (b *ruleBuilder) walkRead(dir string) error {

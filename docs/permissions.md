@@ -104,11 +104,14 @@ segment. A mode switch affects later calls only.
 - Authorize-all-before-run still gates execution, so a denied sibling stops the whole pipeline or
   chain before anything runs.
 
-**Auto edits' auto-approval is bounded to the project tree and is not a grant.**
-`autoEditsPosture`/`isInScopeFileTool` cover exactly `create`/`edit`/`mkdir`/`move`
+**Auto edits' auto-approval is bounded to the project tree and declared writable folders, and is
+not a grant.** `autoEditsPosture`/`isInScopeFileTool` cover exactly `create`/`edit`/`mkdir`/`move`
 (`isAutoEditsTool`) whose resolved target is `IsDescendantOrEqual` the canonical `ProjectRoot`.
-Everything else — unconfined shell, `delete`, VCS mutations, any out-of-root target — keeps its
-ordinary prompt. It decides **per call**, emitting `mode_auto`/`once` with no grant fields and no
+`inWritableFolder` also covers `create`/`edit`/`mkdir` whose resolved target is inside a declared
+`writable_folders` entry, only on a constrained launch whose settings are not broken
+(`liveWritableFolders`); `delete` and `move` gain no authority from that list. Everything else —
+unconfined shell, `delete`, VCS mutations, any other out-of-root target — keeps its ordinary
+prompt. It decides **per call**, emitting `mode_auto`/`once` with no grant fields and no
 turn-cache entry (`emitModeAuto`), so it can never widen what a later grant match covers. A switch
 back to Build binds from the next tool call; a call already in flight keeps the mode it started
 with.
@@ -257,23 +260,27 @@ leaves one best-effort `structured_read_refused` planning record, so both facts 
 and what was held out — stay reconstructable. Permission prompts stay serialized by the shared
 prompt gate alone (`internal/bootstrap/promptgate.go`); the scheduler adds no prompt locking.
 
-## Out-of-root file writes are reachable only by explicit per-write approval
+<a id="out-of-root-file-writes-are-reachable-only-by-explicit-per-write-approval"></a>
+
+## Out-of-root file writes need explicit approval or a declared writable folder
 
 A structured `edit`/`create` outside the project root is sometimes legitimate, but must never happen
-silently or by a blanket escape hatch.
+silently outside a folder the user declared, or by a blanket escape hatch.
 
 An out-of-root resolved **real** target is not a hard `TargetError`: it routes to the four-option
 prompt (once / session / this project / globally), anchored on the resolved real out-of-root folder,
 and denial leaves no grant and no approval. The grant's `path_scope` may point outside the project
-but its settings **file** stays in the project. Auto edits never auto-approves an out-of-root write
-(`isInScopeFileTool` stays project-root-bound). Symlink-escape protection is preserved by the
-real-folder path scope plus `create`'s invoke-time `O_NOFOLLOW` / `os.SameFile` / exact-parent
-guards (`internal/filetools/{resolve,edit,create,delete}.go`).
+but its settings **file** stays in the project. Auto edits auto-approves an out-of-root write only
+for `edit`/`create`/`mkdir` inside a declared `writable_folders` entry, on a constrained launch
+whose settings are not broken (`inWritableFolder`, `liveWritableFolders`); `isInScopeFileTool`
+stays project-root-bound, and a declared folder adds no authority for `delete` or `move`.
+Symlink-escape protection is preserved by the real-folder path scope plus `create`'s invoke-time
+`O_NOFOLLOW` / `os.SameFile` / exact-parent guards (`internal/filetools/{resolve,edit,create,delete}.go`).
 
 **Exception — a [declared write scope](#a-declared-write-scope-is-a-ceiling-not-another-route-to-yes)**
 (`--files-authorized`): a path the caller named on the command line before the run started is
-written with no prompt even when it resolves outside the root. An out-of-root write is still never
-auto-approved by a *mode*.
+written with no prompt even when it resolves outside the root. Apart from the declared
+`writable_folders` case above, an out-of-root write is still never auto-approved by a *mode*.
 
 ## `delete` is irreversible, so it is never auto-approved and never recursively wipes
 
