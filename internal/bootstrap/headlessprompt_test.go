@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
@@ -208,6 +209,75 @@ func TestTerminalPrompter_ShellBlockedPathsNotice(t *testing.T) {
 				t.Fatalf("notice printed after the options:\n%s", got)
 			}
 		})
+	}
+}
+
+func renderTerminalPrompt(t *testing.T, req permissions.MatchRequest, disp dispatch.PromptDisplay, note string) string {
+	t.Helper()
+	var out bytes.Buffer
+	p := newTerminalPrompter(strings.NewReader("1\n"), &out)
+	if _, err := p.build(req, disp)(context.Background(), permissions.ScopeEscalation{Note: note}); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	return out.String()
+}
+
+func TestTerminalPrompter_PrintsTheNoteBeforeTheChoices(t *testing.T) {
+	const note = "System One check failed: out of credits on OpenRouter — asking you instead"
+	direct := permissions.MatchRequest{Kind: matchKindDirect, Subject: "rm x", PathScope: "/proj"}
+	for _, tc := range []struct {
+		name string
+		req  permissions.MatchRequest
+		disp dispatch.PromptDisplay
+	}{
+		{"direct", direct, dispatch.PromptDisplay{Action: "Run command", Subject: "rm x"}},
+		{"tool", permissions.MatchRequest{Kind: matchKindTool, Subject: "create", PathScope: "/proj"}, dispatch.PromptDisplay{Action: "Create file", Subject: "notes.md"}},
+		{"exceptional", direct, dispatch.PromptDisplay{Action: "Allow network access", Subject: "rm x", ExceptionalAuthority: "network access"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			with := renderTerminalPrompt(t, tc.req, tc.disp, note)
+			line := "  " + note + "\n"
+			if strings.Count(with, line) != 1 || strings.Index(with, line) > strings.Index(with, "[1]") {
+				t.Fatalf("note line not printed once before [1]:\n%s", with)
+			}
+			if without := renderTerminalPrompt(t, tc.req, tc.disp, ""); strings.Replace(with, line, "", 1) != without {
+				t.Fatalf("an empty note changed the prompt:\n%s\n--- with note ---\n%s", without, with)
+			}
+		})
+	}
+}
+
+func TestTerminalPrompter_HostPromptIgnoresTheNote(t *testing.T) {
+	req := hostRequest("web_fetch", "docs.example.com")
+	disp := dispatch.PromptDisplay{HostRequest: "https://docs.example.com/guide"}
+	if with, without := renderTerminalPrompt(t, req, disp, "System One check: no Venice API key"), renderTerminalPrompt(t, req, disp, ""); with != without {
+		t.Fatalf("host prompt changed with a note:\n%s", with)
+	}
+}
+
+func TestTerminalPrompter_BoundsAHostileNote(t *testing.T) {
+	note := "System One check failed:\n\tout of credits\r\x1b[2J on OpenRouter " + strings.Repeat("x", 200)
+	req := permissions.MatchRequest{Kind: matchKindTool, Subject: "create", PathScope: "/proj"}
+	got := renderTerminalPrompt(t, req, dispatch.PromptDisplay{Action: "Create file", Subject: "notes.md"}, note)
+	if strings.ContainsAny(got, "\r\t\x1b") {
+		t.Fatalf("the note wrote a raw control byte to the terminal: %q", got)
+	}
+	var row string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "System One check failed") {
+			row = strings.TrimPrefix(line, "  ")
+		}
+	}
+	if row != permissions.BoundPromptFact(note) {
+		t.Fatalf("note row = %q, want the bounded fact on one physical line", row)
+	}
+	for _, esc := range []string{`\x0A`, `\x09`, `\x0D`, `\x1B`} {
+		if !strings.Contains(row, esc) {
+			t.Fatalf("note row %q does not show %s as a visible escape", row, esc)
+		}
+	}
+	if !strings.HasSuffix(row, "…") || utf8.RuneCountInString(row) != 121 {
+		t.Fatalf("note row %q is not cut at 120 code points with an ellipsis", row)
 	}
 }
 

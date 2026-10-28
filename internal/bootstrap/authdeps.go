@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
@@ -63,14 +64,15 @@ type productionAuthorizer struct {
 	modeActive           *mode.ActiveState
 	declaredCommands     []permissions.DeclaredCommand
 	executionConstrained bool
-	writableFolders      []string
+	writable             *writableFoldersReader
 	blocked              *permissions.BlockedPaths
+	systemOne            *systemOneCheck
 	localNotice          sync.Once
 }
 
-func liveWritableFolders(constrained, broken bool, folders []string) []string {
+func liveWritableFolders(constrained, broken bool, live *writableFoldersReader) []string {
 	if constrained && !broken {
-		return folders
+		return live.current()
 	}
 	return nil
 }
@@ -119,7 +121,7 @@ func newProductionAuthorizer(app *tui.App, cache *config.Cache, turn *permission
 		notices:          bgNoticeRenderer{app: app},
 		modeActive:       modeActive,
 		declaredCommands: cache.DeclaredCommands(),
-		writableFolders:  cache.WritableFolders(),
+		writable:         newWritableFoldersReader(cache),
 		display: promptDisplayData{
 			projectRoot:             cache.ProjectRoot(),
 			launchDir:               launchDir,
@@ -158,18 +160,21 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 	modeCtx.DeclaredCommands = a.declaredCommands
 	modeCtx.ExecutionConstrained = a.executionConstrained
 	modeCtx.SettingsBroken = a.settingsBroken()
-	modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, modeCtx.SettingsBroken, a.writableFolders)
+	modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, modeCtx.SettingsBroken, a.writable)
 
 	store := a.activeStore()
 	if m, ok := callMode(ctx, a.modeActive); ok {
 		modeCtx.Mode = m
 	}
 	display := a.buildPromptDisplay(markExceptional(disp, req, modeCtx), req.PathScope)
+	texts := systemOneLiteralTexts{}
+	texts.add(req, disp.Subject)
 	deps := permissions.AuthorizeDeps{
-		Grants:       a.grants,
-		Cache:        a.grants,
-		Prompt:       a.prompts.Build(req, display),
-		PersistGrant: a.persistGrant(store, req.PathScope),
+		Grants:         a.grants,
+		Cache:          a.grants,
+		Prompt:         a.prompts.Build(req, display),
+		PersistGrant:   a.persistGrant(store, req.PathScope),
+		PrePromptCheck: a.systemOne.bind(store, texts),
 		EmitPromptShown: func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
 			return events.EmitPromptShown(store, subjectKind, subject, pathScope, directTokens, id.CommandSubject, id.RequestSubject)
 		},
@@ -182,6 +187,7 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 		EmitMatched: func(subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject string) error {
 			return events.EmitMatchedIdentity(store, subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject)
 		},
+		EmitPromptWait: promptWaitEmitter(store),
 	}
 	return permissions.Authorize(ctx, req, modeCtx, deps)
 }
@@ -213,17 +219,20 @@ func (a *productionAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispat
 	store := a.activeStore()
 	activeMode, _ := callMode(ctx, a.modeActive)
 	broken := a.settingsBroken()
+	folders := liveWritableFolders(a.executionConstrained, broken, a.writable)
 
 	batch := make([]permissions.BatchRequest, len(reqs))
 	displays := make([]PromptDisplay, len(reqs))
 	modeCtxs := make([]permissions.ModeContext, len(reqs))
+	texts := systemOneLiteralTexts{}
 	for i, r := range reqs {
+		texts.add(r.Req, r.Display.Subject)
 		modeCtx := r.ModeCtx
 		modeCtx.ProjectRoot = a.display.projectRoot
 		modeCtx.DeclaredCommands = a.declaredCommands
 		modeCtx.ExecutionConstrained = a.executionConstrained
 		modeCtx.SettingsBroken = broken
-		modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, broken, a.writableFolders)
+		modeCtx.WritableFolders = folders
 		modeCtx.Mode = activeMode
 		batch[i] = permissions.BatchRequest{Req: r.Req, ModeCtx: modeCtx}
 		modeCtxs[i] = modeCtx
@@ -231,10 +240,11 @@ func (a *productionAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispat
 	}
 
 	deps := permissions.AuthorizeDeps{
-		Grants:       a.grants,
-		Cache:        a.grants,
-		PromptBatch:  a.buildBatchPrompt(displays, modeCtxs),
-		PersistGrant: a.persistGrant(store, reqs[0].Req.PathScope),
+		Grants:         a.grants,
+		Cache:          a.grants,
+		PromptBatch:    a.buildBatchPrompt(displays, modeCtxs),
+		PersistGrant:   a.persistGrant(store, reqs[0].Req.PathScope),
+		PrePromptCheck: a.systemOne.bind(store, texts),
 		EmitPromptShown: func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
 			return events.EmitPromptShown(store, subjectKind, subject, pathScope, directTokens, id.CommandSubject, id.RequestSubject)
 		},
@@ -247,6 +257,7 @@ func (a *productionAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispat
 		EmitMatched: func(subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject string) error {
 			return events.EmitMatchedIdentity(store, subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject)
 		},
+		EmitPromptWait: promptWaitEmitter(store),
 	}
 	return permissions.AuthorizeBatch(ctx, batch, deps)
 }
@@ -275,17 +286,20 @@ func (a *productionAuthorizer) AuthorizeIndependent(ctx context.Context, reqs []
 	store := a.activeStore()
 	activeMode, _ := callMode(ctx, a.modeActive)
 	broken := a.settingsBroken()
+	folders := liveWritableFolders(a.executionConstrained, broken, a.writable)
 
 	batch := make([]permissions.BatchRequest, len(reqs))
 	displays := make([]PromptDisplay, len(reqs))
 	targets := make([]string, len(reqs))
+	texts := systemOneLiteralTexts{}
 	for i, r := range reqs {
+		texts.add(r.Req, r.Display.Subject)
 		modeCtx := r.ModeCtx
 		modeCtx.ProjectRoot = a.display.projectRoot
 		modeCtx.Mode = activeMode
 		modeCtx.ExecutionConstrained = a.executionConstrained
 		modeCtx.SettingsBroken = broken
-		modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, broken, a.writableFolders)
+		modeCtx.WritableFolders = folders
 		batch[i] = permissions.BatchRequest{Req: r.Req, ModeCtx: modeCtx}
 		displays[i] = a.buildPromptDisplay(markExceptional(r.Display, r.Req, modeCtx), r.Req.PathScope)
 		targets[i] = r.PreparedTarget
@@ -295,6 +309,7 @@ func (a *productionAuthorizer) AuthorizeIndependent(ctx context.Context, reqs []
 		Grants:            a.grants,
 		Cache:             a.grants,
 		PromptIndependent: a.buildIndependentPrompt(displays, targets),
+		PrePromptCheck:    a.systemOne.bind(store, texts),
 		PersistGrantAt: func(index int) func(permissions.PermissionEntry) (permissions.PermissionEntry, error) {
 			return a.persistGrant(store, reqs[index].Req.PathScope)
 		},
@@ -310,8 +325,16 @@ func (a *productionAuthorizer) AuthorizeIndependent(ctx context.Context, reqs []
 		EmitMatched: func(subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject string) error {
 			return events.EmitMatchedIdentity(store, subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject)
 		},
+		EmitPromptWait: promptWaitEmitter(store),
 	}
 	return permissions.AuthorizeIndependent(ctx, batch, deps)
+}
+
+func promptWaitEmitter(store *sessions.Store) func(time.Duration, int, string) error {
+	return func(waited time.Duration, prompts int, ended string) error {
+		_, err := events.Append(store, events.PermissionPromptWait{WaitedMs: waited.Milliseconds(), Prompts: prompts, Ended: ended})
+		return err
+	}
 }
 
 func callMode(ctx context.Context, active *mode.ActiveState) (string, bool) {
@@ -387,6 +410,7 @@ type independentQuestionKey struct {
 	host                 string
 	clearEnvironment     bool
 	narrowerScope        string
+	note                 string
 	action               string
 	grantStoredSubject   string
 	outOfRootFileWrite   bool
@@ -415,6 +439,7 @@ func independentQuestions(prompts []permissions.BatchPromptRequest, displays []P
 			host:                 p.Req.Host,
 			clearEnvironment:     p.Req.ClearEnvironment,
 			narrowerScope:        p.Escalation.NarrowerScope,
+			note:                 p.Escalation.Note,
 			action:               display.Action,
 			grantStoredSubject:   display.GrantStoredSubject,
 			outOfRootFileWrite:   display.OutOfRootFileWrite,
@@ -571,10 +596,12 @@ func buildBatchPromptRequest(prompts []permissions.BatchPromptRequest, displays 
 	// when a stage broadens an already-approved narrower folder. Dropping it here would hide
 	// trust-scope information a per-stage prompt shows; batching is presentation-only.
 	escalations := make([]string, len(prompts))
+	notes := make([]string, len(prompts))
 	var normalized []permissions.StageNormalization
 	for i, p := range prompts {
 		stages[i] = displayAt(displays, p.Index).Subject
 		escalations[i] = p.Escalation.NarrowerScope
+		notes[i] = p.Escalation.Note
 		normalized = append(normalized, modeCtxAt(modeCtxs, p.Index).Stages...)
 	}
 	whole := modeCtxAt(modeCtxs, rep.Index)
@@ -585,6 +612,7 @@ func buildBatchPromptRequest(prompts []permissions.BatchPromptRequest, displays 
 	}
 	pr.BatchedStages = stages
 	pr.BatchedEscalations = escalations
+	pr.BatchedNotes = notes
 	pr.Subject = ""
 	// One choice authorizes every stage, so the summary describes the whole batch rather than
 	// the representative stage it borrows the shared facts from.

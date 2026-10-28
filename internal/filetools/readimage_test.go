@@ -139,6 +139,11 @@ func TestReadImageTool_SamePathReplacementCannotSplitTheCapture(t *testing.T) {
 	}
 }
 
+func TestReadImageTool_AdvertisePathContract(t *testing.T) {
+	tool, _ := newImageTool(t)
+	assertReadPathContract(t, tool.Advertise())
+}
+
 func TestReadImageTool_ResolveTargetResolvesExplicitOutsideImage(t *testing.T) {
 	tool, _ := newImageTool(t)
 	outside, err := filepath.EvalSymlinks(t.TempDir())

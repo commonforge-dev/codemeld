@@ -153,6 +153,13 @@ func TestRenderHelp_ConnectDescribesKeySetup(t *testing.T) {
 	}
 }
 
+func TestRenderHelp_ListsSystemOne(t *testing.T) {
+	out := RenderHelp(BuildRegistry(nil))
+	if !strings.Contains(out, "/systemone — Show or set the System One read-only check (a validated model, or off)") {
+		t.Errorf("help output missing the /systemone row:\n%s", out)
+	}
+}
+
 func TestRenderHelp_ListsSettingsNotPermissions(t *testing.T) {
 	out := RenderHelp(BuildRegistry(nil))
 	if !strings.Contains(out, "/settings") || !strings.Contains(out, "Show and change settings and stored permission grants") {
@@ -167,7 +174,7 @@ func TestRenderHelp_ListsSettingsNotPermissions(t *testing.T) {
 // order (step 2).
 func TestRenderHelp_AlphabeticalByName(t *testing.T) {
 	out := RenderHelp(BuildRegistry(nil))
-	order := []string{"clear", "connect", "context", "effort", "exit", "help", "mode", "model", "rename", "resume", "settings", "status"}
+	order := []string{"clear", "connect", "context", "effort", "exit", "help", "mode", "model", "rename", "resume", "settings", "skills", "status", "systemone"}
 	last := -1
 	for _, name := range order {
 		idx := strings.Index(out, "/"+name)

@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/sessions"
@@ -71,6 +74,13 @@ type summaryJSON struct {
 			PartialResponses  int    `json:"partial_responses"`
 			OmittedResponses  int    `json:"omitted_responses"`
 		} `json:"cached_input_tokens"`
+		CostUSD struct {
+			Availability      string   `json:"availability"`
+			USD               *float64 `json:"usd"`
+			ReportedResponses int      `json:"reported_responses"`
+			PartialResponses  int      `json:"partial_responses"`
+			OmittedResponses  int      `json:"omitted_responses"`
+		} `json:"cost_usd"`
 	} `json:"totals"`
 }
 
@@ -312,6 +322,95 @@ func TestSessionsSummary_CachedTokenAvailability(t *testing.T) {
 	}
 }
 
+func TestSessionsSummary_CostAvailability(t *testing.T) {
+	response := func(cost *float64, partial bool) sessions.Record {
+		return eventRecord(events.KindModelResponse, events.ModelResponse{
+			Provider: "openrouter", ModelID: "m", InputTokens: 10, OutputTokens: 5,
+			CostUSD: cost, CostUSDPartial: partial, Anomaly: []string{},
+		})
+	}
+	usd := func(v float64) *float64 { return &v }
+
+	tests := []struct {
+		name         string
+		records      []sessions.Record
+		wantText     string
+		availability string
+		wantUSD      *float64
+		counts       [3]int
+	}{
+		{
+			name:         "no model responses",
+			records:      []sessions.Record{textMsg("user", "hello")},
+			wantText:     "  cost (provider-reported, USD): unavailable (no model_response reported cost)",
+			availability: "unavailable",
+		},
+		{
+			name:         "no response reports cost",
+			records:      []sessions.Record{response(nil, false), response(nil, false)},
+			wantText:     "  cost (provider-reported, USD): unavailable (no model_response reported cost)",
+			availability: "unavailable",
+			counts:       [3]int{0, 0, 2},
+		},
+		{
+			name:         "every response reports a cost",
+			records:      []sessions.Record{response(usd(0.25), false), response(usd(0.5), false)},
+			wantText:     "  cost (provider-reported, USD): 0.75 (exact; every one of the 2 recorded responses reported a non-partial cost)",
+			availability: "exact",
+			wantUSD:      usd(0.75),
+			counts:       [3]int{2, 0, 0},
+		},
+		{
+			name:         "a reported zero stays present",
+			records:      []sessions.Record{response(usd(0), false)},
+			wantText:     "  cost (provider-reported, USD): 0 (exact; every one of the 1 recorded responses reported a non-partial cost)",
+			availability: "exact",
+			wantUSD:      usd(0),
+			counts:       [3]int{1, 0, 0},
+		},
+		{
+			name:         "one omitted cost makes the total a lower bound",
+			records:      []sessions.Record{response(usd(0.25), false), response(nil, false)},
+			wantText:     "  cost (provider-reported, USD): >= 0.25 (lower bound; of the recorded responses, reported exact by 1, partial by 0, not reported by 1)",
+			availability: "lower_bound",
+			wantUSD:      usd(0.25),
+			counts:       [3]int{1, 0, 1},
+		},
+		{
+			name:         "a partial cost makes the total a lower bound",
+			records:      []sessions.Record{response(usd(0.25), true)},
+			wantText:     "  cost (provider-reported, USD): >= 0.25 (lower bound; of the recorded responses, reported exact by 0, partial by 1, not reported by 0)",
+			availability: "lower_bound",
+			wantUSD:      usd(0.25),
+			counts:       [3]int{0, 1, 0},
+		},
+		{
+			name:         "an overflowing addition is skipped and counted partial",
+			records:      []sessions.Record{response(usd(1.7e308), false), response(usd(1.7e308), false)},
+			wantText:     "  cost (provider-reported, USD): >= 1.7e+308 (lower bound; of the recorded responses, reported exact by 1, partial by 1, not reported by 0)",
+			availability: "lower_bound",
+			wantUSD:      usd(1.7e308),
+			counts:       [3]int{1, 1, 0},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeSession(t, "cost", tt.records)
+			if out := runSummary(t, path); !strings.Contains(out, tt.wantText) {
+				t.Fatalf("summary output missing %q:\n%s", tt.wantText, out)
+			}
+			c := summaryJSONOf(t, path).Totals.CostUSD
+			gotCounts := [3]int{c.ReportedResponses, c.PartialResponses, c.OmittedResponses}
+			if c.Availability != tt.availability || gotCounts != tt.counts {
+				t.Fatalf("cost_usd = %+v, want availability %q counts %v", c, tt.availability, tt.counts)
+			}
+			if (c.USD == nil) != (tt.wantUSD == nil) || (c.USD != nil && *c.USD != *tt.wantUSD) {
+				t.Fatalf("cost_usd.usd = %v, want %v", c.USD, tt.wantUSD)
+			}
+		})
+	}
+}
+
 func TestSessionsSummary_SparseValidSession(t *testing.T) {
 	path := writeSession(t, "sparse", []sessions.Record{
 		textMsg("user", "hello"),
@@ -436,6 +535,9 @@ func TestSessionsSummaryHelp(t *testing.T) {
 				"contributes only its duration and provider/model pair",
 				"a lower bound when any",
 				"unavailable when none reported it",
+				"Provider-reported cost (cost_usd) is summed and reported the same way, scoped to",
+				"Cost is assumed to be USD, following OpenRouter's convention;",
+				"nor converted.",
 				"current execution capability",
 				"refused with its refusal",
 				"reason, or not recorded",
@@ -445,6 +547,10 @@ func TestSessionsSummaryHelp(t *testing.T) {
 				"and auto-edits commands sandboxed but made every command ask; a failed or unsupported",
 				"check ran them outside the sandbox with ordinary prompts. Neither value describes",
 				"build mode, which always runs commands outside the sandbox.",
+				"The approval_* totals measure time spent waiting on permission prompts",
+				"so overlapping waits are counted once, not summed.",
+				"count of questions shown, since one question can cover several requests.",
+				"totals and have no separate failure count, so a wait that was not cancelled was",
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("summary help missing %q:\n%s", want, out)
@@ -494,5 +600,150 @@ func TestSessionsSummary_ExecutionCapability(t *testing.T) {
 				t.Fatalf("execution = %s, want %s", got, tt.wantJSON)
 			}
 		})
+	}
+}
+
+func promptWait(endMs, waitedMs int64, prompts int, ended string) sessions.Event {
+	ev := eventRecord(events.KindPermissionPromptWait, events.PermissionPromptWait{
+		WaitedMs: waitedMs, Prompts: prompts, Ended: ended,
+	})
+	ev.Timestamp = fixtureTime.Add(time.Duration(endMs) * time.Millisecond)
+	return ev
+}
+
+func approvalTotals(t *testing.T, path string) map[string]json.RawMessage {
+	t.Helper()
+	var report struct {
+		Totals map[string]json.RawMessage `json:"totals"`
+	}
+	if err := json.Unmarshal([]byte(runSummary(t, path, "--json")), &report); err != nil {
+		t.Fatalf("summary --json is not one JSON document: %v", err)
+	}
+	return report.Totals
+}
+
+func TestSessionsSummary_ApprovalWaitIsTheUnionOfIntervals(t *testing.T) {
+	path := writeSession(t, "waits", []sessions.Record{
+		promptWait(1000, 200, 1, "cancelled"),
+		promptWait(1200, 1000, 3, "answered"),
+		promptWait(5000, 300, 2, "failed"),
+	})
+
+	totals := approvalTotals(t, path)
+	for field, want := range map[string]string{
+		"approval_wait_ms":         "1300",
+		"approval_requests":        "6",
+		"approval_waits_cancelled": "1",
+	} {
+		if got := string(totals[field]); got != want {
+			t.Fatalf("%s = %s, want %s (totals=%v)", field, got, want, totals)
+		}
+	}
+
+	out := runSummary(t, path)
+	want := "  permission-prompt wait: 1300 ms across 6 requests (1 waits cancelled)\n"
+	if !strings.Contains(out, want) {
+		t.Fatalf("summary output missing %q:\n%s", want, out)
+	}
+	if !strings.Contains(out, "  cost (provider-reported, USD): unavailable (no model_response reported cost)\n"+want) {
+		t.Fatalf("permission-prompt wait line is not right after the cost line:\n%s", out)
+	}
+}
+
+func TestSessionsSummary_ZeroDurationWaitStillShowsTheLine(t *testing.T) {
+	out := runSummary(t, writeSession(t, "zero-wait", []sessions.Record{
+		promptWait(1000, 0, 1, "answered"),
+	}))
+	want := "  permission-prompt wait: 0 ms across 1 requests (0 waits cancelled)\n"
+	if !strings.Contains(out, want) {
+		t.Fatalf("summary output missing %q:\n%s", want, out)
+	}
+}
+
+func TestSessionsSummary_NoWaitRecordsReportZeroAndNoLine(t *testing.T) {
+	shown := eventRecord(events.KindPermissionPromptShown, events.PermissionPromptShown{
+		SubjectKind: "tool", Subject: "Bash", PathScope: "/proj",
+	})
+	tests := []struct {
+		name    string
+		records []sessions.Record
+	}{
+		{"no permission records", []sessions.Record{textMsg("user", "hello")}},
+		{"legacy prompt shown without waits", []sessions.Record{textMsg("user", "hello"), shown}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeSession(t, "no-waits", tt.records)
+			totals := approvalTotals(t, path)
+			for _, field := range []string{"approval_wait_ms", "approval_requests", "approval_waits_cancelled"} {
+				if got := string(totals[field]); got != "0" {
+					t.Fatalf("%s = %q, want 0 present (totals=%v)", field, got, totals)
+				}
+			}
+			if out := runSummary(t, path); strings.Contains(out, "permission-prompt wait") {
+				t.Fatalf("summary printed a permission-prompt wait line with no wait records:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestSessionsSummary_ApprovalWaitOutOfRangeIsAnError(t *testing.T) {
+	epoch := time.Unix(0, 0).UTC()
+	wait := func(ts time.Time, waitedMs int64, prompts int) sessions.Record {
+		ev := promptWait(0, waitedMs, prompts, "answered")
+		ev.Timestamp = ts
+		return ev
+	}
+	tests := []struct {
+		name    string
+		records []sessions.Record
+	}{
+		{"union and request sum overflow", []sessions.Record{
+			wait(epoch, math.MaxInt64, math.MaxInt),
+			wait(epoch.Add(time.Millisecond), math.MaxInt64, 1),
+		}},
+		{"union overflow only", []sessions.Record{
+			wait(epoch, math.MaxInt64, 1),
+			wait(epoch.Add(time.Millisecond), math.MaxInt64, 1),
+		}},
+		{"request sum overflow only", []sessions.Record{
+			wait(epoch, 0, math.MaxInt),
+			wait(epoch, 0, 1),
+		}},
+		{"interval start underflow", []sessions.Record{
+			wait(epoch.Add(-2*time.Millisecond), math.MaxInt64, 1),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeSession(t, "overflow", tt.records)
+			for _, extra := range [][]string{nil, {"--json"}} {
+				var stdout, stderr bytes.Buffer
+				args := append([]string{"codemeld", "sessions", "summary", path}, extra...)
+				if code := Run(context.Background(), args, &stdout, &stderr); code != 1 {
+					t.Fatalf("%v: exit = %d, want 1 (stdout=%q stderr=%q)", extra, code, stdout.String(), stderr.String())
+				}
+				if !strings.Contains(stderr.String(), "permission-prompt wait totals exceed the representable range") {
+					t.Fatalf("%v: stderr = %q, want the range error", extra, stderr.String())
+				}
+				if stdout.Len() != 0 {
+					t.Fatalf("%v: stdout = %q, want no report", extra, stdout.String())
+				}
+			}
+		})
+	}
+}
+
+func TestSessionsSummary_ApprovalWaitAtTheRangeLimitIsExact(t *testing.T) {
+	ev := promptWait(0, math.MaxInt64, math.MaxInt, "answered")
+	ev.Timestamp = time.Unix(0, 0).UTC().Add(-time.Millisecond)
+	totals := approvalTotals(t, writeSession(t, "limit", []sessions.Record{ev}))
+	for field, want := range map[string]string{
+		"approval_wait_ms":  strconv.FormatInt(math.MaxInt64, 10),
+		"approval_requests": strconv.Itoa(math.MaxInt),
+	} {
+		if got := string(totals[field]); got != want {
+			t.Fatalf("%s = %s, want %s (totals=%v)", field, got, want, totals)
+		}
 	}
 }

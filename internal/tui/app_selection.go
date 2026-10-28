@@ -17,16 +17,30 @@ const responseCopyNotice = "Response copied"
 // codemeld detected while emitting — never that the terminal rejected the update.
 const copyFailedNoticePrefix = "Could not copy: "
 
+const copyNoticeLifetime = 4 * time.Second
+
+func (a *App) copyNotice(text string) {
+	a.Notice(text)
+	seq := a.noticeSeq.Load()
+	a.afterFunc(copyNoticeLifetime, func() {
+		a.streamUpdate(func() {
+			if a.noticeSeq.Load() == seq {
+				a.ClearNotice()
+			}
+		})
+	})
+}
+
 func (a *App) copyControlPayload(body string, response bool) {
 	if err := a.input.copyToClipboard(body); err != nil {
 		a.Notice(copyFailedNoticePrefix + err.Error())
 		return
 	}
 	if response {
-		a.Notice(responseCopyNotice)
+		a.copyNotice(responseCopyNotice)
 		return
 	}
-	a.Notice(codeCopyNotice)
+	a.copyNotice(codeCopyNotice)
 }
 
 // clickRegion is one activatable control: the byte range it occupies in a view's
@@ -284,7 +298,7 @@ func (a *App) handleAppMouse(event *tcell.EventMouse, action tview.MouseAction) 
 			if id, ok := a.statusRegions.activate(); ok {
 				a.status.clearSelection()
 				_ = a.input.copyToClipboard(id)
-				a.Notice(statusCopyNotice)
+				a.copyNotice(statusCopyNotice)
 				a.app.SetFocus(a.status)
 				return nil, action
 			}

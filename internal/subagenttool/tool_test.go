@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,14 +41,6 @@ func toolCallChunk(id, name string) []byte { return indexedToolCallChunk(0, id, 
 
 func toolCallChunkWithArgs(id, name, arguments string) []byte {
 	return []byte(fmt.Sprintf(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":%q,"arguments":%q}}]},"finish_reason":"tool_calls"}]}`, id, name, arguments))
-}
-
-// Byte-identical consecutive calls would trip the turn's repeat check before the step cap.
-func alternatingEmptyArgs(i int) string {
-	if i%2 == 0 {
-		return "{}"
-	}
-	return "{ }"
 }
 
 // The tool_calls index is what the stream assembler keys a call on, so a round carrying more
@@ -314,11 +307,11 @@ func anyList(paths []string) []any {
 	return list
 }
 
-func TestDelegate_AdvertiseMetadata(t *testing.T) {
+func TestGeneralAgent_AdvertiseMetadata(t *testing.T) {
 	tool := newHarness(t).tool()
 
-	if tool.Name() != "delegate" {
-		t.Fatalf("Name() = %q, want delegate", tool.Name())
+	if tool.Name() != "general_agent" {
+		t.Fatalf("Name() = %q, want general_agent", tool.Name())
 	}
 	if tool.SubjectKind() != "tool" {
 		t.Fatalf("SubjectKind() = %q, want tool", tool.SubjectKind())
@@ -356,22 +349,17 @@ func TestDelegate_AdvertiseMetadata(t *testing.T) {
 	if len(allowedArgs) != len(props) {
 		t.Fatalf("accepted arguments %v differ from the advertised properties %v", allowedArgs, props)
 	}
-	rule := "At least one of files, files_delete, files_move, or files_mkdir must name a path"
-	if !strings.Contains(md.Description, rule) {
-		t.Fatalf("Description = %q, want it to state the four-form rule %q", md.Description, rule)
+	rule := "Omit files, files_delete, files_move and files_mkdir, or pass them empty, to start a read-only child"
+	if !strings.Contains(md.Description, rule) || !strings.Contains(md.Description, "the only form usable in Plan mode") {
+		t.Fatalf("Description = %q, want it to state the read-only form %q and that Plan accepts only it", md.Description, rule)
 	}
 	if !strings.Contains(md.Description, "create only the exact directories listed in files_mkdir, which grant nothing inside them") {
 		t.Fatalf("Description = %q, want it to state that files_mkdir grants exact directory creation only", md.Description)
 	}
-	for name, others := range map[string]string{
-		"files":        "files_delete, files_move, or files_mkdir",
-		"files_delete": "files, files_move, or files_mkdir",
-		"files_move":   "files, files_delete, or files_mkdir",
-		"files_mkdir":  "files, files_delete, or files_move",
-	} {
+	for _, name := range []string{"files", "files_delete", "files_move", "files_mkdir"} {
 		form, _ := props[name].(map[string]any)
-		if desc, _ := form["description"].(string); !strings.Contains(desc, "Optional when "+others+" names a path.") {
-			t.Fatalf("%s description = %q, want it optional when %s names a path", name, desc, others)
+		if desc, _ := form["description"].(string); !strings.Contains(desc, "Optional; omit every path list for a read-only child.") {
+			t.Fatalf("%s description = %q, want it optional and naming the read-only form", name, desc)
 		}
 	}
 	mkdirs, _ := props["files_mkdir"].(map[string]any)
@@ -402,9 +390,9 @@ func TestDelegate_AdvertiseMetadata(t *testing.T) {
 	}
 }
 
-// TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn proves every argument fault is
+// TestGeneralAgent_RefusesMalformedCallsBeforeAnyChildTurn proves every argument fault is
 // decided before the child exists: no snapshot is taken, so no provider request is issued.
-func TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
+func TestGeneralAgent_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
 	dir := func(t *testing.T) string {
 		t.Helper()
 		d, err := filepath.EvalSymlinks(t.TempDir())
@@ -503,15 +491,6 @@ func TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
 			args[filesDeleteArg] = []any{"b.txt"}
 			return args
 		}, want: `argument "files_mkdir"[1]`},
-		{name: "no path in any of the four forms", args: func(string) map[string]any {
-			return mkdirDeclareArgs("do it", []string{})
-		}, want: `arguments "files", "files_delete", "files_move" and "files_mkdir" must name at least one path between them`},
-		{name: "missing both path lists", args: func(string) map[string]any {
-			return map[string]any{instructionsArg: "do it"}
-		}, want: "at least one path"},
-		{name: "empty files and files_delete arrays", args: func(string) map[string]any {
-			return declareArgs("do it", []string{}, []string{})
-		}, want: "at least one path"},
 		{name: "files_delete not an array", args: func(string) map[string]any {
 			return map[string]any{instructionsArg: "do it", filesDeleteArg: "a.txt"}
 		}, want: `argument "files_delete" must be an array of strings`},
@@ -552,7 +531,6 @@ func TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
 		{name: "non-string file entry", args: func(string) map[string]any {
 			return map[string]any{instructionsArg: "do it", filesArg: []any{"a.txt", 3}}
 		}, want: `argument "files"[1] must be a string`},
-		{name: "empty files array", args: func(string) map[string]any { return callArgs("do it") }, want: "at least one path"},
 		{name: "empty file entry", args: func(string) map[string]any { return callArgs("do it", "  ") }, want: `argument "files"[0] must not be empty`},
 		{name: "absolute file entry", args: func(string) map[string]any { return callArgs("do it", "/etc/passwd") }, want: "must be relative"},
 		{name: "home-relative file entry", args: func(string) map[string]any { return callArgs("do it", "~/secrets.txt") }, want: "must not be home-relative"},
@@ -598,14 +576,14 @@ func TestDelegate_RefusesMalformedCallsBeforeAnyChildTurn(t *testing.T) {
 	}
 }
 
-// TestDelegate_InstructionReachesTheChildByteIdentical pins the reason delegate takes
+// TestGeneralAgent_InstructionReachesTheChildByteIdentical pins the reason delegate takes
 // structured arguments: shell metacharacters survive because no shell is in the path.
-func TestDelegate_PrepareCanonicalizesWithoutStartingAChild(t *testing.T) {
+func TestGeneralAgent_PrepareCanonicalizesWithoutStartingAChild(t *testing.T) {
 	h := newHarness(t)
 
-	instruction, declared, remove, _, _, targets, err := h.tool().PrepareDelegate(callArgs("do it", "a.txt", "dir/sub/b.txt"))
+	instruction, declared, remove, _, _, targets, err := h.tool().PrepareGeneralAgent(callArgs("do it", "a.txt", "dir/sub/b.txt"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 	if remove != nil {
 		t.Fatalf("prepared delete declaration = %#v, want nil for an omitted files_delete", remove)
@@ -636,16 +614,16 @@ func TestDelegate_PrepareCanonicalizesWithoutStartingAChild(t *testing.T) {
 
 // Two leaves that share a missing parent both mutate that directory, so the shared parent has to
 // appear in each child's targets even though the declared leaves are disjoint.
-func TestDelegate_PrepareSharesTheMissingParentOfDisjointLeaves(t *testing.T) {
+func TestGeneralAgent_PrepareSharesTheMissingParentOfDisjointLeaves(t *testing.T) {
 	h := newHarness(t)
 
-	_, declaredA, _, _, _, targetsA, err := h.tool().PrepareDelegate(callArgs("first", "shared/a.txt"))
+	_, declaredA, _, _, _, targetsA, err := h.tool().PrepareGeneralAgent(callArgs("first", "shared/a.txt"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
-	_, declaredB, _, _, _, targetsB, err := h.tool().PrepareDelegate(callArgs("second", "shared/b.txt"))
+	_, declaredB, _, _, _, targetsB, err := h.tool().PrepareGeneralAgent(callArgs("second", "shared/b.txt"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 
 	shared := filepath.Join(h.dir, "shared")
@@ -659,48 +637,48 @@ func TestDelegate_PrepareSharesTheMissingParentOfDisjointLeaves(t *testing.T) {
 	if err := os.MkdirAll(shared, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	_, _, _, _, _, targetsExisting, err := h.tool().PrepareDelegate(callArgs("third", "shared/c.txt"))
+	_, _, _, _, _, targetsExisting, err := h.tool().PrepareGeneralAgent(callArgs("third", "shared/c.txt"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 	if slices.Contains(targetsExisting, shared) {
 		t.Fatalf("targets %v carry the existing parent %q, want only parents a create would make", targetsExisting, shared)
 	}
 }
 
-func TestDelegate_PreparedTargetsAreNotSharedBetweenCalls(t *testing.T) {
+func TestGeneralAgent_PreparedTargetsAreNotSharedBetweenCalls(t *testing.T) {
 	h := newHarness(t)
 
-	_, _, _, _, _, first, err := h.tool().PrepareDelegate(callArgs("do it", "dir/sub/b.txt"))
+	_, _, _, _, _, first, err := h.tool().PrepareGeneralAgent(callArgs("do it", "dir/sub/b.txt"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 	original := slices.Clone(first)
 	for i := range first {
 		first[i] = filepath.Join(h.dir, "elsewhere.txt")
 	}
-	_, _, _, _, _, second, err := h.tool().PrepareDelegate(callArgs("do it", "dir/sub/b.txt"))
+	_, _, _, _, _, second, err := h.tool().PrepareGeneralAgent(callArgs("do it", "dir/sub/b.txt"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 	if !slices.Equal(second, original) {
 		t.Fatalf("second preparation = %v, want the same targets %v", second, original)
 	}
 }
 
-func TestDelegate_PreparationRefusalCarriesTheInBandCorrective(t *testing.T) {
+func TestGeneralAgent_PreparationRefusalCarriesTheInBandCorrective(t *testing.T) {
 	h := newHarness(t)
 
-	_, _, _, _, _, _, err := h.tool().PrepareDelegate(callArgs("do it"))
+	_, _, _, _, _, _, err := h.tool().PrepareGeneralAgent(callArgs("do it", " "))
 	var refusal *PreparationError
 	if !errors.As(err, &refusal) {
-		t.Fatalf("PrepareDelegate error = %v, want a *PreparationError", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want a *PreparationError", err)
 	}
-	if !strings.Contains(refusal.Error(), ToolName) || !strings.Contains(refusal.Error(), "at least one path") {
+	if !strings.Contains(refusal.Error(), ToolName) || !strings.Contains(refusal.Error(), "must not be empty") {
 		t.Fatalf("error = %q, want it to name the tool and the fault", refusal.Error())
 	}
 
-	direct, ierr := h.tool().Invoke(t.Context(), callArgs("do it"))
+	direct, ierr := h.tool().Invoke(t.Context(), callArgs("do it", " "))
 	if ierr != nil {
 		t.Fatalf("Invoke error = %v, want nil", ierr)
 	}
@@ -714,13 +692,13 @@ func TestDelegate_PreparationRefusalCarriesTheInBandCorrective(t *testing.T) {
 
 // The child's ceiling is the set handed to invocation, never one re-derived from a declaration the
 // filesystem may have moved since.
-func TestDelegate_InvokeFromAPreparedDeclarationSkipsTheRawArguments(t *testing.T) {
+func TestGeneralAgent_InvokeFromAPreparedDeclarationSkipsTheRawArguments(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 	prepared := map[string]bool{filepath.Join(h.dir, "a.txt"): true}
 
-	res, err := h.tool().InvokeWithPreparedDelegate(t.Context(), "narrow the fix", prepared, nil, nil, nil)
+	res, err := h.tool().InvokeWithPreparedGeneralAgent(t.Context(), "narrow the fix", prepared, nil, nil, nil)
 	if err != nil {
-		t.Fatalf("InvokeWithPreparedDelegate error = %v, want nil", err)
+		t.Fatalf("InvokeWithPreparedGeneralAgent error = %v, want nil", err)
 	}
 	if res.ExitCode != 0 {
 		t.Fatalf("ExitCode = %d, want 0; stderr=%q", res.ExitCode, res.Stderr)
@@ -738,7 +716,7 @@ func TestDelegate_InvokeFromAPreparedDeclarationSkipsTheRawArguments(t *testing.
 	}
 }
 
-func TestDelegate_InstructionReachesTheChildByteIdentical(t *testing.T) {
+func TestGeneralAgent_InstructionReachesTheChildByteIdentical(t *testing.T) {
 	instruction := "run `make test` and $(echo hi)\nthen write \"the report\"\n\ttrailing tab"
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 
@@ -761,7 +739,7 @@ func TestDelegate_InstructionReachesTheChildByteIdentical(t *testing.T) {
 	}
 }
 
-func TestDelegate_ChildAdvertisesOnlyThePinnedToolSet(t *testing.T) {
+func TestGeneralAgent_ChildAdvertisesOnlyThePinnedToolSet(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 
 	if _, err := h.tool().Invoke(t.Context(), callArgs("do it", "a.txt")); err != nil {
@@ -824,7 +802,7 @@ func declaredReadOnly(spec vcs.ActionSpec) vcs.ActionSpec {
 }
 
 var pinnedChildTools = []string{
-	"create", "delegate", "delete", "edit", "file_count", "glob", "grep", "list", "mkdir", "move",
+	"create", "delete", "edit", "file_count", "general_agent", "glob", "grep", "list", "mkdir", "move",
 	"read", "read_image", "tree",
 }
 
@@ -881,7 +859,7 @@ func vcsChildCases(t *testing.T) []struct {
 
 // The child's VCS surface is whatever the realized registry classifies as read-only and
 // noncredential — nothing is admitted from the vcs_ name, the action, or the template's source.
-func TestDelegate_ChildVCSSurfaceFollowsRealizedRegistryMetadata(t *testing.T) {
+func TestGeneralAgent_ChildVCSSurfaceFollowsRealizedRegistryMetadata(t *testing.T) {
 	for _, tc := range vcsChildCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
@@ -909,7 +887,7 @@ func TestDelegate_ChildVCSSurfaceFollowsRealizedRegistryMetadata(t *testing.T) {
 
 // Advertising and execution read the one derived set, so a case that leaves an action
 // unadvertised must also keep it away from the parent's real dispatcher.
-func TestDelegate_ChildVCSCallsReachTheParentDispatcherOnlyWhenAdmitted(t *testing.T) {
+func TestGeneralAgent_ChildVCSCallsReachTheParentDispatcherOnlyWhenAdmitted(t *testing.T) {
 	for _, tc := range vcsChildCases(t) {
 		for _, name := range []string{"vcs_status", "vcs_diff", "vcs_commit"} {
 			t.Run(tc.name+"/"+name, func(t *testing.T) {
@@ -945,7 +923,7 @@ func TestDelegate_ChildVCSCallsReachTheParentDispatcherOnlyWhenAdmitted(t *testi
 // The advertised set is only a suggestion to the provider. A child that emits a tool name it
 // was never offered must be refused by the dispatcher rather than reaching the parent's real
 // one, where the call would be judged on the parent's permissions alone.
-func TestDelegate_ChildCallingAnUnadvertisedToolNeverReachesTheParentDispatcher(t *testing.T) {
+func TestGeneralAgent_ChildCallingAnUnadvertisedToolNeverReachesTheParentDispatcher(t *testing.T) {
 	for _, name := range []string{"bash", "vcs_commit", "web_fetch", "ask_user", "web_search"} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t,
@@ -977,7 +955,7 @@ func TestDelegate_ChildCallingAnUnadvertisedToolNeverReachesTheParentDispatcher(
 // Confinement narrows a mixed round rather than failing it: the permitted call beside a refused
 // one still reaches the parent dispatcher. This asserts reachability only, not the plan's
 // ordering or unit metadata.
-func TestDelegate_ConfinementLeavesPermittedCallsInTheSameRoundIntact(t *testing.T) {
+func TestGeneralAgent_ConfinementLeavesPermittedCallsInTheSameRoundIntact(t *testing.T) {
 	h := newHarness(t,
 		streamRound(indexedToolCallChunk(0, "call-1", "read"), indexedToolCallChunk(1, "call-2", "bash")),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -999,7 +977,7 @@ func TestDelegate_ConfinementLeavesPermittedCallsInTheSameRoundIntact(t *testing
 // directly, since no loop-level test can.
 func TestConfinedDispatcher_DispatchRefusesANonPinnedNameDirectly(t *testing.T) {
 	inner := &stubDispatcher{}
-	d := &confinedDispatcher{inner: inner, permitted: childPermittedTools(nil)}
+	d := &confinedDispatcher{inner: inner, permitted: childPermittedTools(nil, false)}
 
 	res, err := d.Dispatch(t.Context(), turn.AssembledToolCall{ID: "call-1", Name: "bash"})
 	if err != nil {
@@ -1020,7 +998,7 @@ func TestConfinedDispatcher_DispatchRefusesANonPinnedNameDirectly(t *testing.T) 
 	}
 }
 
-func TestDelegate_CarriesInheritedModeAndDeclaredWriteIntoAuthorization(t *testing.T) {
+func TestGeneralAgent_CarriesInheritedModeAndDeclaredWriteIntoAuthorization(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 
 	if _, err := h.tool().Invoke(t.Context(), callArgs("do it", "a.txt", "dir/sub/b.txt")); err != nil {
@@ -1046,12 +1024,12 @@ func TestDelegate_CarriesInheritedModeAndDeclaredWriteIntoAuthorization(t *testi
 	if !mc.ChildAgent {
 		t.Fatal("ChildAgent = false, want the ceiling marked as a child declaration")
 	}
-	if len(mc.DelegateWrite) != 0 {
-		t.Fatalf("DelegateWrite = %v, want empty — the child has made no delegate call of its own", mc.DelegateWrite)
+	if len(mc.GeneralAgentWrite) != 0 {
+		t.Fatalf("GeneralAgentWrite = %v, want empty — the child has made no delegate call of its own", mc.GeneralAgentWrite)
 	}
 }
 
-func TestDelegate_MutatingFileToolsReachAuthorizationInsteadOfBeingWithheld(t *testing.T) {
+func TestGeneralAgent_MutatingFileToolsReachAuthorizationInsteadOfBeingWithheld(t *testing.T) {
 	for _, name := range []string{"delete", "mkdir", "move"} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t,
@@ -1074,7 +1052,7 @@ func TestDelegate_MutatingFileToolsReachAuthorizationInsteadOfBeingWithheld(t *t
 	}
 }
 
-func TestDelegate_NestedCallIsAuthorizedAgainstTheChildsOwnDeclaration(t *testing.T) {
+func TestGeneralAgent_NestedCallIsAuthorizedAgainstTheChildsOwnDeclaration(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files":["a.txt"]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -1106,14 +1084,14 @@ func TestDelegate_NestedCallIsAuthorizedAgainstTheChildsOwnDeclaration(t *testin
 		t.Fatalf("nested DeclaredWrite = %v, want the calling child's own set %v", nested.DeclaredWrite, wantParent)
 	}
 	wantNested := map[string]bool{filepath.Join(h.dir, "a.txt"): true}
-	if !reflect.DeepEqual(nested.DelegateWrite, wantNested) {
-		t.Fatalf("nested DelegateWrite = %v, want the resolved nested declaration %v", nested.DelegateWrite, wantNested)
+	if !reflect.DeepEqual(nested.GeneralAgentWrite, wantNested) {
+		t.Fatalf("nested GeneralAgentWrite = %v, want the resolved nested declaration %v", nested.GeneralAgentWrite, wantNested)
 	}
 }
 
 // An empty nested scope is the fail-closed reading: the containment check refuses it, so a nested
 // declaration the child garbled can never widen into an unbounded grandchild.
-func TestDelegate_UnresolvableNestedDeclarationCarriesNoScope(t *testing.T) {
+func TestGeneralAgent_UnresolvableNestedDeclarationCarriesNoScope(t *testing.T) {
 	tests := []struct {
 		name string
 		args string
@@ -1121,7 +1099,7 @@ func TestDelegate_UnresolvableNestedDeclarationCarriesNoScope(t *testing.T) {
 		{"no arguments at all", `{}`},
 		{"arguments that are not JSON", `not json`},
 		{"an absolute path", `{"instructions":"x","files":["/etc/passwd"]}`},
-		{"an empty file list", `{"instructions":"x","files":[]}`},
+		{"a null file list", `{"instructions":"x","files":null}`},
 		{"a path outside the project", `{"instructions":"x","files":["../escape.txt"]}`},
 	}
 	for _, tc := range tests {
@@ -1137,15 +1115,15 @@ func TestDelegate_UnresolvableNestedDeclarationCarriesNoScope(t *testing.T) {
 			if len(h.modeCtxs) != 2 {
 				t.Fatalf("authorization contexts built = %d, want the child's own and the nested call's", len(h.modeCtxs))
 			}
-			if got := h.modeCtxs[1]; len(got.DelegateWrite) != 0 || len(got.DelegateDelete) != 0 {
-				t.Fatalf("DelegateWrite = %v, DelegateDelete = %v, want both empty so the containment check refuses the call",
-					got.DelegateWrite, got.DelegateDelete)
+			if got := h.modeCtxs[1]; len(got.GeneralAgentWrite) != 0 || len(got.GeneralAgentDelete) != 0 || got.GeneralAgentResolved {
+				t.Fatalf("GeneralAgentWrite = %v, GeneralAgentDelete = %v, GeneralAgentResolved = %v, want an unresolved empty candidate the containment check refuses",
+					got.GeneralAgentWrite, got.GeneralAgentDelete, got.GeneralAgentResolved)
 			}
 		})
 	}
 }
 
-func TestDelegate_ChildKeepsTheSnapshotPromptAndEffortOnEveryRound(t *testing.T) {
+func TestGeneralAgent_ChildKeepsTheSnapshotPromptAndEffortOnEveryRound(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunk("call_1", "read")),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -1173,7 +1151,7 @@ func TestDelegate_ChildKeepsTheSnapshotPromptAndEffortOnEveryRound(t *testing.T)
 	}
 }
 
-func TestDelegate_RendersTheChildReplyAndTerminalReason(t *testing.T) {
+func TestGeneralAgent_RendersTheChildReplyAndTerminalReason(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("the answer is 42"), finishChunk()))
 
 	res, err := h.tool().Invoke(t.Context(), callArgs("do it", "a.txt"))
@@ -1195,15 +1173,16 @@ func TestDelegate_RendersTheChildReplyAndTerminalReason(t *testing.T) {
 	}
 }
 
-func TestDelegate_RendersATruncationNoticeAndANonTerminalReason(t *testing.T) {
+func TestGeneralAgent_RendersATruncationNoticeAndANonTerminalReason(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	long := strings.Repeat("x", 17<<10)
-	rounds := make([]func() (provider.Response, error), subagent.DefaultStepCap)
-	for i := range rounds {
-		rounds[i] = streamRound(contentChunk(long), toolCallChunkWithArgs(fmt.Sprintf("call_%d", i+1), "read", alternatingEmptyArgs(i)))
+	h := newHarness(t, streamRound(contentChunk(long), toolCallChunk("call_1", "read")))
+	h.override = func(permissions.ModeContext) turn.ToolDispatcher {
+		return &createOrOKDispatcher{onCall: cancel}
 	}
-	h := newHarness(t, rounds...)
 
-	res, err := h.tool().Invoke(t.Context(), callArgs("do it", "a.txt"))
+	res, err := h.tool().Invoke(ctx, callArgs("do it", "a.txt"))
 	if err != nil {
 		t.Fatalf("Invoke error = %v, want nil", err)
 	}
@@ -1211,18 +1190,15 @@ func TestDelegate_RendersATruncationNoticeAndANonTerminalReason(t *testing.T) {
 	if res.ExitCode == 0 {
 		t.Fatalf("ExitCode = 0, want non-zero for a child that did not complete; out=%q", out[:80])
 	}
-	if !strings.Contains(out, string(subagent.ReasonStepCap)) {
-		t.Fatalf("result does not report the step cap: %q", out[:80])
+	if !strings.Contains(out, "child agent "+string(subagent.ReasonCancelled)) {
+		t.Fatalf("result does not report the cancellation: %q", out[:80])
 	}
 	if !strings.Contains(out, "truncated") {
 		t.Fatalf("result does not report the truncated reply: %q", out[:80])
 	}
-	if len(h.client.requests) != subagent.DefaultStepCap {
-		t.Fatalf("provider requests = %d, want the step cap %d", len(h.client.requests), subagent.DefaultStepCap)
-	}
 }
 
-func TestDelegate_RendersACancelledChildWithANonZeroExit(t *testing.T) {
+func TestGeneralAgent_RendersACancelledChildWithANonZeroExit(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	h := newHarness(t, func() (provider.Response, error) {
@@ -1246,7 +1222,7 @@ func TestDelegate_RendersACancelledChildWithANonZeroExit(t *testing.T) {
 	}
 }
 
-func TestDelegate_WithoutAResolvableParentStartsNoChild(t *testing.T) {
+func TestGeneralAgent_WithoutAResolvableParentStartsNoChild(t *testing.T) {
 	h := newHarness(t)
 	h.snapshotOK = false
 
@@ -1322,7 +1298,42 @@ func (d *writingDispatcher) Dispatch(ctx context.Context, call turn.AssembledToo
 	return turn.ToolResult{Content: string(res.Stdout) + string(res.Stderr), WriteTarget: written, DeleteTarget: deleted, MoveTarget: moved}, nil
 }
 
-func TestDelegate_UndoesTheWritesOfAChildThatDidNotComplete(t *testing.T) {
+type createOrOKDispatcher struct {
+	create *filetools.CreateTool
+	onCall func()
+}
+
+func (d *createOrOKDispatcher) Plan(calls []turn.AssembledToolCall, _ int) turn.ToolPlan {
+	plan := turn.ToolPlan{Units: make([]turn.PlannedToolCall, len(calls))}
+	for i, call := range calls {
+		plan.Units[i] = turn.PlannedToolCall{
+			Call: call,
+			Run:  func(ctx context.Context) (turn.ToolResult, error) { return d.Dispatch(ctx, call) },
+		}
+	}
+	return plan
+}
+
+func (d *createOrOKDispatcher) Dispatch(ctx context.Context, call turn.AssembledToolCall) (turn.ToolResult, error) {
+	if d.onCall != nil {
+		defer d.onCall()
+	}
+	if call.Name != filetools.CreateToolName {
+		return turn.ToolResult{Content: "ok"}, nil
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		return turn.ToolResult{Content: "bad arguments"}, nil
+	}
+	target, _ := args["path"].(string)
+	res, err := d.create.InvokeWithResolvedTarget(ctx, args, target)
+	if err != nil {
+		return turn.ToolResult{}, err
+	}
+	return turn.ToolResult{Content: string(res.Stdout) + string(res.Stderr), WriteTarget: target}, nil
+}
+
+func TestGeneralAgent_UndoesTheWritesOfAChildThatDidNotComplete(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -1370,7 +1381,7 @@ func TestDelegate_UndoesTheWritesOfAChildThatDidNotComplete(t *testing.T) {
 	}
 }
 
-func TestDelegate_KeepsTheWorkOfACompletedChild(t *testing.T) {
+func TestGeneralAgent_KeepsTheWorkOfACompletedChild(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "a.txt")
 	createArgs := fmt.Sprintf(`{"path":%q,"content":"CHILD MADE THIS\n"}`, target)
@@ -1399,7 +1410,56 @@ func TestDelegate_KeepsTheWorkOfACompletedChild(t *testing.T) {
 	}
 }
 
-func TestDelegate_StartsNoChildWhenTheJournalWouldLandInsideTheProject(t *testing.T) {
+func TestGeneralAgent_AChildAtTheRoundLimitWrapsUpAndKeepsItsWrite(t *testing.T) {
+	h := newHarness(t)
+	target := filepath.Join(h.dir, "a.txt")
+	createArgs := fmt.Sprintf(`{"path":%q,"content":"CHILD MADE THIS\n"}`, target)
+	const reply = "stopped at the round limit"
+	rounds := []func() (provider.Response, error){streamRound(toolCallChunkWithArgs("call_0", "create", createArgs))}
+	for i := 1; i < 199; i++ {
+		rounds = append(rounds, streamRound(toolCallChunkWithArgs(fmt.Sprintf("call_%d", i), "read", fmt.Sprintf(`{"n":%d}`, i))))
+	}
+	rounds = append(rounds, streamRound(contentChunk(reply), finishChunk()))
+	h.client.rounds = rounds
+	h.override = func(permissions.ModeContext) turn.ToolDispatcher {
+		return &createOrOKDispatcher{create: filetools.NewCreateTool(h.deps.Home, h.dir, h.dir)}
+	}
+
+	res, err := h.tool().Invoke(t.Context(), callArgs("write the report", "a.txt"))
+	if err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	out := string(res.Stdout)
+	if res.ExitCode != 0 || !strings.Contains(out, reply) {
+		t.Fatalf("Invoke = exit %d, out %q; want 0 and the child's final reply", res.ExitCode, out)
+	}
+	if len(h.client.requests) != 200 {
+		t.Fatalf("provider requests = %d, want 200", len(h.client.requests))
+	}
+	if n := len(h.client.requests[199].Tools); n != 0 {
+		t.Fatalf("final request advertises %d tools, want none", n)
+	}
+	data, rerr := os.ReadFile(target)
+	if rerr != nil || string(data) != "CHILD MADE THIS\n" {
+		t.Fatalf("%s = %q (err=%v), want the child's write kept", target, data, rerr)
+	}
+
+	start, end, _ := h.onePair(t)
+	if start.StepCap != 200 {
+		t.Errorf("start step_cap = %d, want 200", start.StepCap)
+	}
+	if end.Steps != int64(turn.RoundLimit) {
+		t.Errorf("end steps = %d, want %d", end.Steps, turn.RoundLimit)
+	}
+	if end.Reason != events.ChildAgentReasonCompleted || end.RollbackOutcome != events.ChildRollbackNotNeeded {
+		t.Errorf("end reason/rollback = %q/%q, want completed/not_needed", end.Reason, end.RollbackOutcome)
+	}
+	if !reflect.DeepEqual(end.WrittenPaths, []string{target}) {
+		t.Errorf("end written_paths = %v, want %v", end.WrittenPaths, []string{target})
+	}
+}
+
+func TestGeneralAgent_StartsNoChildWhenTheJournalWouldLandInsideTheProject(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		home func(t *testing.T, h *harness) string
@@ -1440,10 +1500,10 @@ func TestDelegate_StartsNoChildWhenTheJournalWouldLandInsideTheProject(t *testin
 	}
 }
 
-// TestDelegate_BindsItsJournalToTheChildsDispatchContext pins the handoff a nested delegate depends
+// TestGeneralAgent_BindsItsJournalToTheChildsDispatchContext pins the handoff a nested delegate depends
 // on: openJournal reads the parent journal out of the dispatch context it is given, so a nested
 // child that cannot see it there would open an unlinked journal its parent never absorbs.
-func TestDelegate_BindsItsJournalToTheChildsDispatchContext(t *testing.T) {
+func TestGeneralAgent_BindsItsJournalToTheChildsDispatchContext(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "a.txt")
 	createArgs := fmt.Sprintf(`{"path":%q,"content":"CHILD MADE THIS\n"}`, target)
@@ -1472,7 +1532,7 @@ func TestDelegate_BindsItsJournalToTheChildsDispatchContext(t *testing.T) {
 	}
 }
 
-func TestDelegate_PrepareAcceptsEveryDeleteDeclarationForm(t *testing.T) {
+func TestGeneralAgent_PrepareAcceptsEveryDeleteDeclarationForm(t *testing.T) {
 	h := newHarness(t)
 	home := filepath.Join(h.dir, "home")
 	if err := os.MkdirAll(filepath.Join(home, "sub"), 0o755); err != nil {
@@ -1492,9 +1552,9 @@ func TestDelegate_PrepareAcceptsEveryDeleteDeclarationForm(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, write, remove, _, _, targets, err := h.tool().PrepareDelegate(declareArgs("do it", nil, []string{tc.remove}))
+			_, write, remove, _, _, targets, err := h.tool().PrepareGeneralAgent(declareArgs("do it", nil, []string{tc.remove}))
 			if err != nil {
-				t.Fatalf("PrepareDelegate error = %v, want a delete-only declaration accepted", err)
+				t.Fatalf("PrepareGeneralAgent error = %v, want a delete-only declaration accepted", err)
 			}
 			if write != nil {
 				t.Fatalf("write declaration = %#v, want nil for an omitted files list", write)
@@ -1512,7 +1572,7 @@ func TestDelegate_PrepareAcceptsEveryDeleteDeclarationForm(t *testing.T) {
 	}
 }
 
-func TestDelegate_OmittedAndSuppliedEmptyListsStayDistinct(t *testing.T) {
+func TestGeneralAgent_OmittedAndSuppliedEmptyListsStayDistinct(t *testing.T) {
 	tests := []struct {
 		name                string
 		args                map[string]any
@@ -1525,9 +1585,9 @@ func TestDelegate_OmittedAndSuppliedEmptyListsStayDistinct(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, write, remove, _, _, _, err := newHarness(t).tool().PrepareDelegate(tc.args)
+			_, write, remove, _, _, _, err := newHarness(t).tool().PrepareGeneralAgent(tc.args)
 			if err != nil {
-				t.Fatalf("PrepareDelegate error = %v, want nil", err)
+				t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 			}
 			if (write == nil) != tc.writeNil || (remove == nil) != tc.removeNil {
 				t.Fatalf("write = %#v, remove = %#v; want nil write=%v, nil remove=%v", write, remove, tc.writeNil, tc.removeNil)
@@ -1536,12 +1596,12 @@ func TestDelegate_OmittedAndSuppliedEmptyListsStayDistinct(t *testing.T) {
 	}
 }
 
-func TestDelegate_SchedulerTargetsCoverTheWriteAndDeleteUnionOnce(t *testing.T) {
+func TestGeneralAgent_SchedulerTargetsCoverTheWriteAndDeleteUnionOnce(t *testing.T) {
 	h := newHarness(t)
 
-	_, _, _, _, _, targets, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"both.txt", "dir/new.txt"}, []string{"both.txt", "gone.txt"}))
+	_, _, _, _, _, targets, err := h.tool().PrepareGeneralAgent(declareArgs("do it", []string{"both.txt", "dir/new.txt"}, []string{"both.txt", "gone.txt"}))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 	want := []string{
 		filepath.Join(h.dir, "both.txt"),
@@ -1554,7 +1614,7 @@ func TestDelegate_SchedulerTargetsCoverTheWriteAndDeleteUnionOnce(t *testing.T) 
 	}
 }
 
-func TestDelegate_CarriesTheDeleteDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
+func TestGeneralAgent_CarriesTheDeleteDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files_delete":["old.txt"]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -1574,7 +1634,7 @@ func TestDelegate_CarriesTheDeleteDeclarationIntoTheChildAndItsNestedCalls(t *te
 	}
 }
 
-func TestDelegate_NestedDeleteOnlyDeclarationIsJudgedAgainstTheImmediateParentsDeleteSet(t *testing.T) {
+func TestGeneralAgent_NestedDeleteOnlyDeclarationIsJudgedAgainstTheImmediateParentsDeleteSet(t *testing.T) {
 	tests := []struct {
 		name       string
 		nested     string
@@ -1597,11 +1657,11 @@ func TestDelegate_NestedDeleteOnlyDeclarationIsJudgedAgainstTheImmediateParentsD
 				t.Fatalf("authorization contexts built = %d, want the child's own and the nested call's", len(h.modeCtxs))
 			}
 			nested := h.modeCtxs[1]
-			if want := map[string]bool{filepath.Join(h.dir, tc.nested): true}; !reflect.DeepEqual(nested.DelegateDelete, want) {
-				t.Fatalf("nested DelegateDelete = %v, want the resolved nested delete declaration %v", nested.DelegateDelete, want)
+			if want := map[string]bool{filepath.Join(h.dir, tc.nested): true}; !reflect.DeepEqual(nested.GeneralAgentDelete, want) {
+				t.Fatalf("nested GeneralAgentDelete = %v, want the resolved nested delete declaration %v", nested.GeneralAgentDelete, want)
 			}
-			if nested.DelegateWrite != nil {
-				t.Fatalf("nested DelegateWrite = %#v, want nil — the nested call supplied no files", nested.DelegateWrite)
+			if nested.GeneralAgentWrite != nil {
+				t.Fatalf("nested GeneralAgentWrite = %#v, want nil — the nested call supplied no files", nested.GeneralAgentWrite)
 			}
 
 			nested.ToolName = ToolName
@@ -1652,7 +1712,7 @@ func journalsLeft(t *testing.T, home string) []string {
 	return left
 }
 
-func TestDelegate_UndoesTheDeletesOfAChildThatDidNotComplete(t *testing.T) {
+func TestGeneralAgent_UndoesTheDeletesOfAChildThatDidNotComplete(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -1719,7 +1779,7 @@ func TestDelegate_UndoesTheDeletesOfAChildThatDidNotComplete(t *testing.T) {
 	}
 }
 
-func TestDelegate_KeepsTheDeleteOfACompletedChild(t *testing.T) {
+func TestGeneralAgent_KeepsTheDeleteOfACompletedChild(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "old.txt")
 	writeWithMode(t, target, "OLD\n", 0o644)
@@ -1824,7 +1884,7 @@ func TestRender_ListsRefusedOperationsWhateverTheReplySays(t *testing.T) {
 	}
 }
 
-func TestDelegate_RecordsACompletedChildAsOneStartAndOneEnd(t *testing.T) {
+func TestGeneralAgent_RecordsACompletedChildAsOneStartAndOneEnd(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "a.txt")
 	createArgs := fmt.Sprintf(`{"path":%q,"content":"CHILD MADE THIS\n"}`, target)
@@ -1882,7 +1942,7 @@ func TestDelegate_RecordsACompletedChildAsOneStartAndOneEnd(t *testing.T) {
 	}
 }
 
-func TestDelegate_RecordsADeleteOnlyChildWithoutWriteAuthority(t *testing.T) {
+func TestGeneralAgent_RecordsADeleteOnlyChildWithoutWriteAuthority(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "old.txt")
 	writeWithMode(t, target, "OLD\n", 0o644)
@@ -1917,7 +1977,7 @@ func TestDelegate_RecordsADeleteOnlyChildWithoutWriteAuthority(t *testing.T) {
 	}
 }
 
-func TestDelegate_RecordsWritesAndDeletesInSeparateFields(t *testing.T) {
+func TestGeneralAgent_RecordsWritesAndDeletesInSeparateFields(t *testing.T) {
 	h := newHarness(t)
 	created := filepath.Join(h.dir, "a.txt")
 	removed := filepath.Join(h.dir, "old.txt")
@@ -1949,7 +2009,7 @@ func TestDelegate_RecordsWritesAndDeletesInSeparateFields(t *testing.T) {
 	}
 }
 
-func TestDelegate_RecordsASymlinkDeclaredInBothFormsAsItsTwoTargets(t *testing.T) {
+func TestGeneralAgent_RecordsASymlinkDeclaredInBothFormsAsItsTwoTargets(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("nothing to do"), finishChunk()))
 	target := filepath.Join(h.dir, "target.txt")
 	link := filepath.Join(h.dir, "link.txt")
@@ -1971,7 +2031,7 @@ func TestDelegate_RecordsASymlinkDeclaredInBothFormsAsItsTwoTargets(t *testing.T
 	}
 }
 
-func TestDelegate_RecordsACancelledChildWithItsRolledBackWrites(t *testing.T) {
+func TestGeneralAgent_RecordsACancelledChildWithItsRolledBackWrites(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "a.txt")
 	createArgs := fmt.Sprintf(`{"path":%q,"content":"HALF DONE\n"}`, target)
@@ -2003,28 +2063,33 @@ func TestDelegate_RecordsACancelledChildWithItsRolledBackWrites(t *testing.T) {
 	}
 }
 
-func TestDelegate_RecordsStepCapAndFailureTerminalReasons(t *testing.T) {
+func TestGeneralAgent_RecordsCancelledAndFailureTerminalReasons(t *testing.T) {
 	tests := []struct {
 		name       string
-		rounds     []func() (provider.Response, error)
+		rounds     func(cancel context.CancelFunc) []func() (provider.Response, error)
 		wantReason string
 	}{
-		{"step_cap", func() []func() (provider.Response, error) {
-			rounds := make([]func() (provider.Response, error), subagent.DefaultStepCap)
-			for i := range rounds {
-				rounds[i] = streamRound(toolCallChunkWithArgs(fmt.Sprintf("call_%d", i), "read", alternatingEmptyArgs(i)))
+		{"cancelled", func(cancel context.CancelFunc) []func() (provider.Response, error) {
+			return []func() (provider.Response, error){
+				func() (provider.Response, error) {
+					cancel()
+					return streamRound(toolCallChunk("call_1", "read"))()
+				},
 			}
-			return rounds
-		}(), events.ChildAgentReasonStepCap},
-		{"failed", []func() (provider.Response, error){
-			func() (provider.Response, error) { return provider.Response{}, errors.New("provider is down") },
+		}, events.ChildAgentReasonCancelled},
+		{"failed", func(context.CancelFunc) []func() (provider.Response, error) {
+			return []func() (provider.Response, error){
+				func() (provider.Response, error) { return provider.Response{}, errors.New("provider is down") },
+			}
 		}, events.ChildAgentReasonFailed},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, tc.rounds...)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			h := newHarness(t, tc.rounds(cancel)...)
 
-			if _, err := h.tool().Invoke(t.Context(), callArgs("try it", "a.txt")); err != nil {
+			if _, err := h.tool().Invoke(ctx, callArgs("try it", "a.txt")); err != nil {
 				t.Fatalf("Invoke error = %v, want nil", err)
 			}
 			_, end, _ := h.onePair(t)
@@ -2069,7 +2134,7 @@ func TestRollbackOutcome_DerivesFromTheJournalReportBeforeTheReason(t *testing.T
 	}
 }
 
-func TestDelegate_AStartAppendFailureStartsNoChild(t *testing.T) {
+func TestGeneralAgent_AStartAppendFailureStartsNoChild(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 	h.storeAt = func(int) *sessions.Store { return nil }
 
@@ -2095,7 +2160,7 @@ func TestDelegate_AStartAppendFailureStartsNoChild(t *testing.T) {
 // A store accessor that stops answering mid-run must not strand an appended start: the pair is
 // written against the one store resolved before the start, so the end is never left to a second
 // lookup that can fail on its own.
-func TestDelegate_AStoreThatStopsAnsweringStillClosesTheLifecyclePair(t *testing.T) {
+func TestGeneralAgent_AStoreThatStopsAnsweringStillClosesTheLifecyclePair(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 	h.storeAt = func(call int) *sessions.Store {
 		if call == 1 {
@@ -2120,7 +2185,7 @@ func TestDelegate_AStoreThatStopsAnsweringStillClosesTheLifecyclePair(t *testing
 	}
 }
 
-func TestDelegate_GivesEachChildItsOwnInvocationIDOnEveryAttributedPath(t *testing.T) {
+func TestGeneralAgent_GivesEachChildItsOwnInvocationIDOnEveryAttributedPath(t *testing.T) {
 	h := newHarness(t)
 	h.client.rounds = []func() (provider.Response, error){
 		streamRound(contentChunk("first"), finishChunk()),
@@ -2152,7 +2217,7 @@ func TestDelegate_GivesEachChildItsOwnInvocationIDOnEveryAttributedPath(t *testi
 	}
 }
 
-func TestDelegate_ANestedCallCarriesTheIssuingChildsInvocationID(t *testing.T) {
+func TestGeneralAgent_ANestedCallCarriesTheIssuingChildsInvocationID(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call_1", ToolName, `{"instructions":"nested work","files":["a.txt"]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2170,7 +2235,7 @@ func TestDelegate_ANestedCallCarriesTheIssuingChildsInvocationID(t *testing.T) {
 	}
 }
 
-func TestDelegate_RecordsUnrecoveredWhenTheRollbackFails(t *testing.T) {
+func TestGeneralAgent_RecordsUnrecoveredWhenTheRollbackFails(t *testing.T) {
 	h := newHarness(t)
 	sub := filepath.Join(h.dir, "reports")
 	if err := os.Mkdir(sub, 0o755); err != nil {
@@ -2262,7 +2327,7 @@ func (d *loggingDispatcher) Dispatch(ctx context.Context, call turn.AssembledToo
 // The surface learns the child exists before it does any work, sees each of its tool rounds
 // while it is still running, and is closed with the recorded outcome — all under the one
 // invocation id the session records.
-func TestDelegate_ReportsTheChildLifecycleWhileItRuns(t *testing.T) {
+func TestGeneralAgent_ReportsTheChildLifecycleWhileItRuns(t *testing.T) {
 	h := newHarness(t,
 		streamRound(contentChunk("looking"), toolCallChunk("call_1", "read")),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2297,7 +2362,7 @@ func TestDelegate_ReportsTheChildLifecycleWhileItRuns(t *testing.T) {
 
 // A child that never calls a tool still opens and closes its block, so a delegate that only
 // answers is not left showing as running.
-func TestDelegate_ReportsAChildThatMakesNoToolCalls(t *testing.T) {
+func TestGeneralAgent_ReportsAChildThatMakesNoToolCalls(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 	sink := &liveActivity{}
 	h.deps.Activity = sink
@@ -2315,7 +2380,7 @@ func TestDelegate_ReportsAChildThatMakesNoToolCalls(t *testing.T) {
 
 // Every precondition failure returns before the child's first round, so nothing may open a
 // block for a child that never ran.
-func TestDelegate_AChildThatNeverStartsReportsNothing(t *testing.T) {
+func TestGeneralAgent_AChildThatNeverStartsReportsNothing(t *testing.T) {
 	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
 	h.storeAt = func(int) *sessions.Store { return nil }
 	sink := &liveActivity{}
@@ -2350,7 +2415,7 @@ func (d writeTargetDispatcher) Dispatch(context.Context, turn.AssembledToolCall)
 
 // An end record that could not be appended leaves the lifecycle unclosed in the session, but
 // the block still closes from the in-process outcome rather than showing a child forever.
-func TestDelegate_ClosesTheLiveBlockWhenTheEndRecordCannotBeAppended(t *testing.T) {
+func TestGeneralAgent_ClosesTheLiveBlockWhenTheEndRecordCannotBeAppended(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunk("call_1", "create")),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2382,7 +2447,7 @@ func TestDelegate_ClosesTheLiveBlockWhenTheEndRecordCannotBeAppended(t *testing.
 
 // A round in which the child delegates onward is still the issuing child's round, so it is
 // reported under the issuing child's invocation id rather than the parent's.
-func TestDelegate_ChildRoundsCarryTheIssuingChildsInvocationID(t *testing.T) {
+func TestGeneralAgent_ChildRoundsCarryTheIssuingChildsInvocationID(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call_1", ToolName, `{"instructions":"nested work","files":["a.txt"]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2419,7 +2484,7 @@ func moveCallArgs(source, destination string) string {
 	return fmt.Sprintf(`{"source":%q,"destination":%q}`, source, destination)
 }
 
-func TestDelegate_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *testing.T) {
+func TestGeneralAgent_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *testing.T) {
 	h := newHarness(t)
 	home := filepath.Join(h.dir, "home")
 	if err := os.MkdirAll(filepath.Join(home, "sub"), 0o755); err != nil {
@@ -2440,9 +2505,9 @@ func TestDelegate_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *test
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, _, moves, _, targets, err := h.tool().PrepareDelegate(moveDeclareArgs("do it", nil, tc.pair))
+			_, _, _, moves, _, targets, err := h.tool().PrepareGeneralAgent(moveDeclareArgs("do it", nil, tc.pair))
 			if err != nil {
-				t.Fatalf("PrepareDelegate error = %v, want a move-only declaration accepted", err)
+				t.Fatalf("PrepareGeneralAgent error = %v, want a move-only declaration accepted", err)
 			}
 			if want := map[permissions.MovePair]bool{tc.want: true}; !reflect.DeepEqual(moves, want) {
 				t.Fatalf("move declaration = %v, want the canonical pair %v", moves, want)
@@ -2453,11 +2518,11 @@ func TestDelegate_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *test
 		})
 	}
 
-	_, _, _, omitted, _, _, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"a.txt"}, nil))
+	_, _, _, omitted, _, _, err := h.tool().PrepareGeneralAgent(declareArgs("do it", []string{"a.txt"}, nil))
 	if err != nil || omitted != nil {
 		t.Fatalf("omitted files_move = %#v (err=%v), want nil", omitted, err)
 	}
-	_, _, _, empty, _, _, err := h.tool().PrepareDelegate(moveDeclareArgs("do it", []string{"a.txt"}))
+	_, _, _, empty, _, _, err := h.tool().PrepareGeneralAgent(moveDeclareArgs("do it", []string{"a.txt"}))
 	if err != nil || empty == nil || len(empty) != 0 {
 		t.Fatalf("supplied empty files_move = %#v (err=%v), want a non-nil empty set", empty, err)
 	}
@@ -2466,7 +2531,7 @@ func TestDelegate_PrepareResolvesMovePairsByTheMoveToolsEndpointContract(t *test
 	}
 }
 
-func TestDelegate_RefusesAMoveDeclarationItCannotResolveBeforeAChildStarts(t *testing.T) {
+func TestGeneralAgent_RefusesAMoveDeclarationItCannotResolveBeforeAChildStarts(t *testing.T) {
 	withExtraField := declareArgs("do it", nil, nil)
 	withExtraField[filesMoveArg] = []any{map[string]any{sourceKey: "a.txt", destinationKey: "b.txt", "mode": "fast"}}
 	notAnObject := declareArgs("do it", nil, nil)
@@ -2515,7 +2580,7 @@ func TestDelegate_RefusesAMoveDeclarationItCannotResolveBeforeAChildStarts(t *te
 	}
 }
 
-func TestDelegate_CarriesTheMoveDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
+func TestGeneralAgent_CarriesTheMoveDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files_move":[{"source":"a.txt","destination":"b.txt"}]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2534,12 +2599,12 @@ func TestDelegate_CarriesTheMoveDeclarationIntoTheChildAndItsNestedCalls(t *test
 			t.Fatalf("authorization context %d DeclaredMoves = %v, want the child's move pairs %v", i, mc.DeclaredMoves, want)
 		}
 	}
-	if !reflect.DeepEqual(h.modeCtxs[1].DelegateMoves, want) {
-		t.Fatalf("nested DelegateMoves = %v, want the resolved nested move pairs %v", h.modeCtxs[1].DelegateMoves, want)
+	if !reflect.DeepEqual(h.modeCtxs[1].GeneralAgentMoves, want) {
+		t.Fatalf("nested GeneralAgentMoves = %v, want the resolved nested move pairs %v", h.modeCtxs[1].GeneralAgentMoves, want)
 	}
 }
 
-func TestDelegate_RecordsAMoveOnlyChildWithoutWriteOrDeleteAuthority(t *testing.T) {
+func TestGeneralAgent_RecordsAMoveOnlyChildWithoutWriteOrDeleteAuthority(t *testing.T) {
 	h := newHarness(t)
 	source := filepath.Join(h.dir, "old.txt")
 	destination := filepath.Join(h.dir, "new.txt")
@@ -2576,7 +2641,7 @@ func TestDelegate_RecordsAMoveOnlyChildWithoutWriteOrDeleteAuthority(t *testing.
 	}
 }
 
-func TestDelegate_UndoesTheMovesOfAChildThatDidNotComplete(t *testing.T) {
+func TestGeneralAgent_UndoesTheMovesOfAChildThatDidNotComplete(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -2652,7 +2717,7 @@ func TestDelegate_UndoesTheMovesOfAChildThatDidNotComplete(t *testing.T) {
 	}
 }
 
-func TestDelegate_PrepareResolvesEveryDirectorySpellingToItsCanonicalTarget(t *testing.T) {
+func TestGeneralAgent_PrepareResolvesEveryDirectorySpellingToItsCanonicalTarget(t *testing.T) {
 	h := newHarness(t)
 	home := filepath.Join(h.dir, "home")
 	for _, dir := range []string{home, filepath.Join(h.dir, "work")} {
@@ -2679,9 +2744,9 @@ func TestDelegate_PrepareResolvesEveryDirectorySpellingToItsCanonicalTarget(t *t
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, _, _, dirs, targets, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}, tc.spelling))
+			_, _, _, _, dirs, targets, err := h.tool().PrepareGeneralAgent(mkdirDeclareArgs("do it", []string{"a.txt"}, tc.spelling))
 			if err != nil {
-				t.Fatalf("PrepareDelegate error = %v, want the directory accepted", err)
+				t.Fatalf("PrepareGeneralAgent error = %v, want the directory accepted", err)
 			}
 			if want := map[string]bool{tc.want: true}; !reflect.DeepEqual(dirs, want) {
 				t.Fatalf("directory declaration = %v, want the canonical target %v", dirs, want)
@@ -2692,15 +2757,15 @@ func TestDelegate_PrepareResolvesEveryDirectorySpellingToItsCanonicalTarget(t *t
 		})
 	}
 
-	_, _, _, _, dirs, _, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}, "made/sub", "./made/sub/", made))
+	_, _, _, _, dirs, _, err := h.tool().PrepareGeneralAgent(mkdirDeclareArgs("do it", []string{"a.txt"}, "made/sub", "./made/sub/", made))
 	if err != nil || !reflect.DeepEqual(dirs, map[string]bool{made: true}) {
 		t.Fatalf("equivalent spellings = %v (err=%v), want one canonical entry %s", dirs, err, made)
 	}
-	_, _, _, _, omitted, _, err := h.tool().PrepareDelegate(declareArgs("do it", []string{"a.txt"}, nil))
+	_, _, _, _, omitted, _, err := h.tool().PrepareGeneralAgent(declareArgs("do it", []string{"a.txt"}, nil))
 	if err != nil || omitted != nil {
 		t.Fatalf("omitted files_mkdir = %#v (err=%v), want nil", omitted, err)
 	}
-	_, _, _, _, empty, _, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}))
+	_, _, _, _, empty, _, err := h.tool().PrepareGeneralAgent(mkdirDeclareArgs("do it", []string{"a.txt"}))
 	if err != nil || empty == nil || len(empty) != 0 {
 		t.Fatalf("supplied empty files_mkdir = %#v (err=%v), want a non-nil empty set", empty, err)
 	}
@@ -2709,15 +2774,15 @@ func TestDelegate_PrepareResolvesEveryDirectorySpellingToItsCanonicalTarget(t *t
 	}
 }
 
-func TestDelegate_SchedulerTargetsAddTheMissingParentsOfDeclaredDirectoriesAsOrderingOnly(t *testing.T) {
+func TestGeneralAgent_SchedulerTargetsAddTheMissingParentsOfDeclaredDirectoriesAsOrderingOnly(t *testing.T) {
 	h := newHarness(t)
 	if err := os.MkdirAll(filepath.Join(h.dir, "work"), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 
-	_, _, _, _, dirs, targets, err := h.tool().PrepareDelegate(mkdirDeclareArgs("do it", []string{"a.txt"}, "x/y", "x/z", "work/new"))
+	_, _, _, _, dirs, targets, err := h.tool().PrepareGeneralAgent(mkdirDeclareArgs("do it", []string{"a.txt"}, "x/y", "x/z", "work/new"))
 	if err != nil {
-		t.Fatalf("PrepareDelegate error = %v, want nil", err)
+		t.Fatalf("PrepareGeneralAgent error = %v, want nil", err)
 	}
 	want := []string{filepath.Join(h.dir, "a.txt"), filepath.Join(h.dir, "work", "new"), filepath.Join(h.dir, "x"), filepath.Join(h.dir, "x", "y"), filepath.Join(h.dir, "x", "z")}
 	if !slices.Equal(targets, want) {
@@ -2728,7 +2793,7 @@ func TestDelegate_SchedulerTargetsAddTheMissingParentsOfDeclaredDirectoriesAsOrd
 	}
 }
 
-func TestDelegate_CarriesTheDirectoryDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
+func TestGeneralAgent_CarriesTheDirectoryDeclarationIntoTheChildAndItsNestedCalls(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files":["report.txt"],"files_mkdir":["made"]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2746,8 +2811,8 @@ func TestDelegate_CarriesTheDirectoryDeclarationIntoTheChildAndItsNestedCalls(t 
 			t.Fatalf("authorization context %d DeclaredDirs = %v, want the child's directories %v", i, mc.DeclaredDirs, want)
 		}
 	}
-	if !reflect.DeepEqual(h.modeCtxs[1].DelegateDirs, want) {
-		t.Fatalf("nested DelegateDirs = %v, want the resolved nested directories %v", h.modeCtxs[1].DelegateDirs, want)
+	if !reflect.DeepEqual(h.modeCtxs[1].GeneralAgentDirs, want) {
+		t.Fatalf("nested GeneralAgentDirs = %v, want the resolved nested directories %v", h.modeCtxs[1].GeneralAgentDirs, want)
 	}
 
 	for _, tc := range []struct {
@@ -2770,7 +2835,7 @@ func TestDelegate_CarriesTheDirectoryDeclarationIntoTheChildAndItsNestedCalls(t 
 	}
 }
 
-func TestDelegate_KeepsTheDeclaredDirectoryOfACompletedChild(t *testing.T) {
+func TestGeneralAgent_KeepsTheDeclaredDirectoryOfACompletedChild(t *testing.T) {
 	h := newHarness(t)
 	target := filepath.Join(h.dir, "made", "sub")
 	h.client.rounds = []func() (provider.Response, error){
@@ -2793,7 +2858,7 @@ func TestDelegate_KeepsTheDeclaredDirectoryOfACompletedChild(t *testing.T) {
 	}
 }
 
-func TestDelegate_UndoesTheDeclaredDirectoryOfAChildThatDidNotComplete(t *testing.T) {
+func TestGeneralAgent_UndoesTheDeclaredDirectoryOfAChildThatDidNotComplete(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -2822,7 +2887,7 @@ func TestDelegate_UndoesTheDeclaredDirectoryOfAChildThatDidNotComplete(t *testin
 	}
 }
 
-func TestDelegate_StartsADirectoryOnlyChildAndRecordsItsDirectories(t *testing.T) {
+func TestGeneralAgent_StartsADirectoryOnlyChildAndRecordsItsDirectories(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		complete bool
@@ -2851,15 +2916,15 @@ func TestDelegate_StartsADirectoryOnlyChildAndRecordsItsDirectories(t *testing.T
 				return d
 			}
 
-			instruction, write, remove, moves, dirs, _, err := h.tool().PrepareDelegate(mkdirDeclareArgs("make it", nil, "made/sub"))
+			instruction, write, remove, moves, dirs, _, err := h.tool().PrepareGeneralAgent(mkdirDeclareArgs("make it", nil, "made/sub"))
 			if err != nil {
-				t.Fatalf("PrepareDelegate error = %v, want a directory-only delegate admitted", err)
+				t.Fatalf("PrepareGeneralAgent error = %v, want a directory-only delegate admitted", err)
 			}
 			want := map[string]bool{target: true}
 			if !reflect.DeepEqual(dirs, want) {
 				t.Fatalf("prepared directories = %v, want %v", dirs, want)
 			}
-			res, err := h.tool().InvokeWithPreparedDelegate(ctx, instruction, write, remove, moves, dirs)
+			res, err := h.tool().InvokeWithPreparedGeneralAgent(ctx, instruction, write, remove, moves, dirs)
 			if err != nil {
 				t.Fatalf("Invoke error = %v, want nil", err)
 			}
@@ -2891,7 +2956,7 @@ func TestDelegate_StartsADirectoryOnlyChildAndRecordsItsDirectories(t *testing.T
 	}
 }
 
-func TestDelegate_CarriesADirectoryOnlyDeclarationIntoANestedCall(t *testing.T) {
+func TestGeneralAgent_CarriesADirectoryOnlyDeclarationIntoANestedCall(t *testing.T) {
 	h := newHarness(t,
 		streamRound(toolCallChunkWithArgs("call-1", ToolName, `{"instructions":"narrower","files_mkdir":["made"]}`)),
 		streamRound(contentChunk("done"), finishChunk()),
@@ -2904,12 +2969,12 @@ func TestDelegate_CarriesADirectoryOnlyDeclarationIntoANestedCall(t *testing.T) 
 		t.Fatalf("authorization contexts built = %d, want the child's own and the nested call's", len(h.modeCtxs))
 	}
 	want := map[string]bool{filepath.Join(h.dir, "made"): true}
-	if !reflect.DeepEqual(h.modeCtxs[1].DeclaredDirs, want) || !reflect.DeepEqual(h.modeCtxs[1].DelegateDirs, want) {
-		t.Fatalf("nested DeclaredDirs/DelegateDirs = %v / %v, want %v for both", h.modeCtxs[1].DeclaredDirs, h.modeCtxs[1].DelegateDirs, want)
+	if !reflect.DeepEqual(h.modeCtxs[1].DeclaredDirs, want) || !reflect.DeepEqual(h.modeCtxs[1].GeneralAgentDirs, want) {
+		t.Fatalf("nested DeclaredDirs/GeneralAgentDirs = %v / %v, want %v for both", h.modeCtxs[1].DeclaredDirs, h.modeCtxs[1].GeneralAgentDirs, want)
 	}
 }
 
-func TestDelegate_AnOverCapDirectoryDeclarationStartsNoChild(t *testing.T) {
+func TestGeneralAgent_AnOverCapDirectoryDeclarationStartsNoChild(t *testing.T) {
 	h := newHarness(t)
 	dirs := make([]any, 33)
 	for i := range dirs {
@@ -2924,5 +2989,335 @@ func TestDelegate_AnOverCapDirectoryDeclarationStartsNoChild(t *testing.T) {
 	}
 	if len(h.client.requests) != 0 {
 		t.Fatalf("provider requests = %d, want no child turn", len(h.client.requests))
+	}
+}
+
+func toolCallsChunk(calls ...[2]string) []byte {
+	type function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	type call struct {
+		Index    int      `json:"index"`
+		ID       string   `json:"id"`
+		Type     string   `json:"type"`
+		Function function `json:"function"`
+	}
+	list := make([]call, len(calls))
+	for i, c := range calls {
+		list[i] = call{Index: i, ID: fmt.Sprintf("call-%s-%d", c[0], i), Type: "function", Function: function{Name: c[0], Arguments: c[1]}}
+	}
+	raw, err := json.Marshal(list)
+	if err != nil {
+		panic(err)
+	}
+	return []byte(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":` + string(raw) + `},"finish_reason":"tool_calls"}]}`)
+}
+
+func advertisedToChild(req provider.Request) []string {
+	names := make([]string, 0, len(req.Tools))
+	for _, def := range req.Tools {
+		names = append(names, def.Name)
+	}
+	return names
+}
+
+func TestGeneralAgent_APathFreeCallStartsAReadOnlyChildInEveryMode(t *testing.T) {
+	for _, mode := range []string{"plan", "auto_edits", "build"} {
+		for name, args := range map[string]map[string]any{
+			"omitted lists": {instructionsArg: "count the files"},
+			"empty lists": {instructionsArg: "count the files", filesArg: []any{}, filesDeleteArg: []any{},
+				filesMoveArg: []any{}, filesMkdirArg: []any{}},
+		} {
+			t.Run(mode+"/"+name, func(t *testing.T) {
+				h := newHarness(t, streamRound(contentChunk("12 files"), finishChunk()))
+				parent := h.deps.Snapshot
+				h.deps.Snapshot = func() (Snapshot, bool) {
+					snap, ok := parent()
+					snap.Mode = mode
+					return snap, ok
+				}
+
+				res, err := h.tool().Invoke(t.Context(), args)
+				if err != nil || res.ExitCode != 0 {
+					t.Fatalf("Invoke = %+v, %v, want a completed child", res, err)
+				}
+				if len(h.client.requests) != 1 {
+					t.Fatalf("provider requests = %d, want the child to start", len(h.client.requests))
+				}
+				mc := h.modeCtxs[0]
+				if mc.Mode != mode || !mc.ChildAgent {
+					t.Fatalf("child authorization context = %+v, want mode %q under a child ceiling", mc, mode)
+				}
+				if len(mc.DeclaredWrite)+len(mc.DeclaredDelete)+len(mc.DeclaredMoves)+len(mc.DeclaredDirs) != 0 {
+					t.Fatalf("child ceiling = %v / %v / %v / %v, want empty", mc.DeclaredWrite, mc.DeclaredDelete, mc.DeclaredMoves, mc.DeclaredDirs)
+				}
+				start, _, raw := h.onePair(t)
+				if len(start.DeclaredPaths)+len(start.DeclaredDeletePaths)+len(start.DeclaredMovePairs)+len(start.DeclaredDirs) != 0 {
+					t.Fatalf("start record declares %+v, want no path", start)
+				}
+				if !strings.Contains(string(raw), `"declared_paths":[]`) {
+					t.Fatalf("session = %s, want declared_paths recorded as []", raw)
+				}
+				if _, serr := os.Stat(filepath.Join(h.deps.Home, ".codemeld", "journals")); !os.IsNotExist(serr) {
+					t.Fatalf("journal storage exists (err=%v), want no undo journal for a read-only child", serr)
+				}
+			})
+		}
+	}
+}
+
+type fileToolDispatcher struct {
+	tools      map[string]tools.Tool
+	dispatched []string
+	results    map[string]tools.Result
+}
+
+func (d *fileToolDispatcher) Plan(calls []turn.AssembledToolCall, _ int) turn.ToolPlan {
+	plan := turn.ToolPlan{Units: make([]turn.PlannedToolCall, len(calls))}
+	for i, call := range calls {
+		plan.Units[i] = turn.PlannedToolCall{
+			Call: call,
+			Run:  func(ctx context.Context) (turn.ToolResult, error) { return d.Dispatch(ctx, call) },
+		}
+	}
+	return plan
+}
+
+func (d *fileToolDispatcher) Dispatch(ctx context.Context, call turn.AssembledToolCall) (turn.ToolResult, error) {
+	d.dispatched = append(d.dispatched, call.Name)
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		return turn.ToolResult{}, err
+	}
+	res, err := d.tools[call.Name].Invoke(ctx, args)
+	if err != nil {
+		return turn.ToolResult{}, err
+	}
+	d.results[call.Name] = res
+	return turn.ToolResult{Content: string(res.Stdout) + string(res.Stderr)}, nil
+}
+
+func TestGeneralAgent_AReadOnlyChildIsNeitherOfferedNorAllowedAWriteTool(t *testing.T) {
+	h := newHarness(t)
+	notes := filepath.Join(h.dir, "notes.txt")
+	writeWithMode(t, notes, "hello\n", 0o644)
+	const outputCap = 4096
+	real := &fileToolDispatcher{results: map[string]tools.Result{}, tools: map[string]tools.Tool{}}
+	for _, tool := range []tools.Tool{
+		filetools.NewReadTool(h.deps.Home, h.dir, h.dir, outputCap),
+		filetools.NewGlobTool(h.deps.Home, h.dir, h.dir, outputCap),
+		filetools.NewGrepTool(h.deps.Home, h.dir, h.dir, outputCap),
+		filetools.NewListTool(h.deps.Home, h.dir, h.dir, outputCap),
+		filetools.NewTreeTool(h.deps.Home, h.dir, h.dir, outputCap),
+		filetools.NewFileCountTool(h.deps.Home, h.dir, h.dir, outputCap),
+		filetools.NewEditTool(h.deps.Home, h.dir, h.dir),
+		filetools.NewCreateTool(h.deps.Home, h.dir, h.dir),
+		filetools.NewDeleteTool(h.deps.Home, h.dir, h.dir),
+		filetools.NewMkdirTool(h.deps.Home, h.dir, h.dir),
+		filetools.NewMoveTool(h.deps.Home, h.dir, h.dir),
+	} {
+		real.tools[tool.Name()] = tool
+	}
+	h.override = func(permissions.ModeContext) turn.ToolDispatcher { return real }
+	writes := [][2]string{
+		{"edit", `{"path":"notes.txt","old_text":"hello","new_text":"changed"}`},
+		{"create", `{"path":"made.txt","content":"new\n"}`},
+		{"delete", `{"path":"notes.txt"}`},
+		{"mkdir", `{"path":"newdir"}`},
+		{"move", `{"source":"notes.txt","destination":"moved.txt"}`},
+	}
+	reads := [][2]string{
+		{"read", `{"path":"notes.txt"}`},
+		{"glob", `{"pattern":"*.txt"}`},
+		{"grep", `{"pattern":"hello"}`},
+		{"list", `{}`},
+		{"tree", `{}`},
+		{"file_count", `{}`},
+	}
+	h.client.rounds = []func() (provider.Response, error){
+		streamRound(toolCallsChunk(writes...)),
+		streamRound(toolCallsChunk(reads...)),
+		streamRound(contentChunk("looked around"), finishChunk()),
+	}
+
+	res, err := h.tool().Invoke(t.Context(), map[string]any{instructionsArg: "look around"})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("Invoke = %+v, %v, want a completed child", res, err)
+	}
+	if len(h.client.requests) != 3 {
+		t.Fatalf("provider requests = %d, want 3", len(h.client.requests))
+	}
+	offered := advertisedToChild(h.client.requests[0])
+	for _, write := range writes {
+		if slices.Contains(offered, write[0]) {
+			t.Errorf("read-only child was offered %q; offered=%v", write[0], offered)
+		}
+	}
+	for _, want := range []string{"read", "glob", "grep", "list", "tree", "file_count", ToolName} {
+		if !slices.Contains(offered, want) {
+			t.Errorf("read-only child was not offered %q; offered=%v", want, offered)
+		}
+	}
+
+	results := map[string]string{}
+	for _, msg := range h.client.requests[2].Messages {
+		if msg.Role == "tool" {
+			results[msg.ToolCallID] = msg.Content
+		}
+	}
+	for i, write := range writes {
+		if slices.Contains(real.dispatched, write[0]) {
+			t.Errorf("%q reached the dispatcher; dispatched=%v", write[0], real.dispatched)
+		}
+		got := results[fmt.Sprintf("call-%s-%d", write[0], i)]
+		if !strings.Contains(got, "not available to a read-only child agent") || !strings.Contains(got, "declared no path") {
+			t.Errorf("%q result = %q, want a refusal naming the read-only child form", write[0], got)
+		}
+	}
+	for _, read := range reads {
+		if r, ok := real.results[read[0]]; !ok || r.ExitCode != 0 {
+			t.Errorf("%q result = %+v (ran=%v), want success", read[0], r, ok)
+		}
+	}
+	if data, rerr := os.ReadFile(notes); rerr != nil || string(data) != "hello\n" {
+		t.Fatalf("notes.txt = %q (err=%v), want it untouched", data, rerr)
+	}
+	for _, absent := range []string{"made.txt", "newdir", "moved.txt"} {
+		if _, serr := os.Lstat(filepath.Join(h.dir, absent)); !os.IsNotExist(serr) {
+			t.Fatalf("%s exists (err=%v), want no file change on disk", absent, serr)
+		}
+	}
+
+	h.override = nil
+	h.client.rounds = append(h.client.rounds, streamRound(contentChunk("done"), finishChunk()))
+	if _, err := h.tool().Invoke(t.Context(), callArgs("write", "a.txt")); err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	declared := advertisedToChild(h.client.requests[3])
+	for _, write := range writes {
+		if !slices.Contains(declared, write[0]) {
+			t.Fatalf("a later path-declaring child lost %q; offered=%v", write[0], declared)
+		}
+	}
+}
+
+func TestGeneralAgent_PathFreeNestedCallsCarryAResolvedEmptyCandidate(t *testing.T) {
+	tests := []struct {
+		name       string
+		parent     map[string]any
+		nested     string
+		wantParent map[string]bool
+		wantNested map[string]bool
+	}{
+		{
+			name:       "a path-free call inside a path-declaring child",
+			parent:     map[string]any{instructionsArg: "write", filesArg: []any{"a.txt"}},
+			nested:     `{"instructions":"just look"}`,
+			wantParent: map[string]bool{"a.txt": true},
+		},
+		{
+			name:   "a path-free grandchild of a path-free child",
+			parent: map[string]any{instructionsArg: "look"},
+			nested: `{"instructions":"look closer","files":[]}`,
+		},
+		{
+			name:       "a path-declaring call inside a path-free child",
+			parent:     map[string]any{instructionsArg: "look"},
+			nested:     `{"instructions":"write","files":["a.txt"]}`,
+			wantNested: map[string]bool{"a.txt": true},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t,
+				streamRound(toolCallChunkWithArgs("call-1", ToolName, tc.nested)),
+				streamRound(contentChunk("done"), finishChunk()),
+			)
+			if _, err := h.tool().Invoke(t.Context(), tc.parent); err != nil {
+				t.Fatalf("Invoke error = %v, want nil", err)
+			}
+			if len(h.modeCtxs) != 2 || !slices.Contains(h.dispatchers[1].dispatched, ToolName) {
+				t.Fatalf("authorization contexts = %d, want the nested call to reach its own authorization", len(h.modeCtxs))
+			}
+			nested := h.modeCtxs[1]
+			if !nested.GeneralAgentResolved {
+				t.Fatal("GeneralAgentResolved = false, want the validated nested declaration marked resolved")
+			}
+			abs := func(rel map[string]bool) map[string]bool {
+				out := map[string]bool{}
+				for p := range rel {
+					out[filepath.Join(h.dir, p)] = true
+				}
+				return out
+			}
+			if !maps.Equal(nested.DeclaredWrite, abs(tc.wantParent)) {
+				t.Fatalf("parent ceiling = %v, want %v", nested.DeclaredWrite, abs(tc.wantParent))
+			}
+			if !maps.Equal(nested.GeneralAgentWrite, abs(tc.wantNested)) {
+				t.Fatalf("nested candidate = %v, want %v", nested.GeneralAgentWrite, abs(tc.wantNested))
+			}
+			if len(nested.GeneralAgentDelete)+len(nested.GeneralAgentMoves)+len(nested.GeneralAgentDirs)+len(nested.DeclaredDelete)+len(nested.DeclaredMoves)+len(nested.DeclaredDirs) != 0 {
+				t.Fatalf("nested context = %+v, want no delete, move or directory scope", nested)
+			}
+		})
+	}
+}
+
+func TestGeneralAgent_AReadOnlyChildWhoseStartRecordFailsStartsNothing(t *testing.T) {
+	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
+	h.deps.ProjectRoot = "relative-root"
+
+	res, err := h.tool().Invoke(t.Context(), map[string]any{instructionsArg: "look"})
+	if err != nil {
+		t.Fatalf("Invoke error = %v, want nil", err)
+	}
+	if res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "could not be recorded in the session, so no child agent started") {
+		t.Fatalf("result = %+v, want the in-band start-record failure", res)
+	}
+	if len(h.client.requests) != 0 {
+		t.Fatalf("provider requests = %d, want no child started", len(h.client.requests))
+	}
+}
+
+func TestGeneralAgent_PathFreeLookAlikesAreNeverAReadOnlyChild(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{"an empty path entry", map[string]any{instructionsArg: "x", filesArg: []any{""}}},
+		{"the launch directory as a file", map[string]any{instructionsArg: "x", filesArg: []any{"."}}},
+		{"a directory only", map[string]any{instructionsArg: "x", filesMkdirArg: []any{"made"}}},
+		{"one move pair only", map[string]any{instructionsArg: "x", filesMoveArg: []any{map[string]any{sourceKey: "src.txt", destinationKey: "dst.txt"}}}},
+		{"a delete only", map[string]any{instructionsArg: "x", filesDeleteArg: []any{"src.txt"}}},
+		{"a null file list", map[string]any{instructionsArg: "x", filesArg: nil}},
+		{"a null delete list beside a real path", map[string]any{instructionsArg: "x", filesArg: []any{"a.txt"}, filesDeleteArg: nil}},
+		{"a null move list beside a real path", map[string]any{instructionsArg: "x", filesArg: []any{"a.txt"}, filesMoveArg: nil}},
+		{"a null directory list beside a real path", map[string]any{instructionsArg: "x", filesArg: []any{"a.txt"}, filesMkdirArg: nil}},
+		{"empty lists beside one real path", map[string]any{instructionsArg: "x", filesArg: []any{}, filesDeleteArg: []any{"src.txt"}, filesMoveArg: []any{}, filesMkdirArg: []any{}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
+			writeWithMode(t, filepath.Join(h.dir, "src.txt"), "x\n", 0o644)
+
+			_, write, remove, moves, dirs, _, perr := h.tool().PrepareGeneralAgent(tc.args)
+			if perr == nil && len(write)+len(remove)+len(moves)+len(dirs) == 0 {
+				t.Fatal("PrepareGeneralAgent accepted the call with no declared path, want a refusal or a declaration")
+			}
+			res, err := h.tool().Invoke(t.Context(), tc.args)
+			if err != nil {
+				t.Fatalf("Invoke error = %v, want nil", err)
+			}
+			if perr != nil || len(h.client.requests) == 0 {
+				if res.ExitCode == 0 || len(h.client.requests) != 0 {
+					t.Fatalf("result = %+v with %d provider requests, want a refusal before any child", res, len(h.client.requests))
+				}
+				return
+			}
+			if offered := advertisedToChild(h.client.requests[0]); !slices.Contains(offered, filetools.EditToolName) {
+				t.Fatalf("child offered %v, want the path-declaring tool set", offered)
+			}
+		})
 	}
 }

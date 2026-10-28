@@ -103,7 +103,7 @@ type retrySignal struct {
 	reason        string
 	retryAfter    time.Duration // honored 429/503 Retry-After delay; meaningful only when hasRetryAfter
 	hasRetryAfter bool          // a 429/503 Retry-After was present and parsed (overrides backoff even at 0)
-	partialChars  int           // assistant runes streamed before a stream_drop
+	partialChars  int           // assistant runes retained before the failure, including held deltas
 	isStreamDrop  bool
 	err           error
 	commit        func(attempts int)
@@ -176,7 +176,7 @@ func (r *Runner) runWithRetry(ctx context.Context, req provider.Request, sel mod
 		r.emitRetry(ctx, sel, attempt, delay, sig)
 		// Discard-and-restart: have the UI roll back the un-sealed partial before
 		// re-issue (the UI owns the visible rollback; the seam is a no-op by default).
-		if (sig.isStreamDrop || sig.phase == events.RetryPhaseToolHandoff) && sig.partialChars > 0 {
+		if (sig.isStreamDrop || sig.phase == events.RetryPhaseToolHandoff || sig.phase == provider.EmptyStreamClassification().Phase) && sig.partialChars > 0 {
 			r.deps.RollbackPartial()
 		}
 		nextAttempt := attempt + 1

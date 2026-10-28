@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/skills"
 )
 
 // fixedEnv is a deterministic environment input set for assembly tests (the env
@@ -27,7 +28,7 @@ func TestAssembleSystemMessage_OrderBaseEnvAgents(t *testing.T) {
 		{Layer: LayerGlobal, LoadOrder: 1, Content: []byte("global rules")},
 		{Layer: LayerWalked, LoadOrder: 2, Content: []byte("project rules")},
 	}
-	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), entries)
+	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil, entries)
 
 	base := BasePrompt(mode.Build)
 	env := EnvironmentBlock(fixedEnv())
@@ -49,8 +50,36 @@ func TestAssembleSystemMessage_OrderBaseEnvAgents(t *testing.T) {
 	}
 }
 
+func TestAssembleSystemMessage_ListsModelInvocableSkillsBeforeAgents(t *testing.T) {
+	loaded := []skills.Skill{
+		{Name: "deploy", Description: "Deploy the\n\tservice\x1b[31m  now", Body: "BODY-MARKER", ModelInvocable: true},
+		{Name: "hidden", Description: "Not for the model", Body: "HIDDEN-BODY", ModelInvocable: false},
+	}
+	entries := []LoadEntry{{Layer: LayerGlobal, LoadOrder: 1, Content: []byte("global rules")}}
+	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), loaded, entries)
+
+	section := "Skills:\nWhen a request matches a skill's description, call the skill tool to load it.\n- deploy: Deploy the service[31m now"
+	want := BasePrompt(mode.Build) + "\n\n" + EnvironmentBlock(fixedEnv()) + "\n\n" + section + "\n\nglobal rules"
+	if got != want {
+		t.Fatalf("assembled message =\n%q\nwant\n%q", got, want)
+	}
+	for _, absent := range []string{"BODY-MARKER", "hidden", "HIDDEN-BODY"} {
+		if strings.Contains(got, absent) {
+			t.Fatalf("assembled message contains %q:\n%s", absent, got)
+		}
+	}
+}
+
+func TestAssembleSystemMessage_NoModelInvocableSkillsLeavesPromptUnchanged(t *testing.T) {
+	loaded := []skills.Skill{{Name: "hidden", Description: "Not for the model", ModelInvocable: false}}
+	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), loaded, nil)
+	if want := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil, nil); got != want {
+		t.Fatalf("assembled message =\n%q\nwant the no-skills message\n%q", got, want)
+	}
+}
+
 func TestAssembleSystemMessage_ZeroAgentsStillNonEmpty(t *testing.T) {
-	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil)
+	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil, nil)
 
 	if got == "" {
 		t.Fatal("assembled message is empty with zero AGENTS.md files; base + env must always be present (req 30)")
@@ -69,8 +98,8 @@ func TestAssembleSystemMessage_AllSkippedAgentsContributeNothing(t *testing.T) {
 	entries := []LoadEntry{
 		{Layer: LayerWalked, LoadOrder: 2, Skipped: true, SkipReason: SkipUnreadable},
 	}
-	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), entries)
-	want := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil)
+	got := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil, entries)
+	want := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil, nil)
 	if got != want {
 		t.Fatalf("all-skipped AGENTS message =\n%q\nwant identical to zero-AGENTS\n%q", got, want)
 	}
@@ -89,7 +118,7 @@ func TestAssembleSystemMessage_PerModeBaseSelected(t *testing.T) {
 		{mode.AutoEdits, "## Auto edits mode"},
 	}
 	for _, tc := range cases {
-		got := AssembleSystemMessage(tc.m, "", "", fixedEnv(), nil)
+		got := AssembleSystemMessage(tc.m, "", "", fixedEnv(), nil, nil)
 		if !strings.HasPrefix(got, BasePrompt(tc.m)) {
 			t.Fatalf("mode %q: assembled message does not lead with that mode's base prompt", tc.m)
 		}
@@ -115,7 +144,7 @@ func TestAssembleSystemMessage_FlaggedModelInsertsSpecialInstructions(t *testing
 		t.Fatal("expected the Granite key to be flagged with a non-empty special-instructions block")
 	}
 
-	got := AssembleSystemMessage(mode.Build, provider, modelID, fixedEnv(), nil)
+	got := AssembleSystemMessage(mode.Build, provider, modelID, fixedEnv(), nil, nil)
 	base := BasePrompt(mode.Build)
 	env := EnvironmentBlock(fixedEnv())
 	want := base + "\n\n" + special + "\n\n" + env
@@ -135,8 +164,8 @@ func TestAssembleSystemMessage_FlaggedModelInsertsSpecialInstructions(t *testing
 	}
 
 	// An unflagged model adds no special section, so it is byte-identical to passing no model.
-	unflagged := AssembleSystemMessage(mode.Build, "openai", "gpt-5.5", fixedEnv(), nil)
-	noModel := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil)
+	unflagged := AssembleSystemMessage(mode.Build, "openai", "gpt-5.5", fixedEnv(), nil, nil)
+	noModel := AssembleSystemMessage(mode.Build, "", "", fixedEnv(), nil, nil)
 	if unflagged != noModel {
 		t.Fatalf("unflagged model assembly differs from no-model assembly:\n%q\n%q", unflagged, noModel)
 	}
@@ -297,6 +326,35 @@ func TestBasePrompt_ShellPathGuidance(t *testing.T) {
 	}
 }
 
+func TestBasePrompt_StructuredVCSAndGlobGuidance(t *testing.T) {
+	wantPhrases := []string{
+		"prefer the advertised `vcs_*` tools for the operations they cover",
+		"for example `vcs_status`, `vcs_diff`, `vcs_log` and `vcs_branch_current`, when advertised",
+		"rely on each tool's own description for what it reports, which can differ between version-control systems",
+		"`bash` is the fallback for operations no advertised tool covers — running builds and tests and the like, in the forms the current mode admits",
+		"they are read-only, project-rooted by default,",
+		"Use the `glob` tool to find files, including under a folder outside the project that you name explicitly",
+	}
+	unwantPhrases := []string{
+		"running builds and tests, version control, and the like",
+		"confined to the project",
+		"or `find` with a relative start path",
+	}
+	for _, m := range []mode.Mode{mode.Plan, mode.Build, mode.AutoEdits} {
+		bp := BasePrompt(m)
+		for _, want := range wantPhrases {
+			if !strings.Contains(bp, want) {
+				t.Errorf("mode %q base prompt missing structured VCS/glob guidance phrase %q", m, want)
+			}
+		}
+		for _, unwant := range unwantPhrases {
+			if strings.Contains(bp, unwant) {
+				t.Errorf("mode %q base prompt still contains %q", m, unwant)
+			}
+		}
+	}
+}
+
 func TestBasePrompt_CopyableContentUsesFencedBlocks(t *testing.T) {
 	wantPhrases := []string{
 		"Put anything the user is meant to copy in a fenced markdown code block",
@@ -325,8 +383,12 @@ func TestBasePrompt_AutoEditsProjectTreeContract(t *testing.T) {
 		"**both** its source and its destination resolve inside the project",
 		"if either end is outside, the whole move pauses for permission",
 		"Auto edits is not blanket approval",
-		"Shell commands, `delete`, version-control actions, any target outside the project",
+		"Version-control actions, any target outside the project apart from the deletes described below, and other out-of-scope or risky actions still pause for permission",
 		"they are not auto-approved",
+		"Inside codemeld's sandbox, while the settings files are valid, a shell command runs without pausing unless codemeld recognizes network access or a version-control history rewrite in it",
+		"delete only what the user's request calls for",
+		"a `delete` call whose target is inside the project or inside a folder listed in `writable_folders`, but not that folder itself; a `delete` anywhere else still pauses",
+		"On a host without the sandbox, or while a settings file is broken, shell commands and `delete` pause for permission exactly as in Build mode",
 	} {
 		if !strings.Contains(auto, want) {
 			t.Errorf("Auto edits base prompt missing project-tree contract wording %q\n--- got ---\n%s", want, auto)
@@ -407,7 +469,7 @@ func TestBasePrompt_AutoEditsRequiresChangeAuthorizingRequest(t *testing.T) {
 
 func TestAssembleSystemMessage_MathGuidanceLimitedToResponses(t *testing.T) {
 	const provider, modelID = "openrouter", "ibm-granite/granite-4.1-8b"
-	got := AssembleSystemMessage(mode.Build, provider, modelID, fixedEnv(), nil)
+	got := AssembleSystemMessage(mode.Build, provider, modelID, fixedEnv(), nil, nil)
 	for _, want := range []string{
 		"When you write mathematics in a response to the user",
 		"This rule applies to your terminal-facing",
@@ -419,7 +481,7 @@ func TestAssembleSystemMessage_MathGuidanceLimitedToResponses(t *testing.T) {
 		}
 	}
 
-	unflagged := AssembleSystemMessage(mode.Build, "openai", "gpt-5.5", fixedEnv(), nil)
+	unflagged := AssembleSystemMessage(mode.Build, "openai", "gpt-5.5", fixedEnv(), nil, nil)
 	if strings.Contains(unflagged, "When you write mathematics in a response to the user") {
 		t.Error("unflagged model assembly carries the flagged model's math instruction")
 	}
@@ -508,6 +570,22 @@ func TestPlanPromptOrdersStructuredToolsFirst(t *testing.T) {
 	}
 	if idxFirst >= idxSecond {
 		t.Fatalf("Plan base prompt orders diagnostics before structured tools: first=%d second=%d", idxFirst, idxSecond)
+	}
+}
+
+func TestPlanPromptOrdersStructuredVCSBeforeShellForms(t *testing.T) {
+	plan := BasePrompt(mode.Plan)
+	const tools = "prefer the advertised read-only `vcs_*` tools, such as `vcs_status`, `vcs_diff`, `vcs_log` and `vcs_branch_current`, when advertised, and rely on each tool's own description for what it reports"
+	const fallback = "Only when no advertised tool answers the question may you use read-only version-control shell forms such as `hg status` and `hg log`"
+	const bounded = "These shell forms are exact: the classifier admits a specific bounded shape"
+	idxTools := strings.Index(plan, tools)
+	idxFallback := strings.Index(plan, fallback)
+	idxBounded := strings.Index(plan, bounded)
+	if idxTools < 0 || idxFallback < 0 || idxBounded < 0 {
+		t.Fatalf("Plan base prompt missing VCS ordering wording (tools=%d fallback=%d bounded=%d)\n--- got ---\n%s", idxTools, idxFallback, idxBounded, plan)
+	}
+	if idxTools >= idxFallback || idxFallback >= idxBounded {
+		t.Fatalf("Plan base prompt VCS guidance out of order: tools=%d fallback=%d bounded=%d", idxTools, idxFallback, idxBounded)
 	}
 }
 

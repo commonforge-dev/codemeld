@@ -33,7 +33,7 @@ func endpointsBody(p50s ...any) string {
 		if p != nil {
 			tp = fmt.Sprintf(`{"p50":%v,"p75":1,"p90":1,"p99":1}`, p)
 		}
-		parts = append(parts, fmt.Sprintf(`{"provider_name":"p%d","pricing":{"prompt":"0.000001","completion":"0.000002"},"throughput_last_30m":%s}`, i, tp))
+		parts = append(parts, fmt.Sprintf(`{"provider_name":"p%d","tag":"p%d/%v","pricing":{"prompt":"0.000001","completion":"0.000002"},"throughput_last_30m":%s}`, i, i, p, tp))
 	}
 	return `{"data":{"endpoints":[` + strings.Join(parts, ",") + `]}}`
 }
@@ -43,7 +43,7 @@ func TestFetchOpenRouterEndpoints_ParsesPricesAndThroughput(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.EscapedPath()
 		_, _ = io.WriteString(w, `{"data":{"endpoints":[
-			{"provider_name":"Inception","pricing":{"prompt":"0.00000004","completion":"0.00000015","discount":0.8},"throughput_last_30m":{"p50":512.5,"p75":400,"p90":300,"p99":100}},
+			{"provider_name":"Inception","tag":"inception/fp8/us","pricing":{"prompt":"0.00000004","completion":"0.00000015","discount":0.8},"throughput_last_30m":{"p50":512.5,"p75":400,"p90":300,"p99":100}},
 			{"provider_name":"Slow","pricing":{"prompt":"0.0000001","completion":"0.0000003"},"throughput_last_30m":null},
 			{"provider_name":"Broken","pricing":{"prompt":"n/a","completion":"0.0000003"},"throughput_last_30m":{"p50":9}}
 		]}}`)
@@ -55,7 +55,7 @@ func TestFetchOpenRouterEndpoints_ParsesPricesAndThroughput(t *testing.T) {
 		t.Fatalf("fetch error = %v", err)
 	}
 	want := []openRouterEndpoint{
-		{ProviderName: "Inception", PromptPerM: 0.04, CompletionPerM: 0.15, Discount: 0.8, P50Throughput: 512.5, HasThroughput: true},
+		{ProviderName: "Inception", Tag: "inception/fp8/us", PromptPerM: 0.04, CompletionPerM: 0.15, Discount: 0.8, P50Throughput: 512.5, HasThroughput: true},
 		{ProviderName: "Slow", PromptPerM: 0.1, CompletionPerM: 0.3},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -237,15 +237,14 @@ func newTestStore(s *endpointsServer) (*OpenRouterEndpointStore, *fakeClock) {
 	return &OpenRouterEndpointStore{HTTPClient: s.srv.Client(), Now: clock.Now}, clock
 }
 
-func lookupBar(ctx context.Context, store *OpenRouterEndpointStore, baseURL, model string) (float64, bool) {
-	return store.SpeedBar(ctx, endpointsEntry(baseURL), "Authorization", "Bearer "+endpointsKey, model)
+func lookupTag(ctx context.Context, store *OpenRouterEndpointStore, baseURL, model string) string {
+	return store.BestValueTag(ctx, endpointsEntry(baseURL), "Authorization", "Bearer "+endpointsKey, model, nil)
 }
 
-func expectLookup(t *testing.T, store *OpenRouterEndpointStore, s *endpointsServer, baseURL string, wantBar float64, wantOK bool, wantHits int32) {
+func expectLookup(t *testing.T, store *OpenRouterEndpointStore, s *endpointsServer, baseURL, wantTag string, wantHits int32) {
 	t.Helper()
-	bar, ok := lookupBar(context.Background(), store, baseURL, "m")
-	if bar != wantBar || ok != wantOK {
-		t.Fatalf("SpeedBar = %v, %v; want %v, %v", bar, ok, wantBar, wantOK)
+	if tag := lookupTag(context.Background(), store, baseURL, "m"); tag != wantTag {
+		t.Fatalf("BestValueTag = %q, want %q", tag, wantTag)
 	}
 	if got := s.hits.Load(); got != wantHits {
 		t.Fatalf("endpoint requests = %d, want %d", got, wantHits)
@@ -255,24 +254,24 @@ func expectLookup(t *testing.T, store *OpenRouterEndpointStore, s *endpointsServ
 func TestOpenRouterEndpointStore_SuccessCachedTwelveHours(t *testing.T) {
 	s := newEndpointsServer(t, endpointsBody(10, 30, 20))
 	store, clock := newTestStore(s)
-	expectLookup(t, store, s, s.srv.URL, 20, true, 1)
+	expectLookup(t, store, s, s.srv.URL, "p1/30", 1)
 	clock.advance(12*time.Hour - time.Second)
-	expectLookup(t, store, s, s.srv.URL, 20, true, 1)
+	expectLookup(t, store, s, s.srv.URL, "p1/30", 1)
 	s.set(http.StatusOK, endpointsBody(50))
 	clock.advance(time.Second)
-	expectLookup(t, store, s, s.srv.URL, 50, true, 2)
+	expectLookup(t, store, s, s.srv.URL, "p0/50", 2)
 }
 
 func TestOpenRouterEndpointStore_FailureRetriedAfterFifteenMinutes(t *testing.T) {
 	s := newEndpointsServer(t, "")
 	s.set(http.StatusServiceUnavailable, "down")
 	store, clock := newTestStore(s)
-	expectLookup(t, store, s, s.srv.URL, 0, false, 1)
+	expectLookup(t, store, s, s.srv.URL, "", 1)
 	clock.advance(15*time.Minute - time.Second)
-	expectLookup(t, store, s, s.srv.URL, 0, false, 1)
+	expectLookup(t, store, s, s.srv.URL, "", 1)
 	s.set(http.StatusOK, endpointsBody(40))
 	clock.advance(time.Second)
-	expectLookup(t, store, s, s.srv.URL, 40, true, 2)
+	expectLookup(t, store, s, s.srv.URL, "p0/40", 2)
 }
 
 func TestOpenRouterEndpointStore_NoBarSuccessCachedTwelveHours(t *testing.T) {
@@ -283,11 +282,11 @@ func TestOpenRouterEndpointStore_NoBarSuccessCachedTwelveHours(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := newEndpointsServer(t, body)
 			store, clock := newTestStore(s)
-			expectLookup(t, store, s, s.srv.URL, 0, false, 1)
+			expectLookup(t, store, s, s.srv.URL, "", 1)
 			clock.advance(12*time.Hour - time.Second)
-			expectLookup(t, store, s, s.srv.URL, 0, false, 1)
+			expectLookup(t, store, s, s.srv.URL, "", 1)
 			clock.advance(time.Second)
-			expectLookup(t, store, s, s.srv.URL, 0, false, 2)
+			expectLookup(t, store, s, s.srv.URL, "", 2)
 		})
 	}
 }
@@ -296,10 +295,10 @@ func TestOpenRouterEndpointStore_KeyedByBaseURL(t *testing.T) {
 	first := newEndpointsServer(t, endpointsBody(10))
 	second := newEndpointsServer(t, endpointsBody(99))
 	store, _ := newTestStore(first)
-	expectLookup(t, store, first, first.srv.URL, 10, true, 1)
-	expectLookup(t, store, first, first.srv.URL+"/", 10, true, 1)
+	expectLookup(t, store, first, first.srv.URL, "p0/10", 1)
+	expectLookup(t, store, first, first.srv.URL+"/", "p0/10", 1)
 	store.HTTPClient = second.srv.Client()
-	expectLookup(t, store, second, second.srv.URL, 99, true, 1)
+	expectLookup(t, store, second, second.srv.URL, "p0/99", 1)
 }
 
 func TestOpenRouterEndpointStore_ConcurrentLookupsShareOneFetch(t *testing.T) {
@@ -308,23 +307,18 @@ func TestOpenRouterEndpointStore_ConcurrentLookupsShareOneFetch(t *testing.T) {
 	store, _ := newTestStore(s)
 
 	const n = 8
-	type result struct {
-		bar float64
-		ok  bool
-	}
-	results := make(chan result, n)
+	results := make(chan string, n)
 	for range n {
 		go func() {
-			bar, ok := lookupBar(context.Background(), store, s.srv.URL, "m")
-			results <- result{bar, ok}
+			results <- lookupTag(context.Background(), store, s.srv.URL, "m")
 		}()
 	}
 	<-s.entered
 	time.Sleep(20 * time.Millisecond)
 	close(s.release)
 	for range n {
-		if r := <-results; r.bar != 20 || !r.ok {
-			t.Fatalf("SpeedBar = %v, %v; want 20, true", r.bar, r.ok)
+		if tag := <-results; tag != "p1/30" {
+			t.Fatalf("BestValueTag = %q, want p1/30", tag)
 		}
 	}
 	if got := s.hits.Load(); got != 1 {
@@ -350,39 +344,38 @@ func TestOpenRouterEndpointStore_WaiterGivesUpWithoutCancellingOwner(t *testing.
 			s.block()
 			store, _ := newTestStore(s)
 
-			ownerDone := make(chan float64, 1)
+			ownerDone := make(chan string, 1)
 			go func() {
-				bar, _ := lookupBar(context.Background(), store, s.srv.URL, "m")
-				ownerDone <- bar
+				ownerDone <- lookupTag(context.Background(), store, s.srv.URL, "m")
 			}()
 			<-s.entered
 
-			if bar, ok := lookupBar(waiterCtx, store, s.srv.URL, "m"); ok {
-				t.Fatalf("waiter SpeedBar = %v, true; want no bar", bar)
+			if tag := lookupTag(waiterCtx, store, s.srv.URL, "m"); tag != "" {
+				t.Fatalf("waiter BestValueTag = %q, want none", tag)
 			}
 			close(s.release)
-			if bar := <-ownerDone; bar != 20 {
-				t.Fatalf("owner SpeedBar = %v, want 20", bar)
+			if tag := <-ownerDone; tag != "p1/30" {
+				t.Fatalf("owner BestValueTag = %q, want p1/30", tag)
 			}
-			expectLookup(t, store, s, s.srv.URL, 20, true, 1)
+			expectLookup(t, store, s, s.srv.URL, "p1/30", 1)
 		})
 	}
 }
 
 func TestOpenRouterEstimate(t *testing.T) {
 	mixed := []openRouterEndpoint{
-		{ProviderName: "slow", PromptPerM: 0.1, CompletionPerM: 0.2, P50Throughput: 10, HasThroughput: true},
-		{ProviderName: "unknown", PromptPerM: 0.05, CompletionPerM: 0.05},
-		{ProviderName: "fast", PromptPerM: 1, CompletionPerM: 2, P50Throughput: 200, HasThroughput: true},
-		{ProviderName: "mid", PromptPerM: 0.3, CompletionPerM: 0.4, Discount: 0.25, P50Throughput: 50, HasThroughput: true},
+		{ProviderName: "slow", Tag: "slow", PromptPerM: 0.1, CompletionPerM: 0.2, P50Throughput: 10, HasThroughput: true},
+		{ProviderName: "unknown", Tag: "unknown", PromptPerM: 0.05, CompletionPerM: 0.05},
+		{ProviderName: "fast", Tag: "fast", PromptPerM: 1, CompletionPerM: 2, P50Throughput: 200, HasThroughput: true},
+		{ProviderName: "mid", Tag: "mid", PromptPerM: 0.3, CompletionPerM: 0.4, Discount: 0.25, P50Throughput: 50, HasThroughput: true},
 	}
 	noSpeed := []openRouterEndpoint{
-		{ProviderName: "a", PromptPerM: 0.5, CompletionPerM: 0.5},
-		{ProviderName: "b", PromptPerM: 0.2, CompletionPerM: 0.3},
+		{ProviderName: "a", Tag: "a", PromptPerM: 0.5, CompletionPerM: 0.5},
+		{ProviderName: "b", Tag: "b", PromptPerM: 0.2, CompletionPerM: 0.3},
 	}
 	ties := []openRouterEndpoint{
-		{ProviderName: "first", PromptPerM: 0.1, CompletionPerM: 0.3, P50Throughput: 40, HasThroughput: true},
-		{ProviderName: "second", PromptPerM: 0.3, CompletionPerM: 0.1, Discount: 0.5, P50Throughput: 40, HasThroughput: true},
+		{ProviderName: "first", Tag: "first", PromptPerM: 0.1, CompletionPerM: 0.3, P50Throughput: 40, HasThroughput: true},
+		{ProviderName: "second", Tag: "second", PromptPerM: 0.3, CompletionPerM: 0.1, Discount: 0.5, P50Throughput: 40, HasThroughput: true},
 	}
 	parsed := func(name, prompt, completion string, discount float64) openRouterEndpoint {
 		p, okP := pricePerMillion(prompt)
@@ -390,7 +383,7 @@ func TestOpenRouterEstimate(t *testing.T) {
 		if !okP || !okC {
 			t.Fatalf("pricePerMillion(%q, %q) failed", prompt, completion)
 		}
-		return openRouterEndpoint{ProviderName: name, PromptPerM: p, CompletionPerM: c, Discount: discount, P50Throughput: 40, HasThroughput: true}
+		return openRouterEndpoint{ProviderName: name, Tag: name, PromptPerM: p, CompletionPerM: c, Discount: discount, P50Throughput: 40, HasThroughput: true}
 	}
 	decimalTies := []openRouterEndpoint{
 		parsed("first", "0.0000001", "0.0000002", 0.1),
@@ -403,6 +396,15 @@ func TestOpenRouterEstimate(t *testing.T) {
 	higherFirst := []openRouterEndpoint{
 		parsed("higher", "0.00000015", "0.0000001501", 0.4),
 		parsed("second", "0.0000001", "0.0000002", 0.1),
+	}
+	cluster := []openRouterEndpoint{
+		{Tag: "cheap", PromptPerM: 0.25, CompletionPerM: 0.32, P50Throughput: 127, HasThroughput: true},
+		{Tag: "quick", PromptPerM: 0.3, CompletionPerM: 0.36, Discount: 0.1, P50Throughput: 154, HasThroughput: true},
+		{Tag: "slow", PromptPerM: 0.1, CompletionPerM: 0.1, P50Throughput: 50, HasThroughput: true},
+	}
+	untagged := []openRouterEndpoint{
+		{PromptPerM: 0.1, CompletionPerM: 0.1, P50Throughput: 40, HasThroughput: true},
+		{PromptPerM: 0.2, CompletionPerM: 0.2, P50Throughput: 40, HasThroughput: true},
 	}
 	est := func(e openRouterEndpoint) OpenRouterEstimate {
 		return OpenRouterEstimate{PromptPerM: e.PromptPerM, CompletionPerM: e.CompletionPerM, Discount: e.Discount}
@@ -423,7 +425,9 @@ func TestOpenRouterEstimate(t *testing.T) {
 		{"default picks the cheapest", mixed, "default", OpenRouterEstimate{PromptPerM: 0.05, CompletionPerM: 0.05}, true},
 		{"throughput picks the fastest known p50", mixed, "throughput", OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2}, true},
 		{"best value picks the cheapest at or above the bar and reports its discount", mixed, "best_value", OpenRouterEstimate{PromptPerM: 0.3, CompletionPerM: 0.4, Discount: 0.25}, true},
-		{"best value without a bar picks the cheapest", noSpeed, "best_value", OpenRouterEstimate{PromptPerM: 0.2, CompletionPerM: 0.3}, true},
+		{"best value without a bar picks nothing", noSpeed, "best_value", OpenRouterEstimate{}, false},
+		{"best value picks the fastest within 20% of the cheapest", cluster, "best_value", est(cluster[1]), true},
+		{"best value without usable tags picks nothing", untagged, "best_value", OpenRouterEstimate{}, false},
 		{"throughput without speed data", noSpeed, "throughput", OpenRouterEstimate{}, false},
 		{"default tie picks the first listed", ties, "default", OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.3}, true},
 		{"throughput tie picks the first listed", ties, "throughput", OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.3}, true},
@@ -443,12 +447,70 @@ func TestOpenRouterEstimate(t *testing.T) {
 	}
 }
 
+func TestOpenRouterBestValue(t *testing.T) {
+	ep := func(tag string, total, p50 float64) openRouterEndpoint {
+		return openRouterEndpoint{Tag: tag, PromptPerM: total, P50Throughput: p50, HasThroughput: true}
+	}
+	noSpeed := func(tag string, total float64) openRouterEndpoint {
+		return openRouterEndpoint{Tag: tag, PromptPerM: total}
+	}
+	cluster := []openRouterEndpoint{
+		ep("slow/fp8", 0.40, 50),
+		ep("relace", 0.57, 127),
+		ep("wafer/nvfp4", 0.66, 154),
+		ep("pricey/fp8", 2.0, 300),
+	}
+	cases := []struct {
+		name      string
+		endpoints []openRouterEndpoint
+		ignored   []string
+		want      string
+	}{
+		{"faster endpoint within 20% wins over the cheapest", cluster, nil, "wafer/nvfp4"},
+		{"exactly 1.2x the cheapest is eligible", []openRouterEndpoint{ep("cheap", 1.0, 100), ep("edge", 1.2, 200)}, nil, "edge"},
+		{"one price unit above 1.2x is not", []openRouterEndpoint{ep("cheap", 1.0, 100), ep("edge", 1.2001, 200)}, nil, "cheap"},
+		{
+			"below the bar or without speed data is never picked nor sets the cheapest price",
+			[]openRouterEndpoint{ep("below", 0.1, 10), noSpeed("unknown", 0.05), ep("bar", 0.5, 50), ep("faster", 0.55, 60)}, nil, "faster",
+		},
+		{"ignored base slug skips its endpoints", cluster, []string{"wafer"}, "relace"},
+		{"ignored full tag skips its endpoint", cluster, []string{"wafer/nvfp4"}, "relace"},
+		{"ignored slug matches only a whole first segment", cluster, []string{"waf"}, "wafer/nvfp4"},
+		{"equal speed picks the cheaper", []openRouterEndpoint{ep("dear", 1.1, 100), ep("thrifty", 1.0, 100)}, nil, "thrifty"},
+		{"equal speed and price keep the first listed", []openRouterEndpoint{ep("first", 1.0, 100), ep("second", 1.0, 100)}, nil, "first"},
+		{"no speed data picks nothing", []openRouterEndpoint{noSpeed("a", 1.0), noSpeed("b", 2.0)}, nil, ""},
+		{"empty list picks nothing", []openRouterEndpoint{}, nil, ""},
+		{"nil list picks nothing", nil, nil, ""},
+		{
+			"missing tags neither win nor lower the cheapest price",
+			[]openRouterEndpoint{ep("", 0.1, 100), ep("tagged", 0.5, 100), ep("faster", 0.58, 120)}, nil, "faster",
+		},
+		{"all tags missing picks nothing", []openRouterEndpoint{ep("", 0.1, 100), ep("", 0.5, 120)}, nil, ""},
+		{"multi-segment tag is returned intact", []openRouterEndpoint{ep("baseten/fp8/us", 1.0, 100), ep("other", 1.0, 50)}, nil, "baseten/fp8/us"},
+		{"ignored base slug matches a multi-segment tag", []openRouterEndpoint{ep("baseten/fp8/us", 1.0, 100), ep("other", 1.0, 100)}, []string{"baseten"}, "other"},
+		{"partial multi-segment prefix is not ignored", []openRouterEndpoint{ep("baseten/fp8/us", 1.0, 100), ep("other", 1.0, 100)}, []string{"baseten/fp8"}, "baseten/fp8/us"},
+		{"bound holds for totals whose multiples overflow int64", []openRouterEndpoint{ep("cheap", 8e14, 100), ep("fast", 9e14, 200)}, nil, "fast"},
+		{"bound excludes for totals whose multiples overflow int64", []openRouterEndpoint{ep("cheap", 7e14, 100), ep("fast", 9e14, 200)}, nil, "cheap"},
+		{"negative cheapest total admits nothing", []openRouterEndpoint{ep("credit", -1.0, 100), ep("smaller", -0.5, 200)}, nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := openRouterBestValue(tc.endpoints, tc.ignored)
+			if got.Tag != tc.want || ok != (tc.want != "") {
+				t.Fatalf("pick = %q, %v; want %q", got.Tag, ok, tc.want)
+			}
+		})
+	}
+}
+
 const estimateBody = `{"data":{"endpoints":[
-	{"provider_name":"a","pricing":{"prompt":"0.0000003","completion":"0.0000004"},"throughput_last_30m":{"p50":10}},
-	{"provider_name":"b","pricing":{"prompt":"0.0000001","completion":"0.0000002","discount":0.5},"throughput_last_30m":{"p50":90}}
+	{"provider_name":"a","tag":"a/fp8","pricing":{"prompt":"0.0000003","completion":"0.0000004"},"throughput_last_30m":{"p50":10}},
+	{"provider_name":"b","tag":"b/fp8","pricing":{"prompt":"0.0000001","completion":"0.0000002","discount":0.5},"throughput_last_30m":{"p50":90}}
 ]}}`
 
 var estimateCheapest = OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.2, Discount: 0.5}
+
+const estimateCheapestTag = "b/fp8"
 
 func estimateNow(store *OpenRouterEndpointStore, baseURL string) (OpenRouterEstimate, bool, chan struct{}) {
 	fetched := make(chan struct{})
@@ -476,14 +538,14 @@ func expectEstimate(t *testing.T, store *OpenRouterEndpointStore, s *endpointsSe
 	}
 }
 
-func TestOpenRouterEndpointStore_SpeedBarFetchFeedsEstimate(t *testing.T) {
+func TestOpenRouterEndpointStore_BestValueTagFetchFeedsEstimate(t *testing.T) {
 	s := newEndpointsServer(t, estimateBody)
 	store, _ := newTestStore(s)
-	expectLookup(t, store, s, s.srv.URL, 10, true, 1)
+	expectLookup(t, store, s, s.srv.URL, estimateCheapestTag, 1)
 	expectEstimate(t, store, s, estimateCheapest, true, 1)
 }
 
-func TestOpenRouterEndpointStore_EstimateFetchesInBackgroundAndFeedsSpeedBar(t *testing.T) {
+func TestOpenRouterEndpointStore_EstimateFetchesInBackgroundAndFeedsBestValueTag(t *testing.T) {
 	s := newEndpointsServer(t, estimateBody)
 	s.block()
 	store, _ := newTestStore(s)
@@ -499,62 +561,60 @@ func TestOpenRouterEndpointStore_EstimateFetchesInBackgroundAndFeedsSpeedBar(t *
 	awaitFetched(t, fetched)
 	awaitFetched(t, joined)
 	expectEstimate(t, store, s, estimateCheapest, true, 1)
-	expectLookup(t, store, s, s.srv.URL, 10, true, 1)
+	expectLookup(t, store, s, s.srv.URL, estimateCheapestTag, 1)
 }
 
-func TestOpenRouterEndpointStore_BarOnlyEntryDoesNotSuppressEstimateFetch(t *testing.T) {
+func TestOpenRouterEndpointStore_UnretainedEntryDoesNotSuppressEstimateFetch(t *testing.T) {
 	s := newEndpointsServer(t, estimateBody)
 	store, clock := newTestStore(s)
 	store.entries = map[openRouterEndpointKey]*openRouterEndpointEntry{
-		{baseURL: s.srv.URL, model: "m"}: {fetched: clock.Now(), bar: 10, hasBar: true},
+		{baseURL: s.srv.URL, model: "m"}: {fetched: clock.Now()},
 	}
 
 	_, ok, fetched := estimateNow(store, s.srv.URL)
 	if ok {
-		t.Fatal("bar-only entry produced an estimate")
+		t.Fatal("unretained entry produced an estimate")
 	}
 	awaitFetched(t, fetched)
 	expectEstimate(t, store, s, estimateCheapest, true, 1)
 }
 
-func TestOpenRouterEndpointStore_SpeedBarJoinsBackgroundFetch(t *testing.T) {
+func TestOpenRouterEndpointStore_BestValueTagJoinsBackgroundFetch(t *testing.T) {
 	s := newEndpointsServer(t, estimateBody)
 	s.block()
 	store, _ := newTestStore(s)
 
 	_, _, fetched := estimateNow(store, s.srv.URL)
 	<-s.entered
-	bar := make(chan float64, 1)
+	tag := make(chan string, 1)
 	go func() {
-		b, _ := lookupBar(context.Background(), store, s.srv.URL, "m")
-		bar <- b
+		tag <- lookupTag(context.Background(), store, s.srv.URL, "m")
 	}()
 	time.Sleep(20 * time.Millisecond)
 	close(s.release)
 	awaitFetched(t, fetched)
-	if got := <-bar; got != 10 {
-		t.Fatalf("SpeedBar = %v, want 10", got)
+	if got := <-tag; got != estimateCheapestTag {
+		t.Fatalf("BestValueTag = %q, want %q", got, estimateCheapestTag)
 	}
 	if got := s.hits.Load(); got != 1 {
 		t.Fatalf("endpoint requests = %d, want 1", got)
 	}
 }
 
-func TestOpenRouterEndpointStore_EstimateDoesNotWaitOnSpeedBarFetch(t *testing.T) {
+func TestOpenRouterEndpointStore_EstimateDoesNotWaitOnBestValueTagFetch(t *testing.T) {
 	s := newEndpointsServer(t, estimateBody)
 	s.block()
 	store, _ := newTestStore(s)
 
-	bar := make(chan float64, 1)
+	tag := make(chan string, 1)
 	go func() {
-		b, _ := lookupBar(context.Background(), store, s.srv.URL, "m")
-		bar <- b
+		tag <- lookupTag(context.Background(), store, s.srv.URL, "m")
 	}()
 	<-s.entered
 	expectEstimate(t, store, s, OpenRouterEstimate{}, false, 1)
 	close(s.release)
-	if got := <-bar; got != 10 {
-		t.Fatalf("SpeedBar = %v, want 10", got)
+	if got := <-tag; got != estimateCheapestTag {
+		t.Fatalf("BestValueTag = %q, want %q", got, estimateCheapestTag)
 	}
 	expectEstimate(t, store, s, estimateCheapest, true, 1)
 }

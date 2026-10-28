@@ -1,5 +1,5 @@
 [tools]
-go = "1.26.9"
+go = "1.26.10"
 "go:golang.org/x/vuln/cmd/govulncheck" = "v1.6.0"
 
 # Machine-local, non-portable config (the process-tooling scripts PATH entry and

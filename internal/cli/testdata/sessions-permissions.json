@@ -113,11 +113,41 @@
     "declared_scope": 0,
     "declared_command": 0,
     "open_read": 0,
-    "confined": 0
+    "confined": 0,
+    "system_one_check": 0
   },
   "refused": {
     "blocked_path": 0,
     "protected_state": 0
+  },
+  "system_one": {
+    "outcomes": {
+      "allowed": 0,
+      "declined": 0,
+      "failed": 0,
+      "skipped": 0
+    },
+    "failure_reasons": {
+      "credits": 0,
+      "auth": 0,
+      "rate_limited": 0,
+      "timeout": 0,
+      "server": 0,
+      "network": 0,
+      "malformed": 0,
+      "no_key": 0
+    },
+    "skipped_reasons": {
+      "paused": 0,
+      "text": 0,
+      "blocked_paths_unavailable": 0,
+      "substitution": 0,
+      "blocked_path": 0,
+      "wrapper": 0,
+      "program_location": 0,
+      "shell_shape": 0
+    },
+    "allowed": []
   },
   "revocation_requests": [
     {

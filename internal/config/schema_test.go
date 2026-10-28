@@ -7,6 +7,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/bootstrap"
 	"codemeld.dev/codemeld/internal/config"
+	"codemeld.dev/codemeld/internal/provider"
 )
 
 func TestValidate_Accepts(t *testing.T) {
@@ -281,6 +282,10 @@ func TestValidate_Accepts(t *testing.T) {
 		{"empty confinement map", `confinement: {}`},
 		{"attribution enabled", `attribution: true`},
 		{"attribution disabled", `attribution: false`},
+		{"system_one off", `system_one: "off"`},
+		{"system_one jev on openrouter", `system_one: openrouter:typesafe/jev-1.13`},
+		{"system_one jev on venice", `system_one: venice:jev-latest`},
+		{"system_one liquid d1", `system_one: openrouter:liquid/d1`},
 		{"empty web_research map", `web_research: {}`},
 		{
 			"web_research enabled only",
@@ -339,6 +344,9 @@ func TestValidate_Rejects(t *testing.T) {
 `,
 			"attribution",
 		},
+		{"system_one bare provider", "system_one: openrouter\n", "system_one"},
+		{"system_one unlisted model", "system_one: openrouter:typesafe/jev-1.12\n", "system_one"},
+		{"system_one non-string", "system_one: true\n", "system_one"},
 		{
 			"wrong-type agent.max_concurrency",
 			`agent:
@@ -1219,5 +1227,108 @@ func TestValidateGlobalSettingsBytes_AcceptsOpenRouterBestValueSort(t *testing.T
 	src := []byte("provider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: or-key\n    routing:\n      sort: best_value\n")
 	if _, _, err := config.ValidateGlobalSettingsBytes(src, "settings.yaml"); err != nil {
 		t.Fatalf("ValidateGlobalSettingsBytes() error = %v, want nil", err)
+	}
+}
+
+func contextWindowsSettings(name, value string) []byte {
+	return []byte("provider:\n  " + name + ":\n    base_url: https://example.test/v1\n    api_key: k\n    context_windows:\n      vendor/model-x: " + value + "\n")
+}
+
+func TestValidate_ContextWindowsAcceptedAndParsedWithoutLoss(t *testing.T) {
+	tests := []struct {
+		name, provider, value string
+		want                  int64
+	}{
+		{"minimum", "openai", "1", 1},
+		{"typical", "ollama", "32768", 32768},
+		{"whole float", "lmstudio", "4096.0", 4096},
+		{"maximum", "openai", "10000000", 10000000},
+		{"maximum on openrouter", "openrouter", "10000000", 10000000},
+		{"maximum as decimal", "openai", "10000000.0", 10000000},
+		{"maximum as exponent on openrouter", "openrouter", "1.0e7", 10000000},
+		{"exponent form", "openrouter", "4.096e3", 4096},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, _, err := config.ValidateGlobalSettingsBytes(contextWindowsSettings(tt.provider, tt.value), "settings.yaml")
+			if err != nil {
+				t.Fatalf("ValidateGlobalSettingsBytes() error = %v, want nil", err)
+			}
+			entries, err := provider.ParseProviders(raw)
+			if err != nil {
+				t.Fatalf("ParseProviders() error = %v", err)
+			}
+			if got := entries[tt.provider].ContextWindows["vendor/model-x"]; got != tt.want {
+				t.Fatalf("ContextWindows[vendor/model-x] = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidate_RejectsInvalidContextWindows(t *testing.T) {
+	values := map[string]string{
+		"zero":                      "0",
+		"negative":                  "-4096",
+		"string":                    `"4096"`,
+		"fractional":                "4096.5",
+		"fractional below maximum":  "9999999.5",
+		"above maximum":             "10000001",
+		"above maximum as decimal":  "10000001.0",
+		"above maximum as exponent": "1.0000001e+7",
+		"above int64 maximum":       "9223372036854775808",
+		"above uint64 maximum":      "18446744073709551616",
+		"large float":               "1e30",
+		"null":                      "null",
+	}
+	for name, value := range values {
+		for _, prov := range []string{"openai", "openrouter"} {
+			t.Run(name+"/"+prov, func(t *testing.T) {
+				_, _, err := config.ValidateGlobalSettingsBytes(contextWindowsSettings(prov, value), "settings.yaml")
+				if err == nil {
+					t.Fatalf("ValidateGlobalSettingsBytes(%s) = nil, want error", value)
+				}
+				if want := "provider." + prov + ".context_windows.vendor/model-x"; !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not name %q", err.Error(), want)
+				}
+			})
+		}
+	}
+}
+
+func TestValidate_ContextWindowsKeepsProviderRules(t *testing.T) {
+	tests := []struct {
+		name, yaml, wantKey string
+	}{
+		{
+			"reserved openai-chatgpt entry with context_windows",
+			"provider:\n  openai-chatgpt:\n    context_windows:\n      gpt-5.5: 4096\n",
+			"provider.openai-chatgpt",
+		},
+		{
+			"retired models key beside context_windows",
+			"provider:\n  openai:\n    base_url: u\n    api_key: k\n    context_windows:\n      gpt-5.5: 4096\n    models: [gpt-5.5]\n",
+			"provider.openai.models",
+		},
+		{
+			"context_windows not an object",
+			"provider:\n  openai:\n    base_url: u\n    api_key: k\n    context_windows: 4096\n",
+			"provider.openai.context_windows",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := config.ValidateGlobalSettingsBytes([]byte(tt.yaml), "settings.yaml")
+			if err == nil {
+				t.Fatalf("ValidateGlobalSettingsBytes() = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantKey) {
+				t.Fatalf("error %q does not mention %q", err.Error(), tt.wantKey)
+			}
+		})
+	}
+
+	_, _, err := config.ValidateProjectSettingsBytes(contextWindowsSettings("openai", "4096"), ".codemeld/settings.yaml")
+	if err == nil || !strings.Contains(err.Error(), "failed at provider.openai") {
+		t.Fatalf("project-layer context_windows: error = %v, want a global-only rejection naming provider", err)
 	}
 }

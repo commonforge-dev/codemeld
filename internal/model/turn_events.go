@@ -4,6 +4,7 @@ package model
 
 import (
 	"encoding/json"
+	"math"
 	"slices"
 
 	"github.com/openai/openai-go/v3"
@@ -32,7 +33,7 @@ func EmitModelTurn(store *sessions.Store, provider, modelID, effort string, sour
 // EmitModelResponse appends a model_response event recording an assistant turn's
 // token usage. A nil anomalies slice renders as []. It appends only — the caller
 // owns flushing.
-func EmitModelResponse(store *sessions.Store, provider, modelID string, inputTokens, outputTokens int64, cachedInputTokens *int64, cachedPartial bool, anomalies []string, upstreamProvider string) error {
+func EmitModelResponse(store *sessions.Store, provider, modelID string, inputTokens, outputTokens int64, cachedInputTokens *int64, cachedPartial bool, costUSD *float64, costPartial bool, anomalies []string, upstreamProvider string) error {
 	_, err := events.Append(store, events.ModelResponse{
 		Provider:                 provider,
 		ModelID:                  modelID,
@@ -40,6 +41,8 @@ func EmitModelResponse(store *sessions.Store, provider, modelID string, inputTok
 		OutputTokens:             outputTokens,
 		CachedInputTokens:        cachedInputTokens,
 		CachedInputTokensPartial: cachedPartial,
+		CostUSD:                  costUSD,
+		CostUSDPartial:           costPartial,
 		Anomaly:                  anomalies,
 		UpstreamProvider:         upstreamProvider,
 	})
@@ -110,7 +113,7 @@ func recordedEffort(effortToSend string) string {
 // chunk.JSON.Usage.Valid(), not by a content choice); when false — the stream
 // ended without a usage chunk, e.g. an interrupted reply or a provider that
 // ignores stream_options — the counts fall back to zero with usage_missing.
-func UsageFromStreamUsage(u openai.CompletionUsage, usageValid bool) (inputTokens, outputTokens int64, cached *int64, anomalies []string) {
+func UsageFromStreamUsage(u openai.CompletionUsage, usageValid bool) (inputTokens, outputTokens int64, cached *int64, cost *float64, anomalies []string) {
 	return normalizeUsage(u, usageValid)
 }
 
@@ -120,9 +123,9 @@ func UsageFromStreamUsage(u openai.CompletionUsage, usageValid bool) (inputToken
 // at most once. A healthy usage object returns a nil anomaly slice, which
 // model_response renders as []. A missing cached count is deliberately not
 // usage_missing: providers legitimately omit that field.
-func normalizeUsage(u openai.CompletionUsage, usageValid bool) (inputTokens, outputTokens int64, cached *int64, anomalies []string) {
+func normalizeUsage(u openai.CompletionUsage, usageValid bool) (inputTokens, outputTokens int64, cached *int64, cost *float64, anomalies []string) {
 	if !usageValid {
-		return 0, 0, nil, []string{anomalyUsageMissing}
+		return 0, 0, nil, nil, []string{anomalyUsageMissing}
 	}
 	missing := false
 	if u.JSON.PromptTokens.Valid() && u.PromptTokens >= 0 {
@@ -141,10 +144,23 @@ func normalizeUsage(u openai.CompletionUsage, usageValid bool) (inputTokens, out
 		c := u.PromptTokensDetails.CachedTokens
 		cached = &c
 	}
+	cost = reportedCost(u)
 	if missing {
-		return inputTokens, outputTokens, cached, []string{anomalyUsageMissing}
+		return inputTokens, outputTokens, cached, cost, []string{anomalyUsageMissing}
 	}
-	return inputTokens, outputTokens, cached, nil
+	return inputTokens, outputTokens, cached, cost, nil
+}
+
+func reportedCost(u openai.CompletionUsage) *float64 {
+	f, ok := u.JSON.ExtraFields["cost"]
+	if !ok {
+		return nil
+	}
+	var cost *float64
+	if json.Unmarshal([]byte(f.Raw()), &cost) != nil || cost == nil || *cost < 0 || math.IsNaN(*cost) || math.IsInf(*cost, 0) {
+		return nil
+	}
+	return cost
 }
 
 // UsageAccumulator sums the exact stream usage of every provider round in one
@@ -159,6 +175,9 @@ type UsageAccumulator struct {
 	cachedTokens  int64
 	hadCached     bool
 	missingCached bool
+	costUSD       float64
+	hadCost       bool
+	missingCost   bool
 	hadUsage      bool
 	missing       bool
 	validRounds   int
@@ -170,7 +189,7 @@ type UsageAccumulator struct {
 // absent chunk (usageValid false) records the usage_missing condition without
 // inventing counts.
 func (a *UsageAccumulator) Add(u openai.CompletionUsage, usageValid bool) {
-	inputTokens, outputTokens, cached, anomalies := normalizeUsage(u, usageValid)
+	inputTokens, outputTokens, cached, cost, anomalies := normalizeUsage(u, usageValid)
 	a.inputTokens += inputTokens
 	a.outputTokens += outputTokens
 	if cached != nil {
@@ -178,6 +197,12 @@ func (a *UsageAccumulator) Add(u openai.CompletionUsage, usageValid bool) {
 		a.hadCached = true
 	} else {
 		a.missingCached = true
+	}
+	if cost != nil && !math.IsInf(a.costUSD+*cost, 0) {
+		a.costUSD += *cost
+		a.hadCost = true
+	} else {
+		a.missingCost = true
 	}
 	if usageValid {
 		a.hadUsage = true
@@ -204,7 +229,7 @@ func (a *UsageAccumulator) UsageRounds() int {
 // all. hadUsage gates the exact-figure indicator update the same way a single
 // round's usageValid did: a usage chunk arrived somewhere, so the
 // indicator can show a real (possibly partial) total instead of its streamed guess.
-func (a *UsageAccumulator) Totals() (inputTokens, outputTokens int64, cached *int64, cachedPartial bool, anomalies []string, hadUsage bool) {
+func (a *UsageAccumulator) Totals() (inputTokens, outputTokens int64, cached *int64, cachedPartial bool, cost *float64, costPartial bool, anomalies []string, hadUsage bool) {
 	if a.missing {
 		anomalies = []string{anomalyUsageMissing}
 	}
@@ -213,7 +238,12 @@ func (a *UsageAccumulator) Totals() (inputTokens, outputTokens int64, cached *in
 		cached = &sum
 		cachedPartial = a.missingCached
 	}
-	return a.inputTokens, a.outputTokens, cached, cachedPartial, anomalies, a.hadUsage
+	if a.hadCost {
+		sum := a.costUSD
+		cost = &sum
+		costPartial = a.missingCost
+	}
+	return a.inputTokens, a.outputTokens, cached, cachedPartial, cost, costPartial, anomalies, a.hadUsage
 }
 
 // SumModelResponseTokens totals recorded provider token usage across every

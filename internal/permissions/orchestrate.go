@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Avoid an import cycle: internal/tui imports internal/permissions.
@@ -69,6 +70,13 @@ type AuthorizeDeps struct {
 	EmitDecision      func(subjectKind, subject, pathScope, outcome, grantKind, grantPathScope string, id DirectIdentity) error
 	EmitDecisionGrant func(subjectKind, subject, pathScope, grantKind, grantPathScope, grantSubject string, id DirectIdentity) error
 	EmitMatched       func(subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject string) error
+	EmitPromptWait    func(waited time.Duration, prompts int, ended string) error
+	PrePromptCheck    func(context.Context, MatchRequest, ModeContext) PrePromptResult
+}
+
+type PrePromptResult struct {
+	Allow bool
+	Note  string
 }
 
 // eventSubject is the subject every permission event records. A direct request's
@@ -108,6 +116,8 @@ const outcomeSourceCache = "cache"
 
 const outcomeSourceModeAuto = "mode_auto"
 
+const outcomeSourceSystemOneCheck = "system_one_check"
+
 const outcomeSourceOpenRead = "open_read"
 
 // OutcomeSourceDeclaredScope is the permission_matched outcome_source a run's declared
@@ -139,10 +149,10 @@ const (
 	toolNameMove   = "move"
 	// Must stay equal to subagenttool.ToolName, which this package cannot import: subagenttool
 	// imports it.
-	toolNameDelegate = "delegate"
+	toolNameGeneralAgent = "general_agent"
 )
 
-// Must stay equal to the delegate tool's delete-, move-, and directory-declaration arguments, for the
+// Must stay equal to the general_agent tool's delete-, move-, and directory-declaration arguments, for the
 // same import reason.
 const (
 	childDeleteArg = "files_delete"
@@ -181,7 +191,7 @@ type ModeContext struct {
 	DeclaredDelete map[string]bool
 	DeclaredMoves  map[MovePair]bool
 	DeclaredDirs   map[string]bool
-	// ChildAgent marks the declared scopes as a child agent's delegate declaration rather than a
+	// ChildAgent marks the declared scopes as a child agent's general_agent declaration rather than a
 	// codemeld run flag pair.
 	ChildAgent bool
 	// ChildInvocationID identifies which child agent's calls these are, for the attribution the
@@ -190,16 +200,22 @@ type ModeContext struct {
 	// DeclaredCommands is the project's declared command list: Auto posture only, and
 	// never consulted in Plan or Build.
 	DeclaredCommands []DeclaredCommand
-	// The Delegate forms are resolved before the grandchild starts, so the subset checks against the
+	// The GeneralAgent forms are resolved before the grandchild starts, so the subset checks against the
 	// declared forms are an authorization decision rather than a report on a running child.
-	DelegateWrite  map[string]bool
-	DelegateDelete map[string]bool
-	DelegateMoves  map[MovePair]bool
-	DelegateDirs   map[string]bool
-	OpenRead       bool
-	ExternalRead   bool
-	ShellPathAsk   bool
-	NetworkEgress  bool
+	GeneralAgentWrite  map[string]bool
+	GeneralAgentDelete map[string]bool
+	GeneralAgentMoves  map[MovePair]bool
+	GeneralAgentDirs   map[string]bool
+	// GeneralAgentResolved is true only when the general_agent tool validated the candidate above, so
+	// a candidate empty in every form is a read-only child rather than a declaration that failed.
+	GeneralAgentResolved bool
+	// GeneralAgentRefused is true when the general_agent tool rejected this call's arguments, so no
+	// inherited candidate may stand in for it.
+	GeneralAgentRefused bool
+	OpenRead            bool
+	ExternalRead        bool
+	ShellPathAsk        bool
+	NetworkEgress       bool
 	// ExecutionConstrained is the launch self-test result, not the displayed capability label.
 	ExecutionConstrained bool
 	SettingsBroken       bool
@@ -237,17 +253,23 @@ func Authorize(ctx context.Context, req MatchRequest, modeCtx ModeContext, deps 
 	}
 
 	if !req.FreshConfirmation {
-		if dec, resolved, err := resolveWithoutPrompt(req, modeCtx, deps); resolved {
+		if dec, resolved, err := resolveWithoutPrompt(ctx, req, modeCtx, deps); resolved {
 			return dec, err
 		}
 	}
 
-	return promptFlow(ctx, req, deps)
+	return promptFlow(ctx, req, modeCtx, deps)
 }
 
-func resolveWithoutPrompt(req MatchRequest, modeCtx ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
-	if req.Kind == subjectKindTool && topLevelDelegate(modeCtx) {
-		dec, err := topLevelDelegateRefusal(req, modeCtx, deps)
+func resolveWithoutPrompt(ctx context.Context, req MatchRequest, modeCtx ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
+	if req.Kind == subjectKindTool && readOnlyGeneralAgent(modeCtx) {
+		modeCtx.Class = ClassReadOnly
+		if dec, handled, err := modePosture(ctx, req, modeCtx, deps); handled {
+			return dec, true, err
+		}
+	}
+	if req.Kind == subjectKindTool && topLevelGeneralAgent(modeCtx) {
+		dec, err := topLevelGeneralAgentRefusal(ctx, req, modeCtx, deps)
 		return dec, true, err
 	}
 	if dec, handled, err := declaredScopePosture(req, modeCtx, deps); handled {
@@ -271,12 +293,12 @@ func resolveWithoutPrompt(req MatchRequest, modeCtx ModeContext, deps AuthorizeD
 		return Decision{}, false, nil
 	}
 
-	if dec, handled, err := modePosture(req, modeCtx, deps); handled {
+	if dec, handled, err := modePosture(ctx, req, modeCtx, deps); handled {
 		return dec, true, err
 	}
 
 	if modeCtx.Mode == modeAutoEdits && confinedShell(req, modeCtx) {
-		if authority, _ := ClassifyExceptional(req, modeCtx); authority != "" {
+		if SandboxedAutoEditsAuthority(req, modeCtx) != "" {
 			return Decision{}, false, nil
 		}
 	}
@@ -323,14 +345,14 @@ func AuthorizeBatch(ctx context.Context, reqs []BatchRequest, deps AuthorizeDeps
 	}
 
 	decisions := make([]Decision, len(reqs))
-	var unresolved []int
+	var prompts []BatchPromptRequest
 	for i, r := range reqs {
-		dec, resolved, err := resolveWithoutPrompt(r.Req, r.ModeCtx, deps)
+		dec, prompt, err := resolveMember(ctx, r, i, deps)
 		if err != nil {
 			return nil, err
 		}
-		if !resolved {
-			unresolved = append(unresolved, i)
+		if prompt != nil {
+			prompts = append(prompts, *prompt)
 			continue
 		}
 		decisions[i] = dec
@@ -338,28 +360,24 @@ func AuthorizeBatch(ctx context.Context, reqs []BatchRequest, deps AuthorizeDeps
 			break
 		}
 	}
-	if len(unresolved) == 0 {
+	if err := emitPromptsShown(prompts, deps); err != nil {
+		return nil, err
+	}
+	if len(prompts) == 0 {
 		return decisions, nil
 	}
 
-	prompts := make([]BatchPromptRequest, len(unresolved))
-	for j, idx := range unresolved {
-		req := reqs[idx].Req
-		if err := deps.EmitPromptShown(req.Kind, eventSubject(req), eventScope(req), req.SubjectTokens, directIdentityOf(req)); err != nil {
-			return nil, err
-		}
-		prompts[j] = BatchPromptRequest{Req: req, Escalation: FindScopeEscalation(req, deps.Grants.Permissions()), Index: idx}
-	}
-
+	start := time.Now()
 	outcome, err := deps.PromptBatch(ctx, prompts)
-	if err != nil {
+	if err := finishPromptCall(ctx, start, len(prompts), err, deps); err != nil {
 		return nil, err
 	}
 
-	for _, idx := range unresolved {
+	for _, p := range prompts {
+		idx := p.Index
 		stageOutcome := outcome
 		// A shared approval cannot select a scope for every unresolved stage.
-		if len(unresolved) > 1 {
+		if len(prompts) > 1 {
 			switch stageOutcome.Choice {
 			case PromptAllowSession, PromptAllowFolder, PromptAllowGlobal:
 				stageOutcome.StoredSubject = ""
@@ -392,45 +410,36 @@ func AuthorizeIndependent(ctx context.Context, reqs []BatchRequest, deps Authori
 	}
 
 	decisions := make([]Decision, len(reqs))
-	var unresolved []int
+	var prompts []BatchPromptRequest
 	for i, r := range reqs {
-		dec, resolved, err := resolveWithoutPrompt(r.Req, r.ModeCtx, deps)
+		dec, prompt, err := resolveMember(ctx, r, i, deps)
 		if err != nil {
 			return nil, err
 		}
-		if !resolved {
-			unresolved = append(unresolved, i)
+		if prompt != nil {
+			prompts = append(prompts, *prompt)
 			continue
 		}
 		decisions[i] = dec
 	}
-	if len(unresolved) == 0 {
+	if err := emitPromptsShown(prompts, deps); err != nil {
+		return nil, err
+	}
+	if len(prompts) == 0 {
 		return decisions, nil
 	}
 
-	prompts := make([]BatchPromptRequest, len(unresolved))
-	for j, idx := range unresolved {
-		req := reqs[idx].Req
-		if err := deps.EmitPromptShown(req.Kind, eventSubject(req), eventScope(req), req.SubjectTokens, directIdentityOf(req)); err != nil {
-			return nil, err
-		}
-		prompts[j] = BatchPromptRequest{Req: req, Escalation: FindScopeEscalation(req, deps.Grants.Permissions()), Index: idx}
-	}
-
+	start := time.Now()
 	outcomes, err := deps.PromptIndependent(ctx, prompts)
-	if err != nil {
-		return nil, err
-	}
-	// The production prompt bridge blocks in a non-context-aware TUI call, so a cancellation
-	// that lands while the group prompt is open surfaces only here.
-	if err := ctx.Err(); err != nil {
+	if err := finishPromptCall(ctx, start, len(prompts), err, deps); err != nil {
 		return nil, err
 	}
 	if len(outcomes) != len(prompts) {
 		return nil, fmt.Errorf("permissions: independent prompt returned %d outcomes for %d requests", len(outcomes), len(prompts))
 	}
 
-	for j, idx := range unresolved {
+	for j, p := range prompts {
+		idx := p.Index
 		reqDeps := deps
 		if deps.PersistGrantAt != nil {
 			reqDeps.PersistGrant = deps.PersistGrantAt(idx)
@@ -442,6 +451,64 @@ func AuthorizeIndependent(ctx context.Context, reqs []BatchRequest, deps Authori
 		decisions[idx] = dec
 	}
 	return decisions, nil
+}
+
+// resolveMember runs the pre-prompt check right after the member's own resolution, so a grouped
+// call consults the check hook in input order whether a member reaches it from Plan posture or at
+// its prompt point.
+func resolveMember(ctx context.Context, r BatchRequest, idx int, deps AuthorizeDeps) (Decision, *BatchPromptRequest, error) {
+	if dec, resolved, err := resolveWithoutPrompt(ctx, r.Req, r.ModeCtx, deps); resolved {
+		return dec, nil, err
+	}
+	allowed, note, err := prePromptCheck(ctx, r.Req, r.ModeCtx, deps)
+	if err != nil || allowed {
+		return Decision{Outcome: outcomeOnce}, nil, err
+	}
+	esc := FindScopeEscalation(r.Req, deps.Grants.Permissions())
+	esc.Note = note
+	return Decision{}, &BatchPromptRequest{Req: r.Req, Escalation: esc, Index: idx}, nil
+}
+
+func emitPromptsShown(prompts []BatchPromptRequest, deps AuthorizeDeps) error {
+	for _, p := range prompts {
+		if err := deps.EmitPromptShown(p.Req.Kind, eventSubject(p.Req), eventScope(p.Req), p.Req.SubjectTokens, directIdentityOf(p.Req)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func prePromptEligible(req MatchRequest, mc ModeContext, deps AuthorizeDeps) bool {
+	if deps.PrePromptCheck == nil || (req.Kind != subjectKindDirect && req.Kind != subjectKindLiteral) {
+		return false
+	}
+	if (mc.Mode != modePlan && mc.Mode != modeAutoEdits) || mc.NetworkEgress || mc.ExternalRead {
+		return false
+	}
+	authority, _ := ClassifyExceptional(req, mc)
+	return authority == ""
+}
+
+func prePromptCheck(ctx context.Context, req MatchRequest, mc ModeContext, deps AuthorizeDeps) (allowed bool, note string, err error) {
+	if !prePromptEligible(req, mc, deps) {
+		return false, "", nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, "", err
+	}
+	res := deps.PrePromptCheck(ctx, req, mc)
+	if err := ctx.Err(); err != nil {
+		return false, "", err
+	}
+	if !res.Allow {
+		return false, res.Note, nil
+	}
+	argHash := matchArgumentHash(req.Kind, PermissionEntry{Subject: req.Subject})
+	if err := deps.EmitMatched(req.Kind, eventSubject(req), req.PathScope,
+		"", "", outcomeOnce, outcomeSourceSystemOneCheck, argHash, directIdentityOf(req).RequestSubject); err != nil {
+		return false, "", err
+	}
+	return true, "", nil
 }
 
 func cacheHit(req MatchRequest, outcome string, deps AuthorizeDeps) (Decision, error) {
@@ -464,19 +531,58 @@ func cacheHit(req MatchRequest, outcome string, deps AuthorizeDeps) (Decision, e
 	return d, nil
 }
 
-func promptFlow(ctx context.Context, req MatchRequest, deps AuthorizeDeps) (Decision, error) {
+func promptFlow(ctx context.Context, req MatchRequest, modeCtx ModeContext, deps AuthorizeDeps) (Decision, error) {
+	allowed, note, err := prePromptCheck(ctx, req, modeCtx, deps)
+	if err != nil {
+		return Decision{}, err
+	}
+	if allowed {
+		return Decision{Outcome: outcomeOnce}, nil
+	}
 	if err := deps.EmitPromptShown(req.Kind, eventSubject(req), eventScope(req), req.SubjectTokens, directIdentityOf(req)); err != nil {
 		return Decision{}, err
 	}
 	esc := FindScopeEscalation(req, deps.Grants.Permissions())
+	esc.Note = note
+	start := time.Now()
 	outcome, err := deps.Prompt(ctx, esc)
-	if err != nil {
-		return Decision{}, err
-	}
-	if err := ctx.Err(); err != nil {
+	if err := finishPromptCall(ctx, start, 1, err, deps); err != nil {
 		return Decision{}, err
 	}
 	return applyOutcome(req, outcome, deps)
+}
+
+const (
+	promptWaitAnswered  = "answered"
+	promptWaitCancelled = "cancelled"
+	promptWaitFailed    = "failed"
+)
+
+// Prompt closures and the emitter may block in calls that ignore ctx, so cancellation is only
+// visible by checking after each returns.
+func finishPromptCall(ctx context.Context, start time.Time, prompts int, promptErr error, deps AuthorizeDeps) error {
+	waited := time.Since(start)
+	ctxErr := ctx.Err()
+	ended := promptWaitAnswered
+	switch {
+	case ctxErr != nil:
+		ended = promptWaitCancelled
+	case promptErr != nil:
+		ended = promptWaitFailed
+	}
+	callErr := promptErr
+	if ctxErr != nil && !errors.Is(promptErr, ctxErr) {
+		callErr = errors.Join(promptErr, ctxErr)
+	}
+	var emitErr error
+	if deps.EmitPromptWait != nil {
+		emitErr = deps.EmitPromptWait(waited, prompts, ended)
+	}
+	err := errors.Join(callErr, emitErr)
+	if lateErr := ctx.Err(); lateErr != nil && !errors.Is(err, lateErr) {
+		err = errors.Join(err, lateErr)
+	}
+	return err
 }
 
 func applyOutcome(req MatchRequest, outcome PromptOutcome, deps AuthorizeDeps) (Decision, error) {
@@ -655,7 +761,7 @@ func planOperationClass(req MatchRequest, mc ModeContext) OperationClass {
 	return mc.Class
 }
 
-func modePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
+func modePosture(ctx context.Context, req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
 	if mc.Mode == "" {
 		return Decision{}, false, nil
 	}
@@ -665,7 +771,7 @@ func modePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision
 	if confinedShell(req, mc) {
 		switch mc.Mode {
 		case modePlan:
-			return planPosture(req, mc, deps)
+			return planPosture(ctx, req, mc, deps)
 		case modeAutoEdits:
 			return autoEditsPosture(req, mc, deps)
 		}
@@ -684,7 +790,7 @@ func modePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision
 	}
 	switch mc.Mode {
 	case modePlan:
-		return planPosture(req, mc, deps)
+		return planPosture(ctx, req, mc, deps)
 	case modeAutoEdits:
 		return autoEditsPosture(req, mc, deps)
 	default:
@@ -692,23 +798,42 @@ func modePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision
 	}
 }
 
-func planPosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
+func planPosture(ctx context.Context, req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
 	if confinedShell(req, mc) {
 		if err := emitConfined(req, deps); err != nil {
 			return Decision{}, true, err
 		}
 		return Decision{Outcome: outcomeOnce}, true, nil
 	}
+	allowed, note, err := prePromptCheck(ctx, req, mc, deps)
+	if err != nil {
+		return Decision{}, true, err
+	}
+	if allowed {
+		return Decision{Outcome: outcomeOnce}, true, nil
+	}
 	if err := emitModeAuto(req, deps, outcomeDeny); err != nil {
 		return Decision{}, true, err
 	}
-	reason := modeDenyReason(req, mc)
+	reason := withDenyNote(modeDenyReason(req, mc), note)
 	return Decision{
 		Outcome:      outcomeDeny,
 		DenyEnvelope: BuildModeDenyEnvelope(reason),
 		DenyReason:   reason,
 		DenialSource: outcomeSourceModeAuto,
 	}, true, nil
+}
+
+const maxDenyNoteBytes = 256
+
+func withDenyNote(reason, note string) string {
+	note = strings.TrimFunc(strings.ToValidUTF8(note, "\uFFFD"), isASCIIWhitespace)
+	note = strings.TrimRightFunc(capUTF8Bytes(note, maxDenyNoteBytes), isASCIIWhitespace)
+	if note == "" {
+		return reason
+	}
+	const sep = "; "
+	return capUTF8Bytes(reason, maxDenyReasonBytes-len(sep)-len(note)) + sep + note
 }
 
 func modeDenyReason(req MatchRequest, mc ModeContext) string {
@@ -883,14 +1008,14 @@ func hasShellLoop(command string) bool {
 }
 
 func autoEditsPosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
-	if isInScopeFileTool(req, mc) || inWritableFolder(req, mc) {
+	if isInScopeFileTool(req, mc) || inWritableFolder(req, mc) || sandboxedDelete(req, mc) {
 		if err := emitModeAuto(req, deps, outcomeOnce); err != nil {
 			return Decision{}, true, err
 		}
 		return Decision{Outcome: outcomeOnce}, true, nil
 	}
 	if confinedShell(req, mc) {
-		if authority, ok := ClassifyExceptional(req, mc); authority != "" || !ok {
+		if SandboxedAutoEditsAuthority(req, mc) != "" {
 			return Decision{}, false, nil
 		}
 		if err := emitConfined(req, deps); err != nil {
@@ -909,6 +1034,17 @@ func inWritableFolder(req MatchRequest, mc ModeContext) bool {
 		return false
 	}
 	return slices.ContainsFunc(mc.WritableFolders, func(root string) bool { return isInProject(mc.TargetPath, root) })
+}
+
+func sandboxedDelete(req MatchRequest, mc ModeContext) bool {
+	if !mc.ExecutionConstrained || mc.SettingsBroken || req.Kind != subjectKindTool || mc.ToolName != toolNameDelete {
+		return false
+	}
+	roots := slices.DeleteFunc(append([]string{mc.ProjectRoot}, mc.WritableFolders...), func(root string) bool { return root == "" })
+	if slices.ContainsFunc(roots, func(root string) bool { return filepath.Clean(mc.TargetPath) == filepath.Clean(root) }) {
+		return false
+	}
+	return slices.ContainsFunc(roots, func(root string) bool { return isInProject(mc.TargetPath, root) })
 }
 
 // Direct route only: matching a declared prefix against a literal subject would authorize an
@@ -971,7 +1107,7 @@ func emitModeAuto(req MatchRequest, deps AuthorizeDeps, outcome string) error {
 }
 
 // declaredScopePosture answers every write tool from the run's declared file scopes — and, for a
-// child agent, the delegate tool as well — returning handled for the denial as well as the
+// child agent, the general_agent tool as well — returning handled for the denial as well as the
 // approval so an uncovered target can never fall through to a grant, the turn cache, Auto edits,
 // or the prompt. Plan is skipped so planPosture stays the sole authority there.
 func declaredScopePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
@@ -982,9 +1118,7 @@ func declaredScopePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) 
 		return Decision{}, false, nil
 	}
 	if declaredScopeCovers(mc) {
-		// A parent run's file declaration bounds a child agent but never grants permission to start
-		// one, so a covered top-level delegate call records no approval of its own.
-		if topLevelDelegate(mc) {
+		if topLevelGeneralAgent(mc) {
 			return Decision{}, false, nil
 		}
 		if err := emitDeclaredScope(req, deps, outcomeOnce); err != nil {
@@ -1004,14 +1138,12 @@ func declaredScopePosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) 
 	}, true, nil
 }
 
-// The allow returned here is not an approval: the caller still authorizes each operation the
-// delegate declares, so no grant, cache entry, or prompt for the tool delegate is ever consulted.
-func topLevelDelegateRefusal(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, error) {
-	posture := declaredScopePosture
+func topLevelGeneralAgentRefusal(ctx context.Context, req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, error) {
+	posture := func() (Decision, bool, error) { return declaredScopePosture(req, mc, deps) }
 	if mc.Mode == modePlan {
-		posture = modePosture
+		posture = func() (Decision, bool, error) { return modePosture(ctx, req, mc, deps) }
 	}
-	if dec, handled, err := posture(req, mc, deps); handled {
+	if dec, handled, err := posture(); handled {
 		return dec, err
 	}
 	return Decision{Outcome: outcomeOnce}, nil
@@ -1027,15 +1159,20 @@ func isDeclaredScopeTool(mc ModeContext) bool {
 	switch mc.ToolName {
 	case toolNameEdit, toolNameCreate, toolNameDelete, toolNameMkdir, toolNameMove:
 		return true
-	case toolNameDelegate:
+	case toolNameGeneralAgent:
 		// A top-level call is judged only once dispatch has prepared its candidate.
-		return mc.ChildAgent || len(mc.DelegateWrite) > 0 || len(mc.DelegateDelete) > 0 || len(mc.DelegateMoves) > 0 || len(mc.DelegateDirs) > 0
+		return mc.ChildAgent || len(mc.GeneralAgentWrite) > 0 || len(mc.GeneralAgentDelete) > 0 || len(mc.GeneralAgentMoves) > 0 || len(mc.GeneralAgentDirs) > 0
 	}
 	return false
 }
 
-func topLevelDelegate(mc ModeContext) bool {
-	return mc.ToolName == toolNameDelegate && !mc.ChildAgent
+func topLevelGeneralAgent(mc ModeContext) bool {
+	return mc.ToolName == toolNameGeneralAgent && !mc.ChildAgent
+}
+
+func readOnlyGeneralAgent(mc ModeContext) bool {
+	return mc.ToolName == toolNameGeneralAgent && mc.GeneralAgentResolved && !mc.GeneralAgentRefused &&
+		len(mc.GeneralAgentWrite) == 0 && len(mc.GeneralAgentDelete) == 0 && len(mc.GeneralAgentMoves) == 0 && len(mc.GeneralAgentDirs) == 0
 }
 
 func declaredScopeCovers(mc ModeContext) bool {
@@ -1048,20 +1185,18 @@ func declaredScopeCovers(mc ModeContext) bool {
 		return mc.ChildAgent && mc.TargetPath != "" && mc.DeclaredDirs[mc.TargetPath]
 	case toolNameMove:
 		return mc.ChildAgent && mc.DeclaredMoves[MovePair{Source: mc.MoveSource, Destination: mc.MoveDestination}]
-	case toolNameDelegate:
-		return delegateWithinParent(mc)
+	case toolNameGeneralAgent:
+		return generalAgentWithinParent(mc)
 	}
 	return false
 }
 
-// A resolved delegate declaration always names a path, so a candidate empty in every form is one that
-// did not resolve and fails rather than passing as the empty subset.
-func delegateWithinParent(mc ModeContext) bool {
-	if len(mc.DelegateWrite) == 0 && len(mc.DelegateDelete) == 0 && len(mc.DelegateMoves) == 0 && len(mc.DelegateDirs) == 0 {
-		return false
+func generalAgentWithinParent(mc ModeContext) bool {
+	if len(mc.GeneralAgentWrite) == 0 && len(mc.GeneralAgentDelete) == 0 && len(mc.GeneralAgentMoves) == 0 && len(mc.GeneralAgentDirs) == 0 {
+		return mc.GeneralAgentResolved && !mc.GeneralAgentRefused
 	}
-	return isDeclaredSubset(mc.DelegateWrite, mc.DeclaredWrite) && isDeclaredSubset(mc.DelegateDelete, mc.DeclaredDelete) &&
-		isDeclaredSubset(mc.DelegateMoves, mc.DeclaredMoves) && isDeclaredSubset(mc.DelegateDirs, mc.DeclaredDirs)
+	return isDeclaredSubset(mc.GeneralAgentWrite, mc.DeclaredWrite) && isDeclaredSubset(mc.GeneralAgentDelete, mc.DeclaredDelete) &&
+		isDeclaredSubset(mc.GeneralAgentMoves, mc.DeclaredMoves) && isDeclaredSubset(mc.GeneralAgentDirs, mc.DeclaredDirs)
 }
 
 func isDeclaredSubset[K comparable](nested, parent map[K]bool) bool {
@@ -1079,8 +1214,8 @@ func declaredScopeDenyReason(mc ModeContext) string {
 	if mc.ChildAgent {
 		return childScopeDenyReason(mc)
 	}
-	if mc.ToolName == toolNameDelegate {
-		return topLevelDelegateDenyReason(mc)
+	if mc.ToolName == toolNameGeneralAgent {
+		return topLevelGeneralAgentDenyReason(mc)
 	}
 	parts := []string{
 		"a declared-scope ceiling is active for this run and only declared paths may be written",
@@ -1095,10 +1230,10 @@ func declaredScopeDenyReason(mc ModeContext) string {
 	), "; ")
 }
 
-// topLevelDelegateDenyReason keeps declaredScopeDenyReason's classification-first ordering, so the
+// topLevelGeneralAgentDenyReason keeps declaredScopeDenyReason's classification-first ordering, so the
 // deny envelope's 512-byte cap can only ever truncate path detail.
-func topLevelDelegateDenyReason(mc ModeContext) string {
-	if delegateWidensOnlyMoves(mc) {
+func topLevelGeneralAgentDenyReason(mc ModeContext) string {
+	if generalAgentWidensOnlyMoves(mc) {
 		return strings.Join([]string{
 			"a declared-scope ceiling is active for this run and a child agent may declare no move pairs",
 			"neither " + declaredWriteFlag + " nor " + declaredDeleteFlag + " can authorize " + childMoveArg,
@@ -1106,7 +1241,7 @@ func topLevelDelegateDenyReason(mc ModeContext) string {
 			childScopeTargetClause(mc),
 		}, "; ")
 	}
-	if delegateWidensOnlyDirs(mc) {
+	if generalAgentWidensOnlyDirs(mc) {
 		return strings.Join([]string{
 			"a declared-scope ceiling is active for this run and a child agent may declare no directories",
 			"neither " + declaredWriteFlag + " nor " + declaredDeleteFlag + " can authorize " + childMkdirArg,
@@ -1115,27 +1250,27 @@ func topLevelDelegateDenyReason(mc ModeContext) string {
 		}, "; ")
 	}
 	form, flag, parent := "write", declaredWriteFlag, mc.DeclaredWrite
-	if delegateWidensOnlyDelete(mc) {
+	if generalAgentWidensOnlyDelete(mc) {
 		form, flag, parent = "delete", declaredDeleteFlag, mc.DeclaredDelete
 	}
 	return strings.Join([]string{
 		"a declared-scope ceiling is active for this run and a child agent may declare only " + form + " paths it already lists",
-		topLevelDelegateListClause(flag, form, len(parent) > 0),
+		topLevelGeneralAgentListClause(flag, form, len(parent) > 0),
 		"the ceiling cannot widen during the run",
 		childScopeTargetClause(mc),
 	}, "; ")
 }
 
-func topLevelDelegateListClause(flag, form string, present bool) string {
+func topLevelGeneralAgentListClause(flag, form string, present bool) string {
 	if !present {
 		return flag + " was not supplied"
 	}
 	return flag + " was supplied but does not list every child " + form + " path this call declared"
 }
 
-func delegateWidensOnlyDelete(mc ModeContext) bool {
-	return len(undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)) == 0 &&
-		len(undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)) > 0
+func generalAgentWidensOnlyDelete(mc ModeContext) bool {
+	return len(undeclaredPaths(mc.GeneralAgentWrite, mc.DeclaredWrite)) == 0 &&
+		len(undeclaredPaths(mc.GeneralAgentDelete, mc.DeclaredDelete)) > 0
 }
 
 func declaredScopeListClause(mc ModeContext) string {
@@ -1167,7 +1302,7 @@ func declaredScopeTargetClause(mc ModeContext) string {
 // envelope's 512-byte cap can only ever truncate path detail.
 func childScopeDenyReason(mc ModeContext) string {
 	return strings.Join([]string{
-		"a child agent may touch only the paths its delegate call declared",
+		"a child agent may touch only the paths its general_agent call declared",
 		childScopeFormClause(mc),
 		"the child declaration cannot widen while the child runs",
 		childScopeTargetClause(mc),
@@ -1182,16 +1317,16 @@ func childScopeFormClause(mc ModeContext) string {
 		return childDirFormClause(mc.DeclaredDirs)
 	case toolNameMove:
 		return childMoveFormClause(mc.DeclaredMoves)
-	case toolNameDelegate:
+	case toolNameGeneralAgent:
 		switch {
-		case delegateWidensOnlyDelete(mc):
-			return "a nested delegate call may declare in " + childDeleteArg + " only delete paths its own parent already declared"
-		case delegateWidensOnlyMoves(mc):
-			return "a nested delegate call may declare in " + childMoveArg + " only whole move pairs its own parent already declared"
-		case delegateWidensOnlyDirs(mc):
-			return "a nested delegate call may declare in " + childMkdirArg + " only directories its own parent already declared"
+		case generalAgentWidensOnlyDelete(mc):
+			return "a nested general_agent call may declare in " + childDeleteArg + " only delete paths its own parent already declared"
+		case generalAgentWidensOnlyMoves(mc):
+			return "a nested general_agent call may declare in " + childMoveArg + " only whole move pairs its own parent already declared"
+		case generalAgentWidensOnlyDirs(mc):
+			return "a nested general_agent call may declare in " + childMkdirArg + " only directories its own parent already declared"
 		}
-		return "a nested delegate call may declare only write paths its own parent already declared"
+		return "a nested general_agent call may declare only write paths its own parent already declared"
 	default:
 		return "the child's declared write paths do not list this target"
 	}
@@ -1200,33 +1335,33 @@ func childScopeFormClause(mc ModeContext) string {
 func childDeleteFormClause(declared map[string]bool) string {
 	switch {
 	case declared == nil:
-		return "this delegate call did not supply " + childDeleteArg
+		return "this general_agent call did not supply " + childDeleteArg
 	case len(declared) == 0:
-		return "this delegate call supplied an empty " + childDeleteArg
+		return "this general_agent call supplied an empty " + childDeleteArg
 	default:
-		return "this delegate call's " + childDeleteArg + " does not list this target"
+		return "this general_agent call's " + childDeleteArg + " does not list this target"
 	}
 }
 
 func childDirFormClause(declared map[string]bool) string {
 	switch {
 	case declared == nil:
-		return "this delegate call did not supply " + childMkdirArg
+		return "this general_agent call did not supply " + childMkdirArg
 	case len(declared) == 0:
-		return "this delegate call supplied an empty " + childMkdirArg
+		return "this general_agent call supplied an empty " + childMkdirArg
 	default:
-		return "this delegate call's " + childMkdirArg + " does not list this directory"
+		return "this general_agent call's " + childMkdirArg + " does not list this directory"
 	}
 }
 
 func childScopeTargetClause(mc ModeContext) string {
-	if mc.ToolName != toolNameDelegate {
+	if mc.ToolName != toolNameGeneralAgent {
 		return declaredScopeTargetClause(mc)
 	}
-	write := undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)
-	remove := undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)
-	moves := undeclaredMoves(mc.DelegateMoves, mc.DeclaredMoves)
-	dirs := undeclaredPaths(mc.DelegateDirs, mc.DeclaredDirs)
+	write := undeclaredPaths(mc.GeneralAgentWrite, mc.DeclaredWrite)
+	remove := undeclaredPaths(mc.GeneralAgentDelete, mc.DeclaredDelete)
+	moves := undeclaredMoves(mc.GeneralAgentMoves, mc.DeclaredMoves)
+	dirs := undeclaredPaths(mc.GeneralAgentDirs, mc.DeclaredDirs)
 	var clauses []string
 	if len(write) > 0 || (len(remove) == 0 && len(moves) == 0 && len(dirs) == 0) {
 		clauses = append(clauses, "undeclared="+strconv.Quote(strings.Join(write, " ")))
@@ -1246,25 +1381,25 @@ func childScopeTargetClause(mc ModeContext) string {
 func childMoveFormClause(declared map[MovePair]bool) string {
 	switch {
 	case declared == nil:
-		return "this delegate call did not supply " + childMoveArg
+		return "this general_agent call did not supply " + childMoveArg
 	case len(declared) == 0:
-		return "this delegate call supplied an empty " + childMoveArg
+		return "this general_agent call supplied an empty " + childMoveArg
 	default:
-		return "this delegate call's " + childMoveArg + " does not declare this source and destination as one pair"
+		return "this general_agent call's " + childMoveArg + " does not declare this source and destination as one pair"
 	}
 }
 
-func delegateWidensOnlyMoves(mc ModeContext) bool {
-	return len(undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)) == 0 &&
-		len(undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)) == 0 &&
-		len(undeclaredMoves(mc.DelegateMoves, mc.DeclaredMoves)) > 0
+func generalAgentWidensOnlyMoves(mc ModeContext) bool {
+	return len(undeclaredPaths(mc.GeneralAgentWrite, mc.DeclaredWrite)) == 0 &&
+		len(undeclaredPaths(mc.GeneralAgentDelete, mc.DeclaredDelete)) == 0 &&
+		len(undeclaredMoves(mc.GeneralAgentMoves, mc.DeclaredMoves)) > 0
 }
 
-func delegateWidensOnlyDirs(mc ModeContext) bool {
-	return len(undeclaredPaths(mc.DelegateWrite, mc.DeclaredWrite)) == 0 &&
-		len(undeclaredPaths(mc.DelegateDelete, mc.DeclaredDelete)) == 0 &&
-		len(undeclaredMoves(mc.DelegateMoves, mc.DeclaredMoves)) == 0 &&
-		len(undeclaredPaths(mc.DelegateDirs, mc.DeclaredDirs)) > 0
+func generalAgentWidensOnlyDirs(mc ModeContext) bool {
+	return len(undeclaredPaths(mc.GeneralAgentWrite, mc.DeclaredWrite)) == 0 &&
+		len(undeclaredPaths(mc.GeneralAgentDelete, mc.DeclaredDelete)) == 0 &&
+		len(undeclaredMoves(mc.GeneralAgentMoves, mc.DeclaredMoves)) == 0 &&
+		len(undeclaredPaths(mc.GeneralAgentDirs, mc.DeclaredDirs)) > 0
 }
 
 func undeclaredMoves(nested, parent map[MovePair]bool) []string {

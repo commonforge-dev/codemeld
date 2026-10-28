@@ -69,6 +69,51 @@ func TestReadTool_AdvertiseMetadata(t *testing.T) {
 	}
 }
 
+func TestReadTool_AdvertisePathContract(t *testing.T) {
+	assertReadPathContract(t, newReadToolIn(t, t.TempDir()).Advertise())
+}
+
+func pathDescription(t *testing.T, md tools.Metadata) string {
+	t.Helper()
+	props, _ := md.Parameters["properties"].(map[string]any)
+	path, _ := props["path"].(map[string]any)
+	desc, _ := path["description"].(string)
+	if desc == "" {
+		t.Fatal("path parameter has no description")
+	}
+	return desc
+}
+
+func assertReadPathContract(t *testing.T, md tools.Metadata) {
+	t.Helper()
+	desc := pathDescription(t, md)
+	for _, want := range []string{
+		"absolute or ~",
+		"outside the project",
+		"without asking unless it is blocked, in which case it is refused",
+		"settings file is broken",
+		"blocked-path list is unknown",
+		"asks first",
+		"leaves the project through `..` or through a symlink inside the project is refused",
+		"~user forms",
+		"malformed paths",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("path description missing %q; got %q", want, desc)
+		}
+	}
+	for _, stale := range []string{"approve it at the permission prompt", "only after you approve"} {
+		if strings.Contains(desc, stale) {
+			t.Errorf("path description still says %q; got %q", stale, desc)
+		}
+	}
+	for _, confined := range []string{"project file", "within the project", "in-project", "project-confined"} {
+		if strings.Contains(md.Description, confined) {
+			t.Errorf("tool description claims project-only confinement with %q; got %q", confined, md.Description)
+		}
+	}
+}
+
 // TestReadTool_VerbatimContent_NoLineNumbers pins Done-when 1: a whole-file read returns the file bytes
 // byte-for-byte with no injected line numbers, and the truncation metadata lives in stderr, not stdout.
 func TestReadTool_VerbatimContent_NoLineNumbers(t *testing.T) {

@@ -38,18 +38,22 @@ safely.
   - **Self-test passed (Linux amd64/arm64 only).** Plan and Auto edits commands —
     including the version-control tools' commands and child agents' commands —
     run inside a mandatory boundary (Landlock ABI 3 or newer, seccomp,
-    `no_new_privs`, resource limits, a fixed environment) with no ordinary
-    command prompt. No setting turns it off. Plan may write nothing except
+    `no_new_privs`, resource limits, and codemeld's own environment minus
+    withheld and secret-looking variables, under a fixed table for `PATH`,
+    `HOME` and the temp folder) with no ordinary command prompt. No setting
+    turns it off. Plan may write nothing except
     `/dev/null` and open no sockets that reach another process; the only socket
-    either mode may create is a Unix stream socketpair, whose two ends stay
-    connected only to each other. Auto edits may write the project's top-level
+    either mode may create is a Unix stream or seqpacket socketpair, whose two
+    ends stay connected only to each other; datagram socketpairs are denied, and
+    the same socketpair rule holds in the approved network variant. Auto edits may write the project's top-level
     files and folders, except `.codemeld` and any entry that is a symlink to the
     project root, to protected state, or to somewhere outside the project, plus a
     private temp folder for the session, plus each folder declared in
     `writable_folders`. While no settings file is broken, codemeld's own edit,
     create and make-folder tools may also write inside a declared folder in Auto
-    edits without a prompt; delete and move gain no authority from a declared
-    folder. Commands see the session's private temp folder as `TMPDIR`, and
+    edits without a prompt, and its delete tool may remove an entry inside the
+    project or a declared folder, though never the project folder or a declared
+    folder itself; move gains no authority from a declared folder. Commands see the session's private temp folder as `TMPDIR`, and
     codemeld adds no other temporary write grant: `/tmp` and the `$TMPDIR`
     codemeld was launched with are writable only through an effective declared
     `writable_folders` entry covering their resolved location, or when that
@@ -63,16 +67,26 @@ safely.
     gives commands no access to the symlink's target. A declared folder under
     `/dev/shm` is not covered by `/dev` or `/dev/shm`, since `/dev/shm` is carved
     out of them, so it keeps its own grant; its parent stays unwritable. No
-    confined command can read `~/.codemeld` or write `~/.codemeld` or
-    `<project>/.codemeld`. In Auto edits, a recognized network, deletion or
-    history-rewrite command asks (allow once or deny); deletion or history
-    rewrite by an unrecognized program runs confined without asking, and a literal
-    command codemeld cannot split into stages gets an ordinary prompt. Approving
-    network access adds internet sockets for that one command. The status bar
-    shows `sandbox: on`.
+    confined command can write `~/.codemeld` or `<project>/.codemeld`, or read
+    `~/.codemeld`, with one exception: confined commands may read and run files
+    in `~/.codemeld/skills` when the conditions in
+    [`docs/skills.md`](docs/skills.md#global-skills-and-the-sandbox) hold. The
+    rest of `~/.codemeld` stays unreadable, skills stay unwritable, and
+    codemeld's file tools still refuse skill paths. In Auto edits, a command
+    with a recognized network or history-rewrite stage asks (allow once or
+    deny), wherever a deletion sits in the chain. Every other command runs
+    confined without asking: file deletion such as `rm`, a command codemeld
+    cannot split into stages, and deletion or history rewrite by an
+    unrecognized program. Version control brings back committed content only,
+    so a deleted file loses its uncommitted edits and an untracked or ignored
+    file is gone, the same loss an overwrite causes. A recognized command is
+    also found inside a visible `bash -c` or `sh -c` body and behind `command`,
+    `nice`, `nohup`, `time` or `xargs`. Approving network access adds internet
+    sockets for that one command. The status bar shows `sandbox: on`.
   - <a id="broken-settings"></a>**Self-test passed, then a settings file's blocked-path list breaks.** Plan and
     Auto edits commands stay confined, and every shell command asks until the
-    file is fixed, except one you already denied this turn; version-control tool
+    file is fixed, except one you already denied this turn; a recognized file
+    deletion asks again with allow once or deny only; version-control tool
     calls do not ask. The status bar shows `sandbox: unavailable`; `/status` and
     headless output add the reason.
   - **Self-test failed, or an unsupported OS, architecture, or kernel.** Commands
@@ -101,6 +115,19 @@ safely.
   file can hold plaintext keys and session tokens, never commit it to a
   repository, paste it into a bug report, or sync it to untrusted locations.
 
+### Project approval state
+
+`~/.codemeld/global/approved-projects.yaml` holds the project roots you approved,
+and nothing else. It lives outside every repository, and the structured file
+tools refuse to write it. Deleting it discards those approvals: the next launch
+on a terminal asks again for a project that has its own codemeld settings or
+version-control templates, while a project with none of those is not asked
+about. A non-interactive run never prompts and never recreates the approvals,
+though it still honours approvals already in the file. An older
+`~/.codemeld/global/trust.yaml` may still be present; it is no longer read and
+can be deleted. See
+[`docs/approvals.md`](docs/approvals.md#project-approval-for-cloned-repositories).
+
 ### What the confinement boundary does not cover
 
 These gaps are known and accepted. Reports that show one of them reaching
@@ -122,7 +149,11 @@ further than described here are still welcome.
   any boundary. Resource limits bound ordinary cases only, not total disk use,
   memory, or descendants that leave the command's process group.
 - **No per-command intent review.** Any program may run inside the boundary,
-  including one that a hostile file in the repository suggests.
+  including one that a hostile file in the repository suggests. In Auto edits,
+  text piped into a shell (`echo 'rm -rf x' | bash`), a script's contents, and
+  arguments `xargs` reads while it runs are not inspected, so a recognized
+  command hidden there runs confined without asking; visible `-c` bodies and
+  wrapped commands are checked.
 - **Output reaches the model.** What a command reads appears in the transcript
   and is sent to your model provider. Blocked paths and the web tools' approval
   prompts bound this, not the socket block.

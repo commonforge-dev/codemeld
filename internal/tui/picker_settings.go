@@ -37,11 +37,13 @@ const (
 	permTabGlobal        = "commands / tool grants"
 	permTabFolders       = "folders"
 	permTabHosts         = "project hosts"
-	permTabSettings      = "settings"
-	permTabIndexFolders  = 1
-	permTabIndexHosts    = 2
-	permTabIndexSettings = 3
-	permTabCount         = 4
+	permTabOpenRouter      = "openrouter"
+	permTabSettings        = "settings"
+	permTabIndexFolders    = 1
+	permTabIndexHosts      = 2
+	permTabIndexOpenRouter = 3
+	permTabIndexSettings   = 4
+	permTabCount           = 5
 )
 
 // settingsFooterHint is the one-row key legend below the list.
@@ -53,10 +55,11 @@ const (
 const discoveryLaunchDirOnly = "launch-dir-only"
 
 const (
-	attributionRowLabel    = "openrouter attribution"
-	dataCollectionRowLabel = "openrouter data collection"
-	sortRowLabel           = "openrouter sort"
-	maxPriceRowLabel       = "openrouter max price"
+	openRouterNoticePrefix = "openrouter "
+	attributionRowLabel    = "attribution"
+	dataCollectionRowLabel = "data collection"
+	sortRowLabel           = "sort"
+	maxPriceRowLabel       = "max price"
 	retentionRowLabel      = "session retention (days)"
 )
 
@@ -151,7 +154,7 @@ func (a *App) openSettingsPicker(rows []PermissionRow, deps SettingsDeps, sessio
 	// only reliable source for the row now under it.
 	pp.list.SetChangedFunc(func(i int, _, _ string, _ rune) {
 		pp.updateFooter(i)
-		a.updateSortHelp(i)
+		a.updateRowHelp(i)
 	})
 
 	pp.help = tview.NewTextView()
@@ -185,8 +188,10 @@ func (a *App) settingsPickerKeys(ev *tcell.EventKey) *tcell.EventKey {
 		a.stepSettingsTab(-1)
 		return nil
 	case tcell.KeyEnter:
-		if pp := a.settingsPicker; pp != nil && pp.activeTab == permTabIndexSettings {
-			a.actOnSettingsRow(pp.list.GetCurrentItem())
+		if pp := a.settingsPicker; pp != nil && (pp.activeTab == permTabIndexOpenRouter || pp.activeTab == permTabIndexSettings) {
+			if id, ok := settingsRowID(pp.activeTab, pp.list.GetCurrentItem()); ok {
+				a.actOnSettingsRow(id)
+			}
 			return nil
 		}
 	case tcell.KeyRune:
@@ -223,14 +228,37 @@ func (a *App) routingSort() string {
 	return a.openRouterSettings.Sort()
 }
 
-func (a *App) settingsRows() []string {
-	return []string{
-		renderAttributionRow(a.attributionOn()),
-		renderSettingsRow(dataCollectionRowLabel, a.dataCollection()),
-		renderSettingsRow(sortRowLabel, a.sortRowValue()),
-		a.maxPriceRow(),
-		renderSettingsRow(retentionRowLabel, a.retentionRowValue()),
+// Only the requested tab's rows are built: the OpenRouter sort row can start a credentialed fetch.
+func (a *App) settingsTabRows(tab int) []string {
+	switch tab {
+	case permTabIndexOpenRouter:
+		return []string{
+			renderAttributionRow(a.attributionOn()),
+			renderSettingsRow(dataCollectionRowLabel, a.dataCollection()),
+			renderSettingsRow(sortRowLabel, a.sortRowValue()),
+			a.maxPriceRow(),
+		}
+	case permTabIndexSettings:
+		return []string{renderSettingsRow(retentionRowLabel, a.retentionRowValue())}
 	}
+	return nil
+}
+
+func settingsRowPlace(id int) (tab, index int) {
+	if id == settingsRowRetention {
+		return permTabIndexSettings, 0
+	}
+	return permTabIndexOpenRouter, id
+}
+
+func settingsRowID(tab, index int) (int, bool) {
+	switch {
+	case tab == permTabIndexOpenRouter && index >= settingsRowAttribution && index <= settingsRowMaxPrice:
+		return index, true
+	case tab == permTabIndexSettings && index == 0:
+		return settingsRowRetention, true
+	}
+	return 0, false
 }
 
 func (a *App) retentionRowValue() string {
@@ -258,10 +286,11 @@ func (a *App) sortRowValue() string {
 
 func (a *App) redrawSortRow(pp *settingsPickerSession, model string) {
 	a.streamUpdate(func() {
-		if pp == nil || a.settingsPicker != pp || pp.activeTab != permTabIndexSettings || a.maxPriceModel() != model {
+		if pp == nil || a.settingsPicker != pp || pp.activeTab != permTabIndexOpenRouter || a.maxPriceModel() != model {
 			return
 		}
-		pp.list.SetItemText(settingsRowSort, renderSettingsRow(sortRowLabel, a.sortRowValue()), "")
+		_, i := settingsRowPlace(settingsRowSort)
+		pp.list.SetItemText(i, renderSettingsRow(sortRowLabel, a.sortRowValue()), "")
 	})
 }
 
@@ -366,7 +395,7 @@ func (a *App) actOnSettingsRow(row int) {
 	default:
 		return
 	}
-	a.writeSettingsRow(row, label, write)
+	a.writeSettingsRow(row, openRouterNoticePrefix+label, write)
 }
 
 func (a *App) writeSettingsRow(row int, label string, write func() error) {
@@ -375,8 +404,10 @@ func (a *App) writeSettingsRow(row int, label string, write func() error) {
 	}
 	a.renderSettingsTab()
 	if pp := a.settingsPicker; pp != nil {
-		pp.list.SetCurrentItem(row)
-		a.updateSortHelp(row)
+		if tab, i := settingsRowPlace(row); tab == pp.activeTab {
+			pp.list.SetCurrentItem(i)
+			a.updateRowHelp(i)
+		}
 	}
 }
 
@@ -416,7 +447,7 @@ func (a *App) showMaxPriceEditor(model string) {
 		AddItem(ed.prompt, 1, 0, true).
 		AddItem(ed.completion, 1, 0, false)
 	form.SetBorder(true)
-	form.SetTitle(" " + tview.Escape(maxPriceRowLabel+" per M tokens ("+model+")") + " ")
+	form.SetTitle(" " + tview.Escape(openRouterNoticePrefix+maxPriceRowLabel+" per M tokens ("+model+")") + " ")
 	a.pages.AddPage(settingsDeletePage, centeredModal(form), true, true)
 	a.app.SetFocus(ed.prompt)
 }
@@ -437,10 +468,10 @@ func (a *App) submitMaxPrice(ed *maxPriceEditor) {
 		p.Completion, p.HasCompletion, err = parsePriceField("output", ed.completion.GetText())
 	}
 	if err != nil {
-		a.Notice(renderSettingFailedNotice(maxPriceRowLabel, err))
+		a.Notice(renderSettingFailedNotice(openRouterNoticePrefix+maxPriceRowLabel, err))
 		return
 	}
-	a.writeSettingsRow(settingsRowMaxPrice, maxPriceRowLabel, func() error {
+	a.writeSettingsRow(settingsRowMaxPrice, openRouterNoticePrefix+maxPriceRowLabel, func() error {
 		return a.openRouterSettings.SetMaxPrice(ed.model, p)
 	})
 }
@@ -529,21 +560,37 @@ func sortHelp(v string) string {
 	case "throughput":
 		return "Fastest providers first, whatever the price"
 	case sortBestValue:
-		return "Cheapest providers first; ones slower than this model's typical speed go last"
+		return "Fastest at typical speed or better, within 20% of the cheapest at that speed"
 	}
 	return "Set in the settings file; Enter switches to default"
 }
 
-func (a *App) updateSortHelp(i int) {
+func (a *App) updateRowHelp(i int) {
 	pp := a.settingsPicker
 	if pp == nil || pp.help == nil {
 		return
 	}
 	text := ""
-	if pp.activeTab == permTabIndexSettings && i == settingsRowSort {
-		text = sortHelp(a.routingSort())
+	if id, ok := settingsRowID(pp.activeTab, i); ok {
+		text = a.settingsRowHelp(id)
 	}
 	pp.help.SetText(text)
+}
+
+func (a *App) settingsRowHelp(id int) string {
+	switch id {
+	case settingsRowAttribution:
+		return "Identify codemeld to OpenRouter on chat requests (app URL, name, categories)"
+	case settingsRowDataCollection:
+		return "allow: may use providers that store or train on prompts; deny: avoid them"
+	case settingsRowSort:
+		return sortHelp(a.routingSort())
+	case settingsRowMaxPrice:
+		return "Input/output price caps per M tokens for OpenRouter models; empty: no cap"
+	case settingsRowRetention:
+		return "Idle days before auto-deletion; pruning runs at a fresh launch, not on resume"
+	}
+	return ""
 }
 
 func renderSettingFailedNotice(label string, err error) string {
@@ -569,8 +616,8 @@ func (a *App) renderSettingsTab() {
 	pp.tabBar.SetText(settingsTabBar(pp.activeTab))
 	pp.list.Clear()
 	switch rows := pp.activeRows(); {
-	case pp.activeTab == permTabIndexSettings:
-		for _, row := range a.settingsRows() {
+	case pp.activeTab == permTabIndexOpenRouter || pp.activeTab == permTabIndexSettings:
+		for _, row := range a.settingsTabRows(pp.activeTab) {
 			pp.list.AddItem(row, "", 0, nil)
 		}
 	case len(rows) == 0:
@@ -580,7 +627,7 @@ func (a *App) renderSettingsTab() {
 			pp.list.AddItem(renderPermissionRow(row), "", 0, nil)
 		}
 	}
-	a.updateSortHelp(pp.list.GetCurrentItem())
+	a.updateRowHelp(pp.list.GetCurrentItem())
 }
 
 func (pp *settingsPickerSession) updateFooter(i int) {
@@ -645,7 +692,7 @@ func samePermissionRow(a, b PermissionRow) bool {
 	return a.Layer == b.Layer && a.Path == b.Path && a.Entry.DedupKey() == b.Entry.DedupKey()
 }
 
-// Returning no grants for the settings tab is what keeps revoke and cursor restore inert
+// Returning no grants for the openrouter and settings tabs is what keeps revoke and cursor restore inert
 // there, without each of them re-testing the tab.
 func (pp *settingsPickerSession) activeRows() []PermissionRow {
 	switch pp.activeTab {
@@ -653,7 +700,7 @@ func (pp *settingsPickerSession) activeRows() []PermissionRow {
 		return pp.folders
 	case permTabIndexHosts:
 		return pp.hosts
-	case permTabIndexSettings:
+	case permTabIndexOpenRouter, permTabIndexSettings:
 		return nil
 	}
 	return pp.global
@@ -953,21 +1000,30 @@ func (a *App) StepSortForTest() string {
 }
 
 func (a *App) ShowSettingsTabForTest() bool {
+	return a.showSettingsTabForTest(permTabIndexSettings)
+}
+
+func (a *App) ShowOpenRouterTabForTest() bool {
+	return a.showSettingsTabForTest(permTabIndexOpenRouter)
+}
+
+func (a *App) showSettingsTabForTest(tab int) bool {
 	pp := a.settingsPicker
 	if pp == nil {
 		return false
 	}
-	pp.activeTab = permTabIndexSettings
+	pp.activeTab = tab
 	a.renderSettingsTab()
 	return true
 }
 
 func (a *App) SortRowForTest() string {
 	pp := a.settingsPicker
-	if pp == nil || pp.activeTab != permTabIndexSettings {
+	tab, i := settingsRowPlace(settingsRowSort)
+	if pp == nil || pp.activeTab != tab {
 		return ""
 	}
-	main, _ := pp.list.GetItemText(settingsRowSort)
+	main, _ := pp.list.GetItemText(i)
 	return main
 }
 
@@ -978,7 +1034,7 @@ func (a *App) SetMaxPriceForTest(prompt, completion string) string {
 		pp.maxPrice.completion.SetText(completion)
 		a.submitMaxPrice(pp.maxPrice)
 	}
-	return a.settingsRows()[settingsRowMaxPrice]
+	return a.settingsRowTextForTest(settingsRowMaxPrice)
 }
 
 func (a *App) SetRetentionForTest(text string, confirm bool) string {
@@ -996,7 +1052,7 @@ func (a *App) SetRetentionForTest(text string, confirm bool) string {
 			}
 		}
 	}
-	return a.settingsRows()[settingsRowRetention]
+	return a.settingsRowTextForTest(settingsRowRetention)
 }
 
 func (a *App) pressEnterOnSettingsRowForTest(row int) string {
@@ -1004,11 +1060,17 @@ func (a *App) pressEnterOnSettingsRowForTest(row int) string {
 	if pp == nil {
 		return ""
 	}
-	pp.activeTab = permTabIndexSettings
+	tab, i := settingsRowPlace(row)
+	pp.activeTab = tab
 	a.renderSettingsTab()
-	pp.list.SetCurrentItem(row)
+	pp.list.SetCurrentItem(i)
 	a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
-	return a.settingsRows()[row]
+	return a.settingsRowTextForTest(row)
+}
+
+func (a *App) settingsRowTextForTest(row int) string {
+	tab, i := settingsRowPlace(row)
+	return a.settingsTabRows(tab)[i]
 }
 
 func renderAttributionRow(on bool) string {
@@ -1023,16 +1085,22 @@ func renderSettingsRow(label, value string) string {
 }
 
 func settingsTabBar(activeTab int) string {
-	labels := []string{permTabGlobal, permTabFolders, permTabHosts, permTabSettings}
+	labels := []string{permTabGlobal, permTabFolders, permTabHosts, permTabOpenRouter, permTabSettings}
 	if activeTab < 0 || activeTab >= len(labels) {
 		activeTab = 0
 	}
-	labels[activeTab] = settingsActiveTab(labels[activeTab])
-	return strings.Join(labels, "   ")
+	for i, label := range labels {
+		if i == activeTab {
+			labels[i] = settingsActiveTab(label)
+		} else {
+			labels[i] = "[" + chromeOnFillText + ":" + statusSegmentBody1 + ":]" + label + "[-:-:-]"
+		}
+	}
+	return strings.Join(labels, " │ ")
 }
 
 func settingsActiveTab(label string) string {
-	return "[" + chromeOnFillText + ":" + accentTealHex + ":b] " + label + " [-:-:-]"
+	return "[" + chromeOnFillText + ":" + accentTealHex + ":b]" + label + "[-:-:-]"
 }
 
 // permissionIsFolderGrant reports whether e is scoped to a specific folder (folders tab)

@@ -42,7 +42,7 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 		// slice flags, so the whole command opts out of urfave's default value splitting.
 		DisableSliceFlagSeparator: true,
 		Usage:                     "run the agent once headlessly: final answer to stdout, tool-round text to stderr (fail-closed; optional --prompt-for-approval)",
-		UsageText:                 "codemeld run [--model <provider/id>] [--effort <advertised-effort|no-reasoning>] [--mode plan|build|auto-edits] [--title <name>] [--prompt-for-approval] [--files-authorized <path>]... [--files-authorized-delete <path>]... [--dev-debug] [--time-limit <duration>] \"<prompt>\"",
+		UsageText:                 "codemeld run [--model <provider/id>] [--effort <advertised-effort|no-reasoning>] [--mode plan|build|auto-edits] [--title <name>] [--prompt-for-approval] [--files-authorized <path>]... [--files-authorized-delete <path>]... [--dev-debug] [--time-limit <duration>] [--no-agents | --no-dir-agent | --agents-file <absolute-path>] \"<prompt>\"",
 		Description: "Run the agent loop once for a single prompt and exit. Only the final answer, or\n" +
 			"the partial answer of an interrupted stream, goes to stdout. The assistant text of\n" +
 			"tool-call rounds goes to stderr alongside tool activity, as do denials, provider\n" +
@@ -62,11 +62,19 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"no-parameter choice. An omitted --effort means 'no-reasoning'; an empty --effort, an\n" +
 			"--effort without --model, or one the selected model does not advertise, is a usage error.\n" +
 			"Without --model the run uses the active model from settings (model.active). --mode\n" +
-			"pins the interaction mode for the run, overriding mode.default; under 'plan' every\n" +
-			"mutating call is denied by the mode. On Linux (amd64/arm64), when codemeld's startup\n" +
+			"pins the interaction mode for the run, overriding mode.default; under 'plan' the mode\n" +
+			"denies mutating tool calls. On Linux (amd64/arm64), when codemeld's startup\n" +
 			"sandbox check passes, 'plan' and 'auto-edits' run shell commands inside an OS sandbox\n" +
 			"with filesystem and process-access restrictions, and 'build' runs them outside it; if\n" +
-			"the check fails or the platform is not supported, commands run outside the sandbox.\n\n" +
+			"the check fails or the platform is not supported, commands run outside the sandbox.\n" +
+			"Under 'plan', with intact settings and a passing startup check on a supported host, a\n" +
+			"shell command runs inside the sandbox, where writes and network access fail. Without\n" +
+			"the sandbox, only read-only commands run under 'plan'; any other command is denied\n" +
+			"without asking unless the opt-in System One check allows that one invocation. Broken\n" +
+			"settings remove automatic sandbox permission: an otherwise-eligible command may still\n" +
+			"get a grant-free, cache-free allow-once from the System One check; otherwise it needs\n" +
+			"approval, or is refused in a non-prompting headless run. An unknown or degraded\n" +
+			"blocked-path list makes a command ineligible for that check.\n\n" +
 			"The run creates a normal session, so it is resumable with 'codemeld --resume <id>'\n" +
 			"and listed by 'codemeld sessions'. Ctrl-C cancels the turn and still persists the\n" +
 			"session durably.\n\n" +
@@ -85,8 +93,10 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"contributes both its .codemeld/settings.yaml and .codemeld/settings.local.yaml\n" +
 			"layers exactly as it does interactively; a project that is not approved contributes\n" +
 			"neither. The gate covers those two settings layers and the project's VCS command\n" +
-			"templates. AGENTS.md files load on their ordinary discovery rules whether or not the\n" +
-			"project is approved: the global one, any above the project root, and the project's own.\n\n" +
+			"templates. AGENTS.md files are outside that gate: by default they load on their\n" +
+			"ordinary discovery rules whether or not the project is approved, and the controls\n" +
+			"below suppress or replace them the same way in either case.\n\n" +
+			agentsFlagsHelp +
 			"With --prompt-for-approval a tool or command that would otherwise be denied instead\n" +
 			"pauses and asks on the terminal (the request prints to stderr, your choice is read\n" +
 			"from stdin); the run then continues headless. Every run offers allow once (run this\n" +
@@ -131,14 +141,14 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"--files-authorized-delete authorizes the exact path whether it is a file, a symlink,\n" +
 			"or an empty directory; a non-empty directory is refused regardless of the\n" +
 			"declaration. Plan mode is unaffected: a declared write is still denied there.\n\n" +
-			"A run ceiling also bounds delegation. A delegate call may declare only write paths\n" +
+			"A run ceiling also bounds delegation. A general_agent call may declare only write paths\n" +
 			"the --files-authorized list already covers; an uncovered declaration is refused ahead\n" +
 			"of any grant, the turn cache, the mode, and --prompt-for-approval, and no child agent\n" +
 			"starts. Coverage is not permission to delegate — a covered call is authorized like any\n" +
-			"other. A child's own writes are bounded by the paths its delegate call declared, and a\n" +
-			"nested delegate call may declare only paths its own parent already declared.\n" +
+			"other. A child's own writes are bounded by the paths its general_agent call declared,\n" +
+			"and a nested general_agent call may declare only paths its own parent already declared.\n" +
 			"--files-authorized-delete on its own leaves the run's write list empty, so every\n" +
-			"delegate declaration is uncovered.\n\n" +
+			"general_agent declaration is uncovered.\n\n" +
 			"Outside the file tools and delegation the lists bound nothing — the lists are not a\n" +
 			"sandbox and do not authorize or confine shell writes. A shell command follows the\n" +
 			"mode's OS sandbox when one is active; where none confines it (build mode, or a failed\n" +
@@ -160,14 +170,18 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"recorded as cancelled. That final round is not bounded by --time-limit, so a caller that\n" +
 			"also wraps the run in its own timeout should set it a few minutes higher. A terminal\n" +
 			"approval prompt already waiting for your answer is not interrupted, but an answer given\n" +
-			"after the limit authorizes nothing. Without --time-limit the run has no time limit.\n\n" +
+			"after the limit authorizes nothing. Time spent waiting on permission prompts counts\n" +
+			"against the limit, and 'codemeld sessions summary' reports it.\n" +
+			"Without --time-limit the run has no time limit.\n\n" +
 			"Exit codes: 0 on a completed run, including one ended by --time-limit with a final\n" +
 			"answer; 2 for a usage error (empty prompt, a malformed,\n" +
 			"missing, or uncatalogued model, an effort without a model or one the model does not\n" +
 			"advertise, an invalid mode, a blank --title, an empty, malformed, zero, or negative\n" +
-			"--time-limit, or --prompt-for-approval without a terminal on stdin);\n" +
+			"--time-limit, --prompt-for-approval without a terminal on stdin, an empty or relative\n" +
+			"--agents-file, --agents-file with --no-agents or --no-dir-agent, or one of those three\n" +
+			"flags placed before 'run');\n" +
 			"1 for a bootstrap or provider failure.",
-		Flags: []ucli.Flag{
+		Flags: append([]ucli.Flag{
 			&ucli.StringFlag{
 				Name:  "model",
 				Usage: "provider/model to use (e.g. openai/gpt-5.5); split on the first '/'. Omit to use model.active",
@@ -190,11 +204,11 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			},
 			&ucli.StringSliceFlag{
 				Name:  "files-authorized",
-				Usage: "path this run may create and edit; repeat once per path (never split on a separator). With either files-authorized flag the lists are the sole authorization for create/edit/delete/mkdir/move, ahead of grants, the turn cache, the mode, and --prompt-for-approval; mkdir and move are never covered; declaring a path also authorizes creating its missing parent directories; a delegate call may declare only paths this list covers, and an uncovered one starts no child; outside the file tools and delegation nothing is bound — the lists are not a sandbox, and where the mode's OS sandbox does not confine it (build mode, or a failed or unsupported startup check) a granted shell command can still write elsewhere",
+				Usage: "path this run may create and edit; repeat once per path (never split on a separator). With either files-authorized flag the lists are the sole authorization for create/edit/delete/mkdir/move, ahead of grants, the turn cache, the mode, and --prompt-for-approval; mkdir and move are never covered; declaring a path also authorizes creating its missing parent directories; a general_agent call may declare only paths this list covers, and an uncovered one starts no child; outside the file tools and delegation nothing is bound — the lists are not a sandbox, and where the mode's OS sandbox does not confine it (build mode, or a failed or unsupported startup check) a granted shell command can still write elsewhere",
 			},
 			&ucli.StringSliceFlag{
 				Name:  "files-authorized-delete",
-				Usage: "path this run may delete — the exact path, whether a file, a symlink, or an empty directory (a non-empty directory is refused regardless); repeat once per path (never split on a separator). Independent of --files-authorized, and subject to the same sole-authorization rule and the same limits; on its own it leaves the run's write list empty, so every delegate declaration is uncovered",
+				Usage: "path this run may delete — the exact path, whether a file, a symlink, or an empty directory (a non-empty directory is refused regardless); repeat once per path (never split on a separator). Independent of --files-authorized, and subject to the same sole-authorization rule and the same limits; on its own it leaves the run's write list empty, so every general_agent declaration is uncovered",
 			},
 			&ucli.BoolFlag{
 				Name:  "dev-debug",
@@ -204,7 +218,7 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 				Name:  "time-limit",
 				Usage: "positive duration (e.g. 28m, 1680s) after which the run stops its work and ends with one tool-less final answer; counted from the start of the command. Omit for no limit",
 			},
-		},
+		}, agentsFlags()...),
 		Action: func(ctx context.Context, c *ucli.Command) error {
 			return runHeadless(ctx, c, stdout, stderr)
 		},
@@ -237,6 +251,10 @@ func runHeadless(ctx context.Context, c *ucli.Command, stdout, stderr io.Writer)
 	if err != nil {
 		return err
 	}
+	agentsSel, err := agentsSelection(c)
+	if err != nil {
+		return err
+	}
 
 	// --prompt-for-approval requires an interactive terminal on stdin: there is no one to
 	// answer a prompt on a piped/redirected stream, and silently falling back to default-deny
@@ -258,6 +276,7 @@ func runHeadless(ctx context.Context, c *ucli.Command, stdout, stderr io.Writer)
 	defer stop()
 
 	steps := bootstrap.HeadlessFreshSteps(stderr, modelOverride, modeKey)
+	steps.AgentInstructionsSelection = agentsSel
 	driver := bootstrap.NewHeadlessDriver(prompt, stdout, stderr)
 	if promptForApproval {
 		driver.EnablePromptForApproval(runStdin)
@@ -410,6 +429,12 @@ func printDenialSummary(stderr io.Writer, denied []bootstrap.DeniedCall) {
 func denialAdvice(call bootstrap.DeniedCall) string {
 	if call.DeclaredScope() {
 		return "to authorize, name the path in --files-authorized or --files-authorized-delete when starting the run; a permission grant and --prompt-for-approval cannot widen a declared scope."
+	}
+	if call.Exceptional {
+		if call.TerminalApprover {
+			return "this exceptional action was denied; it requires explicit allow-once approval in sandboxed Auto edits, and saved grants are not used for it by the current implementation."
+		}
+		return "to authorize this exceptional action in sandboxed Auto edits, run codemeld interactively or restart with --prompt-for-approval and explicitly allow it once; saved grants are not used for this action by the current implementation."
 	}
 	return "to authorize, grant the command/tool (a permission grant in .codemeld/settings.local.yaml) or run codemeld interactively."
 }

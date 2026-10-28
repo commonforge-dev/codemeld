@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -776,26 +777,26 @@ func TestChatCompletion_NonOpenRouterNeverSendsRouting(t *testing.T) {
 }
 
 func TestChatCompletion_OpenRouterBestValueSort(t *testing.T) {
-	withBar := func(ctx context.Context, model string) (float64, bool) {
-		if model != "some-model" {
-			t.Errorf("MinThroughput model = %q, want some-model", model)
+	picked := func(ctx context.Context, model string, ignored []string) string {
+		if model != "some-model" || !slices.Equal(ignored, []string{"together"}) {
+			t.Errorf("BestValueTag(%q, %q), want some-model and the request's ignored providers", model, ignored)
 		}
-		return 42.5, true
+		return "baseten/fp8/us"
 	}
-	noBar := func(context.Context, string) (float64, bool) { return 0, false }
+	none := func(context.Context, string, []string) string { return "" }
 	cases := []struct {
-		name          string
-		minThroughput func(context.Context, string) (float64, bool)
-		want          map[string]any
+		name   string
+		lookup func(context.Context, string, []string) string
+		want   map[string]any
 	}{
-		{"bar", withBar, map[string]any{"sort": "price", "preferred_min_throughput": 42.5}},
-		{"no bar", noBar, map[string]any{"sort": "price"}},
-		{"no lookup", nil, map[string]any{"sort": "price"}},
+		{"pick", picked, map[string]any{"order": []any{"baseten/fp8/us"}, "ignore": []any{"together"}}},
+		{"no pick", none, map[string]any{"sort": "price", "ignore": []any{"together"}}},
+		{"no lookup", nil, map[string]any{"sort": "price", "ignore": []any{"together"}}},
 	}
 	for _, tc := range cases {
 		for _, stream := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stream=%v", tc.name, stream), func(t *testing.T) {
-				raw := captureClientBody(t, ClientConfig{Name: "openrouter", Routing: Routing{Sort: "best_value"}, MinThroughput: tc.minThroughput}, nil, stream)
+				raw := captureClientBody(t, ClientConfig{Name: "openrouter", Routing: Routing{Sort: "best_value"}, BestValueTag: tc.lookup}, []string{"together"}, stream)
 				if got := decodeProviderObject(t, raw); !reflect.DeepEqual(got, tc.want) {
 					t.Fatalf("provider = %#v, want %#v\nbody = %s", got, tc.want, raw)
 				}
@@ -804,7 +805,7 @@ func TestChatCompletion_OpenRouterBestValueSort(t *testing.T) {
 	}
 }
 
-func TestChatCompletion_MinThroughputOnlyForOpenRouterBestValue(t *testing.T) {
+func TestChatCompletion_BestValueTagOnlyForOpenRouterBestValue(t *testing.T) {
 	cases := []struct {
 		name     string
 		provider string
@@ -818,16 +819,16 @@ func TestChatCompletion_MinThroughputOnlyForOpenRouterBestValue(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			called := false
-			lookup := func(context.Context, string) (float64, bool) {
+			lookup := func(context.Context, string, []string) string {
 				called = true
-				return 42.5, true
+				return "picked"
 			}
-			raw := captureClientBody(t, ClientConfig{Name: tc.provider, Routing: Routing{Sort: tc.sort}, MinThroughput: lookup}, nil, false)
+			raw := captureClientBody(t, ClientConfig{Name: tc.provider, Routing: Routing{Sort: tc.sort}, BestValueTag: lookup}, nil, false)
 			if got := decodeProviderObject(t, raw); !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("provider = %#v, want %#v\nbody = %s", got, tc.want, raw)
 			}
 			if called {
-				t.Fatalf("MinThroughput was called for %s sort %q", tc.provider, tc.sort)
+				t.Fatalf("BestValueTag was called for %s sort %q", tc.provider, tc.sort)
 			}
 		})
 	}

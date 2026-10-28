@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/sessions"
 )
@@ -110,26 +111,20 @@ func TestToolLoop_SuggestOnlyRoundFinalizesProseAndOmitsCall(t *testing.T) {
 // so this pins the trimmed guard and the non-nil error that suppresses ToolLoop.Run's
 // success-path Usage callback.
 func TestToolLoop_SuggestOnlyRoundRejectsInvisibleProse(t *testing.T) {
+	suggestCall := toolCallsChunk(toolFrag(0, "call_s", "suggest_followup", suggestArgs))
 	for _, tc := range []struct {
-		name    string
-		content []byte // nil = no content chunk streamed at all
+		name  string
+		round [][]byte
 	}{
-		{name: "empty", content: nil},
-		{name: "whitespace", content: contentChunk("  \n\t ")},
+		{name: "empty", round: [][]byte{suggestCall, usageChunk(150, 25)}},
+		{name: "whitespace", round: [][]byte{contentChunk("  \n\t "), suggestCall, usageChunk(150, 25)}},
+		{name: "parsed text", round: [][]byte{contentChunk(`{"name":"suggest_followup","arguments":` + suggestArgs + `}`), finishChunk("stop"), usageChunk(150, 25)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
 			store.Append(textMsg("user", "summarize the tasks"))
 
-			round := [][]byte{}
-			if tc.content != nil {
-				round = append(round, tc.content)
-			}
-			round = append(round,
-				toolCallsChunk(toolFrag(0, "call_s", "suggest_followup", suggestArgs)),
-				usageChunk(150, 25),
-			)
-			client := &scriptedClient{rounds: [][][]byte{round}}
+			client := &scriptedClient{rounds: [][][]byte{tc.round}}
 
 			disp := &fakeDispatcher{}
 			var suggestCalls, usageCalls, finalizes int
@@ -163,13 +158,20 @@ func TestToolLoop_SuggestOnlyRoundRejectsInvisibleProse(t *testing.T) {
 			if got := disp.dispatchedOrder(); len(got) != 0 {
 				t.Fatalf("dispatched = %v, want none", got)
 			}
-			if len(notices) == 0 {
-				t.Fatal("no failure notice surfaced; a blank suggest-only round must give visible feedback")
+			if len(notices) != 1 {
+				t.Fatalf("notices = %q, want exactly one failure notice", notices)
 			}
 
-			recs := store.Records()
-			if !hasKind(recs, "provider_request_failed") {
-				t.Fatalf("missing provider_request_failed; kinds = %v", eventKinds(recs))
+			recs := diskRecords(t, store)
+			skipped := findProviderRequestRetrySkipped(t, recs)
+			if len(skipped) != 1 || skipped[0].Phase != "empty_response" || skipped[0].SkipReason != "retry_disabled" {
+				t.Fatalf("provider_request_retry_skipped = %+v, want one empty_response retry_disabled", skipped)
+			}
+			if n := kindCount(recs, "provider_request_failed"); n != 1 {
+				t.Fatalf("provider_request_failed = %d, want 1; kinds = %v", n, eventKinds(recs))
+			}
+			if kindIndex(recs, events.KindProviderRequestRetrySkipped) > kindIndex(recs, "provider_request_failed") {
+				t.Fatalf("provider_request_retry_skipped must precede provider_request_failed; kinds = %v", eventKinds(recs))
 			}
 			if mr := decodeModelResponse(t, recs); mr.InputTokens != 150 || mr.OutputTokens != 25 {
 				t.Fatalf("model_response tokens = (%d, %d), want the failed round's billed (150, 25)", mr.InputTokens, mr.OutputTokens)

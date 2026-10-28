@@ -819,7 +819,7 @@ func TestRunHeadless_SessionTitleSurvivesABootstrapFailureAfterSessionCreation(t
 					return nil, boom
 				}
 			case "LoadAgentInstructions":
-				steps.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+				steps.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 					return nil, boom
 				}
 			}
@@ -1397,6 +1397,7 @@ func TestRunHeadless_PromptApprovalProjectGrantPersists(t *testing.T) {
 // through the production assembly rather than through a flag the test set itself.
 func TestRunHeadless_UntrustedProjectWithholdsTheProjectChoice(t *testing.T) {
 	dir := trustProject(t, "model: {}\n")
+	sharedBefore := mustReadFile(t, projectSettingsPath(dir))
 	target := filepath.Join(dir, "notes.txt")
 	if err := os.WriteFile(target, []byte("keep\n"), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -1438,6 +1439,14 @@ func TestRunHeadless_UntrustedProjectWithholdsTheProjectChoice(t *testing.T) {
 		t.Fatalf("project settings gained %d permission entries in an untrusted run: %+v", len(entries), entries)
 	}
 	trustStoreAbsent(t, result.Home)
+	requireSharedProjectSettingsUnchanged(t, dir, sharedBefore, "an untrusted headless run")
+	mustNotExist(t, config.LocalSettingsPath(dir), "an untrusted headless run must not write a project grant")
+
+	var next bytes.Buffer
+	if again := gateTrust(result.Home, dir, dir, strings.NewReader(""), &next, true); again.Trusted || !strings.Contains(next.String(), approvePrompt) {
+		t.Fatalf("next interactive launch = %#v, stderr = %q, want it asked again", again, next.String())
+	}
+	trustStoreAbsent(t, result.Home)
 }
 
 func TestRunHeadless_ApprovedRootOffersTheProjectChoice(t *testing.T) {
@@ -1457,7 +1466,7 @@ func TestRunHeadless_ApprovedRootOffersTheProjectChoice(t *testing.T) {
 	// Project choice, then the exact scope the second question collects.
 	driver.EnablePromptForApproval(strings.NewReader("4\n1\n"))
 	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
-	approveRoot(t, result.Home, dir)
+	storeUnchanged := approvedRootsUnchanged(t, result.Home, dir)
 	result.TrustDecision = HeadlessFreshSteps(&bytes.Buffer{}, nil, "").GateTrust(result.Home, dir, dir)
 	if !result.TrustDecision.Trusted {
 		t.Fatalf("decision = %#v, want the listed root honored", result.TrustDecision)
@@ -1489,8 +1498,89 @@ func TestRunHeadless_ApprovedRootOffersTheProjectChoice(t *testing.T) {
 	if got := entries[0]; got.GrantKind != "folder" || got.Subject != "rm notes.txt" || got.PathScope != dir {
 		t.Fatalf("persisted entry = %+v, want a folder grant for \"rm notes.txt\" scoped to %s", got, dir)
 	}
+	requireSharedProjectSettingsUnchanged(t, dir, "model: {}\n", "a headless project grant")
 
 	trustStoreAbsent(t, processHome)
+	storeUnchanged()
+	if got := trustStore(t, result.Home).Projects; !slices.Equal(got, []string{mustCanonical(t, dir)}) {
+		t.Fatalf("approved roots after the run = %v, want the listed root kept", got)
+	}
+}
+
+func TestRunHeadless_SecondLaunchHonorsALocalGrantWithoutAPrompt(t *testing.T) {
+	dir := mustCanonical(t, t.TempDir())
+	target := filepath.Join(dir, "twice.txt")
+	seed := func() {
+		t.Helper()
+		if err := os.WriteFile(target, []byte("keep\n"), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	home := t.TempDir()
+	seedOpenAIDiscovered(t, SettingsPath(home), "gpt-5.5")
+	storeUnchanged := approvedRootsUnchanged(t, home, dir)
+	launch := func(sessionID, answers string) (*HeadlessDriver, string) {
+		t.Helper()
+		seed()
+		client := toolThenContentClient(nil, "bash", `{"command":"rm twice.txt"}`, "done")
+		defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+		var order []string
+		var stderr bytes.Buffer
+		hermetic := recordingSteps(&order)
+		steps := HeadlessFreshSteps(&stderr, nil, "")
+		steps.ResolveHome = func() (string, error) { return home, nil }
+		steps.RunFirstRun = hermetic.RunFirstRun
+		steps.LoadGlobalSettings = func(string) (map[string]any, error) { return headlessProviderConfig(), nil }
+		steps.ResolveProjectRoot = func(string, map[string]any) (string, []string, error) { return dir, nil, nil }
+		steps.RecoverJournals = hermetic.RecoverJournals
+		steps.LoadVCSTemplates = hermetic.LoadVCSTemplates
+		steps.ValidatePreferredVCS = hermetic.ValidatePreferredVCS
+		steps.DetectVCS = hermetic.DetectVCS
+		steps.BuildToolRegistry = func(any) (any, error) { return &toolRegistryFactory{active: nil}, nil }
+		steps.DetermineModel = func(map[string]any, map[string]any, string, []string) (any, bool, error) {
+			return model.NewActiveState(&model.Selection{Provider: "openai", ID: "gpt-5.5", Effort: model.EffortDefault}, model.SourceProject), false, nil
+		}
+		steps.EnsureFreshSession = func(string, string) (*sessions.Store, error) {
+			return storeAt(t, filepath.Join(t.TempDir(), "session.json"), sessionID, dir), nil
+		}
+		steps.AcquireLock = hermetic.AcquireLock
+		steps.AppendLaunchBegan = hermetic.AppendLaunchBegan
+		steps.InitMode = func(context.Context, *sessions.Store, map[string]any, string, []string) (any, error) {
+			return mode.NewActiveState(mode.Build, mode.SourceDefault), nil
+		}
+		steps.LoadAgentInstructions = hermetic.LoadAgentInstructions
+
+		driver := NewHeadlessDriver("clean up", &bytes.Buffer{}, &stderr)
+		driver.EnablePromptForApproval(strings.NewReader(answers))
+		if _, err := RunHeadless(context.Background(), dir, steps, driver); err != nil {
+			t.Fatalf("launch %s: %v", sessionID, err)
+		}
+		return driver, stderr.String()
+	}
+
+	_, firstErr := launch("01890000-0000-7000-8000-0000000000d2", "4\n1\n")
+	if n := strings.Count(firstErr, "approval required"); n != 1 {
+		t.Fatalf("first launch rendered %d prompts, want 1:\n%s", n, firstErr)
+	}
+	if entries := readPersistedPermissions(t, config.LocalSettingsPath(dir), dir); len(entries) != 1 || entries[0].Subject != "rm twice.txt" {
+		t.Fatalf("local settings after the first launch = %+v, want the one project grant", entries)
+	}
+	mustNotExist(t, projectSettingsPath(dir), "a project grant must not create the shared settings file")
+	storeUnchanged()
+
+	second, secondErr := launch("01890000-0000-7000-8000-0000000000d3", "")
+	if strings.Contains(secondErr, "approval required") {
+		t.Fatalf("second launch prompted, want the local grant to authorize:\n%s", secondErr)
+	}
+	if got := second.DeniedSubjects(); len(got) != 0 {
+		t.Fatalf("DeniedSubjects = %v, want none", got)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("twice.txt stat = %v, want the authorized call to have run", err)
+	}
+	mustNotExist(t, projectSettingsPath(dir), "the second launch must not create the shared settings file")
+	storeUnchanged()
 }
 
 func TestRunHeadless_PromptApprovalProjectGrantPersistFailureDegrades(t *testing.T) {
@@ -1721,7 +1811,12 @@ func TestHeadlessAuthorizer_LocalGrantLeavesSharedProjectSettingsByteIdentical(t
 	shared := seedSharedProjectSettings(t, dir, permissions.PermissionEntry{
 		Kind: "tool", Subject: "list_files", PathScope: dir, GrantKind: "folder",
 	})
-	auth, _ := headlessPersistAuthorizer(t, dir, store)
+	home := t.TempDir()
+	storeUnchanged := approvedRootsUnchanged(t, home, dir)
+	terminal := newTerminalPrompter(strings.NewReader(""), io.Discard)
+	terminal.home = home
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), terminal, &recordingNotices{})
 
 	folder := permissions.PermissionEntry{Kind: "tool", Subject: "read_file", PathScope: dir, GrantKind: "folder"}
 	host := projectHostGrant("web_fetch", "docs.example.com")
@@ -1730,6 +1825,7 @@ func TestHeadlessAuthorizer_LocalGrantLeavesSharedProjectSettingsByteIdentical(t
 			t.Fatalf("persistGrant %+v: %v", entry, err)
 		}
 		requireSharedProjectSettingsUnchanged(t, dir, shared, "a headless local grant write")
+		storeUnchanged()
 	}
 
 	localTarget := config.LocalSettingsPath(dir)
@@ -2422,16 +2518,16 @@ func TestRunHeadless_DeclaredWriteScopeDeniesAnUndeclaredSibling(t *testing.T) {
 
 // --- top-level delegate under the run's declared write ceiling ---
 
-func delegateToolCall(t *testing.T, files ...string) declaredToolCall {
+func generalAgentToolCall(t *testing.T, files ...string) declaredToolCall {
 	t.Helper()
 	encoded, err := json.Marshal(files)
 	if err != nil {
 		t.Fatalf("marshal files: %v", err)
 	}
-	return declaredToolCall{"delegate", `{"instructions":"do it","files":` + string(encoded) + `}`}
+	return declaredToolCall{"general_agent", `{"instructions":"do it","files":` + string(encoded) + `}`}
 }
 
-func runDelegateHeadless(t *testing.T, dir string, m mode.Mode, write, remove []string, call declaredToolCall) (*HeadlessDriver, *BootstrapResult, *stubTurnClient) {
+func runGeneralAgentHeadless(t *testing.T, dir string, m mode.Mode, write, remove []string, call declaredToolCall) (*HeadlessDriver, *BootstrapResult, *stubTurnClient) {
 	t.Helper()
 	client := declaredScopeClient(call)
 	t.Cleanup(swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client }))
@@ -2445,7 +2541,7 @@ func runDelegateHeadless(t *testing.T, dir string, m mode.Mode, write, remove []
 	return driver, result, client
 }
 
-func TestRunHeadless_TopLevelDelegateOutsideTheRunCeilingStartsNoChild(t *testing.T) {
+func TestRunHeadless_TopLevelGeneralAgentOutsideTheRunCeilingStartsNoChild(t *testing.T) {
 	tests := []struct {
 		name  string
 		grant func(result *BootstrapResult, dir string)
@@ -2455,7 +2551,7 @@ func TestRunHeadless_TopLevelDelegateOutsideTheRunCeilingStartsNoChild(t *testin
 			name: "with a folder grant for delegate",
 			grant: func(result *BootstrapResult, dir string) {
 				result.Config["permissions"] = []any{map[string]any{
-					"kind": "tool", "subject": "delegate", "path_scope": dir, "grant_kind": "folder",
+					"kind": "tool", "subject": "general_agent", "path_scope": dir, "grant_kind": "folder",
 				}}
 			},
 		},
@@ -2463,7 +2559,7 @@ func TestRunHeadless_TopLevelDelegateOutsideTheRunCeilingStartsNoChild(t *testin
 			name: "with a global grant for delegate",
 			grant: func(result *BootstrapResult, _ string) {
 				result.Config["permissions"] = []any{map[string]any{
-					"kind": "tool", "subject": "delegate", "path_scope": "*", "grant_kind": "global",
+					"kind": "tool", "subject": "general_agent", "path_scope": "*", "grant_kind": "global",
 				}}
 			},
 		},
@@ -2471,7 +2567,7 @@ func TestRunHeadless_TopLevelDelegateOutsideTheRunCeilingStartsNoChild(t *testin
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := declaredScopeDir(t)
-			client := declaredScopeClient(delegateToolCall(t, "other.txt"))
+			client := declaredScopeClient(generalAgentToolCall(t, "other.txt"))
 			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
 
 			driver := NewHeadlessDriver("delegate the work", &bytes.Buffer{}, &bytes.Buffer{})
@@ -2482,7 +2578,7 @@ func TestRunHeadless_TopLevelDelegateOutsideTheRunCeilingStartsNoChild(t *testin
 				t.Fatalf("driver.Run: %v", err)
 			}
 
-			assertDeclaredDenial(t, driver, result, "delegate")
+			assertDeclaredDenial(t, driver, result, "general_agent")
 			if client.callCount() != 2 {
 				t.Fatalf("provider rounds = %d, want 2 — no child ran and the refusal re-issues", client.callCount())
 			}
@@ -2499,10 +2595,10 @@ func TestRunHeadless_TopLevelDelegateOutsideTheRunCeilingStartsNoChild(t *testin
 	}
 }
 
-func TestRunHeadless_TopLevelDelegateInsideTheRunCeilingLaunchesByDeclaredScope(t *testing.T) {
+func TestRunHeadless_TopLevelGeneralAgentInsideTheRunCeilingLaunchesByDeclaredScope(t *testing.T) {
 	dir := declaredScopeDir(t)
-	driver, result, client := runDelegateHeadless(t, dir, mode.Build, []string{"allowed.txt"}, nil,
-		delegateToolCall(t, "allowed.txt"))
+	driver, result, client := runGeneralAgentHeadless(t, dir, mode.Build, []string{"allowed.txt"}, nil,
+		generalAgentToolCall(t, "allowed.txt"))
 
 	if got := driver.DeniedSubjects(); len(got) != 0 {
 		t.Fatalf("DeniedSubjects = %+v, want none — declared scope covers the launch", got)
@@ -2519,8 +2615,8 @@ func TestRunHeadless_TopLevelDelegateInsideTheRunCeilingLaunchesByDeclaredScope(
 	}
 	var launch []events.PermissionMatched
 	for _, m := range decodePermissionMatched(t, store) {
-		if m.Subject == "delegate" {
-			t.Fatalf("event %+v decided the tool delegate, want only its declared operations", m)
+		if m.Subject == "general_agent" {
+			t.Fatalf("event %+v decided the tool general_agent, want only its declared operations", m)
 		}
 		if m.ChildInvocationID == "" {
 			launch = append(launch, m)
@@ -2532,12 +2628,12 @@ func TestRunHeadless_TopLevelDelegateInsideTheRunCeilingLaunchesByDeclaredScope(
 	}
 }
 
-func TestRunHeadless_PlanDecidesTopLevelDelegateOnItsOwnPosture(t *testing.T) {
+func TestRunHeadless_PlanDecidesTopLevelGeneralAgentOnItsOwnPosture(t *testing.T) {
 	for _, candidate := range []string{"allowed.txt", "other.txt"} {
 		t.Run(candidate, func(t *testing.T) {
 			dir := declaredScopeDir(t)
-			driver, result, _ := runDelegateHeadless(t, dir, mode.Plan, []string{"allowed.txt"}, nil,
-				delegateToolCall(t, candidate))
+			driver, result, _ := runGeneralAgentHeadless(t, dir, mode.Plan, []string{"allowed.txt"}, nil,
+				generalAgentToolCall(t, candidate))
 
 			text := declaredDenyText(t, result)
 			if !permissions.IsModeDenyEnvelope(text) {
@@ -2555,13 +2651,13 @@ func TestRunHeadless_PlanDecidesTopLevelDelegateOnItsOwnPosture(t *testing.T) {
 	}
 }
 
-func TestRunHeadless_TopLevelDelegateReadsAnAbsentWriteListAsEmpty(t *testing.T) {
+func TestRunHeadless_TopLevelGeneralAgentReadsAnAbsentWriteListAsEmpty(t *testing.T) {
 	t.Run("a delete-only ceiling refuses every child write declaration", func(t *testing.T) {
 		dir := declaredScopeDir(t)
-		driver, result, client := runDelegateHeadless(t, dir, mode.Build, nil, []string{"doomed.txt"},
-			delegateToolCall(t, "allowed.txt"))
+		driver, result, client := runGeneralAgentHeadless(t, dir, mode.Build, nil, []string{"doomed.txt"},
+			generalAgentToolCall(t, "allowed.txt"))
 
-		assertDeclaredDenial(t, driver, result, "delegate")
+		assertDeclaredDenial(t, driver, result, "general_agent")
 		if text := declaredDenyText(t, result); !strings.Contains(text, "--files-authorized was not supplied") {
 			t.Fatalf("deny envelope = %s, want it to name the absent write list", text)
 		}
@@ -2572,7 +2668,7 @@ func TestRunHeadless_TopLevelDelegateReadsAnAbsentWriteListAsEmpty(t *testing.T)
 
 	t.Run("neither flag leaves each declared operation to ordinary authorization", func(t *testing.T) {
 		dir := declaredScopeDir(t)
-		driver, result, _ := runDelegateHeadless(t, dir, mode.Build, nil, nil, delegateToolCall(t, "other.txt"))
+		driver, result, _ := runGeneralAgentHeadless(t, dir, mode.Build, nil, nil, generalAgentToolCall(t, "other.txt"))
 
 		if got := driver.DeniedSubjects(); len(got) != 1 || got[0].Subject != filepath.Join(dir, "other.txt") || got[0].DeclaredScope() {
 			t.Fatalf("DeniedSubjects = %+v, want the ordinary refusal of the declared create", got)
@@ -2589,7 +2685,7 @@ func TestRunHeadless_TopLevelDelegateReadsAnAbsentWriteListAsEmpty(t *testing.T)
 	})
 }
 
-func TestRunHeadless_TopLevelDelegateComparesCanonicalPaths(t *testing.T) {
+func TestRunHeadless_TopLevelGeneralAgentComparesCanonicalPaths(t *testing.T) {
 	seed := func(t *testing.T) string {
 		t.Helper()
 		dir := declaredScopeDir(t)
@@ -2607,8 +2703,8 @@ func TestRunHeadless_TopLevelDelegateComparesCanonicalPaths(t *testing.T) {
 
 	t.Run("a candidate resolving into the ceiling is covered", func(t *testing.T) {
 		dir := seed(t)
-		_, result, _ := runDelegateHeadless(t, dir, mode.Build, []string{"linkdir/notes.txt"}, nil,
-			delegateToolCall(t, "real/notes.txt"))
+		_, result, _ := runGeneralAgentHeadless(t, dir, mode.Build, []string{"linkdir/notes.txt"}, nil,
+			generalAgentToolCall(t, "real/notes.txt"))
 
 		if text := declaredDenyText(t, result); strings.Contains(text, "declared-scope ceiling is active") {
 			t.Fatalf("deny envelope = %s, want the symlinked declaration to cover the same real path", text)
@@ -2617,10 +2713,10 @@ func TestRunHeadless_TopLevelDelegateComparesCanonicalPaths(t *testing.T) {
 
 	t.Run("a symlinked spelling of an out-of-ceiling path is refused", func(t *testing.T) {
 		dir := seed(t)
-		driver, result, _ := runDelegateHeadless(t, dir, mode.Build, []string{"linkdir/notes.txt"}, nil,
-			delegateToolCall(t, "linkdir/other.txt"))
+		driver, result, _ := runGeneralAgentHeadless(t, dir, mode.Build, []string{"linkdir/notes.txt"}, nil,
+			generalAgentToolCall(t, "linkdir/other.txt"))
 
-		assertDeclaredDenial(t, driver, result, "delegate")
+		assertDeclaredDenial(t, driver, result, "general_agent")
 		if text := declaredDenyText(t, result); !strings.Contains(text, filepath.Join(dir, "real", "other.txt")) {
 			t.Fatalf("deny envelope = %s, want the canonical resolved path rather than the symlinked spelling", text)
 		}
@@ -2628,10 +2724,10 @@ func TestRunHeadless_TopLevelDelegateComparesCanonicalPaths(t *testing.T) {
 
 	t.Run("a ~-prefixed parent declaration covers nothing in the project", func(t *testing.T) {
 		dir := seed(t)
-		driver, result, _ := runDelegateHeadless(t, dir, mode.Build, []string{"~/elsewhere.txt", "real/notes.txt"}, nil,
-			delegateToolCall(t, "other.txt"))
+		driver, result, _ := runGeneralAgentHeadless(t, dir, mode.Build, []string{"~/elsewhere.txt", "real/notes.txt"}, nil,
+			generalAgentToolCall(t, "other.txt"))
 
-		assertDeclaredDenial(t, driver, result, "delegate")
+		assertDeclaredDenial(t, driver, result, "general_agent")
 		if text := declaredDenyText(t, result); !strings.Contains(text, filepath.Join(dir, "other.txt")) {
 			t.Fatalf("deny envelope = %s, want the canonical candidate named", text)
 		}
@@ -2639,13 +2735,13 @@ func TestRunHeadless_TopLevelDelegateComparesCanonicalPaths(t *testing.T) {
 }
 
 // A call refused on its declaration is a corrective the model can act on, not a denial or an abort.
-func TestRunHeadless_MalformedTopLevelDelegateKeepsTheTurnGoing(t *testing.T) {
+func TestRunHeadless_MalformedTopLevelGeneralAgentKeepsTheTurnGoing(t *testing.T) {
 	dir := declaredScopeDir(t)
-	driver, result, client := runDelegateHeadless(t, dir, mode.Build, []string{"allowed.txt"}, nil,
-		declaredToolCall{"delegate", `{"instructions":"do it","files":[]}`})
+	driver, result, client := runGeneralAgentHeadless(t, dir, mode.Build, []string{"allowed.txt"}, nil,
+		declaredToolCall{"general_agent", `{"instructions":"do it","files":[" "]}`})
 
 	text := declaredDenyText(t, result)
-	if !strings.Contains(text, "delegate: ") || !strings.Contains(text, "at least one path") {
+	if !strings.Contains(text, "general_agent: ") || !strings.Contains(text, "must not be empty") {
 		t.Fatalf("tool message = %q, want the tool's own corrective", text)
 	}
 	if strings.Contains(text, `"denied_by"`) {
@@ -3851,6 +3947,42 @@ func TestRunHeadless_BigBlockedPathsEntryWarnsOnStderr(t *testing.T) {
 	}
 }
 
+func TestRunHeadless_SkippedSkillsWarnOnStderrOnEveryStart(t *testing.T) {
+	for start := range 2 {
+		t.Run(fmt.Sprintf("start=%d", start), func(t *testing.T) {
+			project := declaredScopeDir(t)
+			result := headlessResult(t, project, mode.NewActiveState(mode.Build, mode.SourceConfig))
+			warnings := seedStartupSkills(t, result.Home, project)
+
+			var system string
+			client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+				if !isTitleRequest(req) && len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+					system = req.Messages[0].Content
+				}
+				return provider.Response{Stream: newStream(contentChunk("done"), finishChunk("stop"))}, nil
+			}}
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+			var stdout, stderr bytes.Buffer
+			driver := NewHeadlessDriver("hello", &stdout, &stderr)
+			if err := driver.Run(context.Background(), result); err != nil || stdout.String() != "done\n" {
+				t.Fatalf("driver.Run error = %v, stdout = %q; want a completed run", err, stdout.String())
+			}
+
+			lines := strings.Split(stderr.String(), "\n")
+			for _, w := range warnings {
+				if n := slices.Index(lines, w); n < 0 || slices.Index(lines[n+1:], w) >= 0 {
+					t.Fatalf("stderr has warning line %q at %d, want exactly once\n--- stderr ---\n%s", w, n, stderr.String())
+				}
+			}
+			if got := len(result.Skills.Skipped); got != len(warnings) {
+				t.Fatalf("run record holds %d skipped skills, want %d", got, len(warnings))
+			}
+			assertStartupSkillsPrompt(t, system)
+		})
+	}
+}
+
 func TestRunHeadless_ProjectBlockedPathCountsOnlyInATrustedProject(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -4522,6 +4654,7 @@ func TestHeadlessFreshSteps_RecoverJournals_NeverAsksAndNeverBlocks(t *testing.T
 	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
 	journal := killedChildJournal(t, home, project, target)
 	if err := os.WriteFile(target, []byte("A HAND EDIT\n"), 0o644); err != nil {
 		t.Fatalf("hand edit: %v", err)
@@ -4740,12 +4873,12 @@ func TestRunHeadless_PromptApprovalDoesNotAskForExplicitExternalReads(t *testing
 
 // --- delegate (child agent) --------------------------------------------------
 
-func delegateCall(id, instructions string, files ...string) []byte {
+func generalAgentCall(id, instructions string, files ...string) []byte {
 	args, err := json.Marshal(map[string]any{"instructions": instructions, "files": files})
 	if err != nil {
 		panic(err)
 	}
-	return toolCallsChunk(toolFrag(0, id, "delegate", string(args)))
+	return toolCallsChunk(toolFrag(0, id, "general_agent", string(args)))
 }
 
 // lastToolText lets a scripted parent answer from what its child actually returned, so the
@@ -4759,16 +4892,16 @@ func lastToolText(req provider.Request) string {
 	return "(no tool result)"
 }
 
-// delegateScript scripts each provider round in order and keeps every request. One client
+// generalAgentScript scripts each provider round in order and keeps every request. One client
 // serves parent and child alike because both resolve theirs through buildTurnClient.
-type delegateScript struct {
+type generalAgentScript struct {
 	client   *stubTurnClient
 	mu       sync.Mutex
 	requests []provider.Request
 }
 
-func newDelegateScript(rounds ...func(provider.Request) []byte) *delegateScript {
-	s := &delegateScript{}
+func newGeneralAgentScript(rounds ...func(provider.Request) []byte) *generalAgentScript {
+	s := &generalAgentScript{}
 	s.client = &stubTurnClient{title: streamedTitle("Model title"), fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
 		s.mu.Lock()
 		s.requests = append(s.requests, req)
@@ -4782,17 +4915,17 @@ func newDelegateScript(rounds ...func(provider.Request) []byte) *delegateScript 
 	return s
 }
 
-func (s *delegateScript) install() func() {
+func (s *generalAgentScript) install() func() {
 	return swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return s.client })
 }
 
-func (s *delegateScript) count() int {
+func (s *generalAgentScript) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.requests)
 }
 
-func (s *delegateScript) round(t *testing.T, i int) provider.Request {
+func (s *generalAgentScript) round(t *testing.T, i int) provider.Request {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -4806,15 +4939,15 @@ func finalReply(text string) func(provider.Request) []byte {
 	return func(provider.Request) []byte { return contentChunk(text) }
 }
 
-// TestRunHeadless_DelegateChildResultReachesTheParentReply drives a real child end to end
+// TestRunHeadless_GeneralAgentChildResultReachesTheParentReply drives a real child end to end
 // with no double at the subagent.Run seam: the parent answers with a fact that exists only in
 // the child's result, the instruction survives byte-identical because no shell is in the
 // path, and the child sees only its pinned tools.
-func TestRunHeadless_DelegateChildResultReachesTheParentReply(t *testing.T) {
+func TestRunHeadless_GeneralAgentChildResultReachesTheParentReply(t *testing.T) {
 	dir := declaredScopeDir(t)
 	instruction := "report the build id: `id` $(whoami) \"quoted\"\nsecond line"
-	script := newDelegateScript(
-		func(provider.Request) []byte { return delegateCall("call_1", instruction, "report.txt") },
+	script := newGeneralAgentScript(
+		func(provider.Request) []byte { return generalAgentCall("call_1", instruction, "report.txt") },
 		finalReply("the build id is BUILDID-7788"),
 		func(req provider.Request) []byte { return contentChunk(lastToolText(req)) },
 	)
@@ -4847,7 +4980,7 @@ func TestRunHeadless_DelegateChildResultReachesTheParentReply(t *testing.T) {
 	}
 	got := toolNames(child.Tools)
 	slices.Sort(got)
-	want := []string{"create", "delegate", "delete", "edit", "file_count", "glob", "grep", "list", "mkdir",
+	want := []string{"create", "delete", "edit", "file_count", "general_agent", "glob", "grep", "list", "mkdir",
 		"move", "read", "read_image", "tree"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("child tools = %v, want exactly the pinned set %v", got, want)
@@ -4863,16 +4996,16 @@ func assertOnlyLaunchPromptFor(t *testing.T, result *BootstrapResult, subject, t
 	}
 }
 
-// TestRunHeadless_DelegateChildReadOnlyVCSFactReachesTheParentReply is the terminal proof that
+// TestRunHeadless_GeneralAgentChildReadOnlyVCSFactReachesTheParentReply is the terminal proof that
 // the production registry, delegate tool, child dispatcher, and shared VCS dispatch path are
 // connected: with no double at the subagent.Run seam, the parent answers with a fact only the
 // child's read-only VCS action produced, while the mutating action of the same template is
 // refused before it can run and no second approval is asked of anyone.
-func TestRunHeadless_DelegateChildReadOnlyVCSFactReachesTheParentReply(t *testing.T) {
+func TestRunHeadless_GeneralAgentChildReadOnlyVCSFactReachesTheParentReply(t *testing.T) {
 	const fact = "CHILD-VCS-FACT-4711"
 	dir := declaredScopeDir(t)
-	script := newDelegateScript(
-		func(provider.Request) []byte { return delegateCall("call_1", "report the status", "report.txt") },
+	script := newGeneralAgentScript(
+		func(provider.Request) []byte { return generalAgentCall("call_1", "report the status", "report.txt") },
 		func(provider.Request) []byte {
 			return toolCallsChunk(toolFrag(0, "child_1", "vcs_commit", `{"message":"take the repo"}`))
 		},
@@ -4903,7 +5036,7 @@ func TestRunHeadless_DelegateChildReadOnlyVCSFactReachesTheParentReply(t *testin
 
 	got := toolNames(script.round(t, 1).Tools)
 	slices.Sort(got)
-	want := []string{"create", "delegate", "delete", "edit", "file_count", "glob", "grep", "list", "mkdir",
+	want := []string{"create", "delete", "edit", "file_count", "general_agent", "glob", "grep", "list", "mkdir",
 		"move", "read", "read_image", "tree", "vcs_diff", "vcs_status"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("child tools = %v, want exactly the pinned set plus the read-only VCS actions %v", got, want)
@@ -4932,13 +5065,13 @@ func TestRunHeadless_DelegateChildReadOnlyVCSFactReachesTheParentReply(t *testin
 	assertOnlyLaunchPromptFor(t, result, "create", filepath.Join(dir, "report.txt"))
 }
 
-// TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval covers the parent-side
-// authorization contract: Plan never advertises delegate, Build with no approver denies the declared
+// TestRunHeadless_GeneralAgentIsNotAdvertisedOrAutoApprovedWithoutApproval covers the parent-side
+// authorization contract: Plan advertises delegate beside only read-only tools, Build with no approver denies the declared
 // operation before any child starts, and Auto edits approves an in-project declared operation.
-func TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval(t *testing.T) {
-	t.Run("plan does not advertise it", func(t *testing.T) {
+func TestRunHeadless_GeneralAgentIsNotAdvertisedOrAutoApprovedWithoutApproval(t *testing.T) {
+	t.Run("plan advertises it as the only mutating tool", func(t *testing.T) {
 		dir := declaredScopeDir(t)
-		script := newDelegateScript(finalReply("planned"))
+		script := newGeneralAgentScript(finalReply("planned"))
 		defer script.install()()
 
 		driver := NewHeadlessDriver("plan it", &bytes.Buffer{}, &bytes.Buffer{})
@@ -4946,15 +5079,21 @@ func TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval(t *tes
 		if err := driver.Run(context.Background(), result); err != nil {
 			t.Fatalf("driver.Run: %v", err)
 		}
-		if names := toolNames(script.round(t, 0).Tools); slices.Contains(names, "delegate") {
-			t.Fatalf("Plan advertised %v, want delegate filtered out as a mutating tool", names)
+		names := toolNames(script.round(t, 0).Tools)
+		if !slices.Contains(names, "general_agent") {
+			t.Fatalf("Plan advertised %v, want general_agent offered for its read-only form", names)
+		}
+		for _, mutating := range []string{"edit", "create", "delete", "mkdir", "move"} {
+			if slices.Contains(names, mutating) {
+				t.Fatalf("Plan advertised %v, want %s filtered out", names, mutating)
+			}
 		}
 	})
 
 	t.Run("build denies the declared operation without an approver", func(t *testing.T) {
 		dir := declaredScopeDir(t)
-		script := newDelegateScript(
-			func(provider.Request) []byte { return delegateCall("call_1", "do it", "report.txt") },
+		script := newGeneralAgentScript(
+			func(provider.Request) []byte { return generalAgentCall("call_1", "do it", "report.txt") },
 			finalReply("cannot delegate"),
 		)
 		defer script.install()()
@@ -4967,8 +5106,8 @@ func TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval(t *tes
 		if got := script.count(); got != 2 {
 			t.Fatalf("provider rounds = %d, want 2 — the denial must start no child", got)
 		}
-		if names := toolNames(script.round(t, 0).Tools); !slices.Contains(names, "delegate") {
-			t.Fatalf("Build advertised %v, want delegate offered so the denial is an authorization decision", names)
+		if names := toolNames(script.round(t, 0).Tools); !slices.Contains(names, "general_agent") {
+			t.Fatalf("Build advertised %v, want general_agent offered so the denial is an authorization decision", names)
 		}
 		text := declaredDenyText(t, result)
 		if !strings.Contains(text, `"denied_by":"unattended"`) {
@@ -4981,8 +5120,8 @@ func TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval(t *tes
 
 	t.Run("auto edits approves an in-project declared operation", func(t *testing.T) {
 		dir := declaredScopeDir(t)
-		script := newDelegateScript(
-			func(provider.Request) []byte { return delegateCall("call_1", "do it", "report.txt") },
+		script := newGeneralAgentScript(
+			func(provider.Request) []byte { return generalAgentCall("call_1", "do it", "report.txt") },
 			finalReply("child done"),
 			func(req provider.Request) []byte { return contentChunk(lastToolText(req)) },
 		)
@@ -5001,8 +5140,8 @@ func TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval(t *tes
 		}
 		var launch []events.PermissionMatched
 		for _, m := range decodePermissionMatched(t, reloadStore(t, result.Session)) {
-			if m.Subject == "delegate" {
-				t.Fatalf("event %+v decided the tool delegate, want only its declared operations", m)
+			if m.Subject == "general_agent" {
+				t.Fatalf("event %+v decided the tool general_agent, want only its declared operations", m)
 			}
 			if m.ChildInvocationID == "" {
 				launch = append(launch, m)
@@ -5014,14 +5153,14 @@ func TestRunHeadless_DelegateIsNotAdvertisedOrAutoApprovedWithoutApproval(t *tes
 	})
 }
 
-// TestRunHeadless_DelegateChildWritesOnlyItsDeclaredFiles proves the declared-scope ceiling
+// TestRunHeadless_GeneralAgentChildWritesOnlyItsDeclaredFiles proves the declared-scope ceiling
 // reaches the child: the declared path is written through the shared dispatch/permission
 // route, and the undeclared write is refused. The child has no approver, so that refusal is
 // recoverable — it adapts and finishes rather than dying, and its declared write stands.
-func TestRunHeadless_DelegateChildWritesOnlyItsDeclaredFiles(t *testing.T) {
+func TestRunHeadless_GeneralAgentChildWritesOnlyItsDeclaredFiles(t *testing.T) {
 	dir := declaredScopeDir(t)
-	script := newDelegateScript(
-		func(provider.Request) []byte { return delegateCall("call_1", "write the report", "allowed.txt") },
+	script := newGeneralAgentScript(
+		func(provider.Request) []byte { return generalAgentCall("call_1", "write the report", "allowed.txt") },
 		func(provider.Request) []byte {
 			return toolCallsChunk(toolFrag(0, "child_1", "create", `{"path":"allowed.txt","content":"written\n"}`))
 		},
@@ -5072,10 +5211,10 @@ func TestRunHeadless_DelegateChildWritesOnlyItsDeclaredFiles(t *testing.T) {
 	assertOnlyLaunchPromptFor(t, result, "create", filepath.Join(dir, "allowed.txt"))
 }
 
-// TestRunHeadless_DelegateCannotDeclareAProtectedSettingsPath proves protected-state
+// TestRunHeadless_GeneralAgentCannotDeclareAProtectedSettingsPath proves protected-state
 // precedence: declaring the project settings file refuses the launch before any child starts,
 // even under Auto edits.
-func TestRunHeadless_DelegateCannotDeclareAProtectedSettingsPath(t *testing.T) {
+func TestRunHeadless_GeneralAgentCannotDeclareAProtectedSettingsPath(t *testing.T) {
 	for _, m := range []mode.Mode{mode.Build, mode.AutoEdits} {
 		t.Run(string(m), func(t *testing.T) {
 			dir := declaredScopeDir(t)
@@ -5086,8 +5225,8 @@ func TestRunHeadless_DelegateCannotDeclareAProtectedSettingsPath(t *testing.T) {
 			}
 
 			declared := filepath.Join(".codemeld", "settings.yaml")
-			script := newDelegateScript(
-				func(provider.Request) []byte { return delegateCall("call_1", "grant yourself more", declared) },
+			script := newGeneralAgentScript(
+				func(provider.Request) []byte { return generalAgentCall("call_1", "grant yourself more", declared) },
 				func(req provider.Request) []byte { return contentChunk(lastToolText(req)) },
 			)
 			defer script.install()()
@@ -5657,6 +5796,8 @@ func TestRunHeadless_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 	t.Cleanup(func() { newVCSActionRunner = prev })
 	launchPath := t.TempDir()
 	t.Setenv("PATH", launchPath)
+	t.Setenv("MISE_DATA_DIR", "/launch/mise")
+	t.Setenv("GITHUB_TOKEN", "launch-secret")
 
 	d, _ := runHeadlessCapturingDispatcher(t, result)
 	conf := d.confinement
@@ -5668,6 +5809,11 @@ func TestRunHeadless_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 	}
 	if conf.blocked == nil || conf.blocked != d.guard.Blocked {
 		t.Fatalf("blocked = %p, want the launch guard's %p", conf.blocked, d.guard.Blocked)
+	}
+	if !slices.Contains(conf.inherited, "MISE_DATA_DIR=/launch/mise") || slices.ContainsFunc(conf.inherited, func(e string) bool {
+		return strings.HasPrefix(e, "GITHUB_TOKEN=")
+	}) {
+		t.Fatalf("inherited = %q, want the launch MISE_DATA_DIR and no GITHUB_TOKEN", conf.inherited)
 	}
 	if _, err := os.Stat(conf.tmpDir); conf.tmpDir == "" || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("tmpDir %q stat = %v, want a folder removed when the run returned", conf.tmpDir, err)
@@ -5681,6 +5827,9 @@ func TestRunHeadless_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 		t.Fatalf("vcs runs = %+v, want one confined run", inner.bounded)
 	}
 	got := inner.bounded[0]
+	if !slices.Contains(got.Env, "MISE_DATA_DIR=/launch/mise") {
+		t.Fatalf("vcs env = %q, want the launch snapshot's MISE_DATA_DIR", got.Env)
+	}
 	if len(got.Argv) < 3 || got.Argv[0] != "/proc/self/exe" || got.Argv[1] != enforce.HelperCommand || got.Argv[2] != filepath.Join(conf.lookupPath, "git") {
 		t.Fatalf("vcs argv = %q, want the helper prefix and git from the shared confinement's lookup path", got.Argv)
 	}
@@ -6835,8 +6984,8 @@ func TestRunHeadless_AbsentOrEmptyWritableFoldersKeepTheOutOfRootDenial(t *testi
 			result, l := writableHeadlessRun(t, true, tc.yaml, constrainedLaunch)
 			driver, _ := runWritableHeadless(t, result, declaredScopeClient(writableEditCall(t, l.target, "old", "new")))
 
-			if !l.decision.Trusted || len(driver.authorizer.writableFolders) != 0 {
-				t.Fatalf("decision = %+v, authorizer folders = %v; want a trusted project with none", l.decision, driver.authorizer.writableFolders)
+			if !l.decision.Trusted || len(driver.authorizer.writable.current()) != 0 {
+				t.Fatalf("decision = %+v, live folders = %v; want a trusted project with none", l.decision, driver.authorizer.writable.current())
 			}
 			requireWritableEditDenied(t, result, l, driver)
 		})
@@ -6853,8 +7002,8 @@ func TestRunHeadless_UnapprovedProjectWritableFoldersHaveNoEffect(t *testing.T) 
 
 	driver, _ := runWritableHeadless(t, result, declaredScopeClient(writableEditCall(t, l.target, "old", "new")))
 
-	if len(driver.authorizer.writableFolders) != 0 {
-		t.Fatalf("authorizer folders = %v, want none", driver.authorizer.writableFolders)
+	if got := driver.authorizer.writable.current(); len(got) != 0 {
+		t.Fatalf("live folders = %v, want none", got)
 	}
 	requireWritableEditDenied(t, result, l, driver)
 }
@@ -6874,5 +7023,483 @@ func TestRunHeadless_SavedAllowGrantsOnlyThePrivateTempFolder(t *testing.T) {
 	requirePrivateTempOnly(t, d.confinement, project, launchTmp)
 	if got := settingsBytes(t, global); got != before {
 		t.Fatalf("global settings = %q, want %q unchanged", got, before)
+	}
+}
+
+func TestHeadlessFreshSteps_RecoverJournals_HonorsABlockedPathWithoutAsking(t *testing.T) {
+	prevIsTerminal := stdinIsTerminal
+	stdinIsTerminal = func(io.Reader) bool { return true }
+	t.Cleanup(func() { stdinIsTerminal = prevIsTerminal })
+	home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
+	target := filepath.Join(project, "a.txt")
+	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	journal := killedChildJournal(t, home, project, target)
+	writeLocalProjectSettings(t, project, blockedYAML(target))
+
+	var stderr bytes.Buffer
+	HeadlessFreshSteps(&stderr, nil, "").RecoverJournals(home, project, map[string]any{}, trust.Decision{Trusted: true, Reason: trust.ReasonTrusted, Root: project})
+
+	if strings.Contains(stderr.String(), "Keep, put back, or decide later?") {
+		t.Fatalf("stderr = %q, want no prompt on a headless run", stderr.String())
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "CHILD\n" {
+		t.Fatalf("%s = %q (err=%v), want the blocked file left alone", target, got, err)
+	}
+	if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
+		t.Fatalf("stat the journal record: %v, want it retained", err)
+	}
+	if !strings.Contains(stderr.String(), "a blocked path is involved: "+target) || strings.Contains(stderr.String(), "asks what to do") {
+		t.Fatalf("stderr = %q, want the blocked reason and no promised question", stderr.String())
+	}
+}
+
+func TestRunHeadless_AFolderRemovedMidRunDeniesTheNextEdit(t *testing.T) {
+	result, l := writableHeadlessRun(t, true, declaringWritableFolder, constrainedLaunch)
+	client := settingsEditingClient(t,
+		settingsRound{call: writableEditCall(t, l.target, "old", "mid")},
+		settingsRound{edit: settingsEdit(projectSettingsPath(l.project), writableFoldersYAML()), call: writableEditCall(t, l.target, "mid", "new")},
+	)
+	driver, _ := runWritableHeadless(t, result, client)
+
+	if got := mustReadFile(t, l.target); got != "mid\n" {
+		t.Fatalf("%s = %q, want only the edit made before the removal", l.target, got)
+	}
+	if denied := driver.DeniedSubjects(); len(denied) != 1 {
+		t.Fatalf("DeniedSubjects = %+v, want the edit made after the removal", denied)
+	}
+	if allows := diskModeAutoAllows(t, result); len(allows) != 1 {
+		t.Fatalf("mode_auto matches on disk = %+v, want only the edit made before the removal", allows)
+	}
+}
+
+func TestRunHeadless_AFolderAddedMidRunAllowsTheNextEdit(t *testing.T) {
+	result, l := writableHeadlessRun(t, true, func(string) string { return writableFoldersYAML() }, constrainedLaunch)
+	client := settingsEditingClient(t,
+		settingsRound{call: writableEditCall(t, l.target, "old", "mid")},
+		settingsRound{edit: settingsEdit(projectSettingsPath(l.project), declaringWritableFolder(l.folder)), call: writableEditCall(t, l.target, "old", "new")},
+	)
+	driver, _ := runWritableHeadless(t, result, client)
+
+	if got := mustReadFile(t, l.target); got != "new\n" {
+		t.Fatalf("%s = %q, want only the edit made after the addition", l.target, got)
+	}
+	if denied := driver.DeniedSubjects(); len(denied) != 1 {
+		t.Fatalf("DeniedSubjects = %+v, want the edit made before the addition", denied)
+	}
+	want := events.PermissionMatched{SubjectKind: "tool", Subject: filetools.EditToolName, PathScope: l.folder, Outcome: "once", OutcomeSource: "mode_auto"}
+	if allows := diskModeAutoAllows(t, result); len(allows) != 1 || allows[0] != want {
+		t.Fatalf("mode_auto matches on disk = %+v, want exactly %+v", allows, want)
+	}
+}
+
+func TestRunHeadless_ADeletedProjectSettingsFileWithdrawsFoldersButKeepsBlockedEntries(t *testing.T) {
+	secret := filepath.Join(declaredScopeDir(t), "secret.txt")
+	result, l := writableHeadlessRun(t, true, func(folder string) string { return blockedYAML(secret) + writableFoldersYAML(folder) }, constrainedLaunch)
+	file := projectSettingsPath(l.project)
+	content := mustReadFile(t, file)
+	client := settingsEditingClient(t,
+		settingsRound{call: writableEditCall(t, l.target, "old", "mid")},
+		settingsRound{edit: func() error { return os.Remove(file) }, call: writableEditCall(t, l.target, "mid", "new")},
+		settingsRound{edit: func() error { return os.WriteFile(file, []byte(content), 0o600) }, call: writableEditCall(t, l.target, "mid", "new")},
+	)
+	driver, stderr := runWritableHeadless(t, result, client)
+
+	if got, want := capabilityLines(stderr), []string{"sandbox: on"}; !slices.Equal(got, want) {
+		t.Fatalf("capability lines = %q, want %q: deleting a healthy file must not mark the settings broken", got, want)
+	}
+	if !slices.ContainsFunc(driver.authorizer.blocked.Entries(), func(e permissions.BlockedEntry) bool { return e.Path == secret }) {
+		t.Fatalf("blocked entries = %+v, want %s kept", driver.authorizer.blocked.Entries(), secret)
+	}
+	if got := mustReadFile(t, l.target); got != "new\n" {
+		t.Fatalf("%s = %q, want the first and restored edits applied", l.target, got)
+	}
+	if denied := driver.DeniedSubjects(); len(denied) != 1 {
+		t.Fatalf("DeniedSubjects = %+v, want only the edit made while the file was deleted", denied)
+	}
+	if allows := diskModeAutoAllows(t, result); len(allows) != 2 {
+		t.Fatalf("mode_auto matches on disk = %+v, want the edits before the deletion and after the restore", allows)
+	}
+}
+
+func TestHeadlessAuthorizer_ConcurrentDistinctAuthorizationsShareTheLiveReader(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	cache, err := config.NewCache(l.composition.Config, l.project, l.layerPaths, l.home)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	store := mkStore(t)
+	auth := newHeadlessAuthorizer(cache, func() *sessions.Store { return store }, mode.NewActiveState(mode.AutoEdits, mode.SourceConfig), nil, &recordingNotices{})
+	auth.executionConstrained = true
+	auth.blocked = mustProtectedStatePolicy(t, l.home, l.project, l.layers).Blocked
+	var wg sync.WaitGroup
+	for i, req := range distinctWritableRequests(t, l, 8) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if dec, err := auth.Authorize(context.Background(), req.Req, req.Display, req.ModeCtx); err != nil || dec.Outcome != "once" {
+				t.Errorf("authorization %d = %+v, %v; want an allow", i, dec, err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func recordGroupAnswer(t *testing.T, journal string, choice subagent.Choice, adopted map[string]map[string]any) {
+	t.Helper()
+	record := filepath.Join(journal, "journal.json")
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("read the journal record: %v", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var rec map[string]any
+	if err := dec.Decode(&rec); err != nil {
+		t.Fatalf("decode the journal record: %v", err)
+	}
+	move := rec["moves"].([]any)[0].(map[string]any)
+	endpoints := []any{move["source"], move["destination"]}
+	answer := map[string]any{"members": []any{move["id"]}, "endpoints": endpoints, "choice": choice}
+	if adopted != nil {
+		var states []any
+		for _, path := range endpoints {
+			state := adopted[path.(string)]
+			states = append(states, map[string]any{"path": path, "state": state})
+			for _, pr := range rec["paths"].([]any) {
+				if pr := pr.(map[string]any); pr["path"] == path {
+					pr["last_known"] = state
+				}
+			}
+		}
+		answer["adopted"] = states
+	}
+	rec["answers"] = []any{answer}
+	out, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("encode the journal record: %v", err)
+	}
+	if err := os.WriteFile(record, out, 0o600); err != nil {
+		t.Fatalf("write the journal record: %v", err)
+	}
+}
+
+func TestHeadlessFreshSteps_RecoverJournals_HoldsAnUnansweredGroupAndReplaysARecordedAnswer(t *testing.T) {
+	prevStdin, prevIsTerminal := os.Stdin, stdinIsTerminal
+	stdinIsTerminal = func(io.Reader) bool { return true }
+	t.Cleanup(func() { os.Stdin, stdinIsTerminal = prevStdin, prevIsTerminal })
+	launch := func(t *testing.T, home, project string) string {
+		t.Helper()
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		defer r.Close() //nolint:errcheck // test pipe
+		if _, err := w.WriteString("k\n"); err != nil {
+			t.Fatalf("stage stdin: %v", err)
+		}
+		_ = w.Close()
+		os.Stdin = r
+
+		var stderr bytes.Buffer
+		HeadlessFreshSteps(&stderr, nil, "").RecoverJournals(home, project, map[string]any{}, trust.Decision{})
+
+		if rest, err := io.ReadAll(r); err != nil || string(rest) != "k\n" {
+			t.Fatalf("stdin left = %q (err=%v), want a headless launch to read none of it", rest, err)
+		}
+		if strings.Contains(stderr.String(), "decide later?") {
+			t.Fatalf("stderr = %q, want no question on a headless launch", stderr.String())
+		}
+		return stderr.String()
+	}
+	staged := func(t *testing.T) (home, project, a, b, journal string) {
+		t.Helper()
+		home, project = realPath(t, t.TempDir()), realPath(t, t.TempDir())
+		writeGlobalSettings(t, home, blockedYAML(), 0o600)
+		a, b = filepath.Join(project, "a.txt"), filepath.Join(project, "b.txt")
+		if err := os.WriteFile(a, []byte("ORIGINAL\n"), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		journal = orphanedMoveJournal(t, home, project, nil, permissions.MovePair{Source: a, Destination: b})
+		if err := os.WriteFile(b, []byte("A THIRD WRITER\n"), 0o644); err != nil {
+			t.Fatalf("change the destination: %v", err)
+		}
+		return home, project, a, b, journal
+	}
+	journalKept := func(t *testing.T, journal string, want bool) {
+		t.Helper()
+		if _, err := os.Stat(journal); (err == nil) != want {
+			t.Fatalf("stat %s: %v, want the journal kept = %v", journal, err, want)
+		}
+	}
+
+	t.Run("an unanswered group stays held", func(t *testing.T) {
+		home, project, a, b, journal := staged(t)
+
+		stderr := launch(t, home, project)
+
+		assertFileContent(t, a, "")
+		assertFileContent(t, b, "A THIRD WRITER\n")
+		journalKept(t, journal, true)
+		if !strings.Contains(stderr, "move not undone: "+a+" -> "+b+" (") || !strings.Contains(stderr, "codemeld asks what to do with these moves the next time you start it here interactively") {
+			t.Fatalf("stderr = %q, want the held moves reported for an interactive launch", stderr)
+		}
+	})
+
+	t.Run("a recorded keep is finished", func(t *testing.T) {
+		home, project, a, b, journal := staged(t)
+		recordGroupAnswer(t, journal, subagent.ChoiceKeep, nil)
+
+		launch(t, home, project)
+
+		assertFileContent(t, a, "")
+		assertFileContent(t, b, "A THIRD WRITER\n")
+		journalKept(t, journal, false)
+	})
+
+	t.Run("a recorded restore waits for policy and is then finished", func(t *testing.T) {
+		home, project, a, b, journal := staged(t)
+		recordGroupAnswer(t, journal, subagent.ChoiceRestore, map[string]map[string]any{
+			a: {"exists": false},
+			b: {"exists": true, "data": []byte("A THIRD WRITER\n"), "mode": os.FileMode(0o644)},
+		})
+		writeGlobalSettings(t, home, blockedYAML(b), 0o600)
+
+		stderr := launch(t, home, project)
+
+		assertFileContent(t, a, "")
+		assertFileContent(t, b, "A THIRD WRITER\n")
+		journalKept(t, journal, true)
+		if !strings.Contains(stderr, "a blocked path is involved: "+b) {
+			t.Fatalf("stderr = %q, want the block named", stderr)
+		}
+		writeGlobalSettings(t, home, blockedYAML(), 0o600)
+
+		stderr = launch(t, home, project)
+
+		assertFileContent(t, a, "ORIGINAL\n")
+		assertFileContent(t, b, "")
+		journalKept(t, journal, false)
+		if !strings.Contains(stderr, "put back: "+a+"\n") {
+			t.Fatalf("stderr = %q, want the restored path named", stderr)
+		}
+	})
+}
+
+func TestHeadlessAuthorizer_DeniedCallRecordsExceptional(t *testing.T) {
+	cases := []struct {
+		name        string
+		configure   func(*headlessAuthorizer)
+		exceptional bool
+	}{
+		{"constrained auto edits", func(*headlessAuthorizer) {}, true},
+		{"build", func(a *headlessAuthorizer) { a.modeActive.ApplyUserCommand(mode.Build) }, false},
+		{"unconstrained auto edits", func(a *headlessAuthorizer) { a.executionConstrained = false }, false},
+	}
+	for _, tc := range cases {
+		for _, name := range []string{"direct", "literal"} {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				auth, cwd := exceptionalHeadlessAuthorizer(t, "", nil)
+				tc.configure(auth)
+				call := exceptionalCalls(cwd)[name]
+				dec, err := auth.Authorize(context.Background(), call.req, call.disp, call.modeCtx)
+				if err != nil || dec.DenyEnvelope == "" {
+					t.Fatalf("Authorize = %+v, %v; want a deny", dec, err)
+				}
+				denied := auth.deniedSubjects()
+				if len(denied) != 1 {
+					t.Fatalf("denied = %+v, want one record", denied)
+				}
+				if denied[0].Exceptional != tc.exceptional || denied[0].TerminalApprover {
+					t.Fatalf("denied = %+v, want Exceptional=%v and no terminal approver", denied[0], tc.exceptional)
+				}
+			})
+		}
+	}
+}
+
+func TestHeadlessAuthorizer_TerminalDeniedExceptionalRecordsApprover(t *testing.T) {
+	for _, name := range []string{"direct", "literal"} {
+		t.Run(name, func(t *testing.T) {
+			auth, cwd := exceptionalHeadlessAuthorizer(t, "2\n", &bytes.Buffer{})
+			call := exceptionalCalls(cwd)[name]
+			dec, err := auth.Authorize(context.Background(), call.req, call.disp, call.modeCtx)
+			if err != nil || dec.DenyEnvelope == "" {
+				t.Fatalf("Authorize = %+v, %v; want a deny", dec, err)
+			}
+			denied := auth.deniedSubjects()
+			if len(denied) != 1 || !denied[0].Exceptional || !denied[0].TerminalApprover {
+				t.Fatalf("denied = %+v, want one exceptional record with a terminal approver", denied)
+			}
+		})
+	}
+}
+
+func gatedStdin() (in io.Reader, reading chan struct{}, answers chan string) {
+	reading = make(chan struct{}, 8)
+	answers = make(chan string)
+	in = readerFunc(func(p []byte) (int, error) {
+		reading <- struct{}{}
+		line, ok := <-answers
+		if !ok {
+			return 0, io.EOF
+		}
+		return copy(p, line), nil
+	})
+	return in, reading, answers
+}
+
+func promptWaitRunHeadless(t *testing.T, ctx context.Context, stdin io.Reader) (*sessions.Store, string, error) {
+	t.Helper()
+	dir := t.TempDir()
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("keep\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	store := storeAt(t, filepath.Join(t.TempDir(), "session.json"), "01890000-0000-7000-8000-0000000000b7", dir)
+	client := toolThenContentClient(nil, "bash", `{"command":"rm notes.txt"}`, "ok")
+	t.Cleanup(swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client }))
+
+	driver := NewHeadlessDriver("delete my notes", &bytes.Buffer{}, &bytes.Buffer{})
+	driver.SetSessionTitle("prompt wait")
+	driver.EnablePromptForApproval(stdin)
+	_, err := RunHeadless(ctx, dir, titledHeadlessSteps(t, dir, store), driver)
+	return store, notes, err
+}
+
+func TestRunHeadless_PromptApprovalRecordsTheWaitOnDisk(t *testing.T) {
+	store, notes, err := promptWaitRunHeadless(t, context.Background(), strings.NewReader("1\n"))
+	if err != nil {
+		t.Fatalf("RunHeadless: %v", err)
+	}
+	if _, err := os.Stat(notes); !os.IsNotExist(err) {
+		t.Fatalf("notes.txt still present after allow once: stat err = %v", err)
+	}
+	waits := decodeDiskEvents[events.PermissionPromptWait](t, readSessionFile(t, store.Path()), events.KindPermissionPromptWait)
+	if len(waits) != 1 || waits[0].Ended != "answered" || waits[0].Prompts != 1 {
+		t.Fatalf("persisted prompt waits = %+v, want one answered wait for one request", waits)
+	}
+}
+
+func TestRunHeadless_CancelledTerminalPromptWaitSurvivesTheFinalFlush(t *testing.T) {
+	stdin, reading, answers := gatedStdin()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-reading
+		cancel()
+		answers <- "1\n"
+	}()
+	store, notes, err := promptWaitRunHeadless(t, ctx, stdin)
+	if err != nil {
+		t.Fatalf("RunHeadless: %v, want a clean interrupt after the final flush", err)
+	}
+	if _, statErr := os.Stat(notes); statErr != nil {
+		t.Fatalf("notes.txt was removed by an answer read after cancellation: %v", statErr)
+	}
+	waits := decodeDiskEvents[events.PermissionPromptWait](t, readSessionFile(t, store.Path()), events.KindPermissionPromptWait)
+	if len(waits) != 1 || waits[0].Ended != "cancelled" || waits[0].Prompts != 1 {
+		t.Fatalf("persisted prompt waits = %+v, want one cancelled wait", waits)
+	}
+}
+
+func editAuthorize(ctx context.Context, auth *headlessAuthorizer, target string) (permissions.Decision, error) {
+	return auth.Authorize(ctx,
+		permissions.MatchRequest{Kind: "tool", Subject: filetools.EditToolName, PathScope: target},
+		dispatch.PromptDisplay{Action: dispatch.ActionRunTool, Subject: filetools.EditToolName},
+		permissions.ModeContext{Class: permissions.ClassMutating, ToolName: filetools.EditToolName, TargetPath: target})
+}
+
+func TestHeadlessAuthorizer_QueuedPromptCancelRecordsItsOwnWait(t *testing.T) {
+	dir := t.TempDir()
+	store := mkStore(t)
+	stdin, reading, answers := gatedStdin()
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), newTerminalPrompter(stdin, &bytes.Buffer{}), &recordingNotices{})
+
+	type result struct {
+		dec permissions.Decision
+		err error
+	}
+	authorize := func(ctx context.Context, name string) chan result {
+		out := make(chan result, 1)
+		go func() {
+			dec, err := editAuthorize(ctx, auth, filepath.Join(dir, name))
+			out <- result{dec, err}
+		}()
+		return out
+	}
+	waits := func() []events.PermissionPromptWait {
+		return decodeStoreEvents[events.PermissionPromptWait](t, store, events.KindPermissionPromptWait)
+	}
+
+	first := authorize(context.Background(), "a.txt")
+	<-reading
+	queuedCtx, cancelQueued := context.WithCancel(context.Background())
+	defer cancelQueued()
+	queued := authorize(queuedCtx, "b.txt")
+	waitForPromptShown(store, 2, 5*time.Second)
+	if n := countPermissionEvents(store, events.KindPermissionPromptShown); n != 2 {
+		t.Fatalf("permission_prompt_shown = %d, want the queued request to have reached its prompt", n)
+	}
+	cancelQueued()
+	if r := <-queued; !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("queued request err = %v, want context.Canceled", r.err)
+	}
+	if len(reading) != 0 {
+		t.Fatal("the cancelled queued request read stdin")
+	}
+	if w := waits(); len(w) != 1 || w[0].Ended != "cancelled" || w[0].Prompts != 1 {
+		t.Fatalf("waits after the queued cancel = %+v, want one cancelled wait", w)
+	}
+	if n := countPermissionEvents(store, events.KindPermissionDecision); n != 0 {
+		t.Fatalf("permission_decision = %d while the first prompt is open, want none", n)
+	}
+
+	answers <- "1\n"
+	if r := <-first; r.err != nil || r.dec.DenyEnvelope != "" {
+		t.Fatalf("first request = %+v / %v, want allowed", r.dec, r.err)
+	}
+	w := waits()
+	if len(w) != 2 || w[1].Ended != "answered" || w[1].Prompts != 1 {
+		t.Fatalf("waits after the first answer = %+v, want the cancelled wait then one answered wait", w)
+	}
+
+	third := authorize(context.Background(), "c.txt")
+	<-reading
+	answers <- "1\n"
+	if r := <-third; r.err != nil || r.dec.DenyEnvelope != "" {
+		t.Fatalf("request after the cancel = %+v / %v, want the gate usable and the call allowed", r.dec, r.err)
+	}
+	if n := countPermissionEvents(store, events.KindPermissionDecision); n != 2 {
+		t.Fatalf("permission_decision = %d, want one per answered request and none for the cancelled one", n)
+	}
+}
+
+func TestHeadlessAuthorizer_UnattendedDenyRecordsNoWait(t *testing.T) {
+	for _, child := range []bool{false, true} {
+		t.Run(fmt.Sprintf("child=%v", child), func(t *testing.T) {
+			dir := t.TempDir()
+			store := mkStore(t)
+			auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+				mode.NewActiveState(mode.Build, mode.SourceDefault), nil, &recordingNotices{})
+			if child {
+				auth.childAgent = true
+				auth.childInvocationID = "01890000-0000-7000-8000-0000000000c1"
+			}
+			dec, err := auth.Authorize(context.Background(),
+				permissions.MatchRequest{Kind: "direct", Subject: "rm", SubjectTokens: []string{"rm"}, PathScope: dir},
+				dispatch.PromptDisplay{Action: dispatch.ActionRunCommand, Subject: "rm"},
+				permissions.ModeContext{Class: permissions.ClassMutating})
+			if err != nil || dec.DenyEnvelope == "" {
+				t.Fatalf("Authorize = %+v / %v, want an unattended deny", dec, err)
+			}
+			kinds := permissionEventKinds(store)
+			if !slices.Equal(kinds, []string{events.KindPermissionPromptShown, events.KindPermissionDecision}) {
+				t.Fatalf("event stream = %v, want prompt_shown and decision with no prompt wait", kinds)
+			}
+		})
 	}
 }

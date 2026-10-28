@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -307,10 +308,17 @@ func TestChildAgent_ParentActivityStaysOutsideTheChildBlock(t *testing.T) {
 	want := childAgentRunningHeading + "\n" +
 		"  may write:\n    /project/a.go\n" +
 		"  Edit /project/a.go" +
-		"\n\nRun: go test ./..." +
-		"\n\nRead /project/other.go"
+		"\n\n▸ Run: go test ./..." +
+		"\n\n▸ Read /project/other.go"
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("interleaved parent activity = %q, want %q", got, want)
+	}
+	wantMarkup := []string{"[#6b7480]▸ Run: go test ./...[-:-:-]", "[#6b7480]▸ Read /project/other.go[-:-:-]"}
+	if got := a.transcript.lines[1:]; !slices.Equal(got, wantMarkup) {
+		t.Fatalf("parent activity markup = %q, want %q", got, wantMarkup)
+	}
+	if strings.Contains(a.transcript.lines[0], "▸") || strings.Contains(a.transcript.lines[0], toolActivityColor) {
+		t.Fatalf("child block = %q, want its call lines unmarked", a.transcript.lines[0])
 	}
 }
 

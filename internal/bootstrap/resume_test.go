@@ -61,7 +61,7 @@ func recordingResumeSteps(order *[]string) ResumeSteps {
 			return trust.Decision{Trusted: true, Reason: trust.ReasonTrusted, Root: "/proj"}
 		},
 		ScaffoldProjectIgnore: func(string) error { rec("2.5:ScaffoldProjectIgnore"); return nil },
-		RecoverJournals:       func(string, string) { rec("2.6:RecoverJournals") },
+		RecoverJournals:       func(string, string, map[string]any, trust.Decision) { rec("2.6:RecoverJournals") },
 		ComposeConfig: func(map[string]any, string) (ConfigComposition, error) {
 			rec("3:ComposeConfig")
 			return ConfigComposition{}, nil
@@ -81,7 +81,7 @@ func recordingResumeSteps(order *[]string) ResumeSteps {
 			rec("7b2:InitMode")
 			return nil, nil
 		},
-		LoadAgentInstructions: func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+		LoadAgentInstructions: func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 			rec("7c:LoadAgentInstructions")
 			return nil, nil
 		},
@@ -153,6 +153,7 @@ func TestRunResume_PutsBackAKilledChildsWrite(t *testing.T) {
 			if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
 				t.Fatalf("seed: %v", err)
 			}
+			writeGlobalSettings(t, home, blockedYAML(), 0o600)
 			journal := killedChildJournal(t, home, project, target)
 
 			var stderr strings.Builder
@@ -162,9 +163,9 @@ func TestRunResume_PutsBackAKilledChildsWrite(t *testing.T) {
 				order = append(order, "2:ResolveProjectRoot")
 				return project, nil, nil
 			}
-			steps.RecoverJournals = func(_, projectRoot string) {
+			steps.RecoverJournals = func(_, projectRoot string, global map[string]any, decision trust.Decision) {
 				order = append(order, "2.6:RecoverJournals")
-				DefaultResumeSteps(strings.NewReader(""), io.Discard, &stderr).RecoverJournals(home, projectRoot)
+				DefaultResumeSteps(strings.NewReader(""), io.Discard, &stderr).RecoverJournals(home, projectRoot, global, decision)
 			}
 
 			res, err := launch(steps)
@@ -499,7 +500,7 @@ func TestRunResumeWithID_ShortCircuitsOnStepError(t *testing.T) {
 			}
 		}, "7c:LoadAgentInstructions"},
 		{"step7c_LoadAgentInstructions", func(s *ResumeSteps) {
-			s.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+			s.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 				return nil, sentinel
 			}
 		}, "8:StartTUI"},
@@ -621,7 +622,7 @@ func TestRunResume_PopulatesAgentInstructions(t *testing.T) {
 	entry := agentinstr.LoadEntry{Path: "/proj/AGENTS.md", Layer: agentinstr.LayerWalked, LoadOrder: 2}
 	var order []string
 	steps := recordingResumeSteps(&order)
-	steps.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+	steps.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 		order = append(order, "7c:LoadAgentInstructions")
 		return []agentinstr.LoadEntry{entry}, nil
 	}
@@ -635,13 +636,76 @@ func TestRunResume_PopulatesAgentInstructions(t *testing.T) {
 	}
 }
 
+func TestRunResume_AgentInstructionsSelectionReachesTheProductionAdapter(t *testing.T) {
+	if got := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard).AgentInstructionsSelection; got != (agentinstr.Selection{}) {
+		t.Fatalf("DefaultResumeSteps selection = %+v, want the zero value", got)
+	}
+	adapter := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard).LoadAgentInstructions
+	f := newSelectionFixture(t)
+	routes := map[string]func(ResumeSteps) (*BootstrapResult, error){
+		"id": func(s ResumeSteps) (*BootstrapResult, error) {
+			return runResumeWithID(context.Background(), f.home, f.launchDir, "the-id", s)
+		},
+		"picker": func(s ResumeSteps) (*BootstrapResult, error) {
+			return runResumePicker(context.Background(), f.home, f.launchDir, s)
+		},
+	}
+	for route, run := range routes {
+		for name, sel := range f.selections() {
+			t.Run(route+"/"+name, func(t *testing.T) {
+				var order []string
+				steps := recordingResumeSteps(&order)
+				steps.AgentInstructionsSelection = sel
+				path := filepath.Join(t.TempDir(), "session.json")
+				steps.ResolveResume = func(string, string, string) (string, *sessions.Session, error) {
+					order = append(order, "R1:ResolveResume")
+					return path, &sessions.Session{Metadata: sessions.Metadata{
+						ID:            "01890000-0000-7000-8000-000000000423",
+						Folder:        f.launchDir,
+						StartedAt:     testStart,
+						UpdatedAt:     testStart,
+						SchemaVersion: sessions.CurrentSchemaVersion,
+					}}, nil
+				}
+				var got agentinstr.Selection
+				steps.LoadAgentInstructions = func(ctx context.Context, s *sessions.Store, home, launchDir string, composed map[string]any, root string, layers []string, selection agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
+					order = append(order, "7c:LoadAgentInstructions")
+					got = selection
+					if n := countEvents(s, events.KindAgentInstructionsLoaded); n != 0 {
+						t.Fatalf("agent_instructions_loaded records before step 7c = %d, want 0", n)
+					}
+					return adapter(ctx, s, home, launchDir, composed, root, layers, selection)
+				}
+
+				res, err := run(steps)
+				if err != nil {
+					t.Fatalf("resume: %v", err)
+				}
+				if got != sel {
+					t.Fatalf("step 7c selection = %+v, want %+v", got, sel)
+				}
+				agents := slices.Index(order, "7c:LoadAgentInstructions")
+				for _, earlier := range []string{"R4:RefreshUpdatedAt", "7b2:InitMode"} {
+					if i := slices.Index(order, earlier); i < 0 || i > agents {
+						t.Fatalf("%s did not run before step 7c; order=%v", earlier, order)
+					}
+				}
+				if slices.Index(order, "8:StartTUI") < agents {
+					t.Fatalf("step 8 ran before step 7c; order=%v", order)
+				}
+				f.assertSelectionOutcome(t, sel, res, res.Session)
+			})
+		}
+	}
+}
+
 // TestDefaultResumeSteps_AllStepsWired guards against a forgotten field: every
 // ResumeSteps func must be non-nil, or the orchestrator would panic at that step.
 func TestDefaultResumeSteps_AllStepsWired(t *testing.T) {
 	steps := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard)
 	v := reflect.ValueOf(steps)
 	for i := range v.NumField() {
-		if v.Field(i).IsNil() {
+		if v.Field(i).Kind() == reflect.Func && v.Field(i).IsNil() {
 			t.Errorf("DefaultResumeSteps left %s nil", v.Type().Field(i).Name)
 		}
 	}
@@ -822,7 +886,7 @@ func TestDefaultResumeSteps_LoadAgentInstructions_DurableReplay(t *testing.T) {
 
 	composed := map[string]any{"agent_instructions": map[string]any{"max_file_bytes": maxFileBytes}}
 	step := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard).LoadAgentInstructions
-	entries, err := step(context.Background(), store, home, launchDir, composed, projectRoot, []string{SettingsPath(home)})
+	entries, err := step(context.Background(), store, home, launchDir, composed, projectRoot, []string{SettingsPath(home)}, agentinstr.Selection{})
 	if err != nil {
 		t.Fatalf("LoadAgentInstructions: %v", err)
 	}
@@ -1561,7 +1625,7 @@ func TestDefaultResumeSteps_LoadAgentInstructions_UntrustedRepositoryFilesLoad(t
 		t.Fatalf("decision = %#v, want an ungranted project untrusted", decision)
 	}
 
-	entries, err := steps.LoadAgentInstructions(context.Background(), store, f.home, f.launch, nil, f.root, nil)
+	entries, err := steps.LoadAgentInstructions(context.Background(), store, f.home, f.launch, nil, f.root, nil, agentinstr.Selection{})
 	if err != nil {
 		t.Fatalf("LoadAgentInstructions: %v", err)
 	}
@@ -1837,5 +1901,38 @@ func TestRunResume_CarriesTheTrustHandoffIntoTemplateLoading(t *testing.T) {
 	assertStep4TrustHandoff(t, race, projectRoot, true)
 	if race.res.WithheldInputs != nil {
 		t.Fatalf("WithheldInputs = %#v, want nothing withheld", race.res.WithheldInputs)
+	}
+}
+
+func TestRunResume_RecoveryHonorsAGlobalBlockedPath(t *testing.T) {
+	home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
+	target := filepath.Join(project, "a.txt")
+	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	journal := killedChildJournal(t, home, project, target)
+	writeGlobalSettings(t, home, blockedYAML(target), 0o600)
+
+	var stderr strings.Builder
+	var order []string
+	steps := recordingResumeSteps(&order)
+	steps.LoadGlobalSettings = func(string) (map[string]any, error) { return defaultLoadGlobalSettings(home) }
+	steps.ResolveProjectRoot = func(string, map[string]any) (string, []string, error) { return project, nil, nil }
+	steps.RecoverJournals = func(_, projectRoot string, global map[string]any, decision trust.Decision) {
+		DefaultResumeSteps(strings.NewReader(""), io.Discard, &stderr).RecoverJournals(home, projectRoot, global, decision)
+	}
+
+	if res, err := runResumeWithID(context.Background(), "/home/u", "/cwd", "the-id", steps); err != nil || res == nil {
+		t.Fatalf("resume launch = (%v, %v), want a full launch", res, err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "CHILD\n" {
+		t.Fatalf("%s = %q (err=%v), want the blocked file left alone", target, got, err)
+	}
+	if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
+		t.Fatalf("stat the journal record: %v, want it retained", err)
+	}
+	if !strings.Contains(stderr.String(), "a blocked path is involved: "+target) {
+		t.Fatalf("stderr = %q, want the blocked reason", stderr.String())
 	}
 }

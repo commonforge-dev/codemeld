@@ -103,7 +103,7 @@ type ResumeSteps struct {
 	// before it could unwind them, for the project folder being opened (step 2.6), mirroring the
 	// fresh path: a resumed launch is a launch for that folder too. It returns nothing because
 	// recovery must never block a launch.
-	RecoverJournals func(home, projectRoot string)
+	RecoverJournals func(home, projectRoot string, global map[string]any, decision trust.Decision)
 	// ComposeConfig composes the config layers (step 3), mirroring the fresh path.
 	ComposeConfig func(global map[string]any, projectRoot string) (composition ConfigComposition, err error)
 	// LoadVCSTemplates loads built-in and project VCS templates (step 4), mirroring the fresh
@@ -142,7 +142,8 @@ type ResumeSteps struct {
 	// resumed run, which the CWD-match check has already proven equal to
 	// metadata.folder. composed/projectRoot/layerPaths feed the config.Cache the
 	// per-file size cap is read from.
-	LoadAgentInstructions func(ctx context.Context, store *sessions.Store, home, launchDir string, composed map[string]any, projectRoot string, layerPaths []string) ([]agentinstr.LoadEntry, error)
+	LoadAgentInstructions      func(ctx context.Context, store *sessions.Store, home, launchDir string, composed map[string]any, projectRoot string, layerPaths []string, selection agentinstr.Selection) ([]agentinstr.LoadEntry, error)
+	AgentInstructionsSelection agentinstr.Selection
 	// StartTUI starts the TUI (step 8). It blocks for the lifetime of the run, so
 	// the resume lock acquired above stays held until it returns.
 	StartTUI func(ctx context.Context, result *BootstrapResult) error
@@ -334,7 +335,7 @@ func runResumeSubsequence(ctx context.Context, home, cwd, id string, global map[
 	// Step 2.6 — put back the child agent writes a killed launch left behind, before any later
 	// step reads the project tree, the same placement as the fresh path.
 	if steps.RecoverJournals != nil {
-		steps.RecoverJournals(home, root)
+		steps.RecoverJournals(home, root, global, res.TrustDecision)
 	}
 
 	composition, err := steps.ComposeConfig(global, composeRoot)
@@ -399,7 +400,7 @@ func runResumeSubsequence(ctx context.Context, home, cwd, id string, global map[
 	// agent_instructions_loaded event per discovered file (step 7c). The walk
 	// anchor is the launch CWD (cwd), already proven equal to metadata.folder by the
 	// CWD-match check, not the resolved project root.
-	entries, err := steps.LoadAgentInstructions(ctx, store, home, cwd, composed, root, res.ConfigLayerPaths)
+	entries, err := steps.LoadAgentInstructions(ctx, store, home, cwd, composed, root, res.ConfigLayerPaths, steps.AgentInstructionsSelection)
 	if err != nil {
 		return nil, err
 	}
@@ -471,8 +472,8 @@ func DefaultResumeSteps(stdin io.Reader, stdout, stderr io.Writer) ResumeSteps {
 		ScaffoldProjectIgnore: func(projectRoot string) error {
 			return ScaffoldProjectCodemeldignore(projectRoot, stderr)
 		},
-		RecoverJournals: func(home, projectRoot string) {
-			recoverChildJournals(home, projectRoot, stdin, stderr, stdinIsTerminal(stdin))
+		RecoverJournals: func(home, projectRoot string, global map[string]any, decision trust.Decision) {
+			recoverChildJournals(home, projectRoot, global, decision, stdin, stderr, stdinIsTerminal(stdin))
 		},
 		ComposeConfig:        defaultComposeConfig,
 		LoadVCSTemplates:     loadVCSTemplates,

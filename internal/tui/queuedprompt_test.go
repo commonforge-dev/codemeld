@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -454,12 +455,12 @@ func TestTurnEnded_DiscardWriteFailureKeepsPromptQueued(t *testing.T) {
 	f.enterText("summarize the diff")
 	f.enterText("then run the tests")
 	f.busy = false
-	f.flushErr = errors.New("disk full")
+	f.flushErr = errors.New("flush hook failed")
 
 	f.a.TurnEnded(turnOutcomeInterrupted)
 
 	if len(f.a.queued) != 2 {
-		t.Fatalf("queued = %d prompts after a failed discard write, want both retained", len(f.a.queued))
+		t.Fatalf("queued = %d prompts after the flush hook returned an error, want both retained", len(f.a.queued))
 	}
 	if f.a.queued[0].text != "summarize the diff" {
 		t.Errorf("front prompt = %q, want it kept at the front of the FIFO", f.a.queued[0].text)
@@ -470,8 +471,8 @@ func TestTurnEnded_DiscardWriteFailureKeepsPromptQueued(t *testing.T) {
 	if got := f.a.TranscriptText(); strings.Contains(got, neverSentPrefix) {
 		t.Errorf("transcript = %q, want no never-sent line for a prompt still queued", got)
 	}
-	if got := f.a.NoticeText(); !strings.Contains(got, "disk full") {
-		t.Errorf("notice = %q, want the discard write failure surfaced", got)
+	if got := f.a.NoticeText(); !strings.Contains(got, "flush hook failed") {
+		t.Errorf("notice = %q, want the returned flush hook error surfaced", got)
 	}
 	if got := len(f.queueRowLines()); got != 2 {
 		t.Errorf("queue rows = %d, want both retained prompts still shown", got)
@@ -485,10 +486,10 @@ func TestTurnEnded_DiscardFlushRetryPersistsOneEventPerPrompt(t *testing.T) {
 	f.enterText("then run the tests")
 	f.busy = false
 
-	f.flushErr = errors.New("disk full")
+	f.flushErr = errors.New("flush hook failed")
 	f.a.TurnEnded(turnOutcomeInterrupted)
 	if len(f.a.queued) != 2 {
-		t.Fatalf("queued = %d prompts after a failed discard flush, want both retained", len(f.a.queued))
+		t.Fatalf("queued = %d prompts after the flush hook returned an error, want both retained", len(f.a.queued))
 	}
 
 	f.flushErr = nil
@@ -513,6 +514,147 @@ func TestTurnEnded_DiscardFlushRetryPersistsOneEventPerPrompt(t *testing.T) {
 	transcript := f.a.TranscriptText()
 	if got := strings.Count(transcript, neverSentPrefix); got != len(want) {
 		t.Errorf("transcript has %d never-sent lines, want one per dropped prompt (%d):\n%s", got, len(want), transcript)
+	}
+}
+
+func (f *queueFixture) inMemoryDiscardCount() int {
+	f.t.Helper()
+	n := 0
+	for _, rec := range f.store.Records() {
+		if ev, ok := rec.(sessions.Event); ok && ev.Kind == "queued_prompt_discarded" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestTurnEnded_CompletedNeverSendsPromptDiscardedBeforeFlushError(t *testing.T) {
+	f := newQueueFixture(t)
+	f.busy = true
+	f.enterText("summarize the diff")
+	f.busy = false
+
+	f.flushErr = context.Canceled
+	f.a.TurnEnded(turnOutcomeInterrupted)
+	if got := f.inMemoryDiscardCount(); got != 1 {
+		t.Fatalf("in-memory discard events after the flush hook returned an error = %d, want 1", got)
+	}
+	if len(f.a.queued) != 1 {
+		t.Fatalf("queued = %d prompts after the flush hook returned an error, want the row retained", len(f.a.queued))
+	}
+
+	for turn := 1; turn <= 2; turn++ {
+		f.a.TurnEnded(turnOutcomeCompleted)
+		if len(f.sent) != 0 {
+			t.Fatalf("turn %d: sent %+v, want the discarded prompt never sent", turn, f.sent)
+		}
+		if len(f.a.queued) != 0 || f.queueRowLines() != nil {
+			t.Fatalf("turn %d: queued = %+v rows = %q, want the discarded row removed", turn, f.a.queued, f.queueRowLines())
+		}
+		if got := strings.Count(f.a.TranscriptText(), "not sent: summarize the diff"); got != 1 {
+			t.Fatalf("turn %d: transcript has %d not-sent lines, want 1:\n%s", turn, got, f.a.TranscriptText())
+		}
+	}
+	if got := f.inMemoryDiscardCount(); got != 1 {
+		t.Fatalf("in-memory discard events after the completed turns = %d, want 1", got)
+	}
+
+	f.flushErr = nil
+	if err := f.a.FlushActive(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	want := []events.QueuedPromptDiscarded{{Text: "summarize the diff", Reason: turnOutcomeInterrupted}}
+	if got := f.discardedEvents(); !slices.Equal(got, want) {
+		t.Fatalf("persisted discard events = %+v, want %+v", got, want)
+	}
+}
+
+func TestTurnEnded_CompletedDrainsDiscardedFrontBeforeLiveRow(t *testing.T) {
+	setup := func(t *testing.T) *queueFixture {
+		f := newQueueFixture(t)
+		f.busy = true
+		f.enterText("summarize the diff")
+		f.enterText("then run the tests")
+		f.busy = false
+		f.flushErr = errors.New("flush hook failed")
+		f.a.TurnEnded(turnOutcomeInterrupted)
+		f.flushErr = nil
+		return f
+	}
+
+	t.Run("submits the live row in the same turn", func(t *testing.T) {
+		f := setup(t)
+		f.a.TurnEnded(turnOutcomeCompleted)
+		if len(f.sent) != 1 || f.sent[0].text != "then run the tests" {
+			t.Fatalf("sent = %+v, want only the live row", f.sent)
+		}
+		if len(f.a.queued) != 0 {
+			t.Fatalf("queued = %+v, want both rows gone", f.a.queued)
+		}
+		transcript := f.a.TranscriptText()
+		notSent := strings.Index(transcript, "not sent: summarize the diff")
+		echo := strings.Index(transcript, "then run the tests")
+		if notSent < 0 || echo < notSent || strings.Count(transcript, "not sent: ") != 1 {
+			t.Fatalf("transcript = %q, want one not-sent line for the discarded row before the live echo", transcript)
+		}
+		if got := f.inMemoryDiscardCount(); got != 1 {
+			t.Fatalf("in-memory discard events = %d, want 1", got)
+		}
+	})
+
+	t.Run("keeps the drained row removed when the live submit is rejected", func(t *testing.T) {
+		f := setup(t)
+		f.accept = false
+		f.a.TurnEnded(turnOutcomeCompleted)
+		if want := []string{"queued: then run the tests"}; !equalStrings(f.queueRowLines(), want) {
+			t.Fatalf("queue rows = %q, want %q", f.queueRowLines(), want)
+		}
+		f.accept = true
+		f.a.TurnEnded(turnOutcomeCompleted)
+		if len(f.sent) != 1 || f.sent[0].text != "then run the tests" {
+			t.Fatalf("sent = %+v, want only the live row", f.sent)
+		}
+		if got := strings.Count(f.a.TranscriptText(), "not sent: "); got != 1 {
+			t.Fatalf("transcript has %d not-sent lines, want 1:\n%s", got, f.a.TranscriptText())
+		}
+	})
+
+	t.Run("drains without a submit callback", func(t *testing.T) {
+		f := setup(t)
+		f.a.SetSubmit(nil)
+		f.a.TurnEnded(turnOutcomeCompleted)
+		if want := []string{"queued: then run the tests"}; !equalStrings(f.queueRowLines(), want) {
+			t.Fatalf("queue rows = %q, want %q", f.queueRowLines(), want)
+		}
+		if got := strings.Count(f.a.TranscriptText(), "not sent: summarize the diff"); got != 1 {
+			t.Fatalf("transcript has %d not-sent lines, want 1:\n%s", got, f.a.TranscriptText())
+		}
+	})
+}
+
+func TestUserMessagesUnsent_CompletedDrainsRecordedDiscard(t *testing.T) {
+	f := newQueueFixture(t)
+	f.busy, f.turnTakes = true, true
+	f.enterText("first extra")
+	f.enterText("second extra")
+	f.busy = false
+	if _, err := events.Append(f.store, events.QueuedPromptDiscarded{Text: "first extra", Reason: turnOutcomeInterrupted}); err != nil {
+		t.Fatalf("append discard: %v", err)
+	}
+
+	f.a.UserMessagesUnsent(f.store, 2, 1, turnOutcomeCompleted)()
+
+	if len(f.sent) != 1 || f.sent[0].text != "second extra" {
+		t.Fatalf("sent = %+v, want only the live row", f.sent)
+	}
+	if len(f.a.queued) != 0 {
+		t.Fatalf("queued = %+v, want both rows gone", f.a.queued)
+	}
+	if got := strings.Count(f.a.TranscriptText(), "not sent: first extra"); got != 1 {
+		t.Fatalf("transcript has %d not-sent lines for the recorded row, want 1:\n%s", got, f.a.TranscriptText())
+	}
+	if got := f.inMemoryDiscardCount(); got != 1 {
+		t.Fatalf("in-memory discard events = %d, want the recorded one only", got)
 	}
 }
 
@@ -847,5 +989,85 @@ func TestDispatchQueuedFront_SkipsEchoWhenRunningTurnTakesIt(t *testing.T) {
 	}
 	if got := f.a.TranscriptText(); strings.Contains(got, "queued work") {
 		t.Fatalf("transcript = %q, want no echo for a message the running turn took", got)
+	}
+}
+
+func (f *queueFixture) literalPrompt(sent *[]string) {
+	f.a.SetLiteralPrompt(func(text string, parts ...sessions.ContentPart) bool {
+		if f.busy {
+			if f.turnTakes && !f.a.HasQueuedPrompt() {
+				f.a.SendingPrompt(text, parts...)
+				return true
+			}
+			f.a.EnqueuePrompt(text, parts...)
+			return true
+		}
+		if !f.accept {
+			return false
+		}
+		*sent = append(*sent, text)
+		return true
+	})
+}
+
+func TestDispatchQueuedFront_LiteralEntryDrainsToPromptWithoutDispatch(t *testing.T) {
+	f := newQueueFixture(t)
+	var literal []string
+	f.literalPrompt(&literal)
+	f.busy = true
+	if !f.a.SubmitLiteral("/help me with this") {
+		t.Fatal("held literal prompt rejected")
+	}
+	f.enterText("ordinary follow-up")
+	f.busy = false
+
+	f.a.TurnEnded(turnOutcomeCompleted)
+	if !slices.Equal(literal, []string{"/help me with this"}) || len(f.sent) != 0 {
+		t.Fatalf("literal drain = %q, submit path = %+v; want the held body sent as model input only", literal, f.sent)
+	}
+	if got := f.a.TranscriptText(); !strings.Contains(got, "/help me with this") {
+		t.Fatalf("transcript = %q, want the drained literal echoed", got)
+	}
+
+	f.a.TurnEnded(turnOutcomeCompleted)
+	if len(f.sent) != 1 || f.sent[0].text != "ordinary follow-up" || len(literal) != 1 {
+		t.Fatalf("submit path = %+v, literal = %q; want ordinary input drained through submit", f.sent, literal)
+	}
+}
+
+func TestDispatchQueuedFront_RolledBackLiteralStaysLiteral(t *testing.T) {
+	f := newQueueFixture(t)
+	var literal []string
+	f.literalPrompt(&literal)
+	f.busy, f.turnTakes = true, true
+	if !f.a.SubmitLiteral("/help joined") {
+		t.Fatal("sending literal prompt rejected")
+	}
+	if want := []string{sendingRowPrefix + "/help joined"}; !equalStrings(f.queueRowLines(), want) {
+		t.Fatalf("queue rows = %q, want %q", f.queueRowLines(), want)
+	}
+	end := f.a.UserMessagesUnsent(f.store, 1, 0, turnOutcomeCompleted)
+	f.busy = false
+	end()
+
+	if !slices.Equal(literal, []string{"/help joined"}) || len(f.sent) != 0 {
+		t.Fatalf("literal drain = %q, submit path = %+v; want the rolled-back body sent literally", literal, f.sent)
+	}
+}
+
+func TestSubmitLiteral_ClearsOneShotMarkerOnEveryOutcome(t *testing.T) {
+	for _, accept := range []bool{true, false} {
+		t.Run(fmt.Sprintf("accept=%v", accept), func(t *testing.T) {
+			f := newQueueFixture(t)
+			f.a.SetLiteralPrompt(func(string, ...sessions.ContentPart) bool { return accept })
+			if got := f.a.SubmitLiteral("body"); got != accept {
+				t.Fatalf("SubmitLiteral = %v, want %v", got, accept)
+			}
+			f.busy = true
+			f.enterText("ordinary")
+			if len(f.a.queued) != 1 || f.a.queued[0].literal {
+				t.Fatalf("queued = %+v, want one ordinary entry without the literal marker", f.a.queued)
+			}
+		})
 	}
 }

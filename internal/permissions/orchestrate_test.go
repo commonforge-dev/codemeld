@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/ids"
@@ -1577,14 +1579,14 @@ func TestAuthorizeShellPathAskSkipsModePosture(t *testing.T) {
 		for _, tc := range shellCases(m) {
 			t.Run(m+"/"+tc.name, func(t *testing.T) {
 				f := newFixture(neverPrompt, nil)
-				if _, handled, err := modePosture(tc.req, tc.mc, f.deps); err != nil || !handled {
+				if _, handled, err := modePosture(context.Background(), tc.req, tc.mc, f.deps); err != nil || !handled {
 					t.Fatalf("modePosture without the flag handled = %v, err = %v; want the read-only auto-allow", handled, err)
 				}
 
 				asking := tc.mc
 				asking.ShellPathAsk = true
 				f = newFixture(neverPrompt, nil)
-				if _, handled, err := modePosture(tc.req, asking, f.deps); err != nil || handled {
+				if _, handled, err := modePosture(context.Background(), tc.req, asking, f.deps); err != nil || handled {
 					t.Fatalf("modePosture with the flag handled = %v, err = %v; want not handled", handled, err)
 				}
 				if len(f.cap.events) != 0 {
@@ -2227,7 +2229,7 @@ func TestAuthorizeAutoEditsNonEditToolStillPrompts(t *testing.T) {
 	}
 }
 
-func TestAuthorizeAutoEditsDeleteAlwaysPrompts(t *testing.T) {
+func TestAuthorizeAutoEditsDeleteWithoutASandboxPrompts(t *testing.T) {
 	f := newFixture(choose(PromptAllowOnce), nil)
 
 	req := MatchRequest{Kind: subjectKindTool, Subject: "delete", PathScope: scopeProj}
@@ -2236,7 +2238,93 @@ func TestAuthorizeAutoEditsDeleteAlwaysPrompts(t *testing.T) {
 
 	wantKinds(t, f.cap.kinds(), []string{"permission_prompt_shown", "permission_decision"})
 	if d.Outcome != outcomeOnce {
-		t.Fatalf("an in-project delete in Auto edits must fall through to the prompt (never auto-approved), got %+v", d)
+		t.Fatalf("an in-project delete in Auto edits without a sandbox must fall through to the prompt, got %+v", d)
+	}
+}
+
+func TestAuthorizeConstrainedAutoEditsDeleteIsModeAutoOnce(t *testing.T) {
+	for _, target := range []string{scopeProj + "/doomed.txt", scopeWritable + "/doomed.txt"} {
+		t.Run(target, func(t *testing.T) {
+			req, mc := constrainedAutoTool(toolNameDelete, target)
+			f := newFixture(neverPrompt, nil)
+
+			d := mustAuthorizeMode(t, req, mc, f.deps)
+
+			if d.Outcome != "once" || d.Grant != nil {
+				t.Fatalf("decision = %+v, want once with no grant", d)
+			}
+			wantKinds(t, f.cap.kinds(), []string{"permission_matched"})
+			if ev := f.cap.events[0]; ev.outcome != "once" || ev.outcomeSource != "mode_auto" || ev.grantKind != "" {
+				t.Fatalf("event = %+v, want mode_auto once with no grant", ev)
+			}
+			if f.cap.prompts != 0 || len(f.cap.records) != 0 || len(f.cap.appends) != 0 || len(f.cap.persists) != 0 {
+				t.Fatalf("prompts=%d records=%v appends=%v persists=%v, want none", f.cap.prompts, f.cap.records, f.cap.appends, f.cap.persists)
+			}
+		})
+	}
+}
+
+func TestAuthorizeConstrainedDeleteStillAsksOrDeniesOutsideAutoEdits(t *testing.T) {
+	inRoot := scopeProj + "/doomed.txt"
+	t.Run("build prompts", func(t *testing.T) {
+		req, mc := constrainedAutoTool(toolNameDelete, inRoot)
+		mc.Mode = "build"
+		f := newFixture(choose(PromptAllowOnce), nil)
+		mustAuthorizeMode(t, req, mc, f.deps)
+		if f.cap.prompts != 1 {
+			t.Fatalf("prompts = %d, want 1", f.cap.prompts)
+		}
+	})
+	t.Run("plan denies", func(t *testing.T) {
+		req, mc := constrainedAutoTool(toolNameDelete, inRoot)
+		mc.Mode = modePlan
+		f := newFixture(neverPrompt, nil)
+		if d := mustAuthorizeMode(t, req, mc, f.deps); d.Outcome != "deny" {
+			t.Fatalf("decision = %+v, want deny", d)
+		}
+	})
+	t.Run("undeclared child delete is denied", func(t *testing.T) {
+		req, mc := constrainedAutoTool(toolNameDelete, inRoot)
+		mc.ChildAgent = true
+		f := newFixture(neverPrompt, nil)
+		d := mustAuthorizeMode(t, req, mc, f.deps)
+		if d.Outcome != "deny" || f.cap.prompts != 0 {
+			t.Fatalf("decision = %+v prompts=%d, want a deny without a prompt", d, f.cap.prompts)
+		}
+	})
+}
+
+func TestModePostureConstrainedDeleteNeverApprovesAConfiguredRoot(t *testing.T) {
+	const writableParent = "/home/u"
+	cases := []struct {
+		name     string
+		project  string
+		writable []string
+		target   string
+		allow    bool
+	}{
+		{"project root itself", scopeProj, []string{scopeWritable}, scopeProj, false},
+		{"project root with a trailing slash", scopeProj, []string{scopeWritable}, scopeProj + "/", false},
+		{"writable root itself", scopeProj, []string{scopeWritable}, scopeWritable, false},
+		{"project root under a writable ancestor", scopeProj, []string{writableParent}, scopeProj, false},
+		{"writable root under another writable root", scopeProj, []string{writableParent, scopeWritable}, scopeWritable, false},
+		{"writable root under the project", scopeProj, []string{scopeProj + "/vendor"}, scopeProj + "/vendor", false},
+		{"file under a writable ancestor", scopeProj, []string{writableParent}, writableParent + "/notes.txt", true},
+		{"file in the nested writable root", scopeProj, []string{writableParent, scopeWritable}, scopeWritable + "/a.txt", true},
+		{"file in the project", scopeProj, []string{writableParent}, scopeProj + "/a.txt", true},
+		{"empty roots", "", []string{""}, "a.txt", false},
+		{"empty project root with a writable folder", "", []string{scopeWritable}, scopeProj + "/a.txt", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, mc := constrainedAutoTool(toolNameDelete, tc.target)
+			mc.ProjectRoot, mc.WritableFolders = tc.project, tc.writable
+			if tc.allow {
+				wantModeAutoAllow(t, req, mc)
+			} else {
+				wantUnhandled(t, req, mc)
+			}
+		})
 	}
 }
 
@@ -3442,7 +3530,7 @@ func TestResolveWithoutPrompt_ParityWithAuthorize(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(factored)
 			}
-			gotDec, resolved, err := resolveWithoutPrompt(toolReq(), tc.modeCtx, factored.deps)
+			gotDec, resolved, err := resolveWithoutPrompt(context.Background(), toolReq(), tc.modeCtx, factored.deps)
 			if err != nil {
 				t.Fatalf("resolveWithoutPrompt error: %v", err)
 			}
@@ -4349,9 +4437,9 @@ func childMode(tool, target string, write map[string]bool) ModeContext {
 	return mc
 }
 
-func nestedDelegateMode(parent, nested map[string]bool) ModeContext {
-	mc := childMode(toolNameDelegate, "", parent)
-	mc.DelegateWrite = nested
+func nestedGeneralAgentMode(parent, nested map[string]bool) ModeContext {
+	mc := childMode(toolNameGeneralAgent, "", parent)
+	mc.GeneralAgentWrite = nested
 	return mc
 }
 
@@ -4362,9 +4450,9 @@ func childDeleteMode(target string, write, remove map[string]bool) ModeContext {
 }
 
 func nestedScopesMode(parentWrite, parentDelete, nestedWrite, nestedDelete map[string]bool) ModeContext {
-	mc := nestedDelegateMode(parentWrite, nestedWrite)
+	mc := nestedGeneralAgentMode(parentWrite, nestedWrite)
 	mc.DeclaredDelete = parentDelete
-	mc.DelegateDelete = nestedDelete
+	mc.GeneralAgentDelete = nestedDelete
 	return mc
 }
 
@@ -4407,7 +4495,7 @@ func TestAuthorizeChildScope_WriteAndDeleteDeclarationsAreAsymmetric(t *testing.
 	}
 }
 
-func TestAuthorizeChildScope_NestedDelegateChecksEachFormAgainstItsImmediateParent(t *testing.T) {
+func TestAuthorizeChildScope_NestedGeneralAgentChecksEachFormAgainstItsImmediateParent(t *testing.T) {
 	declTargetC := scopeProj + "/c.txt"
 	tests := []struct {
 		name                      string
@@ -4429,7 +4517,7 @@ func TestAuthorizeChildScope_NestedDelegateChecksEachFormAgainstItsImmediatePare
 			f := newFixture(neverPrompt, nil)
 			mc := nestedScopesMode(tc.parentWrite, tc.parentDelete, tc.nestedWrite, tc.nestedDelete)
 
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			want := outcomeDeny
 			if tc.wantAllow {
 				want = outcomeOnce
@@ -4511,9 +4599,9 @@ func TestAuthorizeChildScope_MkdirMoveAndDeleteNameTheMissingChildForm(t *testin
 		tool string
 		form string
 	}{
-		{toolNameDelete, "this delegate call did not supply files_delete"},
-		{toolNameMkdir, "this delegate call did not supply files_mkdir"},
-		{toolNameMove, "this delegate call did not supply files_move"},
+		{toolNameDelete, "this general_agent call did not supply files_delete"},
+		{toolNameMkdir, "this general_agent call did not supply files_mkdir"},
+		{toolNameMove, "this general_agent call did not supply files_move"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.tool, func(t *testing.T) {
@@ -4554,7 +4642,7 @@ func TestAuthorizeChildScope_AnEmptyDeclarationDeniesRatherThanFallingThrough(t 
 	assertDeclaredEvent(t, f, outcomeDeny)
 }
 
-func TestAuthorizeChildScope_NestedDelegateNeedsASubsetOfItsParent(t *testing.T) {
+func TestAuthorizeChildScope_NestedGeneralAgentNeedsASubsetOfItsParent(t *testing.T) {
 	parent := declSet(declTargetA, declTargetB)
 	tests := []struct {
 		name        string
@@ -4569,7 +4657,7 @@ func TestAuthorizeChildScope_NestedDelegateNeedsASubsetOfItsParent(t *testing.T)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(neverPrompt, nil)
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), nestedDelegateMode(parent, tc.nested), f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), nestedGeneralAgentMode(parent, tc.nested), f.deps)
 			if d.Outcome != tc.wantOutcome {
 				t.Fatalf("decision = %+v, want outcome %s", d, tc.wantOutcome)
 			}
@@ -4578,7 +4666,7 @@ func TestAuthorizeChildScope_NestedDelegateNeedsASubsetOfItsParent(t *testing.T)
 	}
 }
 
-func TestAuthorizeChildScope_NoRouteAuthorizesAChildDelegateCall(t *testing.T) {
+func TestAuthorizeChildScope_NoRouteAuthorizesAChildGeneralAgentCall(t *testing.T) {
 	tests := []struct {
 		name  string
 		mode  string
@@ -4587,13 +4675,13 @@ func TestAuthorizeChildScope_NoRouteAuthorizesAChildDelegateCall(t *testing.T) {
 		{
 			name: "a matching folder grant",
 			setup: func(f *orchFixture, _ MatchRequest) {
-				f.grants.entries = []PermissionEntry{toolGrant(toolNameDelegate, scopeProj, grantKindFolder)}
+				f.grants.entries = []PermissionEntry{toolGrant(toolNameGeneralAgent, scopeProj, grantKindFolder)}
 			},
 		},
 		{
 			name: "a global grant",
 			setup: func(f *orchFixture, _ MatchRequest) {
-				f.grants.entries = []PermissionEntry{toolGrant(toolNameDelegate, allPathsScope, grantKindGlobal)}
+				f.grants.entries = []PermissionEntry{toolGrant(toolNameGeneralAgent, allPathsScope, grantKindGlobal)}
 			},
 		},
 		{
@@ -4611,9 +4699,9 @@ func TestAuthorizeChildScope_NoRouteAuthorizesAChildDelegateCall(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(neverPrompt, nil)
-			req := declReq(toolNameDelegate)
+			req := declReq(toolNameGeneralAgent)
 			tc.setup(f, req)
-			mc := nestedDelegateMode(declSet(declTargetA), declSet(declTargetB))
+			mc := nestedGeneralAgentMode(declSet(declTargetA), declSet(declTargetB))
 			mc.Mode = tc.mode
 
 			d := mustAuthorizeMode(t, req, mc, f.deps)
@@ -4661,7 +4749,7 @@ func TestAuthorizeChildScope_RefusalKeepsTheDeclaredScopeAuditEncoding(t *testin
 }
 
 func TestChildScopeDenyReason_FixedFactsPrecedeTheEscapedTarget(t *testing.T) {
-	const classification = "a child agent may touch only the paths its delegate call declared"
+	const classification = "a child agent may touch only the paths its general_agent call declared"
 	const unwidenable = "the child declaration cannot widen while the child runs"
 	tests := []struct {
 		name     string
@@ -4678,31 +4766,31 @@ func TestChildScopeDenyReason_FixedFactsPrecedeTheEscapedTarget(t *testing.T) {
 		{
 			name:     "delete with files_delete omitted",
 			mc:       childMode(toolNameDelete, declTargetA, declSet(declTargetA)),
-			wantSeq:  []string{classification, "this delegate call did not supply files_delete", unwidenable},
+			wantSeq:  []string{classification, "this general_agent call did not supply files_delete", unwidenable},
 			wantLast: "target=" + strconv.Quote(declTargetA),
 		},
 		{
 			name:     "delete with files_delete supplied empty",
 			mc:       childDeleteMode(declTargetA, declSet(declTargetA), declSet()),
-			wantSeq:  []string{classification, "this delegate call supplied an empty files_delete", unwidenable},
+			wantSeq:  []string{classification, "this general_agent call supplied an empty files_delete", unwidenable},
 			wantLast: "target=" + strconv.Quote(declTargetA),
 		},
 		{
 			name:     "delete whose files_delete misses the target",
 			mc:       childDeleteMode(declTargetA, nil, declSet(declTargetB)),
-			wantSeq:  []string{classification, "this delegate call's files_delete does not list this target", unwidenable},
+			wantSeq:  []string{classification, "this general_agent call's files_delete does not list this target", unwidenable},
 			wantLast: "target=" + strconv.Quote(declTargetA),
 		},
 		{
 			name:     "a nested delegate names delete paths outside its parent",
 			mc:       nestedScopesMode(declSet(declTargetA), declSet(declTargetA), declSet(declTargetA), declSet(declTargetA, declTargetB)),
-			wantSeq:  []string{classification, "a nested delegate call may declare in files_delete only delete paths its own parent already declared", unwidenable},
+			wantSeq:  []string{classification, "a nested general_agent call may declare in files_delete only delete paths its own parent already declared", unwidenable},
 			wantLast: "undeclared_delete=" + strconv.Quote(declTargetB),
 		},
 		{
 			name:     "a nested delegate names the paths outside its parent",
-			mc:       nestedDelegateMode(declSet(declTargetA), declSet(declTargetA, declTargetB, scopeProj+"/c.txt")),
-			wantSeq:  []string{classification, "a nested delegate call may declare only write paths its own parent already declared", unwidenable},
+			mc:       nestedGeneralAgentMode(declSet(declTargetA), declSet(declTargetA, declTargetB, scopeProj+"/c.txt")),
+			wantSeq:  []string{classification, "a nested general_agent call may declare only write paths its own parent already declared", unwidenable},
 			wantLast: "undeclared=" + strconv.Quote(declTargetB+" "+scopeProj+"/c.txt"),
 		},
 	}
@@ -4728,7 +4816,7 @@ func TestChildScopeDenyReason_TruncationCostsOnlyPathDetail(t *testing.T) {
 	long := scopeProj + "/" + strings.Repeat("p", 900) + ".txt"
 	capped := envelopeReason(t, BuildDenyEnvelope(declaredScopeDenyReason(childMode(toolNameEdit, long, declSet(declTargetA)))))
 	for _, want := range []string{
-		"a child agent may touch only the paths its delegate call declared",
+		"a child agent may touch only the paths its general_agent call declared",
 		"the child's declared write paths do not list this target",
 		"the child declaration cannot widen while the child runs",
 		"target=",
@@ -4744,21 +4832,21 @@ func TestChildScopeDenyReason_TruncationCostsOnlyPathDetail(t *testing.T) {
 
 // --- top-level delegate under a codemeld run ceiling ---
 
-func topLevelDelegateMode(write, remove, candidate map[string]bool) ModeContext {
-	mc := declMode(toolNameDelegate, "", write, remove)
-	mc.DelegateWrite = candidate
+func topLevelGeneralAgentMode(write, remove, candidate map[string]bool) ModeContext {
+	mc := declMode(toolNameGeneralAgent, "", write, remove)
+	mc.GeneralAgentWrite = candidate
 	return mc
 }
 
 // Being bounded by the run's write declaration is not itself permission to start a child.
-func TestAuthorizeDeclaredScope_TopLevelDelegateNeedsASubsetOfTheRunCeiling(t *testing.T) {
+func TestAuthorizeDeclaredScope_TopLevelGeneralAgentNeedsASubsetOfTheRunCeiling(t *testing.T) {
 	ceiling := declSet(declTargetA, declTargetB)
 
 	t.Run("an uncovered candidate is refused terminally", func(t *testing.T) {
 		f := newFixture(neverPrompt, nil)
-		mc := topLevelDelegateMode(ceiling, nil, declSet(declTargetA, scopeProj+"/c.txt"))
+		mc := topLevelGeneralAgentMode(ceiling, nil, declSet(declTargetA, scopeProj+"/c.txt"))
 
-		d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+		d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 		if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
 			t.Fatalf("decision = %+v, want a declared-scope denial", d)
 		}
@@ -4767,9 +4855,9 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateNeedsASubsetOfTheRunCeiling(t *t
 
 	t.Run("a covered candidate is left to its operations", func(t *testing.T) {
 		f := newFixture(neverPrompt, nil)
-		mc := topLevelDelegateMode(ceiling, nil, declSet(declTargetA))
+		mc := topLevelGeneralAgentMode(ceiling, nil, declSet(declTargetA))
 
-		d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+		d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 		assertLeftToLaunchOperations(t, f, d)
 	})
 }
@@ -4780,14 +4868,14 @@ func assertLeftToLaunchOperations(t *testing.T, f *orchFixture, d Decision) {
 		t.Fatalf("decision = %+v, want neither a refusal nor a grant", d)
 	}
 	if f.cap.prompts != 0 {
-		t.Fatalf("prompts = %d, want none under the tool name delegate", f.cap.prompts)
+		t.Fatalf("prompts = %d, want none under the tool name general_agent", f.cap.prompts)
 	}
 	if len(f.cap.events) != 0 {
 		t.Fatalf("events = %+v, want no delegate decision recorded", f.cap.events)
 	}
 }
 
-func TestAuthorizeTopLevelDelegate_NoDelegateApprovalIsConsulted(t *testing.T) {
+func TestAuthorizeTopLevelGeneralAgent_NoGeneralAgentApprovalIsConsulted(t *testing.T) {
 	tests := []struct {
 		name  string
 		mode  string
@@ -4797,7 +4885,7 @@ func TestAuthorizeTopLevelDelegate_NoDelegateApprovalIsConsulted(t *testing.T) {
 		{
 			name: "a global delegate grant",
 			setup: func(f *orchFixture, _ MatchRequest) {
-				f.grants.entries = []PermissionEntry{toolGrant(toolNameDelegate, allPathsScope, grantKindGlobal)}
+				f.grants.entries = []PermissionEntry{toolGrant(toolNameGeneralAgent, allPathsScope, grantKindGlobal)}
 			},
 		},
 		{
@@ -4811,9 +4899,9 @@ func TestAuthorizeTopLevelDelegate_NoDelegateApprovalIsConsulted(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(neverPrompt, nil)
-			req := declReq(toolNameDelegate)
+			req := declReq(toolNameGeneralAgent)
 			tc.setup(f, req)
-			mc := topLevelDelegateMode(nil, nil, declSet(declTargetA))
+			mc := topLevelGeneralAgentMode(nil, nil, declSet(declTargetA))
 			mc.Mode = tc.mode
 
 			d := mustAuthorizeMode(t, req, mc, f.deps)
@@ -4822,7 +4910,7 @@ func TestAuthorizeTopLevelDelegate_NoDelegateApprovalIsConsulted(t *testing.T) {
 	}
 }
 
-func TestAuthorizeDeclaredScope_PlanSkipsTheTopLevelDelegateGate(t *testing.T) {
+func TestAuthorizeDeclaredScope_PlanSkipsTheTopLevelGeneralAgentGate(t *testing.T) {
 	tests := []struct {
 		name      string
 		candidate map[string]bool
@@ -4833,10 +4921,10 @@ func TestAuthorizeDeclaredScope_PlanSkipsTheTopLevelDelegateGate(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(neverPrompt, nil)
-			mc := topLevelDelegateMode(declSet(declTargetA), nil, tc.candidate)
+			mc := topLevelGeneralAgentMode(declSet(declTargetA), nil, tc.candidate)
 			mc.Mode = modePlan
 
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			if !IsModeDenyEnvelope(d.DenyEnvelope) {
 				t.Fatalf("decision = %+v, want Plan's mode denial", d)
 			}
@@ -4847,12 +4935,12 @@ func TestAuthorizeDeclaredScope_PlanSkipsTheTopLevelDelegateGate(t *testing.T) {
 	}
 }
 
-func TestAuthorizeDeclaredScope_TopLevelDelegateReadsAnAbsentWriteListAsEmpty(t *testing.T) {
+func TestAuthorizeDeclaredScope_TopLevelGeneralAgentReadsAnAbsentWriteListAsEmpty(t *testing.T) {
 	t.Run("a delete-only ceiling refuses every candidate", func(t *testing.T) {
 		f := newFixture(neverPrompt, nil)
-		mc := topLevelDelegateMode(nil, declSet(declTargetA), declSet(declTargetA))
+		mc := topLevelGeneralAgentMode(nil, declSet(declTargetA), declSet(declTargetA))
 
-		d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+		d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 		if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
 			t.Fatalf("decision = %+v, want a declared-scope denial", d)
 		}
@@ -4864,14 +4952,14 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateReadsAnAbsentWriteListAsEmpty(t 
 
 	t.Run("neither flag skips the subset check", func(t *testing.T) {
 		f := newFixture(neverPrompt, nil)
-		mc := topLevelDelegateMode(nil, nil, declSet(scopeProj+"/c.txt"))
+		mc := topLevelGeneralAgentMode(nil, nil, declSet(scopeProj+"/c.txt"))
 
-		d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+		d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 		assertLeftToLaunchOperations(t, f, d)
 	})
 }
 
-func TestAuthorizeDeclaredScope_NoRouteAuthorizesAnUncoveredTopLevelDelegate(t *testing.T) {
+func TestAuthorizeDeclaredScope_NoRouteAuthorizesAnUncoveredTopLevelGeneralAgent(t *testing.T) {
 	tests := []struct {
 		name  string
 		mode  string
@@ -4880,13 +4968,13 @@ func TestAuthorizeDeclaredScope_NoRouteAuthorizesAnUncoveredTopLevelDelegate(t *
 		{
 			name: "a matching folder grant",
 			setup: func(f *orchFixture, _ MatchRequest) {
-				f.grants.entries = []PermissionEntry{toolGrant(toolNameDelegate, scopeProj, grantKindFolder)}
+				f.grants.entries = []PermissionEntry{toolGrant(toolNameGeneralAgent, scopeProj, grantKindFolder)}
 			},
 		},
 		{
 			name: "a global grant",
 			setup: func(f *orchFixture, _ MatchRequest) {
-				f.grants.entries = []PermissionEntry{toolGrant(toolNameDelegate, allPathsScope, grantKindGlobal)}
+				f.grants.entries = []PermissionEntry{toolGrant(toolNameGeneralAgent, allPathsScope, grantKindGlobal)}
 			},
 		},
 		{
@@ -4904,9 +4992,9 @@ func TestAuthorizeDeclaredScope_NoRouteAuthorizesAnUncoveredTopLevelDelegate(t *
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(neverPrompt, nil)
-			req := declReq(toolNameDelegate)
+			req := declReq(toolNameGeneralAgent)
 			tc.setup(f, req)
-			mc := topLevelDelegateMode(declSet(declTargetA), nil, declSet(declTargetB))
+			mc := topLevelGeneralAgentMode(declSet(declTargetA), nil, declSet(declTargetB))
 			mc.Mode = tc.mode
 
 			d := mustAuthorizeMode(t, req, mc, f.deps)
@@ -4918,11 +5006,11 @@ func TestAuthorizeDeclaredScope_NoRouteAuthorizesAnUncoveredTopLevelDelegate(t *
 	}
 }
 
-func TestTopLevelDelegateRefusal_KeepsTheDeclaredScopeAuditEncoding(t *testing.T) {
+func TestTopLevelGeneralAgentRefusal_KeepsTheDeclaredScopeAuditEncoding(t *testing.T) {
 	f := newFixture(neverPrompt, nil)
-	mc := topLevelDelegateMode(declSet(declTargetA), nil, declSet(declTargetB))
+	mc := topLevelGeneralAgentMode(declSet(declTargetA), nil, declSet(declTargetB))
 
-	d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+	d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 
 	if ev := assertDeclaredEvent(t, f, outcomeDeny); ev.outcomeSource != OutcomeSourceDeclaredScope {
 		t.Fatalf("outcome_source = %q, want %q", ev.outcomeSource, OutcomeSourceDeclaredScope)
@@ -4936,8 +5024,8 @@ func TestTopLevelDelegateRefusal_KeepsTheDeclaredScopeAuditEncoding(t *testing.T
 	}
 }
 
-func TestTopLevelDelegateDenyReason_FixedFactsPrecedeTheEscapedPaths(t *testing.T) {
-	mc := topLevelDelegateMode(declSet(declTargetA), nil, declSet(declTargetA, declTargetB, scopeProj+"/c.txt"))
+func TestTopLevelGeneralAgentDenyReason_FixedFactsPrecedeTheEscapedPaths(t *testing.T) {
+	mc := topLevelGeneralAgentMode(declSet(declTargetA), nil, declSet(declTargetA, declTargetB, scopeProj+"/c.txt"))
 
 	got := declaredScopeDenyReason(mc)
 	at := -1
@@ -4958,9 +5046,9 @@ func TestTopLevelDelegateDenyReason_FixedFactsPrecedeTheEscapedPaths(t *testing.
 	}
 }
 
-func TestTopLevelDelegateDenyReason_TruncationCostsOnlyPathDetail(t *testing.T) {
+func TestTopLevelGeneralAgentDenyReason_TruncationCostsOnlyPathDetail(t *testing.T) {
 	long := scopeProj + "/" + strings.Repeat("p", 900) + ".txt"
-	mc := topLevelDelegateMode(declSet(declTargetA), nil, declSet(long))
+	mc := topLevelGeneralAgentMode(declSet(declTargetA), nil, declSet(long))
 
 	capped := envelopeReason(t, BuildDenyEnvelope(declaredScopeDenyReason(mc)))
 	for _, want := range []string{
@@ -4979,12 +5067,12 @@ func TestTopLevelDelegateDenyReason_TruncationCostsOnlyPathDetail(t *testing.T) 
 }
 
 func topLevelScopesMode(write, remove, candidateWrite, candidateDelete map[string]bool) ModeContext {
-	mc := topLevelDelegateMode(write, remove, candidateWrite)
-	mc.DelegateDelete = candidateDelete
+	mc := topLevelGeneralAgentMode(write, remove, candidateWrite)
+	mc.GeneralAgentDelete = candidateDelete
 	return mc
 }
 
-func TestAuthorizeDeclaredScope_TopLevelDelegateDeleteNeedsASubsetOfTheRunDeleteCeiling(t *testing.T) {
+func TestAuthorizeDeclaredScope_TopLevelGeneralAgentDeleteNeedsASubsetOfTheRunDeleteCeiling(t *testing.T) {
 	declTargetC := scopeProj + "/c.txt"
 	tests := []struct {
 		name                            string
@@ -5015,7 +5103,7 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateDeleteNeedsASubsetOfTheRunDelete
 			mc := topLevelScopesMode(tc.write, tc.remove, tc.candidateWrite, tc.candidateDelete)
 			if tc.wantDenied {
 				f := newFixture(neverPrompt, nil)
-				d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+				d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 				if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
 					t.Fatalf("decision = %+v, want a declared-scope denial", d)
 				}
@@ -5026,13 +5114,13 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateDeleteNeedsASubsetOfTheRunDelete
 				return
 			}
 			f := newFixture(neverPrompt, nil)
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			assertLeftToLaunchOperations(t, f, d)
 		})
 	}
 }
 
-func TestTopLevelDelegateDenyReason_NamesTheDeleteFormWhenOnlyDeletesWiden(t *testing.T) {
+func TestTopLevelGeneralAgentDenyReason_NamesTheDeleteFormWhenOnlyDeletesWiden(t *testing.T) {
 	declTargetC := scopeProj + "/c.txt"
 	mc := topLevelScopesMode(declSet(declTargetA), declSet(declTargetB), declSet(declTargetA), declSet(declTargetB, declTargetC))
 
@@ -5730,10 +5818,10 @@ func TestAuthorizeChildScope_MoveRefusalNamesTheFilesMoveForm(t *testing.T) {
 		moves map[MovePair]bool
 		form  string
 	}{
-		{"files_move omitted", nil, "this delegate call did not supply files_move"},
-		{"files_move supplied empty", movePairs(), "this delegate call supplied an empty files_move"},
+		{"files_move omitted", nil, "this general_agent call did not supply files_move"},
+		{"files_move supplied empty", movePairs(), "this general_agent call supplied an empty files_move"},
 		{"files_move without this pair", movePairs(MovePair{Source: declTargetB, Destination: declTargetA}),
-			"this delegate call's files_move does not declare this source and destination as one pair"},
+			"this general_agent call's files_move does not declare this source and destination as one pair"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5746,7 +5834,7 @@ func TestAuthorizeChildScope_MoveRefusalNamesTheFilesMoveForm(t *testing.T) {
 
 			reason := envelopeReason(t, d.DenyEnvelope)
 			at := -1
-			for _, want := range []string{"a child agent may touch only the paths its delegate call declared", tc.form, "cannot widen while the child runs", "source=" + strconv.Quote(declTargetA)} {
+			for _, want := range []string{"a child agent may touch only the paths its general_agent call declared", tc.form, "cannot widen while the child runs", "source=" + strconv.Quote(declTargetA)} {
 				idx := strings.Index(reason, want)
 				if idx <= at {
 					t.Fatalf("reason %q is missing %q or has it out of order", reason, want)
@@ -5787,11 +5875,11 @@ func TestAuthorizeChildScope_NestedMovePairsMatchOnlyAsWholePairs(t *testing.T) 
 			f := newFixture(neverPrompt, nil)
 			mc := nestedScopesMode(declSet(declTargetA), nil, declSet(declTargetA), nil)
 			if tc.moveOnly {
-				mc.DelegateWrite = nil
+				mc.GeneralAgentWrite = nil
 			}
-			mc.DeclaredMoves, mc.DelegateMoves = tc.parent, tc.nested
+			mc.DeclaredMoves, mc.GeneralAgentMoves = tc.parent, tc.nested
 
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			want := outcomeDeny
 			if tc.wantAllow {
 				want = outcomeOnce
@@ -5804,7 +5892,7 @@ func TestAuthorizeChildScope_NestedMovePairsMatchOnlyAsWholePairs(t *testing.T) 
 				return
 			}
 			reason := envelopeReason(t, d.DenyEnvelope)
-			if !strings.Contains(reason, "a nested delegate call may declare in files_move only whole move pairs its own parent already declared") {
+			if !strings.Contains(reason, "a nested general_agent call may declare in files_move only whole move pairs its own parent already declared") {
 				t.Fatalf("reason %q does not name the nested move-pair rule", reason)
 			}
 			if !strings.Contains(reason, "undeclared_move=") || strings.Contains(reason, "undeclared=") {
@@ -5814,7 +5902,7 @@ func TestAuthorizeChildScope_NestedMovePairsMatchOnlyAsWholePairs(t *testing.T) 
 	}
 }
 
-func TestAuthorizeDeclaredScope_TopLevelDelegateMovePairsAreRefusedUnderARunCeiling(t *testing.T) {
+func TestAuthorizeDeclaredScope_TopLevelGeneralAgentMovePairsAreRefusedUnderARunCeiling(t *testing.T) {
 	ab := MovePair{Source: declTargetA, Destination: declTargetB}
 	tests := []struct {
 		name           string
@@ -5829,15 +5917,15 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateMovePairsAreRefusedUnderARunCeil
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			mc := topLevelScopesMode(declSet(declTargetA, declTargetB), declSet(declTargetA, declTargetB), tc.candidateWrite, nil)
-			mc.DelegateMoves = tc.moves
+			mc.GeneralAgentMoves = tc.moves
 			if !tc.wantDenied {
 				f := newFixture(neverPrompt, nil)
-				d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+				d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 				assertLeftToLaunchOperations(t, f, d)
 				return
 			}
 			f := newFixture(neverPrompt, nil)
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
 				t.Fatalf("decision = %+v, want a declared-scope denial", d)
 			}
@@ -5943,7 +6031,7 @@ func TestAuthorizeConstrainedPlanShellRecordsConfined(t *testing.T) {
 				assertConfinedOnce(t, f, req, d)
 
 				g := newFixture(neverPrompt, nil)
-				d, handled, err := modePosture(req, mc, g.deps)
+				d, handled, err := modePosture(context.Background(), req, mc, g.deps)
 				if err != nil || !handled {
 					t.Fatalf("modePosture handled=%v err=%v, want handled", handled, err)
 				}
@@ -6003,7 +6091,7 @@ func TestModePostureConstrainedPlanLeavesHostUnhandled(t *testing.T) {
 	req := MatchRequest{Kind: subjectKindHost, Subject: "web_fetch", PathScope: "docs.example.com"}
 	mc := ModeContext{Mode: modePlan, Class: ClassMutating, ExecutionConstrained: true}
 
-	_, handled, err := modePosture(req, mc, f.deps)
+	_, handled, err := modePosture(context.Background(), req, mc, f.deps)
 
 	if handled || err != nil {
 		t.Fatalf("host request handled=%v err=%v, want unhandled", handled, err)
@@ -6034,7 +6122,7 @@ func constrainedAutoTool(tool, target string) (MatchRequest, ModeContext) {
 func wantUnhandled(t *testing.T, req MatchRequest, mc ModeContext) {
 	t.Helper()
 	f := newFixture(neverPrompt, nil)
-	if d, handled, err := modePosture(req, mc, f.deps); handled || err != nil {
+	if d, handled, err := modePosture(context.Background(), req, mc, f.deps); handled || err != nil {
 		t.Fatalf("modePosture(%q) = %+v handled=%v err=%v, want unhandled", req.Subject, d, handled, err)
 	}
 	if len(f.cap.events) != 0 {
@@ -6045,7 +6133,7 @@ func wantUnhandled(t *testing.T, req MatchRequest, mc ModeContext) {
 func wantModeAutoAllow(t *testing.T, req MatchRequest, mc ModeContext) {
 	t.Helper()
 	f := newFixture(neverPrompt, nil)
-	d, handled, err := modePosture(req, mc, f.deps)
+	d, handled, err := modePosture(context.Background(), req, mc, f.deps)
 	if !handled || err != nil || d.Outcome != outcomeOnce {
 		t.Fatalf("modePosture(%s %s) = %+v handled=%v err=%v, want a mode_auto allow", req.Subject, mc.TargetPath, d, handled, err)
 	}
@@ -6056,11 +6144,12 @@ func wantModeAutoAllow(t *testing.T, req MatchRequest, mc ModeContext) {
 }
 
 func TestModePostureConstrainedAutoShell(t *testing.T) {
-	for _, input := range []string{"bash build.sh", "make", "touch a", "python -m pip install x", "sudo rm x", "rg foo | head", "ls && pwd", `sh -c 'go build ./...'`} {
+	for _, input := range []string{"bash build.sh", "make", "touch a", "python -m pip install x", "sudo rm x", "rg foo | head", "ls && pwd", `sh -c 'go build ./...'`,
+		"rm x", `sh -c 'if true; then curl x; fi'`} {
 		t.Run("confined "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
 			f := newFixture(neverPrompt, nil)
-			d, handled, err := modePosture(req, mc, f.deps)
+			d, handled, err := modePosture(context.Background(), req, mc, f.deps)
 			if !handled || err != nil {
 				t.Fatalf("handled=%v err=%v, want handled", handled, err)
 			}
@@ -6068,8 +6157,8 @@ func TestModePostureConstrainedAutoShell(t *testing.T) {
 		})
 	}
 	for _, input := range []string{
-		`sh -c 'curl x'`, "curl x", "rm x", "hg --cwd /repo strip", "hg --config extensions.strip= strip",
-		"git -c x=y reset --hard", "git reset HEAD~1 --hard", `sh -c 'if true; then curl x; fi'`, `ls && curl x`,
+		`sh -c 'curl x'`, "curl x", "hg --cwd /repo strip", "hg --config extensions.strip= strip",
+		"git -c x=y reset --hard", "git reset HEAD~1 --hard", `ls && curl x`,
 	} {
 		t.Run("unhandled "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
@@ -6079,7 +6168,7 @@ func TestModePostureConstrainedAutoShell(t *testing.T) {
 	t.Run("git reset --soft is ordinary", func(t *testing.T) {
 		req, mc := constrainedAutoShell(t, "git reset --soft HEAD~1")
 		f := newFixture(neverPrompt, nil)
-		d, _, _ := modePosture(req, mc, f.deps)
+		d, _, _ := modePosture(context.Background(), req, mc, f.deps)
 		assertConfinedOnce(t, f, req, d)
 	})
 }
@@ -6103,11 +6192,29 @@ func TestModePostureConstrainedAutoFileTools(t *testing.T) {
 		mc.ExecutionConstrained = false
 		wantUnhandled(t, req, mc)
 	})
-	t.Run("delete gains no allowance", func(t *testing.T) {
+	t.Run("delete inside the project or a writable folder is allowed", func(t *testing.T) {
 		req, mc := constrainedAutoTool(toolNameDelete, inRoot)
-		wantUnhandled(t, req, mc)
+		wantModeAutoAllow(t, req, mc)
 		req, mc = constrainedAutoTool(toolNameDelete, inWritable)
-		wantUnhandled(t, req, mc)
+		wantModeAutoAllow(t, req, mc)
+		req, mc = constrainedAutoTool(toolNameDelete, scopeProj+"/sub/deep/a.txt")
+		wantModeAutoAllow(t, req, mc)
+	})
+	t.Run("delete outside both scopes is unhandled", func(t *testing.T) {
+		for _, target := range []string{sibling, "/home/u/projx/a.txt", "/etc/passwd"} {
+			req, mc := constrainedAutoTool(toolNameDelete, target)
+			wantUnhandled(t, req, mc)
+		}
+	})
+	t.Run("delete without a sandbox or with broken settings is unhandled", func(t *testing.T) {
+		for _, target := range []string{inRoot, inWritable} {
+			req, mc := constrainedAutoTool(toolNameDelete, target)
+			mc.ExecutionConstrained = false
+			wantUnhandled(t, req, mc)
+			req, mc = constrainedAutoTool(toolNameDelete, target)
+			mc.SettingsBroken = true
+			wantUnhandled(t, req, mc)
+		}
 	})
 	t.Run("move is not widened", func(t *testing.T) {
 		mc := moveAutoMode(inRoot, scopeProj+"/b.txt")
@@ -6153,16 +6260,8 @@ func TestAuthorizeConstrainedAutoOrdinaryShellRecordsConfined(t *testing.T) {
 	} {
 		t.Run("line continuation "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
-			f := newFixture(choose(PromptAllowOnce), nil)
-			mustAuthorizeMode(t, req, mc, f.deps)
-			if f.cap.prompts != 1 {
-				t.Fatalf("prompts = %d, want 1", f.cap.prompts)
-			}
-			for _, ev := range f.cap.events {
-				if ev.outcomeSource == OutcomeSourceConfined {
-					t.Fatalf("automatic confined allowance emitted: %+v", ev)
-				}
-			}
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
 		})
 	}
 	t.Run("declared command hit", func(t *testing.T) {
@@ -6181,6 +6280,8 @@ func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) 
 		{"curl x", directGrant("curl x", allPathsScope, grantKindGlobal)},
 		{`sh -c 'curl x'`, literalGrant(`sh -c 'curl x'`, allPathsScope, grantKindGlobal)},
 		{`ls && curl x`, literalGrant(`ls && curl x`, allPathsScope, grantKindGlobal)},
+		{`rm x && git rebase main`, literalGrant(`rm x && git rebase main`, allPathsScope, grantKindGlobal)},
+		{`rm x | hg strip .`, directGrant("rm x", allPathsScope, grantKindGlobal)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
@@ -6209,6 +6310,14 @@ func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) 
 			}
 		})
 	}
+	for _, input := range []string{`rm test/a 2>&1`, `rm x <<< y`} {
+		t.Run("deletion runs confined "+input, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, input)
+			f := newFixture(neverPrompt, nil)
+			f.grants.entries = []PermissionEntry{literalGrant(input, allPathsScope, grantKindGlobal)}
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+	}
 	t.Run("out-of-scope edit keeps its grant path", func(t *testing.T) {
 		req, mc := constrainedAutoTool(toolNameEdit, "/home/u/elsewhere/a.txt")
 		f := newFixture(neverPrompt, nil)
@@ -6218,6 +6327,243 @@ func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) 
 			t.Fatalf("decision = %+v prompts = %d, want the saved grant", d, f.cap.prompts)
 		}
 	})
+}
+
+func TestAuthorizeConstrainedAutoHereStringsAndBareEnvRunConfined(t *testing.T) {
+	for _, input := range []string{
+		`jq -n '9223372036854775807 + 1'; jq -n '9223372036854775808 > 9223372036854775807'; jq -n '(3600000000000 * 9223372036854775807 / 1) | floor'; jq -n '("1" + ("0" * 5)) | tonumber'; jq -n '[match("(\\d+(\\.\\d*)?|\\.\\d+)(ns|us|ms|s|m|h)"; "g")] | length' <<< 1h30m250ms`,
+		`env | grep -i shell; printf 'x\n'`,
+		`env | grep -i -E 'shell|opt' ; printf 'probe2\n'`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, input)
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+	}
+	t.Run("rm x <<< y", func(t *testing.T) {
+		req, mc := constrainedAutoShell(t, `rm x <<< y`)
+		f := newFixture(neverPrompt, nil)
+		assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+	})
+}
+
+func TestAuthorizeStaticRedirectionRunsConfinedOnlyInConstrainedAutoEdits(t *testing.T) {
+	const readOnly = "ls lib 2>&1"
+	const writes = "printf x > test/a.bats; shellcheck test/a.bats"
+	for _, input := range []string{readOnly, writes} {
+		t.Run("constrained "+input, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, input)
+			if req.Kind != subjectKindLiteral {
+				t.Fatalf("request kind = %q, want literal", req.Kind)
+			}
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+	}
+	for _, mode := range []string{"build", modeAutoEdits} {
+		t.Run(mode+" "+readOnly, func(t *testing.T) {
+			req, mc := shellReqCtxFor(t, mode, readOnly)
+			f := newFixture(neverPrompt, nil)
+			assertModeAutoAllow(t, f, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+		t.Run(mode+" "+writes, func(t *testing.T) {
+			req, mc := shellReqCtxFor(t, mode, writes)
+			f := newFixture(choose(PromptAllowOnce), nil)
+			mustAuthorizeMode(t, req, mc, f.deps)
+			if f.cap.prompts != 1 {
+				t.Fatalf("prompts = %d, want 1", f.cap.prompts)
+			}
+		})
+	}
+}
+
+func canonicalShellReqCtxFor(t *testing.T, mode, input string) (MatchRequest, ModeContext) {
+	t.Helper()
+	req, mc := shellReqCtxFor(t, mode, input)
+	if req.Kind != subjectKindLiteral {
+		t.Fatalf("request kind = %q, want literal", req.Kind)
+	}
+	canonical, err := CanonicalLiteralForm(req.Subject)
+	if err != nil {
+		t.Fatalf("CanonicalLiteralForm(%q): %v", req.Subject, err)
+	}
+	req.Subject = canonical
+	return req, mc
+}
+
+func assertPromptedNotConfined(t *testing.T, f *orchFixture) {
+	t.Helper()
+	if f.cap.prompts != 1 {
+		t.Fatalf("prompts = %d, want 1", f.cap.prompts)
+	}
+	for _, ev := range f.cap.events {
+		if ev.outcomeSource == OutcomeSourceConfined {
+			t.Fatalf("automatic confined allowance emitted: %+v", ev)
+		}
+	}
+}
+
+func TestAuthorizeConstrainedAutoScriptAndAssignmentChains(t *testing.T) {
+	accepted := []string{
+		`bash scripts/x.sh; echo "EXIT=$?"`,
+		`bash scripts/x.sh 2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"`,
+		`SHELL=/usr/bin/bash mise run x 2>&1 | tail -5`,
+		`bash "scripts/x.sh" > out; ls`,
+	}
+	for _, input := range accepted {
+		t.Run("confined "+input, func(t *testing.T) {
+			req, mc := canonicalShellReqCtxFor(t, modeAutoEdits, input)
+			mc.ExecutionConstrained = true
+			mc.ProjectRoot = scopeProj
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+		for _, mode := range []string{"build", modeAutoEdits} {
+			t.Run(mode+" unconstrained "+input, func(t *testing.T) {
+				req, mc := canonicalShellReqCtxFor(t, mode, input)
+				f := newFixture(choose(PromptAllowOnce), nil)
+				mustAuthorizeMode(t, req, mc, f.deps)
+				assertPromptedNotConfined(t, f)
+			})
+		}
+		t.Run("plan unconstrained "+input, func(t *testing.T) {
+			req, mc := canonicalShellReqCtxFor(t, modePlan, input)
+			f := newFixture(neverPrompt, nil)
+			if d := mustAuthorizeMode(t, req, mc, f.deps); d.Outcome != outcomeDeny || f.cap.prompts != 0 {
+				t.Fatalf("decision = %+v prompts = %d, want a Plan denial without a prompt", d, f.cap.prompts)
+			}
+		})
+	}
+	for _, input := range []string{
+		`X=1 rm f; ls`,
+		`X=1 bash script.sh; ls`,
+		`env FOO=bar ls; ls`,
+		`bash "$SCRIPT"; ls`,
+		`sh $OPTIONS > out`,
+		`bash ~/x.sh; ls`,
+		`ls; $X -rf .`,
+	} {
+		t.Run("confined "+input, func(t *testing.T) {
+			req, mc := canonicalShellReqCtxFor(t, modeAutoEdits, input)
+			mc.ExecutionConstrained = true
+			mc.ProjectRoot = scopeProj
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+	}
+	for _, input := range []string{
+		`GIT_DIR=x git push && ls`,
+		`ls;  A=1   curl u`,
+	} {
+		t.Run("prompts "+input, func(t *testing.T) {
+			req, mc := canonicalShellReqCtxFor(t, modeAutoEdits, input)
+			mc.ExecutionConstrained = true
+			mc.ProjectRoot = scopeProj
+			f := newFixture(choose(PromptAllowOnce), nil)
+			mustAuthorizeMode(t, req, mc, f.deps)
+			assertPromptedNotConfined(t, f)
+		})
+	}
+}
+
+func TestAuthorizeConstrainedAutoLeadingCdScopesRemainder(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	split, err := SplitCommand("cd sub && go test ./...")
+	if err != nil || split.CdHint != "sub" || split.LiteralRoute || len(split.Stages) != 1 {
+		t.Fatalf("SplitCommand = %+v, %v; want cd hint sub and one direct stage", split, err)
+	}
+	scope, err := DerivePathScope(t.TempDir(), split.CdHint, root, "", subjectKindDirect)
+	if err != nil {
+		t.Fatalf("DerivePathScope: %v", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope != filepath.Join(resolvedRoot, "sub") {
+		t.Fatalf("scope = %q, want the sub folder", scope)
+	}
+	tokens := split.Stages[0].Tokens
+	req := MatchRequest{Kind: subjectKindDirect, Subject: strings.Join(tokens, " "), SubjectTokens: tokens, PathScope: scope}
+	mc := ModeContext{Mode: modeAutoEdits, Class: ClassMutating, Stages: split.Stages, ExecutionConstrained: true, ProjectRoot: resolvedRoot}
+	f := newFixture(neverPrompt, nil)
+	assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+}
+
+func TestAuthorizeConstrainedAutoWrapperSubstitutionHiddenByInnerQuotesRunsConfined(t *testing.T) {
+	for _, source := range []string{
+		`sh -c "echo x > '$(rm victim)'"`,
+		"sh -c \"echo x > '`rm victim`'\"",
+		`sh -c "echo '$(rm victim)'"`,
+		"sh -c \"echo '`rm victim`'\"",
+	} {
+		t.Run(source, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, source)
+			if req.Kind != subjectKindLiteral {
+				t.Fatalf("request kind = %q, want literal", req.Kind)
+			}
+			canonical, err := CanonicalLiteralForm(req.Subject)
+			if err != nil {
+				t.Fatalf("CanonicalLiteralForm(%q): %v", req.Subject, err)
+			}
+			req.Subject = canonical
+			if authority, _ := ClassifyExceptional(req, mc); authority != "" {
+				t.Fatalf("run authority = %q, want the ordinary sandbox policy", authority)
+			}
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+	}
+}
+
+func TestAuthorizeConstrainedAutoDeletionAndUnsplittableRunConfined(t *testing.T) {
+	for _, input := range []string{
+		`rm -rf build`, `rm x && touch y`, `git clean -fdx`, `find . -delete`,
+		`which -a x; file "$(which x)"`, `env PATH="/d:$PATH" /abs/check.sh`, `bash -c 'rm x'`, `nice rm x`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, input)
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+	}
+}
+
+func TestAuthorizeConstrainedAutoNetworkAndHistoryStagesStillAsk(t *testing.T) {
+	for _, input := range []string{
+		`rm x && git rebase main`, `git rebase main; rm x`, `rm x | hg strip .`, `rm x; curl y`,
+		`git reset --hard && git push`, `rm x && command git push`, `rm x && nice git push`,
+		`rm x | xargs git push`, `rm x; bash -c 'git push'`, `rm x && git commit --amend`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, input)
+			f := newFixture(choose(PromptAllowOnce), nil)
+			mustAuthorizeMode(t, req, mc, f.deps)
+			assertPromptedNotConfined(t, f)
+		})
+	}
+}
+
+func TestAuthorizeDeletionAndUnsplittableStillAskOutsideSandboxedAutoEdits(t *testing.T) {
+	for _, input := range []string{`rm x`, `which -a x; file "$(which x)"`} {
+		for name, set := range map[string]func(*ModeContext){
+			"no sandbox":      func(mc *ModeContext) { mc.ExecutionConstrained = false },
+			"build":           func(mc *ModeContext) { mc.Mode = "build" },
+			"broken settings": func(mc *ModeContext) { mc.SettingsBroken = true },
+		} {
+			t.Run(name+" "+input, func(t *testing.T) {
+				req, mc := constrainedAutoShell(t, input)
+				set(&mc)
+				f := newFixture(choose(PromptAllowOnce), nil)
+				mustAuthorizeMode(t, req, mc, f.deps)
+				assertPromptedNotConfined(t, f)
+			})
+		}
+	}
 }
 
 func brokenSettingsShapes(t *testing.T, mode string) map[string][]BatchRequest {
@@ -6566,9 +6912,9 @@ func TestAuthorizeChildScope_MkdirRefusalNamesTheFilesMkdirForm(t *testing.T) {
 		dirs map[string]bool
 		form string
 	}{
-		{"files_mkdir omitted", nil, "this delegate call did not supply files_mkdir"},
-		{"files_mkdir supplied empty", declSet(), "this delegate call supplied an empty files_mkdir"},
-		{"files_mkdir without this directory", declSet(declDirXZ), "this delegate call's files_mkdir does not list this directory"},
+		{"files_mkdir omitted", nil, "this general_agent call did not supply files_mkdir"},
+		{"files_mkdir supplied empty", declSet(), "this general_agent call supplied an empty files_mkdir"},
+		{"files_mkdir without this directory", declSet(declDirXZ), "this general_agent call's files_mkdir does not list this directory"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -6581,7 +6927,7 @@ func TestAuthorizeChildScope_MkdirRefusalNamesTheFilesMkdirForm(t *testing.T) {
 
 			reason := envelopeReason(t, d.DenyEnvelope)
 			at := -1
-			for _, want := range []string{"a child agent may touch only the paths its delegate call declared", tc.form, "cannot widen while the child runs"} {
+			for _, want := range []string{"a child agent may touch only the paths its general_agent call declared", tc.form, "cannot widen while the child runs"} {
 				idx := strings.Index(reason, want)
 				if idx <= at {
 					t.Fatalf("reason %q is missing %q or has it out of order", reason, want)
@@ -6621,10 +6967,10 @@ func TestAuthorizeChildScope_NestedDirectoriesMustBeASubsetOfTheParentsDirectori
 			if parentWrite == nil {
 				parentWrite = declSet(declTargetA)
 			}
-			mc := nestedDelegateMode(parentWrite, tc.nestedWrite)
-			mc.DeclaredDirs, mc.DelegateDirs = tc.parent, tc.nested
+			mc := nestedGeneralAgentMode(parentWrite, tc.nestedWrite)
+			mc.DeclaredDirs, mc.GeneralAgentDirs = tc.parent, tc.nested
 
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			want := outcomeDeny
 			if tc.wantAllow {
 				want = outcomeOnce
@@ -6637,7 +6983,7 @@ func TestAuthorizeChildScope_NestedDirectoriesMustBeASubsetOfTheParentsDirectori
 				return
 			}
 			reason := envelopeReason(t, d.DenyEnvelope)
-			if !strings.Contains(reason, "a nested delegate call may declare in files_mkdir only directories its own parent already declared") {
+			if !strings.Contains(reason, "a nested general_agent call may declare in files_mkdir only directories its own parent already declared") {
 				t.Fatalf("reason %q does not name the nested directory rule", reason)
 			}
 			if !strings.Contains(reason, "undeclared_mkdir=") || strings.Contains(reason, "undeclared=") {
@@ -6647,7 +6993,7 @@ func TestAuthorizeChildScope_NestedDirectoriesMustBeASubsetOfTheParentsDirectori
 	}
 }
 
-func TestAuthorizeDeclaredScope_TopLevelDelegateDirectoriesAreRefusedUnderARunCeiling(t *testing.T) {
+func TestAuthorizeDeclaredScope_TopLevelGeneralAgentDirectoriesAreRefusedUnderARunCeiling(t *testing.T) {
 	tests := []struct {
 		name           string
 		ceiling        bool
@@ -6667,15 +7013,15 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateDirectoriesAreRefusedUnderARunCe
 				write, remove = declSet(declTargetA, declTargetB, declDirXY), declSet(declTargetA, declTargetB)
 			}
 			mc := topLevelScopesMode(write, remove, tc.candidateWrite, nil)
-			mc.DelegateDirs = tc.dirs
+			mc.GeneralAgentDirs = tc.dirs
 			if !tc.wantDenied {
 				f := newFixture(neverPrompt, nil)
-				d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+				d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 				assertLeftToLaunchOperations(t, f, d)
 				return
 			}
 			f := newFixture(neverPrompt, nil)
-			d := mustAuthorizeMode(t, declReq(toolNameDelegate), mc, f.deps)
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
 			if d.Outcome != outcomeDeny || d.DenialSource != OutcomeSourceDeclaredScope {
 				t.Fatalf("decision = %+v, want a declared-scope denial", d)
 			}
@@ -6699,4 +7045,367 @@ func TestAuthorizeDeclaredScope_TopLevelDelegateDirectoriesAreRefusedUnderARunCe
 			}
 		})
 	}
+}
+
+func pathFreeGeneralAgentMode(m string, child bool, parentWrite map[string]bool) ModeContext {
+	mc := declMode(toolNameGeneralAgent, "", parentWrite, nil)
+	mc.Mode = m
+	mc.ChildAgent = child
+	mc.GeneralAgentResolved = true
+	return mc
+}
+
+func assertModeAutoOnce(t *testing.T, f *orchFixture, d Decision) {
+	t.Helper()
+	if d.Outcome != outcomeOnce || d.DenyEnvelope != "" || !d.ReadOnlyAuto {
+		t.Fatalf("decision = %+v, want the read-only mode allow", d)
+	}
+	wantKinds(t, f.cap.kinds(), []string{"permission_matched"})
+	if ev := f.cap.events[0]; ev.outcomeSource != outcomeSourceModeAuto || ev.outcome != outcomeOnce || ev.grantKind != "" {
+		t.Fatalf("permission_matched = %+v, want mode_auto/once with no grant", ev)
+	}
+	if f.cap.prompts != 0 || len(f.cap.records) != 0 {
+		t.Fatalf("prompts = %d, cache records = %+v, want neither", f.cap.prompts, f.cap.records)
+	}
+}
+
+func TestAuthorizeGeneralAgent_APathFreeCallIsAllowedAsReadOnlyInEveryMode(t *testing.T) {
+	for _, m := range []string{modePlan, modeAutoEdits, "build"} {
+		for _, tc := range []struct {
+			name  string
+			child bool
+			write map[string]bool
+		}{
+			{"top level", false, nil},
+			{"top level under a run ceiling", false, declSet(declTargetA)},
+			{"nested in a path-declaring child", true, declSet(declTargetA)},
+			{"nested in a path-free child", true, nil},
+		} {
+			t.Run(m+"/"+tc.name, func(t *testing.T) {
+				f := newFixture(neverPrompt, nil)
+				d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), pathFreeGeneralAgentMode(m, tc.child, tc.write), f.deps)
+				assertModeAutoOnce(t, f, d)
+			})
+		}
+	}
+}
+
+func TestAuthorizeGeneralAgent_OnlyAResolvedEmptyCandidateIsReadOnly(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		child      bool
+		parent     map[string]bool
+		candidate  map[string]bool
+		resolved   bool
+		refused    bool
+		wantSource string
+	}{
+		{"an unresolved candidate under a child ceiling", "build", true, declSet(declTargetA), nil, false, false, OutcomeSourceDeclaredScope},
+		{"a refused candidate with inherited resolution under a child ceiling", "build", true, declSet(declTargetA), nil, true, true, OutcomeSourceDeclaredScope},
+		{"a path-declaring grandchild of a path-free child", "build", true, nil, declSet(declTargetA), true, false, OutcomeSourceDeclaredScope},
+		{"a path-declaring call outside its parent's paths", "auto_edits", true, declSet(declTargetA), declSet(declTargetB), true, false, OutcomeSourceDeclaredScope},
+		{"a path-declaring top-level call in Plan", modePlan, false, nil, declSet(declTargetA), true, false, outcomeSourceModeAuto},
+		{"a path-declaring nested call in Plan", modePlan, true, declSet(declTargetA), declSet(declTargetA), true, false, outcomeSourceModeAuto},
+		{"an unresolved top-level call in Plan", modePlan, false, nil, nil, false, false, outcomeSourceModeAuto},
+		{"a refused top-level call in Plan", modePlan, false, nil, nil, true, true, outcomeSourceModeAuto},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			mc := pathFreeGeneralAgentMode(tc.mode, tc.child, tc.parent)
+			mc.GeneralAgentWrite = tc.candidate
+			mc.GeneralAgentResolved = tc.resolved
+			mc.GeneralAgentRefused = tc.refused
+
+			d := mustAuthorizeMode(t, declReq(toolNameGeneralAgent), mc, f.deps)
+			if d.Outcome != outcomeDeny || d.ReadOnlyAuto {
+				t.Fatalf("decision = %+v, want a denial rather than a read-only allow", d)
+			}
+			wantKinds(t, f.cap.kinds(), []string{"permission_matched"})
+			if ev := f.cap.events[0]; ev.outcomeSource != tc.wantSource || ev.outcome != outcomeDeny {
+				t.Fatalf("permission_matched = %+v, want %s/deny", ev, tc.wantSource)
+			}
+		})
+	}
+}
+
+type promptWaitRec struct {
+	waited  time.Duration
+	prompts int
+	ended   string
+}
+
+type promptWaitPath struct {
+	name    string
+	prompts int
+	run     func(ctx context.Context, f *orchFixture, prompt func(context.Context) error) error
+}
+
+func promptWaitPaths() []promptWaitPath {
+	allowFolder := PromptOutcome{Choice: PromptAllowFolder}
+	return []promptWaitPath{
+		{name: "single", prompts: 1, run: func(ctx context.Context, f *orchFixture, prompt func(context.Context) error) error {
+			f.deps.Prompt = func(ctx context.Context, _ ScopeEscalation) (PromptOutcome, error) {
+				return allowFolder, prompt(ctx)
+			}
+			_, err := Authorize(ctx, toolReq(), ModeContext{}, f.deps)
+			return err
+		}},
+		{name: "batch", prompts: 2, run: func(ctx context.Context, f *orchFixture, prompt func(context.Context) error) error {
+			f.grants.entries = []PermissionEntry{toolGrant("granted", scopeProj, grantKindFolder)}
+			f.deps.PromptBatch = func(ctx context.Context, _ []BatchPromptRequest) (PromptOutcome, error) {
+				return allowFolder, prompt(ctx)
+			}
+			_, err := AuthorizeBatch(ctx, []BatchRequest{batchReq("needs_a"), batchReq("granted"), batchReq("needs_b")}, f.deps)
+			return err
+		}},
+		{name: "independent", prompts: 3, run: func(ctx context.Context, f *orchFixture, prompt func(context.Context) error) error {
+			f.grants.entries = []PermissionEntry{toolGrant("granted", scopeProj, grantKindFolder)}
+			f.deps.PromptIndependent = func(ctx context.Context, reqs []BatchPromptRequest) ([]PromptOutcome, error) {
+				outcomes := make([]PromptOutcome, len(reqs))
+				for i := range outcomes {
+					outcomes[i] = allowFolder
+				}
+				return outcomes, prompt(ctx)
+			}
+			_, err := AuthorizeIndependent(ctx, []BatchRequest{
+				independentReq("read", scopeProj), independentReq("granted", scopeProj),
+				independentReq("grep", scopeProj), independentReq("list", scopeProj),
+			}, f.deps)
+			return err
+		}},
+	}
+}
+
+func bindPromptWaits(f *orchFixture, emit func() error) *[]promptWaitRec {
+	var waits []promptWaitRec
+	f.deps.EmitPromptWait = func(waited time.Duration, prompts int, ended string) error {
+		waits = append(waits, promptWaitRec{waited: waited, prompts: prompts, ended: ended})
+		f.cap.events = append(f.cap.events, orchEmitted{kind: "permission_prompt_wait"})
+		if emit != nil {
+			return emit()
+		}
+		return nil
+	}
+	return &waits
+}
+
+func assertNothingApplied(t *testing.T, f *orchFixture) {
+	t.Helper()
+	if len(f.cap.records) != 0 || len(f.cap.appends) != 0 || len(f.cap.persists) != 0 {
+		t.Fatalf("records = %+v, appends = %+v, persists = %+v, want no outcome applied", f.cap.records, f.cap.appends, f.cap.persists)
+	}
+	if slices.Contains(f.cap.kinds(), "permission_decision") {
+		t.Fatalf("events = %v, want no permission_decision", f.cap.kinds())
+	}
+}
+
+func assertOneWait(t *testing.T, waits []promptWaitRec, prompts int, ended string) promptWaitRec {
+	t.Helper()
+	if len(waits) != 1 {
+		t.Fatalf("wait events = %+v, want exactly one", waits)
+	}
+	if waits[0].prompts != prompts || waits[0].ended != ended {
+		t.Fatalf("wait = %+v, want prompts=%d ended=%s", waits[0], prompts, ended)
+	}
+	return waits[0]
+}
+
+func TestPromptWait_OnePerCallCountsSubmittedRequests(t *testing.T) {
+	const delay = 20 * time.Millisecond
+	for _, p := range promptWaitPaths() {
+		t.Run(p.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			waits := bindPromptWaits(f, nil)
+			begin := time.Now()
+			err := p.run(context.Background(), f, func(context.Context) error {
+				time.Sleep(delay)
+				return nil
+			})
+			outer := time.Since(begin)
+			if err != nil {
+				t.Fatalf("authorize error: %v", err)
+			}
+			w := assertOneWait(t, *waits, p.prompts, "answered")
+			if w.waited < delay || w.waited > outer {
+				t.Fatalf("waited = %v, want between %v and the call's %v", w.waited, delay, outer)
+			}
+			kinds := f.cap.kinds()
+			waitAt := slices.Index(kinds, "permission_prompt_wait")
+			if waitAt < 0 || slices.Contains(kinds[:waitAt], "permission_decision") || !slices.Contains(kinds[:waitAt], "permission_prompt_shown") {
+				t.Fatalf("events = %v, want the wait after every prompt_shown and before any decision", kinds)
+			}
+			if got := len(f.cap.persists); got != p.prompts {
+				t.Fatalf("persists = %d, want %d applied outcomes", got, p.prompts)
+			}
+		})
+	}
+}
+
+func TestPromptWait_NilEmitterIsSafe(t *testing.T) {
+	for _, p := range promptWaitPaths() {
+		t.Run(p.name, func(t *testing.T) {
+			f := newFixture(neverPrompt, nil)
+			if err := p.run(context.Background(), f, func(context.Context) error { return nil }); err != nil {
+				t.Fatalf("authorize error: %v", err)
+			}
+			if got := len(f.cap.persists); got != p.prompts {
+				t.Fatalf("persists = %d, want %d applied outcomes", got, p.prompts)
+			}
+		})
+	}
+}
+
+func TestPromptWait_EndedReflectsPromptReturn(t *testing.T) {
+	boom := errors.New("prompt transport failed")
+	cases := []struct {
+		name   string
+		prompt func(cancel context.CancelFunc) func(context.Context) error
+		ended  string
+		want   error
+	}{
+		{name: "cancelled while waiting", ended: "cancelled", want: context.Canceled, prompt: func(cancel context.CancelFunc) func(context.Context) error {
+			return func(ctx context.Context) error {
+				cancel()
+				<-ctx.Done()
+				return ctx.Err()
+			}
+		}},
+		{name: "answered after the context was done", ended: "cancelled", want: context.Canceled, prompt: func(cancel context.CancelFunc) func(context.Context) error {
+			return func(context.Context) error {
+				cancel()
+				return nil
+			}
+		}},
+		{name: "failed", ended: "failed", want: boom, prompt: func(context.CancelFunc) func(context.Context) error {
+			return func(context.Context) error { return boom }
+		}},
+	}
+	for _, p := range promptWaitPaths() {
+		for _, tc := range cases {
+			for _, bound := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/emitter=%v", p.name, tc.name, bound), func(t *testing.T) {
+					f := newFixture(neverPrompt, nil)
+					var waits *[]promptWaitRec
+					if bound {
+						waits = bindPromptWaits(f, nil)
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					err := p.run(ctx, f, tc.prompt(cancel))
+					if !errors.Is(err, tc.want) {
+						t.Fatalf("err = %v, want %v", err, tc.want)
+					}
+					assertNothingApplied(t, f)
+					if bound {
+						assertOneWait(t, *waits, p.prompts, tc.ended)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPromptWait_AppendFailureSurfacesWithoutApplying(t *testing.T) {
+	appendErr := errors.New("append failed")
+	boom := errors.New("prompt transport failed")
+	cases := []struct {
+		name   string
+		prompt func(cancel context.CancelFunc) func(context.Context) error
+		ended  string
+		want   []error
+	}{
+		{name: "answered", ended: "answered", want: []error{appendErr}, prompt: func(context.CancelFunc) func(context.Context) error {
+			return func(context.Context) error { return nil }
+		}},
+		{name: "cancelled", ended: "cancelled", want: []error{appendErr, context.Canceled}, prompt: func(cancel context.CancelFunc) func(context.Context) error {
+			return func(context.Context) error {
+				cancel()
+				return nil
+			}
+		}},
+		{name: "failed", ended: "failed", want: []error{appendErr, boom}, prompt: func(context.CancelFunc) func(context.Context) error {
+			return func(context.Context) error { return boom }
+		}},
+	}
+	for _, p := range promptWaitPaths() {
+		for _, tc := range cases {
+			t.Run(p.name+"/"+tc.name, func(t *testing.T) {
+				f := newFixture(neverPrompt, nil)
+				waits := bindPromptWaits(f, func() error { return appendErr })
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				err := p.run(ctx, f, tc.prompt(cancel))
+				for _, want := range tc.want {
+					if !errors.Is(err, want) {
+						t.Fatalf("err = %v, want it to match %v", err, want)
+					}
+				}
+				assertNothingApplied(t, f)
+				assertOneWait(t, *waits, p.prompts, tc.ended)
+			})
+		}
+	}
+}
+
+func TestPromptWait_CancelDuringEmissionAppliesNothing(t *testing.T) {
+	appendErr := errors.New("append failed")
+	for _, p := range promptWaitPaths() {
+		for _, emitFails := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/append-fails=%v", p.name, emitFails), func(t *testing.T) {
+				f := newFixture(neverPrompt, nil)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				waits := bindPromptWaits(f, func() error {
+					cancel()
+					if emitFails {
+						return appendErr
+					}
+					return nil
+				})
+				err := p.run(ctx, f, func(context.Context) error { return nil })
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("err = %v, want context.Canceled", err)
+				}
+				if emitFails && !errors.Is(err, appendErr) {
+					t.Fatalf("err = %v, want it to also match the append error", err)
+				}
+				assertNothingApplied(t, f)
+				assertOneWait(t, *waits, p.prompts, "answered")
+			})
+		}
+	}
+}
+
+func TestPromptWait_NoEventWithoutAPrompt(t *testing.T) {
+	t.Run("grant match", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
+		waits := bindPromptWaits(f, nil)
+		f.grants.entries = []PermissionEntry{toolGrant("vcs_commit", scopeProj, grantKindFolder)}
+		mustAuthorize(t, toolReq(), f.deps)
+		if len(*waits) != 0 {
+			t.Fatalf("waits = %+v, want none for a grant match", *waits)
+		}
+	})
+	t.Run("read-only auto-allow", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
+		waits := bindPromptWaits(f, nil)
+		mustAuthorizeMode(t, toolReq(), ModeContext{Mode: modePlan, Class: ClassReadOnly}, f.deps)
+		if len(*waits) != 0 {
+			t.Fatalf("waits = %+v, want none for a read-only auto-allow", *waits)
+		}
+	})
+	t.Run("batch all resolved", func(t *testing.T) {
+		f := newFixture(neverPrompt, nil)
+		waits := bindPromptWaits(f, nil)
+		f.deps.PromptBatch = neverBatchPrompt
+		f.grants.entries = []PermissionEntry{toolGrant("a", scopeProj, grantKindFolder)}
+		if _, err := AuthorizeBatch(context.Background(), []BatchRequest{batchReq("a")}, f.deps); err != nil {
+			t.Fatalf("AuthorizeBatch error: %v", err)
+		}
+		if len(*waits) != 0 {
+			t.Fatalf("waits = %+v, want none when no stage prompted", *waits)
+		}
+	})
 }

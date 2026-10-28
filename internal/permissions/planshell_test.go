@@ -275,7 +275,7 @@ func TestClassifyReadOnlyShellMutating(t *testing.T) {
 		{"mutating-capable find", `find . -delete`},
 		{"find with -exec", `find . -exec rm {} +`},
 		{"tree writes a file with -o", `tree -o out.txt`},
-		{"diff writes a file with --output", `diff --output=out a b`},
+		{"diff runs pr with -l", `diff -l a b`},
 		{"hostname can set the system hostname", `hostname newname`},
 		{"sed mutates in place with -i", `sed -i s/a/b/ f`},
 		{"env clearing the environment carries assignments", `env -i PATH=/usr/bin ls`},
@@ -485,7 +485,7 @@ func TestVCSReadOnlySubcommandSetsAreCurated(t *testing.T) {
 		}
 	}
 	sort.Strings(configured)
-	wantConfigured := []string{"[", "awk", "bash", "command", "date", "df", "dmesg", "file", "find", "free", "git", "hg", "jj", "journalctl", "lsof", "pgrep", "pidof", "ps", "pstree", "rg", "sed", "sh", "sort", "ss", "tail", "test", "top", "type", "uniq", "uptime", "vmstat"}
+	wantConfigured := []string{"[", "awk", "bash", "command", "date", "df", "diff", "dmesg", "env", "file", "find", "free", "git", "hg", "jj", "journalctl", "lsof", "pgrep", "pidof", "ps", "pstree", "rg", "sed", "sh", "sort", "ss", "tail", "test", "top", "type", "uniq", "uptime", "vmstat"}
 	if len(configured) != len(wantConfigured) {
 		t.Fatalf("configured (non-name-only) policies = %v, want exactly %v", configured, wantConfigured)
 	}
@@ -1077,7 +1077,7 @@ func TestClassifyReadOnlyShellTailFollow(t *testing.T) {
 }
 
 func TestShortFlagClusterScanIsOptInPerPolicy(t *testing.T) {
-	want := []string{"file", "hg", "jj", "rg", "sort", "tail"}
+	want := []string{"diff", "file", "hg", "jj", "rg", "sort", "tail"}
 	got := make([]string, 0, len(want))
 	for name, policy := range commandPolicies {
 		if policy.clusterShortFlags {
@@ -3284,6 +3284,81 @@ func TestPlatformGatingDenies(t *testing.T) {
 	}
 }
 
+func TestDiffReadOnlyOnLinuxInEveryMode(t *testing.T) {
+	withShellPlatform(t, "linux")
+	for _, input := range []string{
+		"diff a b",
+		"diff -u a b",
+		"diff -U 5 a b",
+		"diff -r d1 d2",
+		"diff -q a b",
+		"diff --unified=3 a b",
+		"diff --color=never -u a b",
+	} {
+		for _, mode := range []string{"build", modeAutoEdits, modePlan} {
+			t.Run(mode+"/"+input, func(t *testing.T) {
+				if got := classifyReadOnlyShell(shellCtx(t, input)); got != ClassReadOnly {
+					t.Fatalf("classifyReadOnlyShell(%q) = %q, want read_only", input, got)
+				}
+				f := newFixture(neverPrompt, nil)
+				req, mc := shellReqCtxFor(t, mode, input)
+				d := mustAuthorizeMode(t, req, mc, f.deps)
+				assertModeAutoAllow(t, f, d)
+			})
+		}
+	}
+}
+
+func TestDiffStaysNonReadOnlyOffLinux(t *testing.T) {
+	for _, platform := range []string{"freebsd", "darwin"} {
+		t.Run(platform, func(t *testing.T) {
+			withShellPlatform(t, platform)
+			if got := classifyReadOnlyShell(shellCtx(t, "diff a b")); got != ClassMutating {
+				t.Fatalf("classifyReadOnlyShell(%q) on %s = %q, want mutating", "diff a b", platform, got)
+			}
+		})
+	}
+}
+
+func TestDiffPaginateIsNeverReadOnly(t *testing.T) {
+	withShellPlatform(t, "linux")
+	assertShellClass(t, []string{
+		"diff -l a b",
+		"diff --paginate a b",
+		"diff --pag a b",
+		"diff --pagi a b",
+		"diff --paginate=x a b",
+		"diff -ul a b",
+		"diff -rul d1 d2",
+		"diff -u -l a b",
+		"diff a b -l",
+		"diff -u a b > out",
+		"diff -u a b -l 2>/dev/null",
+	}, ClassMutating)
+}
+
+func TestDiffLiteralRouteNeedsExpansionFreeArgs(t *testing.T) {
+	withShellPlatform(t, "linux")
+	for _, tc := range []struct {
+		input string
+		want  OperationClass
+	}{
+		{"diff -u a b 2>/dev/null", ClassReadOnly},
+		{"diff -u $FILES 2>/dev/null", ClassMutating},
+		{"diff -u *.txt b 2>/dev/null", ClassMutating},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			req, mc := shellCtx(t, tc.input)
+			if !mc.LiteralRoute {
+				t.Fatalf("SplitCommand(%q) did not take the literal route", tc.input)
+			}
+			if got := classifyReadOnlyShell(req, mc); got != tc.want {
+				t.Fatalf("classifyReadOnlyShell(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFreeBSDDiagnosticsReadOnly(t *testing.T) {
 	withShellPlatform(t, "freebsd")
 	for _, input := range []string{
@@ -4928,5 +5003,221 @@ func TestClassifyReadOnlyShellEnvClearedEnvironmentIsNeverAutoAllowed(t *testing
 	bareReq, bareMC := shellCtx(t, "env ls")
 	if got := classifyReadOnlyShell(bareReq, bareMC); got != ClassReadOnly {
 		t.Fatalf("classifyReadOnlyShell(%q) = %q, want read_only (bare env stays execution-equivalent)", "env ls", got)
+	}
+}
+
+func TestStripClassifierHereStrings(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"jq -n input <<< 1", "jq -n input", true},
+		{"grep x <<< 'a b'", "grep x", true},
+		{"cat a <<< x b", "cat a b", true},
+		{"jq . <<< a; jq . <<< 'b'", "jq .; jq .", true},
+		{"jq . <<< x | head", "jq . | head", true},
+		{"jq . <<< 'a $b' 2>/dev/null", "jq . 2>/dev/null", true},
+		{"jq . <<<x", "jq .", true},
+		{"grep x f 2>/dev/null", "grep x f 2>/dev/null", true},
+		{"cat << EOF", "cat << EOF", true},
+		{"echo '<<<' x", "echo '<<<' x", true},
+		{"jq . <<< $VAR", "", false},
+		{`jq . <<< "$VAR"`, "", false},
+		{"jq . <<< $(id)", "", false},
+		{"jq . <<< `id`", "", false},
+		{`jq . <<< a\\b`, "", false},
+		{`jq . <<< a\b`, "", false},
+		{`jq . <<< "a"`, "", false},
+		{"jq . 0<<< x", "", false},
+		{"jq . 3<<< x", "", false},
+		{"jq .<<< x", "", false},
+		{"jq . <<<< x", "", false},
+		{"<<< x", "", false},
+		{"ls; <<< x cat", "", false},
+		{" <<< x", "", false},
+		{"jq . <<< ;", "", false},
+		{"jq . <<< | cat", "", false},
+		{"jq . <<<", "", false},
+		{"jq . <<< <(rm x)", "", false},
+		{"jq . <<< >(rm x)", "", false},
+		{"jq . <<< {a,b}", "", false},
+		{"jq . <<< ~", "", false},
+		{"jq . <<< *", "", false},
+		{"jq . <<< a>out", "", false},
+		{"jq . <<< a<b", "", false},
+		{"jq . <<< 'a'b", "", false},
+		{"jq . <<< 1 3<<< x", "", false},
+		{"ls\n<<< x inproj", "", false},
+		{"ls\r<<< x inproj", "", false},
+		{"jq . <<< x\nrm y", "", false},
+		{"jq . <<< 'unterminated", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, ok := stripClassifierHereStrings(tc.in)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("stripClassifierHereStrings(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestHereStringClassifiesReadOnly(t *testing.T) {
+	for _, input := range []string{
+		`jq -n 'input' <<< '1'`,
+		`grep x <<< 'a b'`,
+		`jq -n '9223372036854775807 + 1'; jq -n '[match("(\\d+)"; "g")] | length' <<< '1h30m250ms'`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			req, mc := shellCtx(t, input)
+			if !mc.LiteralRoute {
+				t.Fatalf("SplitCommand(%q) did not take the literal route", input)
+			}
+			if got := classifyReadOnlyShell(req, mc); got != ClassReadOnly {
+				t.Fatalf("classifyReadOnlyShell(%q) = %q, want read_only", input, got)
+			}
+		})
+	}
+}
+
+func TestHereStringBypassesStayMutating(t *testing.T) {
+	for _, subject := range []string{
+		"jq . <<< $VAR",
+		`jq . <<< "$VAR"`,
+		"jq . <<< $(id)",
+		"jq . <<< `id`",
+		`jq . <<< a\\b`,
+		"jq . 0<<< x",
+		"jq . 3<<< x",
+		"cat << EOF",
+		"jq . <<<< x",
+		"<<< x",
+		"rm x <<< y",
+		"sh <<< 'rm x'",
+		"xargs rm <<< f",
+		"jq . <<< <(rm x)",
+		"jq . <<< >(rm x)",
+		"jq . <<< {a,b}",
+		"jq . <<< a>out",
+		"jq . <<< a<b",
+		"jq . <<< 1 > out",
+		"jq . <<< 1 >> out",
+		"jq . <<< 1 2> err",
+		"jq . <<< 1 3<<< x",
+		"ls\n<<< x inproj",
+		"ls\r<<< x inproj",
+		"ls\n<<< x ls",
+	} {
+		t.Run(subject, func(t *testing.T) {
+			if got := classifyLiteralCompound(subject); got != ClassMutating {
+				t.Fatalf("classifyLiteralCompound(%q) = %q, want mutating", subject, got)
+			}
+		})
+	}
+}
+
+func TestHereStringLiteralsRunHgAndPS(t *testing.T) {
+	if !LiteralRunsHg("hg status <<< x") {
+		t.Fatal("LiteralRunsHg(hg status <<< x) = false, want true")
+	}
+	if !LiteralRunsPS("ps aux <<< x") {
+		t.Fatal("LiteralRunsPS(ps aux <<< x) = false, want true")
+	}
+}
+
+func TestHereStringLeavesGrantIdentityAndNullStripUnchanged(t *testing.T) {
+	for _, input := range []string{"jq . <<< a", "jq . <<< a; jq . <<< b", "grep x <<< 'a b' | head"} {
+		t.Run(input, func(t *testing.T) {
+			canon, err := CanonicalLiteralForm(input)
+			if err != nil {
+				t.Fatalf("CanonicalLiteralForm(%q): %v", input, err)
+			}
+			if canon != input {
+				t.Fatalf("CanonicalLiteralForm(%q) = %q, want the here-string text preserved", input, canon)
+			}
+			if _, ok := RecognizeSimpleCompoundForGrant(canon); ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) recognized a here-string command", canon)
+			}
+			if _, ok := stripNullRedirects(canon); ok {
+				t.Fatalf("stripNullRedirects(%q) accepted a here-string", canon)
+			}
+			changed := strings.Replace(canon, "<<< a", "<<< z", 1)
+			changed = strings.Replace(changed, "<<< 'a b'", "<<< 'z b'", 1)
+			if MatchesLiteralSubject(changed, canon) {
+				t.Fatalf("a changed stdin word %q matched the stored subject %q", changed, canon)
+			}
+		})
+	}
+}
+
+func TestBareEnvClassifiesReadOnly(t *testing.T) {
+	for _, input := range []string{
+		"env",
+		"env | grep -i shell",
+		`env | grep -i shell; printf 'x\n'`,
+		`"env" | grep -i shell; printf 'x\n'`,
+		`"env" ; printf x`,
+		"env 2>/dev/null; printf x",
+		"env <<< x",
+	} {
+		t.Run(input, func(t *testing.T) {
+			if got := classifyReadOnlyShell(shellCtx(t, input)); got != ClassReadOnly {
+				t.Fatalf("classifyReadOnlyShell(%q) = %q, want read_only", input, got)
+			}
+		})
+	}
+	for _, subject := range []string{"env", `env | grep -i shell; printf 'x\n'`, "env; printf x"} {
+		if got := classifyLiteralCompound(subject); got != ClassReadOnly {
+			t.Fatalf("classifyLiteralCompound(%q) = %q, want read_only", subject, got)
+		}
+	}
+}
+
+func TestEnvWithArgumentsStaysNotReadOnly(t *testing.T) {
+	for _, input := range []string{
+		"env rm x",
+		"env -i",
+		"env -u X",
+		"env FOO=bar",
+		"FOO=1 env",
+		"/usr/bin/env",
+		"env sh -c 'id'",
+		`"env"; printf x`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			if got := classifyReadOnlyShell(shellCtx(t, input)); got == ClassReadOnly {
+				t.Fatalf("classifyReadOnlyShell(%q) = read_only, want not read_only", input)
+			}
+		})
+	}
+	if !stageTokensReadOnly([]string{"env"}) {
+		t.Fatal(`stageTokensReadOnly(["env"]) = false, want true`)
+	}
+	for _, tokens := range [][]string{
+		{"env", "rm", "x"},
+		{"env", "-i"},
+		{"env", "-u", "X"},
+		{"env", "FOO=bar"},
+		{"env", "sh", "-c", "id"},
+	} {
+		if stageTokensReadOnly(tokens) {
+			t.Fatalf("stageTokensReadOnly(%q) = true, want false", tokens)
+		}
+	}
+}
+
+func TestBareEnvDoesNotWaiveNeighbourStageChecks(t *testing.T) {
+	for _, subject := range []string{
+		"env; sed -n '1p' f",
+		"env; ps aux",
+		"env; sort $X 2>/dev/null",
+		`sh -c "env; ps $X"`,
+	} {
+		t.Run(subject, func(t *testing.T) {
+			if got := classifyLiteralCompound(subject); got != ClassMutating {
+				t.Fatalf("classifyLiteralCompound(%q) = %q, want mutating", subject, got)
+			}
+		})
 	}
 }

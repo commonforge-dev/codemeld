@@ -1,6 +1,6 @@
 # Development setup
 
-_Last updated: 2026-10-16_
+_Last updated: 2026-10-21_
 
 This page is the whole "get building" story: the toolchain, the commands, and how to run the
 binary. The dependency list itself is [`go.mod`](../go.mod).
@@ -131,8 +131,10 @@ differently and neither overrides the other):
 
 Run `./codemeld auth status` to see which providers are authenticated (it prints no secrets), then
 run `./codemeld` inside any project folder. See the top-level [`README.md`](../README.md) "Quick
-start" for the full first-run flow, [`docs/architecture.md`](../docs/architecture.md) → "OpenAI
-authentication" for how the two providers differ, and that page for what happens on launch.
+start" for the full first-run flow,
+[`docs/architecture.md`](../docs/architecture.md#openai-authentication-two-separate-providers) →
+"OpenAI authentication: two separate providers" for how the two providers differ, and that page's
+[Overview](../docs/architecture.md#overview) for what startup sets up.
 
 Run `./codemeld config check` to validate your settings files without starting a session. It
 writes nothing and never approves a project.
@@ -186,4 +188,4 @@ there is no hosted CI. macOS and FreeBSD build but are untested. Windows is not 
 does not compile for it. Confined shell execution works only on Linux amd64 and arm64; every other
 platform runs shell commands unconfined with ordinary prompts. There is **no CGO**, so the
 binary is a single static file with no runtime dependencies. See the Per-OS Gates table in
-[`docs/architecture.md`](../docs/architecture.md).
+[`docs/architecture.md`](../docs/architecture.md#per-os-gates).

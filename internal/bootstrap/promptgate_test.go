@@ -8,6 +8,8 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -15,7 +17,10 @@ import (
 	"testing"
 
 	"codemeld.dev/codemeld/internal/dispatch"
+	"codemeld.dev/codemeld/internal/ids"
+	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/permissions"
+	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/tui"
 )
 
@@ -477,6 +482,53 @@ func TestBuildBatchPromptRequest_CarriesPerStageEscalation(t *testing.T) {
 	}
 }
 
+func TestBuildPromptRequest_CopiesTheNoteUnchanged(t *testing.T) {
+	const note = "  System One check failed: out of credits\n"
+	for _, kind := range []string{"direct", "literal", "tool"} {
+		pr, err := buildPromptRequest(permissions.MatchRequest{Kind: kind, Subject: "x", PathScope: "/work"}, PromptDisplay{}, permissions.ScopeEscalation{Note: note})
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		if pr.Note != note {
+			t.Fatalf("%s: Note = %q, want %q unchanged", kind, pr.Note, note)
+		}
+	}
+}
+
+func TestBuildBatchPromptRequest_CarriesPerStageNotes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		notes []string
+	}{
+		{"second stage only", []string{"", "out of credits"}},
+		{"two distinct notes", []string{"no key", "out of credits"}},
+		{"all empty", []string{"", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prompts := []permissions.BatchPromptRequest{
+				{Req: permissions.MatchRequest{Kind: "direct", Subject: "find . -name x", PathScope: "/work"},
+					Escalation: permissions.ScopeEscalation{Note: tc.notes[0]}},
+				{Req: permissions.MatchRequest{Kind: "direct", Subject: "grep foo", PathScope: "/work"}, Index: 1,
+					Escalation: permissions.ScopeEscalation{Note: tc.notes[1]}},
+			}
+			displays := []PromptDisplay{
+				{Action: "Run command", Subject: "find . -name x"},
+				{Action: "Run command", Subject: "grep foo"},
+			}
+			pr, err := buildBatchPromptRequest(prompts, displays, nil)
+			if err != nil {
+				t.Fatalf("buildBatchPromptRequest returned error: %v", err)
+			}
+			if !reflect.DeepEqual(pr.BatchedNotes, tc.notes) {
+				t.Fatalf("BatchedNotes = %#v, want %#v index-aligned with the stages", pr.BatchedNotes, tc.notes)
+			}
+			if pr.Note != "" {
+				t.Fatalf("Note = %q, want empty so a batched note is not shown twice", pr.Note)
+			}
+		})
+	}
+}
+
 func TestBuildBatchPromptRequest_ListsSourceSpellingPerStage(t *testing.T) {
 	prompts := []permissions.BatchPromptRequest{
 		{Req: permissions.MatchRequest{Kind: "direct", Subject: "git commit -m a b", PathScope: "/work"}, Index: 0},
@@ -512,7 +564,7 @@ func TestBuildBatchPromptRequest_SingleStageUsesOrdinaryPrompt(t *testing.T) {
 	prompts := []permissions.BatchPromptRequest{
 		{Req: permissions.MatchRequest{Kind: "direct", Subject: "find . -name x",
 			SubjectTokens: []string{"find", ".", "-name", "x"}, PathScope: "/work"},
-			Escalation: permissions.ScopeEscalation{NarrowerScope: "/work/sub"}},
+			Escalation: permissions.ScopeEscalation{NarrowerScope: "/work/sub", Note: "System One check: no Venice API key"}},
 	}
 	displays := []PromptDisplay{
 		{Action: "Run command", Subject: "find . -name x", Pipeline: "cat file | find x"},
@@ -533,9 +585,12 @@ func TestBuildBatchPromptRequest_SingleStageUsesOrdinaryPrompt(t *testing.T) {
 	if pr.CanonicalProgram != "find" || !reflect.DeepEqual(pr.CanonicalArgs, []string{".", "-name", "x"}) {
 		t.Errorf("canonical command = %q %#v, want find [. -name x]", pr.CanonicalProgram, pr.CanonicalArgs)
 	}
-	if len(pr.BatchedStages) != 0 || len(pr.BatchedEscalations) != 0 {
-		t.Errorf("BatchedStages=%#v BatchedEscalations=%#v, want both empty for an N=1 batch",
-			pr.BatchedStages, pr.BatchedEscalations)
+	if len(pr.BatchedStages) != 0 || len(pr.BatchedEscalations) != 0 || len(pr.BatchedNotes) != 0 {
+		t.Errorf("BatchedStages=%#v BatchedEscalations=%#v BatchedNotes=%#v, want all empty for an N=1 batch",
+			pr.BatchedStages, pr.BatchedEscalations, pr.BatchedNotes)
+	}
+	if pr.Note != "System One check: no Venice API key" {
+		t.Errorf("Note = %q, want the single stage's own note", pr.Note)
 	}
 }
 
@@ -1229,7 +1284,7 @@ func TestBuildBatchPromptRequest_ExceptionalBatchNamesThePrecedenceAuthority(t *
 	}{
 		{"network after deletion", []string{"rm -f out.txt", "curl https://example.com"}, "network access"},
 		{"network before deletion", []string{"curl https://example.com", "rm -f out.txt"}, "network access"},
-		{"exceptional stage not first", []string{"sort data.txt", "hg strip tip", "rm -f out.txt"}, "file deletion"},
+		{"exceptional stage not first", []string{"sort data.txt", "hg strip tip", "rm -f out.txt"}, "VCS history rewrite"},
 		{"history rewrite only", []string{"sort data.txt", "hg strip tip"}, "VCS history rewrite"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1332,5 +1387,252 @@ func TestPromptGate_ExceptionalPromptRejectsGrantChoices(t *testing.T) {
 	}
 	if out, err := newPromptGateBuilder(show).Build(req, unmarked)(context.Background(), permissions.ScopeEscalation{}); err != nil || out.Choice != permissions.PromptAllowSession {
 		t.Fatalf("unmarked session = %+v, %v; want the grant choice kept", out, err)
+	}
+}
+
+func sandboxedAutoShell(t *testing.T, input string, broken bool) (permissions.MatchRequest, permissions.ModeContext) {
+	t.Helper()
+	split, err := permissions.SplitCommand(input)
+	if err != nil {
+		t.Fatalf("SplitCommand(%q): %v", input, err)
+	}
+	mc := permissions.ModeContext{
+		Mode: "auto_edits", ExecutionConstrained: true, SettingsBroken: broken,
+		Stages: split.Stages, LiteralRoute: split.LiteralRoute,
+	}
+	if split.LiteralRoute {
+		canonical, err := permissions.CanonicalLiteralForm(split.LiteralInput)
+		if err != nil {
+			t.Fatalf("CanonicalLiteralForm(%q): %v", split.LiteralInput, err)
+		}
+		return permissions.MatchRequest{Kind: matchKindLiteral, Subject: canonical}, mc
+	}
+	tokens := split.Stages[0].Tokens
+	return permissions.MatchRequest{Kind: matchKindDirect, Subject: strings.Join(tokens, " "), SubjectTokens: tokens}, mc
+}
+
+func TestExceptionalAuthority_SandboxedAutoEditsNamesWhatStillAsks(t *testing.T) {
+	const deletion, network, history = "file deletion", "network access", "VCS history rewrite"
+	for _, tc := range []struct{ command, valid, broken string }{
+		{`rm -rf build`, "", deletion},
+		{`git clean -fdx`, "", deletion},
+		{`which -a x; file "$(which x)"`, "", ""},
+		{`rm x && git rebase main`, history, deletion},
+		{`git rebase main; rm x`, history, deletion},
+		{`rm x | hg strip .`, history, deletion},
+		{`rm x; curl y`, network, network},
+		{`git reset --hard && git push`, network, network},
+		{`rm x && command git push`, network, network},
+		{`rm x && nice git push`, network, network},
+		{`rm x | xargs git push`, network, network},
+		{`rm x; bash -c 'git push'`, network, network},
+		{`rm x && git commit --amend`, history, deletion},
+	} {
+		for _, broken := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/broken=%v", tc.command, broken), func(t *testing.T) {
+				req, mc := sandboxedAutoShell(t, tc.command, broken)
+				want := tc.valid
+				if broken {
+					want = tc.broken
+				}
+				got := markExceptional(dispatch.PromptDisplay{Action: dispatch.ActionRunCommand, Subject: tc.command}, req, mc)
+				if got.ExceptionalAuthority != want || want != "" && got.Action != "Allow "+want {
+					t.Fatalf("display = %+v, want authority %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func brokenSettingsAutoBatch(sources ...string) ([]permissions.BatchPromptRequest, []PromptDisplay, []permissions.ModeContext) {
+	prompts, displays, modeCtxs := constrainedAutoBatch(sources...)
+	for i := range modeCtxs {
+		modeCtxs[i].SettingsBroken = true
+		disp := markExceptional(dispatch.PromptDisplay{Action: dispatch.ActionRunCommand, Subject: sources[i], Pipeline: "p"}, prompts[i].Req, modeCtxs[i])
+		displays[i].Action, displays[i].ExceptionalAuthority = disp.Action, disp.ExceptionalAuthority
+	}
+	return prompts, displays, modeCtxs
+}
+
+func TestPromptGate_BrokenSettingsDeletionKeepsAllowOnceOrDeny(t *testing.T) {
+	grantOptions := []tui.PromptOption{tui.OptionAllowSession, tui.OptionAllowFolder, tui.OptionAllowGlobal, tui.OptionAllowProject}
+	choose := func(option tui.PromptOption, shown *[]tui.PromptRequest) promptShower {
+		return func(pr tui.PromptRequest) (tui.PromptDecision, error) {
+			*shown = append(*shown, pr)
+			return tui.PromptDecision{Option: option, StoredSubject: "rm :*"}, nil
+		}
+	}
+	for _, sources := range [][]string{{"rm -f out.txt"}, {"sort data.txt", "rm -f out.txt"}} {
+		name := strings.Join(sources, " | ")
+		t.Run("single "+name, func(t *testing.T) {
+			prompts, displays, _ := brokenSettingsAutoBatch(sources...)
+			last := len(sources) - 1
+			if displays[last].ExceptionalAuthority != "file deletion" || displays[last].Action != "Allow file deletion" {
+				t.Fatalf("broken-settings display = %+v, want the file deletion marker", displays[last])
+			}
+			for _, option := range grantOptions {
+				var shown []tui.PromptRequest
+				if out, err := newPromptGateBuilder(choose(option, &shown)).Build(prompts[last].Req, displays[last])(context.Background(), permissions.ScopeEscalation{}); err == nil {
+					t.Fatalf("option %d mapped to %+v, want an error", option, out)
+				}
+			}
+			_, valid, _ := constrainedAutoBatch(sources...)
+			var shown []tui.PromptRequest
+			out, err := newPromptGateBuilder(choose(tui.OptionAllowSession, &shown)).Build(prompts[last].Req, valid[last])(context.Background(), permissions.ScopeEscalation{})
+			if err != nil || out.Choice != permissions.PromptAllowSession || valid[last].ExceptionalAuthority != "" {
+				t.Fatalf("valid-settings session = %+v, %v (marker %q); want no deletion marker", out, err, valid[last].ExceptionalAuthority)
+			}
+		})
+		t.Run("batched "+name, func(t *testing.T) {
+			prompts, displays, modeCtxs := brokenSettingsAutoBatch(sources...)
+			for _, option := range grantOptions {
+				var shown []tui.PromptRequest
+				auth := &productionAuthorizer{prompts: newPromptGateBuilder(choose(option, &shown))}
+				if out, err := auth.buildBatchPrompt(displays, modeCtxs)(context.Background(), prompts); err == nil {
+					t.Fatalf("batch option %d mapped to %+v, want an error", option, out)
+				}
+				if len(shown) != 1 || shown[0].ExceptionalAuthority != "file deletion" {
+					t.Fatalf("shown = %+v, want one prompt marked file deletion", shown)
+				}
+			}
+			for _, option := range []tui.PromptOption{tui.OptionAllowOnce, tui.OptionDeny} {
+				var shown []tui.PromptRequest
+				auth := &productionAuthorizer{prompts: newPromptGateBuilder(choose(option, &shown))}
+				if _, err := auth.buildBatchPrompt(displays, modeCtxs)(context.Background(), prompts); err != nil {
+					t.Fatalf("batch option %d: %v", option, err)
+				}
+			}
+		})
+	}
+}
+
+type recordingShellRunner struct {
+	mu    sync.Mutex
+	specs []cmdrunner.RunSpec
+}
+
+func (r *recordingShellRunner) NewInvocationID() string { return ids.NewV7() }
+
+func (r *recordingShellRunner) Exec(_ context.Context, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.specs = append(r.specs, spec)
+	return cmdrunner.RunResult{}, nil
+}
+
+func (r *recordingShellRunner) PreflightPipeline(context.Context, []cmdrunner.RunSpec) error {
+	return nil
+}
+
+func (r *recordingShellRunner) Pipeline(_ context.Context, specs []cmdrunner.RunSpec) ([]cmdrunner.PipelineResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.specs = append(r.specs, specs...)
+	results := make([]cmdrunner.PipelineResult, len(specs))
+	for i, spec := range specs {
+		results[i].InvocationID = spec.InvocationID
+	}
+	return results, nil
+}
+
+type requestRecordingAuthorizer struct {
+	*productionAuthorizer
+	mu   sync.Mutex
+	reqs []permissions.MatchRequest
+}
+
+func (a *requestRecordingAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, disp dispatch.PromptDisplay, mc permissions.ModeContext) (permissions.Decision, error) {
+	a.mu.Lock()
+	a.reqs = append(a.reqs, req)
+	a.mu.Unlock()
+	return a.productionAuthorizer.Authorize(ctx, req, disp, mc)
+}
+
+func (a *requestRecordingAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispatch.BatchAuthRequest) ([]permissions.Decision, error) {
+	a.mu.Lock()
+	for _, r := range reqs {
+		a.reqs = append(a.reqs, r.Req)
+	}
+	a.mu.Unlock()
+	return a.productionAuthorizer.AuthorizeBatch(ctx, reqs)
+}
+
+func TestDispatchShell_SandboxedAutoEditsRunsAutomaticCommandsAndAsksTheRest(t *testing.T) {
+	const network = "network access"
+	for _, tc := range []struct {
+		command, authority string
+		stages             int
+		networkProgram     string
+	}{
+		{`rm -rf build`, "", 1, ""},
+		{`which -a ls; file "$(which ls)"`, "", 1, ""},
+		{`rm x && git rebase main`, "VCS history rewrite", 2, ""},
+		{`rm x | hg strip .`, "VCS history rewrite", 2, ""},
+		{`rm x; curl https://example.com`, network, 2, "curl"},
+	} {
+		for _, approve := range []bool{true, false} {
+			if tc.authority == "" && !approve {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/approve=%v", tc.command, approve), func(t *testing.T) {
+				f := newS1Fixture(t, jevName)
+				prependFixturePrograms(t, "git", "hg", "curl")
+				auth, _, _ := f.production(t, mode.AutoEdits, mkStore(t))
+				auth.executionConstrained = true
+				option := tui.OptionDeny
+				if approve {
+					option = tui.OptionAllowOnce
+				}
+				var shown []tui.PromptRequest
+				auth.prompts = newPromptGateBuilder(func(pr tui.PromptRequest) (tui.PromptDecision, error) {
+					shown = append(shown, pr)
+					return tui.PromptDecision{Option: option}, nil
+				})
+				rec := &requestRecordingAuthorizer{productionAuthorizer: auth}
+				run := &recordingShellRunner{}
+
+				_, err := dispatch.DispatchShell(context.Background(), tc.command, f.home, f.project, rec, run)
+
+				var denied *dispatch.DeniedError
+				if approve != (err == nil) || !approve && !errors.As(err, &denied) {
+					t.Fatalf("DispatchShell = %v, want approve=%v", err, approve)
+				}
+				wantPrompts := 1
+				if tc.authority == "" {
+					wantPrompts = 0
+				}
+				if len(shown) != wantPrompts || wantPrompts == 1 && shown[0].ExceptionalAuthority != tc.authority {
+					t.Fatalf("prompts = %+v, want %d naming %q", shown, wantPrompts, tc.authority)
+				}
+				if !approve {
+					if len(run.specs) != 0 {
+						t.Fatalf("denied command executed %+v", run.specs)
+					}
+					return
+				}
+				if len(run.specs) != tc.stages {
+					t.Fatalf("executed %d specs %+v, want %d", len(run.specs), run.specs, tc.stages)
+				}
+				for _, spec := range run.specs {
+					wantNetwork := tc.networkProgram != "" && filepath.Base(spec.Argv[0]) == tc.networkProgram
+					if (spec.ExceptionalAuthority == network) != wantNetwork {
+						t.Fatalf("spec %q authority = %q, want network authority only on %q", spec.Argv, spec.ExceptionalAuthority, tc.networkProgram)
+					}
+				}
+				if got := f.server.requests(); len(got) != 0 {
+					t.Fatalf("System One requests = %+v, want none", got)
+				}
+				if grants := auth.grants.Permissions(); len(grants) != 0 {
+					t.Fatalf("stored grants %+v, want none", grants)
+				}
+				if tc.authority == "" {
+					for _, req := range rec.reqs {
+						if outcome, hit := auth.grants.turn.Lookup(req); hit {
+							t.Fatalf("automatic allowance cached %q for %+v", outcome, req)
+						}
+					}
+				}
+			})
+		}
 	}
 }

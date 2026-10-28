@@ -93,6 +93,7 @@ func TestTreeTool_AdvertiseMetadata(t *testing.T) {
 	if got := formatProp["enum"]; !reflect.DeepEqual(got, []string{"ai", "human"}) {
 		t.Fatalf("format enum = %#v, want [ai human]", got)
 	}
+	assertOutsideScanAdvertise(t, md, "directory outside the project is walked without asking", "such a walk asks first")
 }
 
 // mkTreeFixture builds a small nested tree under root and returns it:

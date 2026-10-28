@@ -6,6 +6,7 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -306,11 +307,11 @@ type turnController struct {
 	// response.
 	dispatcher turn.ToolDispatcher
 
-	// delegateParent is the run-scoped holder a delegate call reads a child's inherited model,
+	// generalAgentParent is the run-scoped holder a general_agent call reads a child's inherited model,
 	// mode, and system prompt from. StartTUI binds the same instance it gave the registry's
-	// delegate binding (setDelegateParent); it stays nil where delegation is not wired, which
-	// publishes nothing and leaves a delegate call with no parent.
-	delegateParent *parentTurnHolder
+	// general_agent binding (setGeneralAgentParent); it stays nil where delegation is not wired, which
+	// publishes nothing and leaves a general_agent call with no parent.
+	generalAgentParent *parentTurnHolder
 
 	// devDebug, modeName, and armTUIDebug carry the dev-debug wiring, set once by
 	// StartTUI (setDevDebug). When devDebug is on, dispatch threads the gate and the active
@@ -327,6 +328,8 @@ type turnController struct {
 	onTurnComplete func(ctx context.Context, client provider.Client, sel model.Selection, store *sessions.Store, firstUser, firstAssistant string)
 
 	onUnsent func(store *sessions.Store, unsent []turn.PendingUserMessage, outcome string) func()
+
+	onResponse func(sessionID string, resp events.ModelResponse)
 
 	ignoredProviders      *turn.IgnoredProviders
 	ignoredProvidersStore *sessions.Store
@@ -372,10 +375,10 @@ func (c *turnController) setToolDispatcher(d turn.ToolDispatcher) { c.dispatcher
 
 func (c *turnController) setToolEventStore(store *toolEventStore) { c.toolEvents = store }
 
-// setDelegateParent binds the run-scoped parent-turn holder onto the controller. StartTUI
-// passes the same instance it gave the registry's delegate binding, so what this controller
+// setGeneralAgentParent binds the run-scoped parent-turn holder onto the controller. StartTUI
+// passes the same instance it gave the registry's general_agent binding, so what this controller
 // publishes is what a child reads.
-func (c *turnController) setDelegateParent(h *parentTurnHolder) { c.delegateParent = h }
+func (c *turnController) setGeneralAgentParent(h *parentTurnHolder) { c.generalAgentParent = h }
 
 // setChatGPTAuth binds the OpenAI ChatGPT session resolver and the resolved global
 // settings path so a submitted turn whose selected provider is openai-chatgpt can
@@ -399,6 +402,10 @@ func (c *turnController) setToolAdvertiser(assemble func() []provider.ToolDefini
 // with no completion side effect.
 func (c *turnController) setTurnCompleteHook(fn func(ctx context.Context, client provider.Client, sel model.Selection, store *sessions.Store, firstUser, firstAssistant string)) {
 	c.onTurnComplete = fn
+}
+
+func (c *turnController) setResponseObserver(fn func(sessionID string, resp events.ModelResponse)) {
+	c.onResponse = fn
 }
 
 func (c *turnController) setUnsentHook(fn func(*sessions.Store, []turn.PendingUserMessage, string) func()) {
@@ -529,8 +536,8 @@ func buildTurnClient(providerID string, kind provider.AuthKind, cache *config.Ca
 	}
 	if providerID == "openrouter" {
 		store := openRouterEndpoints
-		cfg.MinThroughput = func(ctx context.Context, model string) (float64, bool) {
-			return store.SpeedBar(ctx, entry, authHeader, authValue, model)
+		cfg.BestValueTag = func(ctx context.Context, model string, ignored []string) string {
+			return store.BestValueTag(ctx, entry, authHeader, authValue, model, ignored)
 		}
 	}
 	return newTurnProviderClient(cfg), true
@@ -629,12 +636,12 @@ func (c *turnController) dispatch(store *sessions.Store, submitStart time.Time) 
 		c.armTUIDebug(sel.Provider, sel.ID, modeName)
 	}
 
-	// Publish this turn for any child a delegate call in it starts. It happens here, on the
+	// Publish this turn for any child a general_agent call in it starts. It happens here, on the
 	// event-loop goroutine before the turn goroutine exists, so the tool-dispatch goroutine
 	// never reads the run-scoped active states and a /model or /mode change landing mid-turn
 	// reaches the next turn's children, not this turn's.
-	if c.delegateParent != nil {
-		c.delegateParent.publish(sel, source, modeName, systemPrompt)
+	if c.generalAgentParent != nil {
+		c.generalAgentParent.publish(sel, source, modeName, systemPrompt)
 	}
 
 	// One cancellation handle for the whole agentic turn. The turn runs under turnCtx
@@ -649,7 +656,8 @@ func (c *turnController) dispatch(store *sessions.Store, submitStart time.Time) 
 	// sum /status uses) are this turn's ↑/↓ display bases. Each round's exact usage is
 	// added on top per channel, so the figures the indicator settles on equal what
 	// /status reports after the turn (its prior session totals plus this turn's usage).
-	priorIn, priorOut := model.SumModelResponseTokens(store.Records())
+	prior := store.Records()
+	priorIn, priorOut := model.SumModelResponseTokens(prior)
 
 	// Idle indicator: the provider's human-facing name for the waiting copy,
 	// resolved once here from the selected provider's catalog entry (id fallback for a
@@ -774,7 +782,7 @@ func (c *turnController) dispatch(store *sessions.Store, submitStart time.Time) 
 	}
 	c.surface.ShowIndicator(priorIn, priorOut)
 
-	goTurn(func() { c.run(turnCtx, loop, live, client, sel, store) })
+	goTurn(func() { c.run(turnCtx, loop, live, client, sel, store, len(prior)) })
 	return nil
 }
 
@@ -786,9 +794,11 @@ func (c *turnController) dispatch(store *sessions.Store, submitStart time.Time) 
 // (and its context). The loop's error is otherwise already acted on inside the loop (or
 // is a context cancellation from Cancel()); run only inspects it to decide whether the
 // turn completed successfully, which gates the first-turn completion hook.
-func (c *turnController) run(ctx context.Context, loop *turn.ToolLoop, live *liveTurn, client provider.Client, sel model.Selection, store *sessions.Store) {
+func (c *turnController) run(ctx context.Context, loop *turn.ToolLoop, live *liveTurn, client provider.Client, sel model.Selection, store *sessions.Store, baseline int) {
 	err := loop.Run(ctx)
 	outcome := turnOutcome(err, loop.Denied())
+	sessionID := store.SessionID()
+	resp, responded := lastResponseAfter(store.Records(), baseline)
 	var firstUser, firstAssistant string
 	titleable := false
 	if err == nil && !loop.Denied() && c.onTurnComplete != nil {
@@ -841,7 +851,27 @@ func (c *turnController) run(ctx context.Context, loop *turn.ToolLoop, live *liv
 		}
 	}
 
+	if responded && c.onResponse != nil {
+		c.onResponse(sessionID, resp)
+	}
+
 	ended()
+}
+
+func lastResponseAfter(records []sessions.Record, baseline int) (events.ModelResponse, bool) {
+	var last events.ModelResponse
+	found := false
+	for _, rec := range records[min(baseline, len(records)):] {
+		ev, ok := rec.(sessions.Event)
+		if !ok || ev.Kind != events.KindModelResponse {
+			continue
+		}
+		var p events.ModelResponse
+		if json.Unmarshal(ev.Payload, &p) == nil {
+			last, found = p, true
+		}
+	}
+	return last, found
 }
 
 func turnRecoveryLine(err error, sessionID string) string {

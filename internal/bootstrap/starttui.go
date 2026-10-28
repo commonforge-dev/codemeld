@@ -33,6 +33,8 @@ import (
 	"codemeld.dev/codemeld/internal/sessionfailures"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/sessionturn"
+	"codemeld.dev/codemeld/internal/subagenttool"
+	"codemeld.dev/codemeld/internal/systemone"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/tui"
 	"codemeld.dev/codemeld/internal/turn"
@@ -56,7 +58,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Alpha 0.4.6"
+var codemeldVersion = "Alpha 0.4.7"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -154,6 +156,8 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 		startBackgroundPrune(ctx, app, result.Home, composed)
 	}
 
+	skillLines := loadSkills(result, cache.AgentInstructionsMaxFileBytes())
+
 	// Realize the production tool registry now that the config cache and turn-store
 	// accessor exist: the step-6c factory registers vcs_<action> tools (when active VCS data is
 	// present) with the run's output cap and an event appender bound to the submitted turn's store,
@@ -161,17 +165,19 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	// failure.
 	toolEvents := &toolEventStore{}
 	assemblePrompt := newSystemPromptAssembler(result, modeActive, active)
-	// One run-scoped holder for both the delegate binding below and the turn controller built
+	// One run-scoped holder for both the general_agent binding below and the turn controller built
 	// after it: registry realization precedes controller construction, so it has to exist here
 	// for both sides to reference the same instance.
-	delegateParent := &parentTurnHolder{}
+	generalAgentParent := &parentTurnHolder{}
 	blockedEntries, err := blockedEntriesFromLayers(result.Home, result.SettingsLayers)
 	if err != nil {
 		return fmt.Errorf("bootstrap: StartTUI build blocked paths: %w", err)
 	}
-	conf = launchConfinement(execution, tmpDir, modeActive, cache, result.Home, guard)
+	inherited, _ := runner.InheritedEnvironment(os.Environ())
+	conf = launchConfinement(execution, tmpDir, modeActive, cache, result.Home, guard, inherited)
+	systemOne := newSystemOneCheck(cache, guard.Blocked)
 	registry, err := realizeToolRegistry(result.ToolRegistry, cache, toolEvents.Active, result.Home, result.LaunchDir, guard,
-		delegateBinding{parent: delegateParent, notices: app, confinement: conf})
+		generalAgentBinding{parent: generalAgentParent, notices: app, confinement: conf, systemOne: systemOne})
 	if err != nil {
 		return fmt.Errorf("bootstrap: StartTUI build tool registry: %w", err)
 	}
@@ -193,13 +199,14 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	authorizer := newInteractiveAuthorizer(app, cache, result, modeActive)
 	authorizer.executionConstrained = execution.SelfTestPassed
 	authorizer.blocked = guard.Blocked
+	authorizer.systemOne = systemOne
 	for _, row := range launchRows {
 		authorizer.grants.addRow(row)
 	}
 	assembleTools := newCapabilityGatedToolAdvertiser(newInteractiveToolAdvertiser(newToolAdvertiser(registry, modeActive)), cache, active)
 	turnCtl := newTurnController(ctx, app, cache, active, assemblePrompt, authorizer)
 	turnCtl.setToolEventStore(toolEvents)
-	turnCtl.setDelegateParent(delegateParent)
+	turnCtl.setGeneralAgentParent(generalAgentParent)
 	// Bind the OpenAI ChatGPT session resolver and global settings path so a submitted
 	// openai-chatgpt turn loads, proactively refreshes, and one-shot reactively refreshes
 	// the stored session; other providers ignore it.
@@ -228,6 +235,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	turnCtl.setTurnCompleteHook(newTitleOnComplete(app, func(providerID, modelID string) []string {
 		return cache.SelectableCatalog().SupportedEffort(providerID, modelID)
 	}))
+	turnCtl.setResponseObserver(newContextWindowNotice(app, cache))
 	turnCtl.setUnsentHook(func(store *sessions.Store, unsent []turn.PendingUserMessage, outcome string) func() {
 		recorded := 0
 		if outcome != "completed" {
@@ -264,7 +272,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	exit := newExitController(ctx, app, stdout, resumeLock, turnCtl, stopBlockedDelivery)
 	status := newStatusState(app, cache, active, result, execution)
 	status.live = recorder.current
-	contextSt := newContextState(app, active)
+	contextSt := newContextState(app, cache, active)
 
 	// Wire /clear's transcript reset now that statusState exists: after the session
 	// swap, /clear wipes the visible pane and re-renders the launch banner for the fresh
@@ -283,8 +291,15 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	// path-4 picker can open or the event loop starts accepting prompts, so
 	// the banner is always the first lines a user sees. It re-presents statusState's
 	// version, selection, and launch dir — the same single source /status reads.
+	skillCommands, skillCommandWarnings := tui.SkillCommands(result.Skills.Loaded, tui.SkillDeps{Submit: app.SubmitLiteral, ReplaceEcho: app.ReplaceNextEcho})
 	app.AppendBanner(bannerLines(status)...)
 	for _, line := range bigBlockedEntryWarnings(result.Home, blockedEntries, guard.Blocked.FoldCase()) {
+		app.Append(line)
+	}
+	for _, line := range skillLines {
+		app.Append(line)
+	}
+	for _, line := range skillCommandWarnings {
 		app.Append(line)
 	}
 
@@ -323,6 +338,10 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	// model path and is left untouched.
 	app.SetModelPickerDeps(newModelPickerDeps(ctx, app, cache, active, chatgptAuth, result.Home, result.LaunchDir))
 
+	systemOneDeps := newSystemOneDeps(cache, func() string { return systemOne.status(app.ActiveStore()) })
+	systemOneDeps.OpenPicker = app.OpenSystemOnePicker
+	app.SetSystemOneDeps(systemOneDeps)
+
 	// path 4: a selectable model exists but none was determined at launch, so
 	// open the provider-aware picker now that its deps are installed. Carried as
 	// an explicit launch flag rather than implied by an empty active state, which alone
@@ -335,7 +354,15 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	renameHandler := tui.NewRenameHandler(tui.RenameDeps{SetTitle: newRenameTitleWrite(ctx, app)})
 	compact := &compactLease{}
 	defer func() { retErr = errors.Join(retErr, compact.end()) }()
-	reg := tui.BuildRegistry(map[string]tui.HandlerFunc{
+	entry := newPromptEntrypoint(ctx, app, turnCtl)
+	app.SetLiteralPrompt(func(input string, imageParts ...sessions.ContentPart) bool {
+		if compact.held() {
+			app.Notice("compaction is running; your input was kept")
+			return false
+		}
+		return entry(input, imageParts...)
+	})
+	reg := tui.MustNewRegistry(append(tui.BuildRegistry(map[string]tui.HandlerFunc{
 		"status":   tui.NewStatusHandler(status),
 		"context":  tui.NewContextHandler(contextSt),
 		"effort":   tui.NewEffortHandler(effortDeps),
@@ -364,12 +391,14 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 			ProjectDestinationsAllowed: projectBlockedDestinations,
 			Destinations:               tui.NewBlockedDestinationPresenter(app),
 		}),
-	})
+		"systemone": tui.NewSystemOneHandler(systemOneDeps),
+		"skills":    tui.NewSkillsHandler(skillsView(result)),
+	}).Commands(), skillCommands...))
 	// Install the same registry on the app so Tab name-completion matches
 	// the live command set the submit adapter dispatches through; without this
 	// App.registry stays nil and Tab is inert in production.
 	app.SetRegistry(reg)
-	submit := tui.NewSubmitFunc(reg, app, newPromptEntrypoint(ctx, app, turnCtl))
+	submit := tui.NewSubmitFunc(reg, app, entry)
 	app.SetSubmit(func(input string, imageParts ...sessions.ContentPart) bool {
 		if compact.held() {
 			app.Notice("compaction is running; your input was kept")
@@ -563,6 +592,36 @@ func queueBlockedNotices(app *tui.App, blocked *permissions.BlockedPaths, record
 	})
 }
 
+const systemOneParentDirReason = "parent_dir_error: the settings file may have changed; this session's selection is unchanged"
+
+func newSystemOneDeps(cache *config.Cache, status func() string) tui.SystemOneDeps {
+	choices := make([]tui.SystemOneChoice, len(systemone.Models))
+	for i, m := range systemone.Models {
+		choices[i] = tui.SystemOneChoice{Name: m.Name, Provider: m.Provider, ModelID: m.ModelID}
+	}
+	return tui.SystemOneDeps{
+		Current: cache.SystemOne,
+		Set: func(name string) error {
+			reason, _, err := cache.SetSystemOne(name)
+			switch {
+			case reason == config.ReasonParentDirError:
+				return errors.New(systemOneParentDirReason)
+			case reason != config.ReasonNone:
+				return errors.New(string(reason))
+			case err != nil:
+				return errors.New(string(config.ReasonWriteError))
+			}
+			return nil
+		},
+		Choices: choices,
+		HasKey: func(name string) bool {
+			entry, ok := cache.Provider(name)
+			return ok && entry.APIKey != ""
+		},
+		Status: status,
+	}
+}
+
 var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
 	return tui.SettingsDeps{
 		Lister: permissionsCacheLister{grants: authorizer.grants},
@@ -646,8 +705,8 @@ func newInteractiveAuthorizer(app *tui.App, cache *config.Cache, result *Bootstr
 // controller calls at dispatch. Each call reads the current run-scoped
 // interaction mode and active model and assembles the active mode's base
 // prompt, that model's special instructions, the environment block (today's date,
-// the launch directory, the project root, and the detected VCS), and the launch-loaded
-// AGENTS.md instructions into the single synthetic system message.
+// the launch directory, the project root, and the detected VCS), the launch-loaded skills
+// list, and the launch-loaded AGENTS.md instructions into the single synthetic system message.
 // Reading the mode and model per call is what lets a /mode or /model switch take effect
 // on the next turn rather than being frozen at startup; the date is read from the
 // system clock (host local timezone) so it stays current across a long-running session,
@@ -677,7 +736,7 @@ func activeModelIDs(active *model.ActiveState) (providerID, modelID string) {
 // the per-turn system-prompt assembler's single assembly point (fresh env per dispatch),
 // producing the exact system-message bytes BuildRequest sends.
 func assembleSystemMessageFrom(result *BootstrapResult, m mode.Mode, providerID, modelID string, env agentinstr.EnvironmentInputs) string {
-	return agentinstr.AssembleSystemMessage(m, providerID, modelID, env, result.AgentInstructions)
+	return agentinstr.AssembleSystemMessage(m, providerID, modelID, env, result.Skills.Loaded, result.AgentInstructions)
 }
 
 // turnEnvironmentInputs builds the environment-block inputs for one assembly:
@@ -698,15 +757,15 @@ func turnEnvironmentInputs(result *BootstrapResult) agentinstr.EnvironmentInputs
 // contextState is the production tui.ContextState. It reads the active provider/model
 // from the run-scoped model state and the session's token records live from the active
 // store — the same live sources /status reads — so /context reports current usage, not
-// a startup copy. No provider or catalog exposes a model context-window size yet, so
-// ContextWindow reports 0 (unknown) until a real source lands.
+// a startup copy.
 type contextState struct {
 	app    *tui.App
+	cache  *config.Cache
 	active *model.ActiveState
 }
 
-func newContextState(app *tui.App, active *model.ActiveState) contextState {
-	return contextState{app: app, active: active}
+func newContextState(app *tui.App, cache *config.Cache, active *model.ActiveState) contextState {
+	return contextState{app: app, cache: cache, active: active}
 }
 
 func (s contextState) Selection() (provider, modelID string) {
@@ -726,10 +785,9 @@ func (s contextState) Records() []sessions.Record {
 }
 
 // ContextWindow reports the active model's context-window size in tokens, or 0 when
-// codemeld does not know it. No configured provider or built-in catalog exposes a
-// window size today, so this returns 0 and /context renders an unknown window.
+// codemeld does not know it.
 func (s contextState) ContextWindow() int64 {
-	return 0
+	return s.cache.ContextWindow(s.Selection())
 }
 
 // newToolAdvertiser returns the per-turn advertised-tool source the turn controller
@@ -772,8 +830,7 @@ func newInteractiveToolAdvertiser(base func() []provider.ToolDefinition) func() 
 // It enumerates the registry's tools (deterministic List, already
 // name-sorted) and the product-authored `bash` definition, then sorts the whole set by
 // name so the provider request body is stable regardless of where `bash` falls relative
-// to the registry names. In Plan only read-only registry tools are advertised; Build and
-// Auto edits advertise all. `bash` is advertised in
+// to the registry names. `bash` is advertised in
 // every mode — its read/write intent is per-invocation, so Plan's shell
 // restriction is enforced by posture, not at advertise time — and it carries
 // no registry entry, since dispatch routes the pinned name to the shell path.
@@ -781,7 +838,7 @@ func advertisedTools(registry *tools.Registry, m mode.Mode) []provider.ToolDefin
 	var defs []provider.ToolDefinition
 	for _, t := range registry.List() {
 		meta := t.Advertise()
-		if m == mode.Plan && !meta.ReadOnly {
+		if m == mode.Plan && !meta.ReadOnly && t.Name() != subagenttool.ToolName {
 			continue
 		}
 		defs = append(defs, provider.ToolDefinition{
@@ -1080,6 +1137,33 @@ func newTitleOnComplete(app *tui.App, supportedEffort func(providerID, modelID s
 				return
 			}
 			app.RefreshSessionBadge(store)
+		})
+	}
+}
+
+func newContextWindowNotice(app *tui.App, cache *config.Cache) func(sessionID string, resp events.ModelResponse) {
+	warned := map[string]bool{}
+	return func(sessionID string, resp events.ModelResponse) {
+		window := cache.ContextWindow(resp.Provider, resp.ModelID)
+		threshold := window - window/10
+		if window <= 0 || resp.InputTokens < threshold {
+			return
+		}
+		amount := fmt.Sprint(resp.InputTokens)
+		if slices.Contains(resp.Anomaly, "usage_missing") {
+			amount = "at least " + amount
+		}
+		advice := "If individual requests approach the limit, check the server/model limit and match `context_windows`; the declaration does not raise capacity. For Ollama, check `OLLAMA_CONTEXT_LENGTH` or model `num_ctx`."
+		if entry, ok := cache.SelectableCatalog().Entry(resp.Provider); ok && entry.AuthKind == provider.AuthKindChatGPTSession {
+			advice = "If individual requests approach the limit, start a shorter or new session, or switch to a larger-window model."
+		}
+		text := fmt.Sprintf("%s/%s: %s recorded input tokens across rounds/retries; window %d, 90%% threshold %d. This is not one request's size. %s", resp.Provider, resp.ModelID, amount, window, threshold, advice)
+		app.RunBackgroundAfterDraw(func() error { return nil }, func(error) {
+			if active := app.ActiveStore(); active == nil || active.SessionID() != sessionID || warned[sessionID] {
+				return
+			}
+			app.Notice(text)
+			warned[sessionID] = true
 		})
 	}
 }
@@ -1399,7 +1483,7 @@ var recordExecutionCapability = func(ctx context.Context, store *sessions.Store,
 	return err
 }
 
-func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive *mode.ActiveState, cache *config.Cache, home string, guard securitystate.Policy) *confinement {
+func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive *mode.ActiveState, cache *config.Cache, home string, guard securitystate.Policy, inherited []string) *confinement {
 	lookupPath := os.Getenv("PATH")
 	if cache.ProgramLookup() == "strict" {
 		lookupPath = runner.FixedPATH
@@ -1412,10 +1496,11 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 		},
 		home:        home,
 		projectRoot: cache.ProjectRoot(),
-		writeRoots:  cache.WritableFolders(),
+		writable:    newWritableFoldersReader(cache),
 		blocked:     guard.Blocked,
 		lookupPath:  lookupPath,
 		lookupSet:   true,
 		tmpDir:      tmpDir,
+		inherited:   inherited,
 	}
 }

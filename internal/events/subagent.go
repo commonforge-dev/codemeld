@@ -86,9 +86,6 @@ func (p ChildAgentStart) validate() error {
 	if err := required(k, "model_id", p.ModelID); err != nil {
 		return err
 	}
-	if len(p.DeclaredPaths)+len(p.DeclaredDeletePaths)+len(p.DeclaredMovePairs)+len(p.DeclaredDirs) == 0 {
-		return fmt.Errorf("%s.declared_paths: required field is empty and none of declared_delete_paths, declared_move_pairs or declared_dirs names a path", k)
-	}
 	if err := childPathList(k, "declared_paths", p.DeclaredPaths, maxChildDeclaredPaths); err != nil {
 		return err
 	}

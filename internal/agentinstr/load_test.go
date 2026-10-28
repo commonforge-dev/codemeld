@@ -85,7 +85,7 @@ func loaded(content string) fakeFile {
 
 func load(t *testing.T, home, launchDir string, maxBytes int) []LoadEntry {
 	t.Helper()
-	got, err := LoadAgentInstructions(home, launchDir, maxBytes)
+	got, err := LoadAgentInstructions(home, launchDir, maxBytes, Selection{})
 	if err != nil {
 		t.Fatalf("LoadAgentInstructions() error = %v", err)
 	}
@@ -430,7 +430,7 @@ func TestLoadAgentInstructions_NonRegularCandidateIsABoundedUnreadableSkip(t *te
 			}
 			done := make(chan result, 1)
 			go func() {
-				entries, err := LoadAgentInstructions("", launchDir, 1<<20)
+				entries, err := LoadAgentInstructions("", launchDir, 1<<20, Selection{})
 				done <- result{entries, err}
 			}()
 
@@ -552,5 +552,212 @@ func TestLoadAgentInstructions_RegularCandidateStillLoadsThroughTheBoundedReader
 	entry := findByPath(t, load(t, "", launchDir, 1<<20), path)
 	if entry.Skipped || string(entry.Content) != content {
 		t.Fatalf("entry = %+v, want the file loaded with its exact bytes", entry)
+	}
+}
+
+func forbidIO(t *testing.T) {
+	t.Helper()
+	origStat, origLstat, origRead, origDir, origOpen := stat, lstat, readFile, readDir, openCandidate
+	t.Cleanup(func() {
+		stat, lstat, readFile, readDir, openCandidate = origStat, origLstat, origRead, origDir, origOpen
+	})
+	fail := func(path string) error {
+		t.Errorf("unexpected filesystem access to %s", path)
+		return &os.PathError{Op: "forbidden", Path: path, Err: syscall.EPERM}
+	}
+	stat = func(p string) (os.FileInfo, error) { return nil, fail(p) }
+	lstat = stat
+	readFile = func(p string, _ int) ([]byte, error) { return nil, fail(p) }
+	readDir = func(p string) ([]os.DirEntry, error) { return nil, fail(p) }
+	openCandidate = func(p string) (*os.File, error) { return nil, fail(p) }
+}
+
+func loadSel(t *testing.T, home, launchDir string, maxBytes int, sel Selection) []LoadEntry {
+	t.Helper()
+	got, err := LoadAgentInstructions(home, launchDir, maxBytes, sel)
+	if err != nil {
+		t.Fatalf("LoadAgentInstructions(%+v) error = %v", sel, err)
+	}
+	return got
+}
+
+func TestLoadAgentInstructions_InvalidSelectionErrorsBeforeAnyIO(t *testing.T) {
+	for name, sel := range map[string]Selection{
+		"unknown mode":           {Mode: SelectionMode(99)},
+		"negative mode":          {Mode: SelectionMode(-1), Path: "/abs/AGENTS.md"},
+		"explicit empty path":    {Mode: ExplicitFile},
+		"explicit relative path": {Mode: ExplicitFile, Path: "rel/AGENTS.md"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			forbidIO(t)
+			got, err := LoadAgentInstructions("/home/u", "/home/u/proj", 65536, sel)
+			if err == nil || got != nil {
+				t.Fatalf("got %+v, %v; want nil entries and an error", got, err)
+			}
+		})
+	}
+}
+
+func TestLoadAgentInstructions_DiscoverNoneReadsNothing(t *testing.T) {
+	forbidIO(t)
+	if got := loadSel(t, "/home/u", "/home/u/proj", 65536, Selection{Mode: DiscoverNone, Path: "ignored"}); len(got) != 0 {
+		t.Fatalf("got %+v, want no entries", got)
+	}
+}
+
+func TestLoadAgentInstructions_DiscoverAllIgnoresPath(t *testing.T) {
+	const home = "/home/u"
+	globalPath := filepath.Join(home, ".codemeld", "global", "AGENTS.md")
+	fs := &fakeFS{files: map[string]fakeFile{
+		globalPath:               loaded("global"),
+		"/home/u/proj/AGENTS.md": loaded("proj"),
+	}}
+	fs.install(t)
+
+	got := loadSel(t, home, "/home/u/proj", 65536, Selection{Mode: DiscoverAll, Path: "not/absolute"})
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2: %+v", len(got), got)
+	}
+	wantEntry(t, got[0], globalPath, LayerGlobal, 1)
+	wantEntry(t, got[1], "/home/u/proj/AGENTS.md", LayerWalked, 2)
+}
+
+func TestLoadAgentInstructions_DiscoverAllButLaunchDirDropsOnlyTheLaunchFile(t *testing.T) {
+	const home = "/home/u"
+	globalPath := filepath.Join(home, ".codemeld", "global", "AGENTS.md")
+	fs := &fakeFS{files: map[string]fakeFile{
+		globalPath:               loaded("global"),
+		"/home/u/AGENTS.md":      loaded("same"),
+		"/home/u/proj/AGENTS.md": loaded("same"),
+	}}
+	fs.install(t)
+
+	got := loadSel(t, home, "/home/u/proj", 65536, Selection{Mode: DiscoverAllButLaunchDir, Path: "not/absolute"})
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2: %+v", len(got), got)
+	}
+	wantEntry(t, got[0], globalPath, LayerGlobal, 1)
+	wantEntry(t, got[1], "/home/u/AGENTS.md", LayerWalked, 2)
+}
+
+func TestLoadAgentInstructions_DiscoverAllButLaunchDirKeepsGlobalWhenLaunchedThere(t *testing.T) {
+	const home = "/home/u"
+	globalDir := filepath.Join(home, ".codemeld", "global")
+	globalPath := filepath.Join(globalDir, "AGENTS.md")
+	fs := &fakeFS{files: map[string]fakeFile{globalPath: loaded("global")}}
+	fs.install(t)
+
+	got := loadSel(t, home, globalDir, 65536, Selection{Mode: DiscoverAllButLaunchDir})
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1: %+v", len(got), got)
+	}
+	wantEntry(t, got[0], globalPath, LayerGlobal, 1)
+}
+
+func TestLoadAgentInstructions_ExplicitFileReplacesDiscovery(t *testing.T) {
+	const home = "/home/u"
+	globalPath := filepath.Join(home, ".codemeld", "global", "AGENTS.md")
+	fs := &fakeFS{files: map[string]fakeFile{
+		globalPath:               loaded("global"),
+		"/home/u/proj/AGENTS.md": loaded("proj"),
+		"/elsewhere/custom.md":   loaded("custom"),
+		"/elsewhere/big.md":      {size: 11, content: []byte("01234567890")},
+		"/elsewhere/denied.md":   {size: 5, readErr: syscall.EACCES},
+		"/elsewhere/broken.md":   {statErr: syscall.EIO},
+	}}
+	fs.install(t)
+	explicit := func(p string) []LoadEntry {
+		return loadSel(t, home, "/home/u/proj", 10, Selection{Mode: ExplicitFile, Path: p})
+	}
+
+	t.Run("loaded and cleaned", func(t *testing.T) {
+		got := explicit("/elsewhere/sub/../custom.md")
+		if len(got) != 1 {
+			t.Fatalf("got %d entries, want 1: %+v", len(got), got)
+		}
+		wantEntry(t, got[0], "/elsewhere/custom.md", LayerWalked, 2)
+		if got[0].Skipped || string(got[0].Content) != "custom" {
+			t.Fatalf("entry = %+v, want loaded verbatim", got[0])
+		}
+	})
+	t.Run("global path is recorded as walked", func(t *testing.T) {
+		got := explicit(globalPath)
+		if len(got) != 1 {
+			t.Fatalf("got %d entries, want 1: %+v", len(got), got)
+		}
+		wantEntry(t, got[0], globalPath, LayerWalked, 2)
+	})
+	t.Run("missing is silently absent", func(t *testing.T) {
+		if got := explicit("/elsewhere/missing.md"); len(got) != 0 {
+			t.Fatalf("got %+v, want no entries", got)
+		}
+	})
+	t.Run("oversized", func(t *testing.T) {
+		got := explicit("/elsewhere/big.md")
+		if len(got) != 1 {
+			t.Fatalf("got %d entries, want 1: %+v", len(got), got)
+		}
+		wantEntry(t, got[0], "/elsewhere/big.md", LayerWalked, 2)
+		if !got[0].Skipped || got[0].SkipReason != SkipSizeLimit || got[0].ErrorCategory != "" || got[0].ErrorDetail != "" {
+			t.Fatalf("entry = %+v, want a bare size_limit skip", got[0])
+		}
+	})
+	for name, tc := range map[string]struct {
+		path string
+		cat  fserrors.Category
+	}{
+		"unreadable on read": {"/elsewhere/denied.md", fserrors.PermissionDenied},
+		"unreadable on stat": {"/elsewhere/broken.md", fserrors.IOError},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := explicit(tc.path)
+			if len(got) != 1 {
+				t.Fatalf("got %d entries, want 1: %+v", len(got), got)
+			}
+			wantEntry(t, got[0], tc.path, LayerWalked, 2)
+			if !got[0].Skipped || got[0].SkipReason != SkipUnreadable || got[0].ErrorCategory != tc.cat || got[0].ErrorDetail == "" {
+				t.Fatalf("entry = %+v, want an unreadable skip with category %q and detail", got[0], tc.cat)
+			}
+		})
+	}
+}
+
+func TestLoadAgentInstructions_ExplicitFileKeepsSymlinkAndNonRegularSemantics(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.md")
+	if err := os.WriteFile(target, []byte("linked"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	link := filepath.Join(dir, "link.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	fifo := filepath.Join(dir, "fifo.md")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	got := loadSel(t, "", dir, 1<<20, Selection{Mode: ExplicitFile, Path: link})
+	if len(got) != 1 || got[0].Path != link || got[0].Skipped || string(got[0].Content) != "linked" {
+		t.Fatalf("got %+v, want the symlink path loaded unresolved", got)
+	}
+
+	for name, path := range map[string]string{"fifo": fifo, "directory": t.TempDir()} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan []LoadEntry, 1)
+			go func() {
+				entries, _ := LoadAgentInstructions("", dir, 1<<20, Selection{Mode: ExplicitFile, Path: path})
+				done <- entries
+			}()
+			select {
+			case got := <-done:
+				if len(got) != 1 || got[0].Path != path || got[0].Layer != LayerWalked || got[0].LoadOrder != 2 ||
+					!got[0].Skipped || got[0].SkipReason != SkipUnreadable {
+					t.Fatalf("got %+v, want one walked/order-2 unreadable skip", got)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("explicit non-regular candidate blocked the load")
+			}
+		})
 	}
 }

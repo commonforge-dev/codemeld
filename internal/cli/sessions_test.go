@@ -1027,6 +1027,43 @@ func TestSessionsShow_KindFilter(t *testing.T) {
 	}
 }
 
+func TestSessionsShow_KindFilterSelectsSkillLoads(t *testing.T) {
+	const emptyDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	const abcDigest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+	path := filepath.Join(t.TempDir(), "fixture.json")
+	sess := buildFixtureSession("/some/folder")
+	sess.Records = append(sess.Records,
+		eventRecord("skill_loaded", map[string]any{
+			"name": "my-skill", "layer": "project", "via": "slash", "file": "", "bytes": 0, "sha256": emptyDigest,
+		}),
+		eventRecord("skill_loaded", map[string]any{
+			"name": "7zip", "layer": "global", "via": "tool", "file": "refs/guide.md", "bytes": 3, "sha256": abcDigest,
+		}),
+	)
+	writeFixtureSession(t, path, sess)
+
+	out := runShow(t, path, "--kind", "skill_loaded")
+	if !strings.Contains(out, "records: 2 of "+strconv.Itoa(len(sess.Records))) {
+		t.Fatalf("--kind skill_loaded header wrong:\n%s", out)
+	}
+	if got := strings.Count(out, "kind=skill_loaded"); got != 2 {
+		t.Fatalf("skill_loaded records = %d, want 2:\n%s", got, out)
+	}
+	for _, want := range []string{
+		`"name": "my-skill"`, `"via": "slash"`, `"file": ""`, `"sha256": "` + emptyDigest + `"`,
+		`"name": "7zip"`, `"layer": "global"`, `"via": "tool"`, `"file": "refs/guide.md"`, `"bytes": 3`, `"sha256": "` + abcDigest + `"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("--kind skill_loaded output missing %s:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"kind=slash_command", "kind=tool_exec_end", "role=user"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("--kind skill_loaded kept %q:\n%s", unwanted, out)
+		}
+	}
+}
+
 func TestSessionsShow_TurnFilter(t *testing.T) {
 	path, turnA, turnB := turnFixture(t)
 
@@ -2168,7 +2205,7 @@ func TestSessionsPermissions_Path_Report(t *testing.T) {
 		{"second identical prompt takes the second decision", "2. [denied] tool  Bash  scope=/proj"},
 		{"a stale decision and a mismatched scope leave the prompt pending", "3. [pending] tool  Curl  scope=/proj"},
 		{"a host prompt is scoped by host_scope", "4. [granted] host  web_search  scope=example.com"},
-		{"the tally counts every non-prompted source", "non-prompted authorizations: 4 (grant: 1, cache: 1, mode_auto: 2, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0)"},
+		{"the tally counts every non-prompted source", "non-prompted authorizations: 4 (grant: 1, cache: 1, mode_auto: 2, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2239,11 +2276,30 @@ func TestSessionsPermissions_NoPermissionEvents(t *testing.T) {
 
 	for _, want := range []string{
 		"prompts shown: 0",
-		"non-prompted authorizations: 0 (grant: 0, cache: 0, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0)",
+		"non-prompted authorizations: 0 (grant: 0, cache: 0, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)",
+		"skipped by reason: paused: 0, text: 0, blocked_paths_unavailable: 0, substitution: 0, blocked_path: 0, wrapper: 0, program_location: 0, shell_shape: 0\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("permissions output missing %q:\n%s", want, out)
 		}
+	}
+	report := decodeSystemOnePermissions(t, path)
+	wantSkipped := map[string]int{"paused": 0, "text": 0, "blocked_paths_unavailable": 0, "substitution": 0, "blocked_path": 0, "wrapper": 0, "program_location": 0, "shell_shape": 0}
+	if !reflect.DeepEqual(report.SystemOne.SkippedReasons, wantSkipped) {
+		t.Fatalf("system_one.skipped_reasons = %v, want all zeros %v", report.SystemOne.SkippedReasons, wantSkipped)
+	}
+}
+
+func TestSessionsPermissions_UnknownSkippedReasonFailsTheLoad(t *testing.T) {
+	path := writeSession(t, "unknown-skipped", []sessions.Record{
+		eventRecord(events.KindPermissionSystemOneCheck, systemOneCheck("literal", "ls", "openrouter", "jev/jev-1", "skipped", "teapot", "", 0, 0)),
+	})
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"codemeld", "sessions", "permissions", path}, &stdout, &stderr); code == 0 {
+		t.Fatalf("exit = 0, want a load failure (stdout=%q)", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot be loaded") || stdout.Len() != 0 {
+		t.Fatalf("stderr = %q, stdout = %q; want only the cannot be loaded failure", stderr.String(), stdout.String())
 	}
 }
 
@@ -2437,7 +2493,7 @@ func TestSessionsPermissions_ClassifiesGrantsAndEscalations(t *testing.T) {
 				`grant=session grant_host=docs.example.com grant_subject="web_fetch"`,
 		},
 		{"summary counts", "prompts shown: 9 (granted: 7, denied: 1, pending: 1)"},
-		{"the tally counts every non-prompted source", "non-prompted authorizations: 3 (grant: 1, cache: 1, mode_auto: 1, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0)"},
+		{"the tally counts every non-prompted source", "non-prompted authorizations: 3 (grant: 1, cache: 1, mode_auto: 1, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)"},
 		{"explicit revocations are listed and counted apart from the prompts", "explicit revocation requests: 2"},
 		{
 			"a path revocation names the stored grant's own identity and its source",
@@ -4035,6 +4091,13 @@ func TestSessionsHelp(t *testing.T) {
 				"declared_command",
 				"open_read",
 				"confined",
+				"system_one_check",
+				"System One checks",
+				"skipped checks by reason too: paused",
+				"structural reason (text, blocked_paths_unavailable, substitution, blocked_path,",
+				"wrapper, program_location, shell_shape) when the command could not qualify and",
+				"no model was asked",
+				"t_read_only",
 				"blocked_path",
 				"protected_state",
 				"--json",
@@ -4055,6 +4118,7 @@ func TestSessionsHelp(t *testing.T) {
 				"codemeld sessions permissions <session-id|path> [--json]",
 				"granted, denied, or pending",
 				"scope escalation",
+				"System One checks",
 				"explicit revocation requests",
 			},
 			notWants: []string{"codemeld sessions doctor", "inspect recorded sessions"},
@@ -4085,6 +4149,8 @@ func TestSessionsHelp(t *testing.T) {
 				"Tool-call", "message, event, and compaction records", "compaction record",
 				"--kind", "--turn", "--last", "--json",
 				"records: <selected> of <total>",
+				"Each skill load is a skill_loaded event",
+				"--kind skill_loaded lists only the skill loads.",
 			},
 		},
 		{
@@ -4266,7 +4332,7 @@ func TestSessionsPermissions_CountsDeclaredScope(t *testing.T) {
 	path := writeSession(t, "declared", records)
 
 	text := runPermissions(t, path)
-	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 2, declared_command: 0, open_read: 0, confined: 0)"; !strings.Contains(text, want) {
+	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 2, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)"; !strings.Contains(text, want) {
 		t.Fatalf("permissions text missing %q:\n%s", want, text)
 	}
 
@@ -4299,7 +4365,7 @@ func TestSessionsPermissions_CountsDeclaredCommand(t *testing.T) {
 	path := writeSession(t, "declared-command", records)
 
 	text := runPermissions(t, path)
-	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 2, open_read: 0, confined: 0)"; !strings.Contains(text, want) {
+	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 2, open_read: 0, confined: 0, system_one_check: 0)"; !strings.Contains(text, want) {
 		t.Fatalf("permissions text missing %q:\n%s", want, text)
 	}
 
@@ -4332,7 +4398,7 @@ func TestSessionsPermissions_CountsOpenRead(t *testing.T) {
 	path := writeSession(t, "open-read", records)
 
 	text := runPermissions(t, path)
-	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 2, confined: 0)"; !strings.Contains(text, want) {
+	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 2, confined: 0, system_one_check: 0)"; !strings.Contains(text, want) {
 		t.Fatalf("permissions text missing %q:\n%s", want, text)
 	}
 
@@ -4360,7 +4426,7 @@ func TestSessionsPermissions_CountsConfined(t *testing.T) {
 	path := writeSession(t, "confined", records)
 
 	text := runPermissions(t, path)
-	if want := "non-prompted authorizations: 3 (grant: 0, cache: 0, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 3)"; !strings.Contains(text, want) {
+	if want := "non-prompted authorizations: 3 (grant: 0, cache: 0, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 3, system_one_check: 0)"; !strings.Contains(text, want) {
 		t.Fatalf("permissions text missing %q:\n%s", want, text)
 	}
 
@@ -4398,7 +4464,7 @@ func TestSessionsPermissions_CountsRefusals(t *testing.T) {
 
 	text := runPermissions(t, path)
 	for _, want := range []string{
-		"non-prompted authorizations: 1 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0)",
+		"non-prompted authorizations: 1 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)",
 		"refused before approval: 3 (blocked_path: 2, protected_state: 1)",
 	} {
 		if !strings.Contains(text, want) {
@@ -5209,5 +5275,176 @@ func TestSessionsListHelp(t *testing.T) {
 		if strings.Contains(out, "codemeld sessions doctor <session-id|path>  ") {
 			t.Errorf("%v printed the parent help:\n%s", args, out)
 		}
+	}
+}
+
+func systemOneFloat(v float64) *float64 { return &v }
+
+func systemOneCheck(subjectKind, subject, provider, model, outcome, reason, effect string, pReadOnly, tReadOnly float64) events.PermissionSystemOneCheck {
+	p := events.PermissionSystemOneCheck{
+		SubjectKind: subjectKind, Subject: subject, PathScope: auditProj,
+		Provider: provider, ModelID: model, Outcome: outcome, Reason: reason, Effect: effect, DurationMs: 300,
+	}
+	if outcome == "allowed" || outcome == "declined" {
+		p.PReadOnly, p.PSecrets, p.PCode = systemOneFloat(pReadOnly), systemOneFloat(0), systemOneFloat(0.01)
+		p.TReadOnly, p.TSecrets, p.TCode = systemOneFloat(tReadOnly), systemOneFloat(0.5), systemOneFloat(0)
+	}
+	return p
+}
+
+type systemOnePermissionsJSON struct {
+	NonPrompted map[string]int `json:"non_prompted"`
+	SystemOne   struct {
+		Outcomes       map[string]int `json:"outcomes"`
+		FailureReasons map[string]int `json:"failure_reasons"`
+		SkippedReasons map[string]int `json:"skipped_reasons"`
+		Allowed        []struct {
+			Subject   string  `json:"subject"`
+			ModelID   string  `json:"model_id"`
+			PReadOnly float64 `json:"p_read_only"`
+			TReadOnly float64 `json:"t_read_only"`
+		} `json:"allowed"`
+	} `json:"system_one"`
+}
+
+func decodeSystemOnePermissions(t *testing.T, path string) systemOnePermissionsJSON {
+	t.Helper()
+	out := runPermissions(t, path, "--json")
+	var report systemOnePermissionsJSON
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("--json output is not one valid JSON document: %v\n%s", err, out)
+	}
+	return report
+}
+
+func TestSessionsPermissions_SystemOneChecksFromSessionFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "system-one.json")
+	store := sessions.New(path, &sessions.Session{Metadata: sessions.Metadata{
+		ID: ids.NewV7(), Folder: "/some/folder", StartedAt: fixtureTime, UpdatedAt: fixtureTime, SchemaVersion: 1,
+	}})
+	checks := []events.PermissionSystemOneCheck{
+		systemOneCheck("direct", "git status", "openrouter", "jev/jev-1", "allowed", "", "read_only", 0.97, 0.9),
+		systemOneCheck("direct", "rm -rf build", "venice", "jev/jev-2", "declined", "", "deletes", 0.1, 0.8),
+		systemOneCheck("literal", "ls | wc -l", "openrouter", "jev/jev-1", "failed", "timeout", "", 0, 0),
+		systemOneCheck("direct", "make", "openrouter", "jev/jev-1", "skipped", "paused", "", 0, 0),
+		systemOneCheck("literal", "bash --version | head -1", "openrouter", "jev/jev-1", "skipped", "wrapper", "", 0, 0),
+		systemOneCheck("literal", "type jq bats | head", "openrouter", "jev/jev-1", "skipped", "wrapper", "", 0, 0),
+		systemOneCheck("literal", "echo $(id)", "openrouter", "jev/jev-1", "skipped", "substitution", "", 0, 0),
+		systemOneCheck("direct", "nosuchprogram x", "openrouter", "jev/jev-1", "skipped", "program_location", "", 0, 0),
+	}
+	for _, p := range checks {
+		if err := events.EmitSystemOneCheckAttributed(store, p, ""); err != nil {
+			t.Fatalf("EmitSystemOneCheckAttributed(%s) error = %v", p.Outcome, err)
+		}
+	}
+	if err := events.EmitMatchedIdentity(store, "direct", "git status", auditProj, "", "", "once", "system_one_check", "", ""); err != nil {
+		t.Fatalf("EmitMatchedIdentity() error = %v", err)
+	}
+	if _, _, err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	text := runPermissions(t, path)
+	for _, want := range []string{
+		"non-prompted authorizations: 1 (grant: 0, cache: 0, mode_auto: 0, declared_scope: 0, declared_command: 0, open_read: 0, confined: 0, system_one_check: 1)",
+		"System One checks: 8 (allowed: 1, declined: 1, failed: 1, skipped: 5)",
+		"failed by reason: credits: 0, auth: 0, rate_limited: 0, timeout: 1, server: 0, network: 0, malformed: 0, no_key: 0\n" +
+			"skipped by reason: paused: 1, text: 0, blocked_paths_unavailable: 0, substitution: 1, blocked_path: 0, wrapper: 2, program_location: 1, shell_shape: 0\n",
+		"  1. [allowed] \"git status\"  model=\"jev/jev-1\"  p_read_only=0.97  t_read_only=0.9\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("permissions text missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "rm -rf build") || strings.Contains(text, "  2. [allowed]") {
+		t.Fatalf("a check that was not allowed was listed as allowed:\n%s", text)
+	}
+
+	report := decodeSystemOnePermissions(t, path)
+	total := 0
+	for _, n := range report.NonPrompted {
+		total += n
+	}
+	if report.NonPrompted["system_one_check"] != 1 || total != 1 {
+		t.Fatalf("non_prompted = %v, want exactly one system_one_check authorization", report.NonPrompted)
+	}
+	wantOutcomes := map[string]int{"allowed": 1, "declined": 1, "failed": 1, "skipped": 5}
+	if !reflect.DeepEqual(report.SystemOne.Outcomes, wantOutcomes) {
+		t.Fatalf("system_one.outcomes = %v, want %v", report.SystemOne.Outcomes, wantOutcomes)
+	}
+	wantReasons := map[string]int{"credits": 0, "auth": 0, "rate_limited": 0, "timeout": 1, "server": 0, "network": 0, "malformed": 0, "no_key": 0}
+	if !reflect.DeepEqual(report.SystemOne.FailureReasons, wantReasons) {
+		t.Fatalf("system_one.failure_reasons = %v, want %v", report.SystemOne.FailureReasons, wantReasons)
+	}
+	wantSkipped := map[string]int{"paused": 1, "text": 0, "blocked_paths_unavailable": 0, "substitution": 1, "blocked_path": 0, "wrapper": 2, "program_location": 1, "shell_shape": 0}
+	if !reflect.DeepEqual(report.SystemOne.SkippedReasons, wantSkipped) {
+		t.Fatalf("system_one.skipped_reasons = %v, want %v", report.SystemOne.SkippedReasons, wantSkipped)
+	}
+	allowed := report.SystemOne.Allowed
+	if len(allowed) != 1 || allowed[0].Subject != "git status" || allowed[0].ModelID != "jev/jev-1" ||
+		allowed[0].PReadOnly != 0.97 || allowed[0].TReadOnly != 0.9 {
+		t.Fatalf("system_one.allowed = %+v, want the one allowed git status check", allowed)
+	}
+}
+
+func TestSessionsPermissions_SystemOneChecksAreNotPairedWithMatches(t *testing.T) {
+	matched := func() sessions.Record {
+		return eventRecord(events.KindPermissionMatched, events.PermissionMatched{
+			SubjectKind: "direct", Subject: "git status", PathScope: auditProj, Outcome: "once", OutcomeSource: "system_one_check",
+		})
+	}
+	path := writeSession(t, "system-one-interleaved", []sessions.Record{
+		eventRecord(events.KindPermissionSystemOneCheck, systemOneCheck("direct", "git status", "openrouter", "jev/jev-1", "allowed", "", "read_only", 0.95, 0.9)),
+		eventRecord(events.KindPermissionSystemOneCheck, systemOneCheck("direct", "git status", "venice", "jev/jev-2", "allowed", "", "read_only", 0.99, 0.97)),
+		eventRecord(events.KindPermissionSystemOneCheck, systemOneCheck("direct", "curl x", "openrouter", "jev/jev-1", "declined", "", "network", 0.2, 0.9)),
+		matched(),
+		eventRecord(events.KindPermissionSystemOneCheck, systemOneCheck("direct", "ls", "openrouter", "jev/jev-1", "failed", "network", "", 0, 0)),
+		matched(),
+		eventRecord(events.KindPermissionSystemOneCheck, systemOneCheck("direct", "ls", "openrouter", "jev/jev-1", "skipped", "paused", "", 0, 0)),
+	})
+
+	text := runPermissions(t, path)
+	first := strings.Index(text, "  1. [allowed] \"git status\"  model=\"jev/jev-1\"  p_read_only=0.95  t_read_only=0.9\n")
+	second := strings.Index(text, "  2. [allowed] \"git status\"  model=\"jev/jev-2\"  p_read_only=0.99  t_read_only=0.97\n")
+	if first < 0 || second < first {
+		t.Fatalf("allowed rows missing or out of record order:\n%s", text)
+	}
+	if want := "confined: 0, system_one_check: 2)"; !strings.Contains(text, want) {
+		t.Fatalf("permissions text missing %q:\n%s", want, text)
+	}
+
+	report := decodeSystemOnePermissions(t, path)
+	if report.NonPrompted["system_one_check"] != 2 {
+		t.Fatalf("non_prompted.system_one_check = %d, want 2", report.NonPrompted["system_one_check"])
+	}
+	if got := report.SystemOne.Allowed; len(got) != 2 || got[0].ModelID != "jev/jev-1" || got[1].ModelID != "jev/jev-2" {
+		t.Fatalf("system_one.allowed = %+v, want both git status rows in record order", got)
+	}
+}
+
+func TestSessionsPermissions_SystemOneAllowedRowEscapesControls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "system-one-controls.json")
+	store := sessions.New(path, &sessions.Session{Metadata: sessions.Metadata{
+		ID: ids.NewV7(), Folder: "/some/folder", StartedAt: fixtureTime, UpdatedAt: fixtureTime, SchemaVersion: 1,
+	}})
+	subject, model := "git status\nprintf done", "jev/\x1b[2Jjev-1"
+	if err := events.EmitSystemOneCheckAttributed(store, systemOneCheck("direct", subject, "openrouter", model, "allowed", "", "read_only", 0.97, 0.9), ""); err != nil {
+		t.Fatalf("EmitSystemOneCheckAttributed() error = %v", err)
+	}
+	if _, _, err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	text := runPermissions(t, path)
+	if want := `  1. [allowed] "git status\nprintf done"  model="jev/\x1b[2Jjev-1"  p_read_only=0.97  t_read_only=0.9` + "\n"; !strings.Contains(text, want) {
+		t.Fatalf("permissions text missing one escaped allowed line %q:\n%s", want, text)
+	}
+	if strings.Contains(text, "\x1b") || strings.Contains(text, "\nprintf done") {
+		t.Fatalf("permissions text carries a raw control from the allowed row:\n%q", text)
+	}
+
+	allowed := decodeSystemOnePermissions(t, path).SystemOne.Allowed
+	if len(allowed) != 1 || allowed[0].Subject != subject || allowed[0].ModelID != model {
+		t.Fatalf("system_one.allowed = %+v, want the original subject and model_id", allowed)
 	}
 }

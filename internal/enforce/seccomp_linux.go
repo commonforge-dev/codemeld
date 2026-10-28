@@ -98,10 +98,11 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 		"clone3": {bpf.RetConstant{Val: unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)}},
 		"socketpair": {
 			loadArg(0),
-			bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.AF_UNIX, SkipTrue: 3},
+			bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.AF_UNIX, SkipTrue: 4},
 			loadArg(1),
 			bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: ^uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)},
-			bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.SOCK_STREAM, SkipTrue: 1},
+			bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.SOCK_STREAM, SkipTrue: 2},
+			bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.SOCK_SEQPACKET, SkipTrue: 1},
 			eperm,
 			bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW},
 		},

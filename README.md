@@ -4,7 +4,7 @@
 
 **codemeld** is a coding assistant you run in your own projects, from your own terminal. You choose the model provider and the version-control system, you decide what leaves your machine, and you approve a command once instead of every time it's written slightly differently.
 
-> **Status:** v0.4.6 is the latest release; v0.4.5 was the first public release. See [the roadmap](ROADMAP.md) for what's planned.
+> **Status:** v0.4.7 is the latest release. See [the roadmap](ROADMAP.md) for what's planned.
 
 ---
 
@@ -32,14 +32,16 @@ A mode sets how much the agent may do before it stops to ask. It never replaces 
 |---|---|---|
 | **Plan** | Read, search, and plan. | Denied. Write tools aren't offered to the model, and mutating requests to codemeld's own tools are refused without a prompt. On a host with confined shell commands (below), Plan's shell commands run inside the boundary, where writes fail. |
 | **Build** (default) | Normal work. | Prompted, unless an existing grant covers the request. |
-| **Auto edits** | Continuous work with fewer interruptions. | Auto-approved inside your project: creating, editing, making folders, and moving files. Creating, editing, and making folders are also auto-approved inside a declared `writable_folders` entry (see below). Deletes, version-control changes, and any other change outside the project still prompt. |
+| **Auto edits** | Continuous work with fewer interruptions. | Auto-approved inside your project: creating, editing, making folders, and moving files. Creating, editing, and making folders are also auto-approved inside a declared `writable_folders` entry (see below). With shell commands confined and no settings file broken, deleting is auto-approved inside the project and declared folders too. Version-control changes and any other change outside the project still prompt. |
 
 - Switch with `/mode <plan|build|auto-edits>`, or press shift+tab to cycle through them.
-- Auto edits covers only those four operations, and only when the target, after symlinks are resolved, is inside the project, or, for creating, editing, and making folders, inside a folder declared in `writable_folders` while shell commands are confined (below) and no settings file is broken. A move needs both ends inside the project; a declared folder never auto-approves a delete or a move.
+- Auto edits covers only those four operations, plus deleting while shell commands are confined (below) and no settings file is broken, and only when the target, after symlinks are resolved, is inside the project, or, for creating, editing, making folders, and deleting, inside a folder declared in `writable_folders` while shell commands are confined and no settings file is broken. Deleting the project folder or a declared folder itself still prompts. A move needs both ends inside the project; a declared folder never auto-approves a move.
 - Auto-edit approvals are per call. Nothing is stored, so switching back to Build applies from the next tool call.
 - Shell commands follow their own rules. On a supported Linux host they run inside a boundary (below). Elsewhere they prompt, and Plan refuses mutating ones.
 
-Full rules: [docs/permissions.md](docs/permissions.md).
+What codemeld asks and when: [docs/approvals.md](docs/approvals.md).
+
+**System One check (opt-in, off by default).** In Plan and Auto edits, codemeld can ask a small decision model whether a shell command that would otherwise prompt only reads, and run that one command without asking when the model is confident. It is never used in Build, never for network access, deletion, or history rewrites, and it saves no approval. Turning it on sends the checked command text to the model's provider and accepts a model's judgment in place of a proof. How the models were chosen and the risks: [docs/system-one.md](docs/system-one.md).
 
 ### Confined shell commands (Linux)
 
@@ -47,10 +49,10 @@ On Linux amd64 and arm64 hosts with Landlock ABI 3 or newer (kernel 6.2+) that p
 
 - **Plan:** no filesystem writes (except `/dev/null`) and no network. A blocked write or network call simply fails.
 - **Auto edits:** writes are limited to the project's top-level files and folders (not `.codemeld`, and not symlinks that leave the project), plus a private temp folder for the session and each folder declared in `writable_folders`. Commands get that private folder as `TMPDIR`; codemeld adds no other temp grant, so `/tmp` and the launch `$TMPDIR` are writable only when an effective declared `writable_folders` entry covers where they resolve, or when they resolve inside a granted project top-level entry (never the project root itself, `.codemeld`, or an entry resolving outside the project), and blocked and protected paths stay carved out. Approving network access for one command opens sockets for that command only.
-- **Every confined command** can read the filesystem except `~/.codemeld` and your blocked paths, and cannot write `~/.codemeld` or `<project>/.codemeld`.
+- **Every confined command** can read the filesystem except `~/.codemeld` and your blocked paths, and cannot write `~/.codemeld` or `<project>/.codemeld`. The one exception: it may read and run files in `~/.codemeld/skills`, under conditions listed in [docs/skills.md](docs/skills.md#global-skills-and-the-sandbox). Those files stay unwritable, and codemeld's file tools still refuse them.
 - **Build** shell commands always run outside the boundary, with ordinary prompts.
 
-The status bar shows `sandbox: on`, `sandbox: off`, or `sandbox: unavailable`. `unavailable` has two meanings. If the self-test failed or the host is unsupported, the boundary is off, so Plan and Auto edits use ordinary permission behavior: prompts, and Plan's usual refusals. If the self-test passed but a settings file's blocked-path list is broken, commands stay confined, and every shell command asks until the file is fixed, except one you already denied this turn (see [the broken-settings case](SECURITY.md#broken-settings) for version-control tool calls). `/status` shows the reason. What the boundary does not cover is in [SECURITY.md](SECURITY.md); fallback cases are in [docs/architecture.md](docs/architecture.md).
+The status bar shows `sandbox: on`, `sandbox: off`, or `sandbox: unavailable`. `unavailable` has two meanings. If the self-test failed or the host is unsupported, the boundary is off, so Plan and Auto edits use ordinary permission behavior: prompts, and Plan's usual refusals. If the self-test passed but a settings file's blocked-path list is broken, commands stay confined, and every shell command asks until the file is fixed, except one you already denied this turn (see [the broken-settings case](SECURITY.md#broken-settings) for version-control tool calls). `/status` shows the reason. What the boundary does not cover is in [SECURITY.md](SECURITY.md); fallback cases are in [docs/architecture.md](docs/architecture.md#what-the-capability-authorizes).
 
 ---
 
@@ -72,7 +74,7 @@ See [Releases](https://github.com/commonforge-dev/codemeld/releases)
 
 ### With the Go toolchain
 
-Needs the Go version on the `go` line of `go.mod` (currently 1.26.9).
+Needs the Go version on the `go` line of `go.mod`.
 
 ```sh
 go install codemeld.dev/codemeld/cmd/codemeld@latest
@@ -126,13 +128,17 @@ Then follow the steps below, using `./codemeld` in place of `codemeld`.
 
 By default, codemeld reads only the `.codemeld/settings.yaml` in the folder you launch from. To let it search upward for the nearest one, set `discovery.boundary: project-root` in the global settings file; project files reject that key.
 
+### Skills
+
+A skill is a folder with a `SKILL.md` of instructions, in `~/.codemeld/skills/<name>/` or `<project>/.codemeld/skills/<name>/`. Start one with `/<name>` in the app, or let the model load it when a request matches its description. How to write one and how codemeld treats it: [docs/skills.md](docs/skills.md).
+
 ---
 
 ## Learn more
 
 - [Roadmap](ROADMAP.md): released versions and planned work
-- [Architecture notes](docs/architecture.md): cross-cutting constraints
-- [Permissions](docs/permissions.md): the full rules behind the modes and prompts
+- [Architecture](docs/architecture.md): the main parts, platform support, the sandbox, privacy, and the rules a change must keep
+- [Permissions](docs/approvals.md): what codemeld does without asking, what it asks about, and what it refuses
 - [Tech stack](docs/tech-stack.md): libraries and tooling choices
 - [Design rationale](docs/RATIONALE.md): what existing tools got wrong, in the author's view
 

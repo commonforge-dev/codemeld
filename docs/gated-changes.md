@@ -21,7 +21,7 @@ output; a "fixture" is the file that copy lives in.)
 
 **Files**: `internal/agentinstr/snapshot_test.go`, plus the saved copies committed in
 `internal/agentinstr/testdata/snapshots/` (`plan.txt`, `build.txt`, `auto_edits.txt`,
-`base_env_only.txt`, `with_agents.txt`, `special_latex.txt`) — that directory is the
+`base_env_only.txt`, `with_agents.txt`, `special_latex.txt`, `with_skills.txt`) — that directory is the
 authoritative set.
 
 **What makes it fail**: any wording change to a base prompt (`internal/agentinstr/baseprompts/shared.md`,
@@ -37,8 +37,14 @@ Two of the saved copies, `base_env_only.txt` and `with_agents.txt`, also pin how
 populated loaded `AGENTS.md` are assembled into the message — so a change to that assembly fires the
 gate too, even though the `AGENTS.md` wording itself belongs to the project, not the product.
 
-**What it does not cover**: this gate watches exactly two product-authored sources — the five
-embedded Markdown files and the generated environment block — because those are the normal-turn
+`with_skills.txt` pins the skills list that sits between the environment block and `AGENTS.md`:
+its heading, the instruction sentence telling the model to call the skill tool, and the
+`- name: description` lines, all written by `skillsSection` in `internal/agentinstr/assemble.go`.
+A change to that wording or to where the list goes fires the gate. The skill names and
+descriptions themselves belong to whoever wrote the skill, not the product.
+
+**What it does not cover**: this gate watches exactly three product-authored sources — the five
+embedded Markdown files, the generated environment block, and the skills-list wording — because those are the normal-turn
 assembly text. The title and compaction instructions are product-authored, editable instruction text
 as well; they are simply inline Go in separate requests. Their focused tests, and the actual
 advertised-tool coverage, are separate from this gate:

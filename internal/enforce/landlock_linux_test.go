@@ -189,6 +189,11 @@ func autoPolicy(roots, noWrite []string, blocked ...string) Policy {
 	return Policy{Mode: ModeAutoEdits, BlockedPaths: append([]string{floor}, blocked...), WriteRoots: roots, NoWritePaths: noWrite, TmpDir: "/tmp"}
 }
 
+func withReadRoots(p Policy, roots ...string) Policy {
+	p.ReadRoots = roots
+	return p
+}
+
 func TestLandlockRules(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -367,6 +372,42 @@ func TestLandlockRules(t *testing.T) {
 			extra:  []string{"/dev/shm/x/y/"},
 			policy: autoPolicy([]string{"/dev/shm/x/y", "/dev/shm/x"}, nil),
 			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/dev/shm/x:RW"},
+		},
+		{
+			name: "real skills folder gets one read rule inside the floor",
+			extra: []string{"/home/u/.codemeld/skills/pdf/fill.py", "/home/u/.codemeld/skills/leak -> /home/u/.codemeld/sessions",
+				"/home/u/.codemeld/sessions/s.json", "/home/u/.codemeld/settings.yaml"},
+			policy: withReadRoots(planPolicy(), "/home/u/.codemeld/skills"),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N", "/home/u/.codemeld/skills:R"},
+		},
+		{
+			name:   "missing skills folder",
+			policy: withReadRoots(planPolicy(), "/home/u/.codemeld/skills"),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N"},
+		},
+		{
+			name:   "skills is a file",
+			extra:  []string{"/home/u/.codemeld/skills"},
+			policy: withReadRoots(planPolicy(), "/home/u/.codemeld/skills"),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N"},
+		},
+		{
+			name:   "skills symlinked to the floor",
+			extra:  []string{"/home/u/.codemeld/skills -> /home/u/.codemeld"},
+			policy: withReadRoots(planPolicy(), "/home/u/.codemeld/skills"),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N"},
+		},
+		{
+			name:   "skills symlinked to home",
+			extra:  []string{"/home/u/.codemeld/skills -> /home/u"},
+			policy: withReadRoots(planPolicy(), "/home/u/.codemeld/skills"),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N"},
+		},
+		{
+			name:   "auto skills folder gets the same read rule and no write",
+			extra:  []string{"/home/u/.codemeld/skills/pdf/fill.py", "/home/u/.codemeld/sessions/s.json"},
+			policy: withReadRoots(autoPolicy(nil, nil), "/home/u/.codemeld/skills"),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:RW", "/dev/null:N", "/home/u/.codemeld/skills:R"},
 		},
 	}
 	for _, c := range cases {

@@ -186,6 +186,10 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					"selected records machine-readably, with tool-call arguments unescaped into JSON\n" +
 					"values and an argument that is not valid JSON carried raw with the same invalid\n" +
 					"flag the printed form uses.\n\n" +
+					"Each skill load is a skill_loaded event: the skill name, its layer (global or\n" +
+					"project), how it was loaded (tool or slash), the file read (empty for SKILL.md),\n" +
+					"and the byte count and SHA-256 digest of the loaded content, never the text\n" +
+					"itself. --kind skill_loaded lists only the skill loads.\n\n" +
 					"The filters compose in one invocation, and a record keeps the number of its\n" +
 					"position in the whole session. Whenever a filter is active the header reads\n" +
 					"'records: <selected> of <total>', so a filter that matched nothing is visibly a\n" +
@@ -236,11 +240,21 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					"hit, a mode posture, a run's declared file scope, a project's declared\n" +
 					"command-list hit, or a read of an explicitly named path allowed without asking —\n" +
 					"are never listed as prompts. They are counted at the end by their source (grant,\n" +
-					"cache, mode_auto, declared_scope, declared_command, open_read, confined) so the\n" +
-					"prompt count has a denominator.\n\n" +
+					"cache, mode_auto, declared_scope, declared_command, open_read, confined,\n" +
+					"system_one_check) so the prompt count has a denominator.\n\n" +
 					"Refusals made before any approval, by a blocked path (blocked_path) or a protected\n" +
 					"settings file (protected_state), are counted at the end by source, apart from the\n" +
 					"non-prompted authorizations.\n\n" +
+					"System One checks, where a configured model judged a prompted shell command,\n" +
+					"are counted by outcome (allowed, declined, failed, skipped). Failed checks are\n" +
+					"broken down by reason, and skipped checks by reason too: paused, when an earlier\n" +
+					"credits or authentication failure paused the check for the session, or a\n" +
+					"structural reason (text, blocked_paths_unavailable, substitution, blocked_path,\n" +
+					"wrapper, program_location, shell_shape) when the command could not qualify and\n" +
+					"no model was asked. Each allowed command is listed with its model, p_read_only,\n" +
+					"and the t_read_only threshold applied, so its margin can be reviewed. An allowed\n" +
+					"check is counted once among the non-prompted authorizations, under\n" +
+					"system_one_check.\n\n" +
 					"The report ends with the explicit revocation requests: the grants a human removed\n" +
 					"through the /settings revoke control, each naming the stored grant's own kind,\n" +
 					"subject, scope, and grant kind. These are read only from recorded revocation\n" +
@@ -344,7 +358,22 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					"reported as availability, not as a bare number: an absent cached_input_tokens\n" +
 					"means the provider did not report it, so the total is exact only when every\n" +
 					"contributing response reported a non-partial value, a lower bound when any\n" +
-					"response omitted it or marked it partial, and unavailable when none reported it.\n\n" +
+					"response omitted it or marked it partial, and unavailable when none reported it.\n" +
+					"Provider-reported cost (cost_usd) is summed and reported the same way, scoped to\n" +
+					"the recorded responses: exact only when every recorded response reported a\n" +
+					"non-partial cost. Cost is assumed to be USD, following OpenRouter's convention;\n" +
+					"every provider's reported cost is summed and its currency is neither verified\n" +
+					"nor converted.\n\n" +
+					"The approval_* totals measure time spent waiting on permission prompts, from\n" +
+					"permission_prompt_wait records. approval_wait_ms is the length of the union of the\n" +
+					"recorded wait intervals, so overlapping waits are counted once, not summed.\n" +
+					"approval_requests sums the requests submitted to each prompt call; it is not a\n" +
+					"count of questions shown, since one question can cover several requests.\n" +
+					"approval_waits_cancelled counts cancelled waits. Failed waits count toward both\n" +
+					"totals and have no separate failure count, so a wait that was not cancelled was\n" +
+					"not necessarily answered. With no wait records all three are 0 and the text\n" +
+					"report omits the permission-prompt wait line; that means no wait was recorded,\n" +
+					"not that none happened.\n\n" +
 					"A session with no execution records, no rounds, or no model responses reports\n" +
 					"zeroes and exits 0. This is a read-only historical read of one file: it writes,\n" +
 					"locks, and repairs nothing. It prints stored subjects and path scopes verbatim,\n" +
@@ -1042,10 +1071,104 @@ type nonPromptedCounts struct {
 	DeclaredCommand int `json:"declared_command"`
 	OpenRead        int `json:"open_read"`
 	Confined        int `json:"confined"`
+	SystemOneCheck  int `json:"system_one_check"`
 }
 
 func (c nonPromptedCounts) total() int {
-	return c.Grant + c.Cache + c.ModeAuto + c.DeclaredScope + c.DeclaredCommand + c.OpenRead + c.Confined
+	return c.Grant + c.Cache + c.ModeAuto + c.DeclaredScope + c.DeclaredCommand + c.OpenRead + c.Confined + c.SystemOneCheck
+}
+
+type systemOneOutcomeCounts struct {
+	Allowed  int `json:"allowed"`
+	Declined int `json:"declined"`
+	Failed   int `json:"failed"`
+	Skipped  int `json:"skipped"`
+}
+
+type systemOneFailureCounts struct {
+	Credits     int `json:"credits"`
+	Auth        int `json:"auth"`
+	RateLimited int `json:"rate_limited"`
+	Timeout     int `json:"timeout"`
+	Server      int `json:"server"`
+	Network     int `json:"network"`
+	Malformed   int `json:"malformed"`
+	NoKey       int `json:"no_key"`
+}
+
+type systemOneSkippedCounts struct {
+	Paused                  int `json:"paused"`
+	Text                    int `json:"text"`
+	BlockedPathsUnavailable int `json:"blocked_paths_unavailable"`
+	Substitution            int `json:"substitution"`
+	BlockedPath             int `json:"blocked_path"`
+	Wrapper                 int `json:"wrapper"`
+	ProgramLocation         int `json:"program_location"`
+	ShellShape              int `json:"shell_shape"`
+}
+
+type systemOneAllowedRow struct {
+	Subject   string  `json:"subject"`
+	ModelID   string  `json:"model_id"`
+	PReadOnly float64 `json:"p_read_only"`
+	TReadOnly float64 `json:"t_read_only"`
+}
+
+type systemOneReport struct {
+	Outcomes       systemOneOutcomeCounts `json:"outcomes"`
+	FailureReasons systemOneFailureCounts `json:"failure_reasons"`
+	SkippedReasons systemOneSkippedCounts `json:"skipped_reasons"`
+	Allowed        []systemOneAllowedRow  `json:"allowed"`
+}
+
+func (r *systemOneReport) add(p events.PermissionSystemOneCheck) {
+	switch p.Outcome {
+	case "allowed":
+		r.Outcomes.Allowed++
+		r.Allowed = append(r.Allowed, systemOneAllowedRow{Subject: p.Subject, ModelID: p.ModelID, PReadOnly: *p.PReadOnly, TReadOnly: *p.TReadOnly})
+	case "declined":
+		r.Outcomes.Declined++
+	case "skipped":
+		r.Outcomes.Skipped++
+		switch p.Reason {
+		case "paused":
+			r.SkippedReasons.Paused++
+		case "text":
+			r.SkippedReasons.Text++
+		case "blocked_paths_unavailable":
+			r.SkippedReasons.BlockedPathsUnavailable++
+		case "substitution":
+			r.SkippedReasons.Substitution++
+		case "blocked_path":
+			r.SkippedReasons.BlockedPath++
+		case "wrapper":
+			r.SkippedReasons.Wrapper++
+		case "program_location":
+			r.SkippedReasons.ProgramLocation++
+		case "shell_shape":
+			r.SkippedReasons.ShellShape++
+		}
+	case "failed":
+		r.Outcomes.Failed++
+		switch p.Reason {
+		case "credits":
+			r.FailureReasons.Credits++
+		case "auth":
+			r.FailureReasons.Auth++
+		case "rate_limited":
+			r.FailureReasons.RateLimited++
+		case "timeout":
+			r.FailureReasons.Timeout++
+		case "server":
+			r.FailureReasons.Server++
+		case "network":
+			r.FailureReasons.Network++
+		case "malformed":
+			r.FailureReasons.Malformed++
+		case "no_key":
+			r.FailureReasons.NoKey++
+		}
+	}
 }
 
 type refusedCounts struct {
@@ -1074,6 +1197,7 @@ type permissionsReport struct {
 	Pending     int               `json:"pending"`
 	NonPrompted nonPromptedCounts `json:"non_prompted"`
 	Refused     refusedCounts     `json:"refused"`
+	SystemOne   systemOneReport   `json:"system_one"`
 	Revocations []revocationRow   `json:"revocation_requests"`
 }
 
@@ -1220,7 +1344,10 @@ func correlationKey(subjectKind, subject, scope, commandSubject, requestSubject 
 // permission_revoke_requested is not an authorization at all, so it feeds its own
 // list. A session written before that event existed simply reports none.
 func buildPermissionsReport(path string, sess *sessions.Session) permissionsReport {
-	r := permissionsReport{Session: path, Folder: sess.Metadata.Folder, Rows: []promptRow{}, Revocations: []revocationRow{}}
+	r := permissionsReport{
+		Session: path, Folder: sess.Metadata.Folder, Rows: []promptRow{}, Revocations: []revocationRow{},
+		SystemOne: systemOneReport{Allowed: []systemOneAllowedRow{}},
+	}
 	unanswered := map[tupleKey][]int{}
 	var prior []storedGrant
 	for _, rec := range sess.Records {
@@ -1284,11 +1411,19 @@ func buildPermissionsReport(path string, sess *sessions.Session) permissionsRepo
 				r.NonPrompted.OpenRead++
 			case "confined":
 				r.NonPrompted.Confined++
+			case "system_one_check":
+				r.NonPrompted.SystemOneCheck++
 			case "blocked_path":
 				r.Refused.BlockedPath++
 			case "protected_state":
 				r.Refused.ProtectedState++
 			}
+		case events.KindPermissionSystemOneCheck:
+			var p events.PermissionSystemOneCheck
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				continue
+			}
+			r.SystemOne.add(p)
 		case events.KindPermissionRevokeRequested:
 			var p events.PermissionRevokeRequested
 			if err := json.Unmarshal(ev.Payload, &p); err != nil {
@@ -1318,8 +1453,8 @@ func buildPermissionsReport(path string, sess *sessions.Session) permissionsRepo
 }
 
 // renderPermissions writes the human-readable permissions report: a header, one
-// line per prompt in record order, the non-prompted tally, and the explicit
-// revocation requests. The tally and the revocation count are printed even when
+// line per prompt in record order, the non-prompted tally, the System One checks, and
+// the explicit revocation requests. The tally and the revocation count are printed even when
 // they are zero, because zero prompts against a large non-prompted count — and a
 // session with no revocations at all — are the interesting cases.
 func renderPermissions(w io.Writer, r permissionsReport) {
@@ -1338,10 +1473,24 @@ func renderPermissions(w io.Writer, r permissionsReport) {
 			fmt.Fprintln(w, line)
 		}
 	}
-	fmt.Fprintf(w, "\nnon-prompted authorizations: %d (grant: %d, cache: %d, mode_auto: %d, declared_scope: %d, declared_command: %d, open_read: %d, confined: %d)\n",
-		r.NonPrompted.total(), r.NonPrompted.Grant, r.NonPrompted.Cache, r.NonPrompted.ModeAuto, r.NonPrompted.DeclaredScope, r.NonPrompted.DeclaredCommand, r.NonPrompted.OpenRead, r.NonPrompted.Confined)
+	fmt.Fprintf(w, "\nnon-prompted authorizations: %d (grant: %d, cache: %d, mode_auto: %d, declared_scope: %d, declared_command: %d, open_read: %d, confined: %d, system_one_check: %d)\n",
+		r.NonPrompted.total(), r.NonPrompted.Grant, r.NonPrompted.Cache, r.NonPrompted.ModeAuto, r.NonPrompted.DeclaredScope, r.NonPrompted.DeclaredCommand, r.NonPrompted.OpenRead, r.NonPrompted.Confined, r.NonPrompted.SystemOneCheck)
 	fmt.Fprintf(w, "refused before approval: %d (blocked_path: %d, protected_state: %d)\n",
 		r.Refused.BlockedPath+r.Refused.ProtectedState, r.Refused.BlockedPath, r.Refused.ProtectedState)
+
+	so := r.SystemOne
+	fmt.Fprintf(w, "\nSystem One checks: %d (allowed: %d, declined: %d, failed: %d, skipped: %d)\n",
+		so.Outcomes.Allowed+so.Outcomes.Declined+so.Outcomes.Failed+so.Outcomes.Skipped,
+		so.Outcomes.Allowed, so.Outcomes.Declined, so.Outcomes.Failed, so.Outcomes.Skipped)
+	f := so.FailureReasons
+	fmt.Fprintf(w, "failed by reason: credits: %d, auth: %d, rate_limited: %d, timeout: %d, server: %d, network: %d, malformed: %d, no_key: %d\n",
+		f.Credits, f.Auth, f.RateLimited, f.Timeout, f.Server, f.Network, f.Malformed, f.NoKey)
+	sk := so.SkippedReasons
+	fmt.Fprintf(w, "skipped by reason: paused: %d, text: %d, blocked_paths_unavailable: %d, substitution: %d, blocked_path: %d, wrapper: %d, program_location: %d, shell_shape: %d\n",
+		sk.Paused, sk.Text, sk.BlockedPathsUnavailable, sk.Substitution, sk.BlockedPath, sk.Wrapper, sk.ProgramLocation, sk.ShellShape)
+	for i, row := range so.Allowed {
+		fmt.Fprintf(w, "  %d. [allowed] %q  model=%q  p_read_only=%g  t_read_only=%g\n", i+1, row.Subject, row.ModelID, row.PReadOnly, row.TReadOnly)
+	}
 
 	fmt.Fprintf(w, "\nexplicit revocation requests: %d\n", len(r.Revocations))
 	for i, row := range r.Revocations {
@@ -2182,7 +2331,9 @@ var showKinds = []string{
 	events.KindPermissionMatched,
 	events.KindPermissionPersistFailed,
 	events.KindPermissionPromptShown,
+	events.KindPermissionPromptWait,
 	events.KindPermissionRevokeRequested,
+	events.KindPermissionSystemOneCheck,
 	events.KindProviderRequestFailed,
 	events.KindProviderRequestRetry,
 	events.KindProviderRequestRetrySkipped,
@@ -2193,6 +2344,7 @@ var showKinds = []string{
 	events.KindSessionForked,
 	events.KindSessionPruneSummary,
 	events.KindSessionWriteFailed,
+	events.KindSkillLoaded,
 	events.KindSlashCommand,
 	events.KindStreamInterrupted,
 	events.KindStructuredReadEnd,

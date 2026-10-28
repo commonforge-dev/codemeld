@@ -12,6 +12,7 @@ import (
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/provider"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/toolactivity"
 )
 
 func TestReplaySessionRecords_RendersVisibleAndSkipsHidden(t *testing.T) {
@@ -564,8 +565,8 @@ func TestReplaySessionRecords_ProjectsWebActivityAtRecordPosition(t *testing.T) 
 	a := New(nil)
 	a.ReplaySessionRecords(records)
 
-	want := "▌ research tview escaping\n\nWebSearch tview escape tags\n\nnow reading the docs" + visibleResponseLine + "\n\n" +
-		"WebFetch https://go.dev/doc/effective_go\n\nescape tags with tview.Escape" + visibleResponseLine
+	want := "▌ research tview escaping\n\n▸ WebSearch tview escape tags\n\nnow reading the docs" + visibleResponseLine + "\n\n" +
+		"▸ WebFetch https://go.dev/doc/effective_go\n\nescape tags with tview.Escape" + visibleResponseLine
 	got := a.TranscriptText()
 	if got != want {
 		t.Fatalf("replayed transcript = %q, want %q", got, want)
@@ -593,7 +594,7 @@ func TestReplaySessionRecords_RetainsOnlyWebCallsFromMixedRound(t *testing.T) {
 	a := New(nil)
 	a.ReplaySessionRecords(records)
 
-	want := "WebSearch alpha\nWebFetch https://a.test\n\nWebSearch beta"
+	want := "▸ WebSearch alpha\n▸ WebFetch https://a.test\n\n▸ WebSearch beta"
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("replayed transcript = %q, want %q", got, want)
 	}
@@ -628,7 +629,7 @@ func TestReplaySessionRecords_HandlesMalformedWebToolCallWrappers(t *testing.T) 
 
 			want := "▌ q\n\nanswer" + visibleResponseLine
 			if tc.want != "" {
-				want = "▌ q\n\n" + tc.want + "\n\nanswer" + visibleResponseLine
+				want = "▌ q\n\n▸ " + tc.want + "\n\nanswer" + visibleResponseLine
 			}
 			if got := a.TranscriptText(); got != want {
 				t.Fatalf("replayed transcript = %q, want %q", got, want)
@@ -648,7 +649,7 @@ func TestReplaySessionRecords_MalformedCallDoesNotDropTheRound(t *testing.T) {
 		assistantMsg("answer"),
 	})
 
-	want := "WebSearch still shown\nweb_fetch\n\nanswer" + visibleResponseLine
+	want := "▸ WebSearch still shown\n▸ web_fetch\n\nanswer" + visibleResponseLine
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("replayed transcript = %q, want %q", got, want)
 	}
@@ -663,12 +664,42 @@ func TestReplaySessionRecords_WebActivityRendersLiterally(t *testing.T) {
 		),
 	})
 
-	want := "WebSearch [red]tview tag[-] syntax\nWebFetch https://a.test/p?q=[b]#[c]"
+	want := "▸ WebSearch [red]tview tag[-] syntax\n▸ WebFetch https://a.test/p?q=[b]#[c]"
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("replayed transcript = %q, want %q (tag syntax must stay literal)", got, want)
 	}
 	if raw := a.transcript.view.GetText(false); !strings.Contains(raw, "[red[]") {
 		t.Fatalf("replayed transcript raw = %q, want the escaped bracket guard", raw)
+	}
+}
+
+func TestReplaySessionRecords_WebOnlyRoundMatchesLiveActivity(t *testing.T) {
+	calls := []struct{ name, arguments string }{
+		{"web_search", `{"query":"[red]tview tag"}`},
+		{"web_fetch", `{"url":"https://a.test/[b]"}`},
+	}
+	var toolCalls []sessions.ToolCall
+	var liveLines []string
+	for i, c := range calls {
+		toolCalls = append(toolCalls, webToolCall(fmt.Sprintf("c%d", i), c.name, c.arguments))
+		line, ok := toolactivity.WebLine(c.name, c.arguments)
+		if !ok {
+			t.Fatalf("WebLine(%q) not a web line", c.name)
+		}
+		liveLines = append(liveLines, line)
+	}
+
+	live := New(nil)
+	live.AppendToolActivity(liveLines)
+	replay := New(nil)
+	replay.ReplaySessionRecords([]sessions.Record{assistantToolCallMsg("", toolCalls...)})
+
+	want := "[#6b7480]▸ WebSearch [red[]tview tag[-:-:-]\n[#6b7480]▸ WebFetch https://a.test/[b[][-:-:-]"
+	if got := live.transcript.view.GetText(false); got != want {
+		t.Fatalf("live markup = %q, want %q", got, want)
+	}
+	if got := replay.transcript.view.GetText(false); got != want {
+		t.Fatalf("replayed markup = %q, want the live markup %q", got, want)
 	}
 }
 
@@ -685,7 +716,7 @@ func TestReplaySessionRecords_WebActivityLeavesFooterPairingUnchanged(t *testing
 				assistantToolCallMsg("", webToolCall("c1", "web_search", `{"query":"gopher"}`)),
 				turnLatencyEvent("openai", "gpt-x", 1000),
 			},
-			want: "WebSearch gopher",
+			want: "▸ WebSearch gopher",
 		},
 		{
 			name: "completed research turn footers only its visible reply",
@@ -697,7 +728,7 @@ func TestReplaySessionRecords_WebActivityLeavesFooterPairingUnchanged(t *testing
 				assistantMsg("the answer"),
 				turnLatencyEvent("openai", "gpt-x", 1000),
 			},
-			want: "▌ q\n\nWebFetch https://a.test\n\nthe answer" + visibleResponseLine + "\n\nopenai - gpt-x - 1s - " + footerClock(),
+			want: "▌ q\n\n▸ WebFetch https://a.test\n\nthe answer" + visibleResponseLine + "\n\nopenai - gpt-x - 1s - " + footerClock(),
 		},
 	}
 	for _, tc := range cases {
@@ -735,7 +766,7 @@ func TestReplaySessionRecords_BoundsWebActivityBlocks(t *testing.T) {
 	if want := fmt.Sprintf("▌ msg%d", extra/2); blocks[1] != want {
 		t.Errorf("first kept block = %q, want %q", blocks[1], want)
 	}
-	if want := fmt.Sprintf("WebSearch q%d", rounds-1); blocks[len(blocks)-1] != want {
+	if want := fmt.Sprintf("▸ WebSearch q%d", rounds-1); blocks[len(blocks)-1] != want {
 		t.Errorf("last block = %q, want the newest activity %q", blocks[len(blocks)-1], want)
 	}
 }
@@ -1176,7 +1207,7 @@ func TestReplaySessionRecords_PairsEachAskUserCallInsideItsOwnResponseGroup(t *t
 	a := New(nil)
 	a.ReplaySessionRecords(records)
 
-	want := "WebSearch object stores\n\n" +
+	want := "▸ WebSearch object stores\n\n" +
 		"Answered (ask_user):\n  Where should sessions be stored? — Local disk\n\n" +
 		"asking again" + visibleResponseLine + "\n\n" +
 		"Answered (ask_user):\n  Where should sessions be stored? — Object store"

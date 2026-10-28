@@ -41,7 +41,7 @@ func init() {
 	}
 	probes["m-core"] = probe{0, mxCoreProbe}
 	probes["m-sockets"] = probe{0, mxSocketsProbe}
-	probes["m-pair-isolation"] = probe{4, mxPairIsolationProbe}
+	probes["m-pair-isolation"] = probe{6, mxPairIsolationProbe}
 	probes["m-clone"] = probe{0, mxCloneProbe}
 	probes["m-meta"] = probe{1, mxMetaProbe}
 	probes["m-x32"] = probe{0, mxX32Probe}
@@ -193,12 +193,14 @@ func mxSocketsProbe([]string) int {
 		}
 		mxEmit(c.name, mxErrno(err))
 	}
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
-	mxEmit("socketpair", mxErrno(err))
-	if err == nil {
-		mxEmit("socketpair-exchange", mxErrno(mxExchange(fds[0], fds[1])))
-		_ = unix.Close(fds[0])
-		_ = unix.Close(fds[1])
+	for _, c := range []mxSocketCase{{"socketpair", unix.AF_UNIX, unix.SOCK_STREAM}, {"socketpair-seqpacket", unix.AF_UNIX, unix.SOCK_SEQPACKET}} {
+		fds, err := unix.Socketpair(c.domain, c.typ|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		mxEmit(c.name, mxErrno(err))
+		if err == nil {
+			mxEmit(c.name+"-exchange", mxErrno(mxExchange(fds[0], fds[1])))
+			_ = unix.Close(fds[0])
+			_ = unix.Close(fds[1])
+		}
 	}
 	for _, c := range mxPairTypeCases() {
 		fds, err := unix.Socketpair(c.domain, c.typ|unix.SOCK_CLOEXEC, 0)
@@ -214,7 +216,6 @@ func mxSocketsProbe([]string) int {
 func mxPairTypeCases() []mxSocketCase {
 	return []mxSocketCase{
 		{"socketpair-dgram", unix.AF_UNIX, unix.SOCK_DGRAM},
-		{"socketpair-seqpacket", unix.AF_UNIX, unix.SOCK_SEQPACKET},
 	}
 }
 
@@ -235,19 +236,33 @@ func mxExchange(a, b int) error {
 	return nil
 }
 
+type mxPairType struct {
+	name, network string
+	sotype        int
+}
+
+func mxPairTypes() []mxPairType {
+	return []mxPairType{{"stream", "unix", unix.SOCK_STREAM}, {"seqpacket", "unixpacket", unix.SOCK_SEQPACKET}}
+}
+
 type mxPairCase struct {
+	typ         mxPairType
 	end         int
 	state, kind string
 }
 
-func (c mxPairCase) label() string { return fmt.Sprintf("e%d-%s-%s", c.end, c.state, c.kind) }
+func (c mxPairCase) label() string {
+	return fmt.Sprintf("%s-e%d-%s-%s", c.typ.name, c.end, c.state, c.kind)
+}
 
 func mxPairCases() []mxPairCase {
 	var out []mxPairCase
-	for end := range 2 {
-		for _, state := range []string{"open", "shutdown", "closed"} {
-			for _, kind := range []string{"path", "abstract"} {
-				out = append(out, mxPairCase{end, state, kind})
+	for _, typ := range mxPairTypes() {
+		for end := range 2 {
+			for _, state := range []string{"open", "shutdown", "closed"} {
+				for _, kind := range []string{"path", "abstract"} {
+					out = append(out, mxPairCase{typ, end, state, kind})
+				}
 			}
 		}
 	}
@@ -255,10 +270,15 @@ func mxPairCases() []mxPairCase {
 }
 
 func mxPairIsolationProbe(a []string) int {
-	outsidePath, outsideAbstract, bindDir, abstractPrefix := a[0], a[1], a[2], a[3]
+	outsides := map[string][]string{}
+	for i, typ := range mxPairTypes() {
+		outsides[typ.name] = a[2*i : 2*i+2]
+	}
+	bindDir, abstractPrefix := a[4], a[5]
 	for _, c := range mxPairCases() {
 		label := c.label()
-		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+		outsidePath, outsideAbstract := outsides[c.typ.name][0], outsides[c.typ.name][1]
+		fds, err := unix.Socketpair(unix.AF_UNIX, c.typ.sotype|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
 			mxEmit(label+"-pair", mxErrno(err))
 			continue
@@ -1510,14 +1530,16 @@ func TestEnforceSockets(t *testing.T) {
 	for _, c := range mxPairTypeCases() {
 		denied = append(denied, c.name)
 	}
-	names = append(slices.Clone(denied), "socketpair", "socketpair-exchange")
+	allowedPairs := []string{"socketpair", "socketpair-exchange", "socketpair-seqpacket", "socketpair-seqpacket-exchange"}
+	names = append(slices.Clone(denied), allowedPairs...)
 
 	control := mxRun(t, bin, ControlArg, mxPlan(f), f.base, f.env(t, f.base, ""), "m-sockets")
 	mxComplete(t, "control", control, names...)
 
-	streamPairAllowed := func(label string, res mxResult) {
-		mxWant(t, label+"/socketpair", res, "socketpair", 0)
-		mxWant(t, label+"/socketpair-exchange", res, "socketpair-exchange", 0)
+	pairsAllowed := func(label string, res mxResult) {
+		for _, n := range allowedPairs {
+			mxWant(t, label+"/"+n, res, n, 0)
+		}
 		for _, c := range mxPairTypeCases() {
 			mxWant(t, label+"/"+c.name, res, c.name, unix.EPERM)
 		}
@@ -1530,14 +1552,14 @@ func TestEnforceSockets(t *testing.T) {
 		for _, n := range denied {
 			mxWant(t, label+"/"+n, res, n, unix.EPERM)
 		}
-		streamPairAllowed(label, res)
+		pairsAllowed(label, res)
 	}
 
 	net := mxRun(t, bin, ProbeArg, mxAuto(f, []string{wr}, nil, tmp, NetworkAccessAuthority), f.base, f.env(t, f.base, tmp), "m-sockets")
 	mxComplete(t, "net", net, names...)
 	mxWant(t, "net/inet", net, "inet", 0)
 	mxWant(t, "net/inet6", net, "inet6", 0)
-	streamPairAllowed("net", net)
+	pairsAllowed("net", net)
 	for _, name := range []string{"unix", "netlink", "packet", "inet-raw", "inet6-raw"} {
 		mxWant(t, "net/"+name, net, name, unix.EPERM)
 	}
@@ -1559,18 +1581,18 @@ func TestEnforceSockets(t *testing.T) {
 }
 
 type mxOutsidePeer struct {
-	ln   *net.UnixListener
-	addr string
+	ln            *net.UnixListener
+	network, addr string
 }
 
-func mxListenOutside(t *testing.T, addr string) mxOutsidePeer {
+func mxListenOutside(t *testing.T, network, addr string) mxOutsidePeer {
 	t.Helper()
-	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: addr, Net: "unix"})
+	ln, err := net.ListenUnix(network, &net.UnixAddr{Name: addr, Net: network})
 	if err != nil {
-		t.Fatalf("outside listener %s: %v", addr, err)
+		t.Fatalf("outside %s listener %s: %v", network, addr, err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	p := mxOutsidePeer{ln, addr}
+	p := mxOutsidePeer{ln, network, addr}
 	if foreign := p.drain(t); len(foreign) != 0 {
 		t.Fatalf("outside listener %s: unexpected connections from pids %v", addr, foreign)
 	}
@@ -1579,7 +1601,7 @@ func mxListenOutside(t *testing.T, addr string) mxOutsidePeer {
 
 func (p mxOutsidePeer) drain(t *testing.T) (foreign []int32) {
 	t.Helper()
-	c, err := net.DialTimeout("unix", p.addr, 2*time.Second)
+	c, err := net.DialTimeout(p.network, p.addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("outside listener %s not live: %v", p.addr, err)
 	}
@@ -1688,9 +1710,17 @@ func TestEnforceSocketpairIsolation(t *testing.T) {
 	bin := mxBinary(t)
 	f := mxSetup(t)
 	abstract := filepath.Base(f.base)
-	outsides := []mxOutsidePeer{
-		mxListenOutside(t, filepath.Join(f.mkdir(t, "outside"), "l.sock")),
-		mxListenOutside(t, "@"+abstract+"-listener"),
+	outsideDir := f.mkdir(t, "outside")
+	var outsides []mxOutsidePeer
+	outsideArgs := []string{"m-pair-isolation"}
+	networks := map[string]string{}
+	for _, typ := range mxPairTypes() {
+		path, name := filepath.Join(outsideDir, typ.name+".sock"), abstract+"-"+typ.name+"-listener"
+		outsides = append(outsides, mxListenOutside(t, typ.network, path), mxListenOutside(t, typ.network, "@"+name))
+		outsideArgs = append(outsideArgs, path, name)
+	}
+	for _, c := range mxPairCases() {
+		networks[c.label()] = c.typ.network
 	}
 	wr := f.mkdir(t, "wr")
 	for _, v := range mxPlanAutoNet {
@@ -1699,7 +1729,7 @@ func TestEnforceSocketpairIsolation(t *testing.T) {
 		var bound []string
 		res := mxRunAwaiting(t, bin, f.policy(v, []string{wr}, nil, tmp), f.base, f.env(t, f.base, tmp), func(label, name string) {
 			bound = append(bound, label)
-			c, err := net.DialTimeout("unix", name, 2*time.Second)
+			c, err := net.DialTimeout(networks[label], name, 2*time.Second)
 			if err == nil {
 				_ = c.Close()
 				t.Errorf("%s/%s: outside client connected to the confined endpoint bound at %q", v.name, label, name)
@@ -1708,8 +1738,8 @@ func TestEnforceSocketpairIsolation(t *testing.T) {
 			if !errors.Is(err, syscall.ECONNREFUSED) {
 				t.Errorf("%s/%s: outside client dial %q: %v, want ECONNREFUSED from a bound endpoint that is not listening", v.name, label, name, err)
 			}
-		}, "m-pair-isolation", outsides[0].addr, abstract+"-listener", bindDir, abstract+"-"+v.name+"-")
-		var keys []string
+		}, append(slices.Clone(outsideArgs), bindDir, abstract+"-"+v.name+"-")...)
+		var keys, wantBound []string
 		for _, c := range mxPairCases() {
 			for _, op := range []string{"unspec", "connect-path", "connect-abstract", "bind", "listen", "accept"} {
 				keys = append(keys, c.label()+"-"+op)
@@ -1717,11 +1747,18 @@ func TestEnforceSocketpairIsolation(t *testing.T) {
 		}
 		mxComplete(t, v.name, res, keys...)
 		for _, c := range mxPairCases() {
-			for _, op := range []string{"connect-path", "connect-abstract", "accept"} {
-				if k := c.label() + "-" + op; res.lines[k] == 0 {
-					t.Errorf("%s: %s succeeded on a stream socketpair endpoint", v.name, k)
-				}
+			for op, want := range map[string]unix.Errno{"connect-path": unix.EISCONN, "connect-abstract": unix.EISCONN, "listen": unix.EINVAL, "accept": unix.EINVAL} {
+				mxWant(t, v.name, res, c.label()+"-"+op, want)
 			}
+			if !v.auto && c.kind == "path" {
+				mxWant(t, v.name, res, c.label()+"-bind", unix.EACCES)
+				continue
+			}
+			mxWant(t, v.name, res, c.label()+"-bind", 0)
+			wantBound = append(wantBound, c.label())
+		}
+		if !slices.Equal(bound, wantBound) {
+			t.Errorf("%s: outside-client checks ran for %v, want exactly %v", v.name, bound, wantBound)
 		}
 		for _, o := range outsides {
 			if foreign := o.drain(t); len(foreign) != 0 {
@@ -1796,5 +1833,121 @@ func TestEnforceForcedABIRefusal(t *testing.T) {
 	got := Resolve(ResolveInput{Home: f.home, HelperExecutable: bin})
 	if got.Capability != Refused || !strings.Contains(got.Reason, "landlock ABI 2 < 3") {
 		t.Errorf("forced ABI 2: Resolve() = %+v, want Refused with reason containing %q", got, "landlock ABI 2 < 3")
+	}
+}
+
+func mxSkillsTree(t *testing.T, f mxFx, dir string) (script, leak string) {
+	t.Helper()
+	script = filepath.Join(dir, "x", "run.sh")
+	if err := os.MkdirAll(filepath.Dir(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho RAN=7\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	leak = filepath.Join(dir, "x", "leak")
+	if err := os.Symlink(filepath.Join(f.home, ".codemeld", "global", "settings.yaml"), leak); err != nil {
+		t.Fatal(err)
+	}
+	return script, leak
+}
+
+func TestEnforceSkillsReadRoot(t *testing.T) {
+	mxRequire(t)
+	bin := mxBinary(t)
+	for _, v := range mxPlanAutoNet {
+		t.Run(v.name, func(t *testing.T) {
+			f := mxSetup(t)
+			skills := filepath.Join(f.home, ".codemeld", "skills")
+			script, leak := mxSkillsTree(t, f, skills)
+			tmp := f.tmpFor(t, v)
+			env := f.env(t, f.base, tmp)
+			p := f.policy(v, nil, nil, tmp)
+			p.ReadRoots = []string{skills}
+
+			run := mxRun(t, bin, "", p, f.base, env, script)
+			mxComplete(t, v.name+"/run-skill-script", run, "RAN")
+			if run.lines["RAN"] != 7 {
+				t.Errorf("%s: skill script printed RAN=%d, want 7", v.name, run.lines["RAN"])
+			}
+			for _, c := range []struct {
+				name string
+				args []string
+				want unix.Errno
+			}{
+				{"read-skill-file", []string{"m-read", script}, 0},
+				{"read-home-codemeld", []string{"m-read", filepath.Join(f.home, ".codemeld", "global", "settings.yaml")}, unix.EACCES},
+				{"read-through-skills-symlink", []string{"m-read", leak}, unix.EACCES},
+			} {
+				res := mxRun(t, bin, ProbeArg, p, f.base, env, c.args...)
+				mxWant(t, v.name+"/skills/"+c.name, res, "result", c.want)
+			}
+			if !v.auto {
+				return
+			}
+			for _, c := range []struct {
+				name string
+				args []string
+			}{
+				{"create-in-skills", []string{"m-open-write", filepath.Join(skills, "x", "new")}},
+				{"change-skill-file", []string{"m-write-existing", script}},
+			} {
+				res := mxRun(t, bin, ProbeArg, p, f.base, env, c.args...)
+				mxWant(t, v.name+"/skills/"+c.name, res, "result", unix.EACCES)
+			}
+			if _, err := os.Lstat(filepath.Join(skills, "x", "new")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("%s: denied create left a file in skills (%v)", v.name, err)
+			}
+		})
+	}
+}
+
+func TestEnforceRedirectedSkillsRootStaysUnwritable(t *testing.T) {
+	mxRequire(t)
+	bin := mxBinary(t)
+	for _, v := range mxAutoNet {
+		for _, rootName := range []string{"project", "declared"} {
+			t.Run(v.name+"/"+rootName, func(t *testing.T) {
+				f := mxSetup(t)
+				project := f.mkdir(t, "proj")
+				real := f.mkdir(t, "proj", "shared", "skills")
+				script, _ := mxSkillsTree(t, f, real)
+				neighbor := f.writeFile(t, "proj", "shared", "neighbor")
+				neighborDir := f.mkdir(t, "proj", "shared", "other")
+				alias := filepath.Join(f.home, ".codemeld", "skills")
+				if err := os.Symlink(real, alias); err != nil {
+					t.Fatal(err)
+				}
+				root := project
+				if rootName == "declared" {
+					root = filepath.Dir(real)
+				}
+				tmp := f.tmpFor(t, v)
+				env := f.env(t, f.base, tmp)
+				p := f.policy(v, []string{root}, []string{filepath.Join(project, ".codemeld"), real}, tmp)
+				p.ReadRoots = []string{real}
+				for _, c := range []struct {
+					name string
+					args []string
+					want unix.Errno
+				}{
+					{"read-through-alias", []string{"m-read", filepath.Join(alias, "x", "run.sh")}, 0},
+					{"change-through-alias", []string{"m-write-existing", filepath.Join(alias, "x", "run.sh")}, unix.EACCES},
+					{"create-through-alias", []string{"m-open-write", filepath.Join(alias, "x", "new-alias")}, unix.EACCES},
+					{"change-resolved", []string{"m-write-existing", script}, unix.EACCES},
+					{"create-resolved", []string{"m-open-write", filepath.Join(real, "x", "new-real")}, unix.EACCES},
+					{"change-neighbor", []string{"m-write-existing", neighbor}, 0},
+					{"create-in-neighbor-folder", []string{"m-open-write", filepath.Join(neighborDir, "new")}, 0},
+				} {
+					res := mxRun(t, bin, ProbeArg, p, f.base, env, c.args...)
+					mxWant(t, v.name+"/"+rootName+"/"+c.name, res, "result", c.want)
+				}
+				for _, name := range []string{"new-alias", "new-real"} {
+					if _, err := os.Lstat(filepath.Join(real, "x", name)); !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("denied create left %s in the skills folder (%v)", name, err)
+					}
+				}
+			})
+		}
 	}
 }

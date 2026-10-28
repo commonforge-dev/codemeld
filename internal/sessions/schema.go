@@ -73,6 +73,7 @@ type Message struct {
 	ToolCalls  []ToolCall // present only on assistant tool-call turns
 	ToolCallID string     // present only on tool-result turns
 	ParentID   string
+	Reasoning  *Reasoning
 
 	// toolCallsPresent and toolCallIDPresent record whether the JSON carried the
 	// corresponding sibling field at load time, independent of its value. The
@@ -85,6 +86,13 @@ type Message struct {
 }
 
 func (Message) isRecord() {}
+
+type Reasoning struct {
+	Provider string          `json:"provider"`
+	ModelID  string          `json:"model_id"`
+	Text     string          `json:"text,omitempty"`
+	Details  json.RawMessage `json:"details,omitempty"`
+}
 
 // Event is an event record: a kind-tagged entry with an opaque payload
 // object. Per-kind payload shape is validated by the events package, not here.
@@ -244,6 +252,7 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		ToolCalls  []json.RawMessage `json:"tool_calls,omitempty"`
 		ToolCallID string            `json:"tool_call_id,omitempty"`
 		ParentID   string            `json:"parent_id,omitempty"`
+		Reasoning  *Reasoning        `json:"reasoning,omitempty"`
 	}{
 		Type:       "message",
 		ID:         m.ID,
@@ -252,6 +261,7 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		Timestamp:  formatTimestamp(m.Timestamp),
 		ToolCallID: m.ToolCallID,
 		ParentID:   m.ParentID,
+		Reasoning:  m.Reasoning,
 	}
 	if len(m.ToolCalls) > 0 {
 		w.ToolCalls = make([]json.RawMessage, len(m.ToolCalls))
@@ -657,6 +667,7 @@ func parseMessage(i int, raw json.RawMessage) (Record, error) {
 		ToolCalls  json.RawMessage `json:"tool_calls"`
 		ToolCallID json.RawMessage `json:"tool_call_id"`
 		ParentID   json.RawMessage `json:"parent_id"`
+		Reasoning  json.RawMessage `json:"reasoning"`
 	}
 	if err := json.Unmarshal(raw, &rm); err != nil {
 		return nil, fmt.Errorf("records[%d]: %w", i, err)
@@ -727,7 +738,42 @@ func parseMessage(i int, raw json.RawMessage) (Record, error) {
 			}
 		}
 	}
+	if len(bytes.TrimSpace(rm.Reasoning)) != 0 {
+		r, err := parseReasoning(i, msg.Role, rm.Reasoning)
+		if err != nil {
+			return nil, err
+		}
+		msg.Reasoning = r
+	}
 	return msg, nil
+}
+
+func parseReasoning(i int, role string, raw json.RawMessage) (*Reasoning, error) {
+	if role != "assistant" {
+		return nil, fmt.Errorf("records[%d].reasoning: is only permitted on role: assistant", i)
+	}
+	var r Reasoning
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return nil, fmt.Errorf("records[%d].reasoning: %w", i, err)
+	}
+	if r.Provider == "" || r.ModelID == "" {
+		return nil, fmt.Errorf("records[%d].reasoning: provider and model_id must be non-empty strings", i)
+	}
+	if d := bytes.TrimSpace(r.Details); len(d) != 0 {
+		var entries []json.RawMessage
+		if d[0] != '[' || json.Unmarshal(d, &entries) != nil {
+			return nil, fmt.Errorf("records[%d].reasoning.details: must be a list", i)
+		}
+		for j, e := range entries {
+			if e[0] != '{' {
+				return nil, fmt.Errorf("records[%d].reasoning.details[%d]: must be an object", i, j)
+			}
+		}
+	}
+	if r.Text == "" && len(r.Details) == 0 {
+		return nil, fmt.Errorf("records[%d].reasoning: needs text or details", i)
+	}
+	return &r, nil
 }
 
 func validateModelContextContent(i int, c Content) error {

@@ -11,10 +11,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/openai/openai-go/v3"
@@ -51,6 +53,10 @@ func usageChunk(in, out int64) []byte {
 
 func cachedUsageChunk(in, out, cached int64) []byte {
 	return []byte(fmt.Sprintf(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d,"prompt_tokens_details":{"cached_tokens":%d}}}`, in, out, in+out, cached))
+}
+
+func costUsageChunk(in, out int64, cost string) []byte {
+	return []byte(fmt.Sprintf(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d,"cost":%s}}`, in, out, in+out, cost))
 }
 
 // sliceDecoder replays a fixed list of chunk payloads as SSE events.
@@ -459,6 +465,60 @@ func TestRun_CachedPromptTokensReachRecordAndContext(t *testing.T) {
 	}
 	if strings.Contains(out, "at least") {
 		t.Errorf("/context rendered a fully reported total as a lower bound\n--- output ---\n%s", out)
+	}
+}
+
+func TestToolLoop_OpenRouterCostReachesSessionFile(t *testing.T) {
+	store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+	store.Append(textMsg("user", "hi"))
+	loop := NewToolLoop(Deps{
+		Active: selectedState("openrouter", "m", model.EffortDefault),
+		Store:  store,
+		Client: &scriptedClient{rounds: [][][]byte{{contentChunk("Hello"), finishChunk("stop"), costUsageChunk(120, 40, "0.00123")}}},
+	}, &fakeDispatcher{}, 3)
+
+	if err := loop.Run(context.Background()); err != nil {
+		t.Fatalf("loop.Run() error = %v, want nil", err)
+	}
+	if _, _, err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+	reloaded, _, err := sessions.OpenSession(store.Path())
+	if err != nil {
+		t.Fatalf("reopen persisted session: %v", err)
+	}
+	mr := decodeModelResponse(t, reloaded.Records)
+	if mr.CostUSD == nil || *mr.CostUSD != 0.00123 {
+		t.Fatalf("reloaded cost_usd = %v, want 0.00123", mr.CostUSD)
+	}
+	if mr.CostUSDPartial {
+		t.Error("cost_usd_partial = true, want false for a single reported round")
+	}
+}
+
+func TestRun_StandaloneRunnerRecordsReportedCost(t *testing.T) {
+	for _, cost := range []string{"0.00123", "0"} {
+		t.Run(cost, func(t *testing.T) {
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			runner := New(Deps{
+				Active: selectedState("openrouter", "m", model.EffortDefault),
+				Store:  store,
+				Client: streamClient(contentChunk("Hello"), finishChunk("stop"), costUsageChunk(120, 40, cost)),
+				Usage:  func(int64, int64) {},
+			})
+
+			if err := runner.Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			want, _ := strconv.ParseFloat(cost, 64)
+			mr := decodeModelResponse(t, store.Records())
+			if mr.CostUSD == nil || *mr.CostUSD != want {
+				t.Fatalf("cost_usd = %v, want %v", mr.CostUSD, want)
+			}
+			if mr.CostUSDPartial {
+				t.Error("cost_usd_partial = true, want false for a standalone round")
+			}
+		})
 	}
 }
 
@@ -1898,7 +1958,7 @@ func TestRun_ProviderStreamIdleNotModelVisible(t *testing.T) {
 	if !hasKind(recs, events.KindProviderStreamIdle) {
 		t.Fatalf("missing provider_stream_idle event; kinds = %v", eventKinds(recs))
 	}
-	msgs := messagesFromRecords(recs)
+	msgs := messagesFromRecords(recs, model.Selection{})
 	if len(msgs) != 1 || msgs[0].Role != "assistant" || msgs[0].Content != "hi" {
 		t.Fatalf("request history = %+v, want only the assistant %q message (idle event excluded)", msgs, "hi")
 	}
@@ -2415,7 +2475,7 @@ func TestRun_FailedAttemptFoldsItsUsageOnce(t *testing.T) {
 			if err := runner.Run(ctx); err == nil {
 				t.Fatal("Run() error = nil, want the attempt's failure")
 			}
-			in, out, _, _, anomalies, hadUsage := acc.Totals()
+			in, out, _, _, _, _, anomalies, hadUsage := acc.Totals()
 			if in != 40 || out != 4 || !hadUsage || len(anomalies) != 0 || acc.UsageRounds() != 1 {
 				t.Fatalf("accumulated = (%d, %d, had %v, anomalies %v, rounds %d), want (40, 4) folded once", in, out, hadUsage, anomalies, acc.UsageRounds())
 			}
@@ -2454,5 +2514,633 @@ func TestRun_RetriedAttemptUsageIsCountedOnce(t *testing.T) {
 	}
 	if acc.UsageRounds() != 2 {
 		t.Fatalf("usage rounds = %d, want 2", acc.UsageRounds())
+	}
+}
+
+type stepDecoder struct {
+	step func(i int) ([]byte, error)
+	i    int
+	cur  ssestream.Event
+	err  error
+}
+
+func (d *stepDecoder) Next() bool {
+	data, err := d.step(d.i)
+	d.i++
+	if data == nil {
+		d.err = err
+		return false
+	}
+	d.cur = ssestream.Event{Data: data}
+	return true
+}
+func (d *stepDecoder) Event() ssestream.Event { return d.cur }
+func (d *stepDecoder) Close() error           { return nil }
+func (d *stepDecoder) Err() error             { return d.err }
+
+func stepClient(step func(ctx context.Context, call, i int) ([]byte, error)) *fakeClient {
+	c := &fakeClient{}
+	c.fn = func(ctx context.Context, _ provider.Request) (provider.Response, error) {
+		call := c.callCount()
+		dec := &stepDecoder{step: func(i int) ([]byte, error) { return step(ctx, call, i) }}
+		return provider.Response{Stream: ssestream.NewStream[openai.ChatCompletionChunk](dec, nil)}, nil
+	}
+	return c
+}
+
+func chunkAt(i int, chunks ...[]byte) ([]byte, error) {
+	if i < len(chunks) {
+		return chunks[i], nil
+	}
+	return nil, nil
+}
+
+func reasoningChunk(text string) []byte {
+	return []byte(fmt.Sprintf(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning":%q},"finish_reason":""}]}`, text))
+}
+
+func emptyChunk() []byte {
+	return []byte(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[]}`)
+}
+
+type noOutputTimers struct {
+	mu      sync.Mutex
+	chans   []chan time.Time
+	created []time.Time
+	stops   []int
+}
+
+func fakeNoOutputTimers(t *testing.T) *noOutputTimers {
+	t.Helper()
+	f := &noOutputTimers{}
+	restore := noOutputTimer
+	noOutputTimer = func() (<-chan time.Time, func()) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		i := len(f.chans)
+		f.chans = append(f.chans, make(chan time.Time, 1))
+		f.created = append(f.created, now())
+		f.stops = append(f.stops, 0)
+		return f.chans[i], func() {
+			f.mu.Lock()
+			f.stops[i]++
+			f.mu.Unlock()
+		}
+	}
+	t.Cleanup(func() { noOutputTimer = restore })
+	return f
+}
+
+func (f *noOutputTimers) fire() {
+	f.mu.Lock()
+	c := f.chans[len(f.chans)-1]
+	f.mu.Unlock()
+	select {
+	case c <- time.Time{}:
+	default:
+	}
+}
+
+func (f *noOutputTimers) fireIfDue() {
+	f.mu.Lock()
+	due := !now().Before(f.created[len(f.created)-1].Add(noOutputLimit))
+	f.mu.Unlock()
+	if due {
+		f.fire()
+	}
+}
+
+func (f *noOutputTimers) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.chans)
+}
+
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func fakeClock(t *testing.T) *testClock {
+	t.Helper()
+	c := &testClock{t: time.Date(2026, 10, 24, 21, 52, 45, 0, time.UTC)}
+	restore := now
+	now = func() time.Time {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.t
+	}
+	t.Cleanup(func() { now = restore })
+	return c
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+func noOutputDeps(store *sessions.Store, client provider.Client, retry RetryPolicy) Deps {
+	return Deps{
+		Active: selectedState("openrouter", "z-ai/glm-5.3-flash", model.EffortDefault),
+		Store:  store,
+		Client: client,
+		Retry:  retry,
+		Flush:  storeFlush(store),
+	}
+}
+
+func onlyNoOutputFailure(t *testing.T, recs []sessions.Record) events.ProviderRequestFailed {
+	t.Helper()
+	failed := eventsOf[events.ProviderRequestFailed](t, recs, events.KindProviderRequestFailed, "provider_request_failed")
+	if len(failed) != 1 || failed[0].Phase != "stream_drop" || failed[0].Reason != "stream_no_output" {
+		t.Fatalf("provider_request_failed = %+v, want one stream_drop/stream_no_output", failed)
+	}
+	return failed[0]
+}
+
+func hasNoOutputRecord(recs []sessions.Record) bool {
+	for _, r := range recs {
+		if e, ok := r.(sessions.Event); ok && strings.Contains(string(e.Payload), "stream_no_output") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNoOutputLimitDefaultIsThirtyMinutes(t *testing.T) {
+	if noOutputLimit != 30*time.Minute {
+		t.Fatalf("noOutputLimit = %v, want 30m", noOutputLimit)
+	}
+}
+
+func TestRun_NoOutputTimeoutCancelsAndRetries(t *testing.T) {
+	cases := map[string]func(ctx context.Context, i int, f *noOutputTimers) ([]byte, error){
+		"reasoning only": func(_ context.Context, i int, f *noOutputTimers) ([]byte, error) {
+			if i == 3 {
+				f.fire()
+			}
+			return reasoningChunk("thinking"), nil
+		},
+		"empty chunks only": func(_ context.Context, i int, f *noOutputTimers) ([]byte, error) {
+			if i == 3 {
+				f.fire()
+			}
+			return emptyChunk(), nil
+		},
+		"blocked read": func(ctx context.Context, _ int, f *noOutputTimers) ([]byte, error) {
+			f.fire()
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	for name, first := range cases {
+		t.Run(name, func(t *testing.T) {
+			noSleep(t)
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := stepClient(func(ctx context.Context, call, i int) ([]byte, error) {
+				if call == 1 {
+					return first(ctx, i, timers)
+				}
+				return chunkAt(i, contentChunk("answer"), finishChunk("stop"))
+			})
+			var deltas []string
+			deps := noOutputDeps(store, client, retryOn())
+			deps.Sink = func(d string) { deltas = append(deltas, d) }
+
+			if err := New(deps).Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v, want nil after the retry recovers", err)
+			}
+			recs := diskRecords(t, store)
+			terms := turnTerminalEvents(t, recs)
+			if len(terms) != 2 || terms[0].Outcome != events.TurnOutcomeProviderFailed || terms[0].FailurePhase != "stream_drop" || terms[1].Outcome != events.TurnOutcomeCompleted {
+				t.Fatalf("turn_terminal = %+v, want provider_failed/stream_drop then completed", terms)
+			}
+			retries := findProviderRequestRetry(t, recs)
+			if len(retries) != 1 || retries[0].Phase != "stream_drop" || retries[0].Reason != "stream_no_output" || retries[0].PartialCharsDiscarded != 0 {
+				t.Fatalf("provider_request_retry = %+v, want one stream_drop/stream_no_output with 0 discarded", retries)
+			}
+			if hasKind(recs, events.KindProviderRequestFailed) {
+				t.Fatalf("provider_request_failed committed for a recovered attempt; kinds = %v", eventKinds(recs))
+			}
+			if timers.count() != 2 {
+				t.Fatalf("no-output timers = %d, want one per attempt (2)", timers.count())
+			}
+			if fmt.Sprint(deltas) != "[answer]" {
+				t.Fatalf("sink deltas = %v, want only the retry's answer", deltas)
+			}
+		})
+	}
+}
+
+func TestRun_NoOutputTimeoutTerminalFailure(t *testing.T) {
+	cases := []struct {
+		name      string
+		retry     RetryPolicy
+		calls     int
+		streamErr func(ctx context.Context) error
+	}{
+		{"retry disabled, stream returns context.Canceled", RetryPolicy{}, 1, func(ctx context.Context) error { return ctx.Err() }},
+		{"retry disabled, stream returns nil Err", RetryPolicy{}, 1, func(context.Context) error { return nil }},
+		{"retries exhausted", RetryPolicy{Enabled: true, MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, Budget: time.Hour}, 2, func(ctx context.Context) error { return ctx.Err() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			noSleep(t)
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := stepClient(func(ctx context.Context, _, i int) ([]byte, error) {
+				if i == 0 {
+					return reasoningChunk("hmm"), nil
+				}
+				timers.fire()
+				<-ctx.Done()
+				return nil, tc.streamErr(ctx)
+			})
+			var sunk, interrupts int
+			deps := noOutputDeps(store, client, tc.retry)
+			deps.Sink = func(string) { sunk++ }
+			deps.Interrupt = func() { interrupts++ }
+
+			err := New(deps).Run(context.Background())
+			if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run() error = %v, want a non-cancellation provider failure", err)
+			}
+			if client.callCount() != tc.calls {
+				t.Fatalf("provider calls = %d, want %d", client.callCount(), tc.calls)
+			}
+			recs := diskRecords(t, store)
+			failed := onlyNoOutputFailure(t, recs)
+			if failed.PartialResponseChars != 0 || failed.HTTPStatus != nil {
+				t.Fatalf("provider_request_failed = %+v, want 0 partial chars and no status", failed)
+			}
+			if !strings.Contains(failed.ErrorDetail, "codemeld cancelled") {
+				t.Fatalf("error_detail = %q, want the local cancellation named", failed.ErrorDetail)
+			}
+			if sunk != 0 || interrupts != 0 || len(assistantMessages(recs)) != 0 {
+				t.Fatalf("sink %d, interrupts %d, assistant messages %d, want no partial transcript", sunk, interrupts, len(assistantMessages(recs)))
+			}
+		})
+	}
+}
+
+func TestRun_FirstOutputDisablesNoOutputTimer(t *testing.T) {
+	cases := map[string][]byte{"content": contentChunk("hi"), "tool call": toolCallChunk()}
+	for name, first := range cases {
+		t.Run(name, func(t *testing.T) {
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := stepClient(func(_ context.Context, _, i int) ([]byte, error) {
+				if i == 1 {
+					timers.fire()
+					return reasoningChunk("after"), nil
+				}
+				return chunkAt(i, first, nil, finishChunk("stop"))
+			})
+			handoffs := 0
+			deps := noOutputDeps(store, client, RetryPolicy{})
+			deps.OnToolCalls = func(context.Context, ToolCallHandoff) error { handoffs++; return nil }
+
+			if err := New(deps).Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			recs := diskRecords(t, store)
+			if hasNoOutputRecord(recs) || hasKind(recs, events.KindProviderRequestFailed) {
+				t.Fatalf("a round with early output recorded a failure; kinds = %v", eventKinds(recs))
+			}
+			if name == "tool call" && handoffs != 1 {
+				t.Fatalf("tool-call handoffs = %d, want 1", handoffs)
+			}
+			if name == "content" && !hasKind(recs, "model_response") {
+				t.Fatalf("missing model_response; kinds = %v", eventKinds(recs))
+			}
+			if timers.stops[0] == 0 {
+				t.Fatal("no-output timer never stopped")
+			}
+		})
+	}
+}
+
+func gateNthRead(t *testing.T, n int) chan struct{} {
+	t.Helper()
+	gate := make(chan struct{})
+	restore := idleTimer
+	reads := 0
+	idleTimer = func() (<-chan time.Time, func()) {
+		reads++
+		if reads == n {
+			<-gate
+		}
+		return nil, func() {}
+	}
+	t.Cleanup(func() { idleTimer = restore })
+	return gate
+}
+
+func TestRun_ReadyQualifyingChunkRacingTimerIsProcessed(t *testing.T) {
+	for range 20 {
+		synctest.Test(t, func(t *testing.T) {
+			timers := fakeNoOutputTimers(t)
+			gate := gateNthRead(t, 2)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := stepClient(func(_ context.Context, _, i int) ([]byte, error) {
+				return chunkAt(i, reasoningChunk("x"), contentChunk("answer"), finishChunk("stop"))
+			})
+			var deltas []string
+			deps := noOutputDeps(store, client, RetryPolicy{})
+			deps.Sink = func(d string) { deltas = append(deltas, d) }
+			done := make(chan error, 1)
+			go func() { done <- New(deps).Run(context.Background()) }()
+			synctest.Wait()
+			timers.fire()
+			close(gate)
+			if err := <-done; err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			recs := diskRecords(t, store)
+			if hasNoOutputRecord(recs) || fmt.Sprint(deltas) != "[answer]" {
+				t.Fatalf("deltas %v, kinds %v: a ready content chunk lost to the timer", deltas, eventKinds(recs))
+			}
+		})
+	}
+}
+
+func TestRun_NoOutputTimeoutCannotBeStarvedByReadyReads(t *testing.T) {
+	for range 20 {
+		synctest.Test(t, func(t *testing.T) {
+			timers := fakeNoOutputTimers(t)
+			gate := gateNthRead(t, 3)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			var reads atomic.Int32
+			client := stepClient(func(_ context.Context, _, i int) ([]byte, error) {
+				reads.Add(1)
+				if i%2 == 0 {
+					return reasoningChunk("r"), nil
+				}
+				return emptyChunk(), nil
+			})
+			done := make(chan error, 1)
+			go func() { done <- New(noOutputDeps(store, client, RetryPolicy{})).Run(context.Background()) }()
+			synctest.Wait()
+			timers.fire()
+			close(gate)
+			<-done
+			if got := reads.Load(); got != 3 {
+				t.Fatalf("stream reads = %d, want 3 (the read in hand when the timer fired is the last)", got)
+			}
+			recs := diskRecords(t, store)
+			onlyNoOutputFailure(t, recs)
+			if rounds := providerRoundTripEvents(t, recs); len(rounds) != 1 || rounds[0].Chunks != 3 {
+				t.Fatalf("provider_round_trip = %+v, want one with 3 chunks", rounds)
+			}
+		})
+	}
+}
+
+func TestRun_LateReadAfterNoOutputTimeoutIsDrained(t *testing.T) {
+	cases := map[string][]byte{
+		"content":   []byte(deltaChunk(`{"content":"late","reasoning":"çé"}`)),
+		"tool call": toolCallChunk(),
+	}
+	for name, late := range cases {
+		t.Run(name, func(t *testing.T) {
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := stepClient(func(ctx context.Context, _, i int) ([]byte, error) {
+				switch i {
+				case 0:
+					return reasoningChunk("ñü"), nil
+				case 1:
+					timers.fire()
+					<-ctx.Done()
+					return late, nil
+				}
+				t.Error("stream read after the drained read")
+				return nil, nil
+			})
+			var sunk, progress, handoffs int
+			deps := noOutputDeps(store, client, RetryPolicy{})
+			deps.Sink = func(string) { sunk++ }
+			deps.Progress = func(int) { progress++ }
+			deps.OnToolCalls = func(context.Context, ToolCallHandoff) error { handoffs++; return nil }
+			runner := New(deps)
+
+			if err := runner.Run(context.Background()); err == nil || errors.Is(err, context.Canceled) {
+				t.Fatalf("Run() error = %v, want the no-output failure", err)
+			}
+			if retained, _ := runner.Cancel(); retained != 0 || sunk != 0 || progress != 0 || handoffs != 0 {
+				t.Fatalf("retained %d, sink %d, progress %d, handoffs %d, want the late read to reach none", retained, sunk, progress, handoffs)
+			}
+			recs := diskRecords(t, store)
+			if failed := onlyNoOutputFailure(t, recs); failed.PartialResponseChars != 0 {
+				t.Fatalf("partial_response_chars = %d, want 0", failed.PartialResponseChars)
+			}
+			if len(assistantMessages(recs)) != 0 {
+				t.Fatal("a drained read produced an assistant message")
+			}
+			wantReasoning := int64(2)
+			if name == "content" {
+				wantReasoning = 4
+			}
+			if rounds := providerRoundTripEvents(t, recs); len(rounds) != 1 || rounds[0].Chunks != 2 || rounds[0].ReasoningChars != wantReasoning {
+				t.Fatalf("provider_round_trip = %+v, want chunks 2 and reasoning_chars %d", rounds, wantReasoning)
+			}
+		})
+	}
+}
+
+func TestRun_GenuineCancelBeforeNoOutputTripRecordsNoTimeout(t *testing.T) {
+	for _, name := range []string{"user cancel", "run time limit"} {
+		t.Run(name, func(t *testing.T) {
+			noSleep(t)
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			var armed atomic.Bool
+			client := stepClient(func(ctx context.Context, _, i int) ([]byte, error) {
+				if i == 0 {
+					armed.Store(true)
+					return reasoningChunk("r"), nil
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			})
+			ctx, expire := context.WithCancelCause(context.Background())
+			defer expire(nil)
+			runner := New(noOutputDeps(store, client, retryOn()))
+			interrupt := func() { runner.Cancel() }
+			if name == "run time limit" {
+				interrupt = func() { expire(errTimeLimit) }
+			}
+			restoreNow := now
+			now = func() time.Time {
+				if armed.CompareAndSwap(true, false) {
+					timers.fire()
+					interrupt()
+				}
+				return restoreNow()
+			}
+			t.Cleanup(func() { now = restoreNow })
+
+			if err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run() error = %v, want the cancellation", err)
+			}
+			recs := diskRecords(t, store)
+			if hasNoOutputRecord(recs) || hasKind(recs, events.KindProviderRequestFailed) || hasKind(recs, events.KindProviderRequestRetry) {
+				t.Fatalf("a genuine cancel recorded a provider failure; kinds = %v", eventKinds(recs))
+			}
+			if terms := turnTerminalEvents(t, recs); len(terms) != 1 || terms[0].Outcome != events.TurnOutcomeCancelled {
+				t.Fatalf("turn_terminal = %+v, want one cancelled", terms)
+			}
+		})
+	}
+}
+
+func outputlessForever(clock *testClock, timers *noOutputTimers) func(context.Context, int, int) ([]byte, error) {
+	return func(_ context.Context, _, i int) ([]byte, error) {
+		if i >= 120 {
+			return nil, nil
+		}
+		clock.advance(time.Minute)
+		timers.fireIfDue()
+		if i%2 == 0 {
+			return reasoningChunk("r"), nil
+		}
+		return emptyChunk(), nil
+	}
+}
+
+func TestRun_NoOutputTimerOnePerAttemptNotReset(t *testing.T) {
+	noSleep(t)
+	clock := fakeClock(t)
+	timers := fakeNoOutputTimers(t)
+	store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+	outputless := outputlessForever(clock, timers)
+	client := stepClient(func(ctx context.Context, call, i int) ([]byte, error) {
+		if call == 1 {
+			return outputless(ctx, call, i)
+		}
+		return chunkAt(i, contentChunk("answer"), finishChunk("stop"))
+	})
+
+	if err := New(noOutputDeps(store, client, retryOn())).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if timers.count() != 2 || !timers.created[1].After(timers.created[0]) {
+		t.Fatalf("timers created at %v, want one per attempt with a fresh one for the retry", timers.created)
+	}
+	rounds := providerRoundTripEvents(t, diskRecords(t, store))
+	if len(rounds) != 2 || rounds[0].DurationMs != (30*time.Minute).Milliseconds() || rounds[0].Chunks != 30 {
+		t.Fatalf("provider_round_trip = %+v, want the first cut at 30m after 30 chunks", rounds)
+	}
+}
+
+func TestRun_NoOutputTimerStartsAfterSlowStreamOpen(t *testing.T) {
+	clock := fakeClock(t)
+	timers := fakeNoOutputTimers(t)
+	store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+	opened := now()
+	client := &fakeClient{}
+	client.fn = func(context.Context, provider.Request) (provider.Response, error) {
+		clock.advance(10 * time.Minute)
+		dec := &stepDecoder{step: func(i int) ([]byte, error) {
+			if i < 25 {
+				clock.advance(time.Minute)
+				timers.fireIfDue()
+				return reasoningChunk("r"), nil
+			}
+			return chunkAt(i-25, contentChunk("answer"), finishChunk("stop"))
+		}}
+		return provider.Response{Stream: ssestream.NewStream[openai.ChatCompletionChunk](dec, nil)}, nil
+	}
+
+	if err := New(noOutputDeps(store, client, RetryPolicy{})).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want nil: 25m of streaming after a 10m open is within the allowance", err)
+	}
+	if want := opened.Add(10 * time.Minute); !timers.created[0].Equal(want) {
+		t.Fatalf("timer anchored at %v, want %v (after the stream opened)", timers.created[0], want)
+	}
+	if !hasKind(diskRecords(t, store), "model_response") {
+		t.Fatal("missing model_response")
+	}
+}
+
+func TestRun_TwentyEightMinuteOutputlessStreamIsNotCut(t *testing.T) {
+	clock := fakeClock(t)
+	timers := fakeNoOutputTimers(t)
+	store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+	client := stepClient(func(_ context.Context, _, i int) ([]byte, error) {
+		if i < 28 {
+			clock.advance(time.Minute)
+			timers.fireIfDue()
+			return reasoningChunk("r"), nil
+		}
+		clock.advance(time.Second)
+		timers.fireIfDue()
+		return nil, nil
+	})
+
+	_ = New(noOutputDeps(store, client, RetryPolicy{})).Run(context.Background())
+	recs := diskRecords(t, store)
+	failed := findProviderRequestFailed(t, recs)
+	if failed.Phase != "empty_response" || failed.Reason != "zero_delta_stream" {
+		t.Fatalf("provider_request_failed = %s/%s, want empty_response/zero_delta_stream", failed.Phase, failed.Reason)
+	}
+	if rounds := providerRoundTripEvents(t, recs); len(rounds) != 1 || rounds[0].DurationMs != 1681000 {
+		t.Fatalf("provider_round_trip = %+v, want one lasting 28m01s", rounds)
+	}
+}
+
+func TestRun_RepeatedNoOutputAttemptsRetryBounds(t *testing.T) {
+	cases := []struct {
+		name  string
+		retry RetryPolicy
+		calls int
+		skip  string
+	}{
+		{"default budget", retryOn(), 2, "budget_exhausted"},
+		{"enlarged budget", RetryPolicy{Enabled: true, MaxAttempts: 4, BaseDelay: 500 * time.Millisecond, MaxDelay: 8 * time.Second, Budget: 10 * time.Hour}, 4, "max_attempts_reached"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			noSleep(t)
+			clock := fakeClock(t)
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := stepClient(outputlessForever(clock, timers))
+
+			err := New(noOutputDeps(store, client, tc.retry)).Run(context.Background())
+			if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run() error = %v, want a non-cancellation provider failure", err)
+			}
+			if client.callCount() != tc.calls || timers.count() != tc.calls {
+				t.Fatalf("provider calls = %d, timers = %d, want %d", client.callCount(), timers.count(), tc.calls)
+			}
+			recs := diskRecords(t, store)
+			if retries := findProviderRequestRetry(t, recs); len(retries) != tc.calls-1 {
+				t.Fatalf("provider_request_retry = %d, want %d", len(retries), tc.calls-1)
+			}
+			if skipped := findProviderRequestRetrySkipped(t, recs); len(skipped) != 1 || skipped[0].SkipReason != tc.skip || skipped[0].Reason != "stream_no_output" {
+				t.Fatalf("provider_request_retry_skipped = %+v, want one %s for stream_no_output", skipped, tc.skip)
+			}
+			onlyNoOutputFailure(t, recs)
+		})
+	}
+}
+
+func TestRun_ProviderRoundTripCountsChunksAndReasoningRunes(t *testing.T) {
+	store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+	client := streamClient(
+		[]byte(deltaChunk(`{"reasoning":"héllo","reasoning_details":[{"type":"reasoning.text","text":"héllo","index":0}]}`)),
+		emptyChunk(),
+		contentChunk("ok"),
+		finishChunk("stop"),
+		usageChunk(1, 1),
+	)
+	if err := New(noOutputDeps(store, client, RetryPolicy{})).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rounds := providerRoundTripEvents(t, diskRecords(t, store)); len(rounds) != 1 || rounds[0].Chunks != 5 || rounds[0].ReasoningChars != 5 {
+		t.Fatalf("provider_round_trip = %+v, want chunks 5 and reasoning_chars 5", rounds)
 	}
 }

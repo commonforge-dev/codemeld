@@ -155,6 +155,7 @@ type PromptRequest struct {
 	// must not hide trust-scope information. An empty entry means that stage does not broaden any
 	// approved scope. Empty/nil for a non-escalating batch. Display-only, like BatchedStages.
 	BatchedEscalations []string
+	BatchedNotes       []string
 	// ApprovalIndex and ApprovalTotal are this prompt's 1-based position in a walk of separate
 	// approval questions and the number of questions in that walk. The overlay shows the position
 	// only when ApprovalTotal exceeds 1, and discloses nothing about the questions that follow.
@@ -208,6 +209,7 @@ type PromptRequest struct {
 	// It changes nothing about matching or persistence — display only. Empty for every
 	// non-escalating prompt.
 	ScopeEscalationNarrower string
+	Note                    string
 	// Compound, when non-nil, carries the recognized simple-compound decomposition
 	// (its ordered direct-command stages and pinned operators) for a literal-command
 	// subject the backend recognized as a simple compound. It gates the
@@ -550,6 +552,9 @@ func promptFactLines(req PromptRequest) []string {
 	} else if req.isShellSubject() {
 		lines = append(lines, ShellBlockedPathsNotice)
 	}
+	if req.Note != "" {
+		lines = append(lines, permissions.BoundPromptFact(req.Note))
+	}
 
 	// Scope-escalation warning: the request's path scope is broader than — an ancestor
 	// of — a folder the user already approved for this same subject. Surface the
@@ -565,6 +570,11 @@ func promptFactLines(req PromptRequest) []string {
 			continue
 		}
 		lines = append(lines, fmt.Sprintf("Stage %d: %s%s", i+1, scopeEscalationNotice, permissions.BoundPromptFact(narrower)))
+	}
+	for i, note := range req.BatchedNotes {
+		if note != "" {
+			lines = append(lines, fmt.Sprintf("Stage %d: %s", i+1, permissions.BoundPromptFact(note)))
+		}
 	}
 	if req.ExceptionalAuthority != "" {
 		return append(lines, "", exceptionalAllowOnceExplanation)

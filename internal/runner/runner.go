@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -161,13 +162,11 @@ func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, erro
 	}
 
 	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
-	killGroupOnCancel(cmd)
+	inv := killGroupOnCancel(cmd, spec.InvocationID)
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
-	if spec.Env != nil {
-		cmd.Env = spec.Env
-	}
+	cmd.Env = commandEnv(spec.Env, spec.InvocationID)
 	if len(spec.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(spec.Stdin)
 	}
@@ -176,7 +175,14 @@ func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, erro
 	cmd.Stderr = &stderr
 
 	start := time.Now()
-	err := cmd.Run()
+	err := cmd.Start()
+	if err == nil {
+		inv.started(ctx, cmd.Process.Pid)
+		inv.awaitExit()
+		err = cmd.Wait()
+		inv.exited()
+		inv.finish()
+	}
 	duration := time.Since(start)
 
 	res := RunResult{
@@ -208,36 +214,36 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 	}
 
 	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
-	killGroupOnCancel(cmd)
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
-	if spec.Env != nil {
-		cmd.Env = spec.Env
-	}
-	if len(spec.Stdin) > 0 {
-		cmd.Stdin = bytes.NewReader(spec.Stdin)
-	}
+	cmd.Env = commandEnv(spec.Env, spec.InvocationID)
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		return RunResult{}, fmt.Errorf("runner: capture setup: %w", err)
 	}
 	errR, errW, err := os.Pipe()
 	if err != nil {
-		_ = outR.Close()
-		_ = outW.Close()
+		closeFiles(outR, outW)
 		return RunResult{}, fmt.Errorf("runner: capture setup: %w", err)
+	}
+	var inR, inW *os.File
+	if len(spec.Stdin) > 0 {
+		if inR, inW, err = os.Pipe(); err != nil {
+			closeFiles(outR, outW, errR, errW)
+			return RunResult{}, fmt.Errorf("runner: capture setup: %w", err)
+		}
+		cmd.Stdin = inR
 	}
 	cmd.Stdout = outW
 	cmd.Stderr = errW
+	inv := killGroupOnCancel(cmd, spec.InvocationID, outR, errR, inW)
 
 	start := time.Now()
 	startErr := cmd.Start()
-	_ = outW.Close()
-	_ = errW.Close()
+	closeFiles(outW, errW, inR)
 	if startErr != nil {
-		_ = outR.Close()
-		_ = errR.Close()
+		closeFiles(outR, errR, inW)
 		return RunResult{
 			InvocationID:      spec.InvocationID,
 			ExitCode:          -1,
@@ -246,6 +252,7 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 		}, nil
 	}
 
+	inv.started(ctx, cmd.Process.Pid)
 	var stdoutCap, stderrCap capture
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -257,8 +264,18 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 		defer wg.Done()
 		stderrCap = drainStream(errR, maxCapture)
 	}()
+	if inW != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feedStdin(inW, spec.Stdin)
+		}()
+	}
+	inv.awaitExit()
 	waitErr := cmd.Wait()
+	inv.exited()
 	wg.Wait()
+	inv.finish()
 	duration := time.Since(start)
 
 	if stdoutCap.err != nil || stderrCap.err != nil {
@@ -297,7 +314,7 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		results[i] = PipelineResult{InvocationID: specs[i].InvocationID, ExitCode: -1}
 	}
 
-	pipes, err := newStagePipes(n)
+	pipes, err := newStagePipes(n, len(specs[0].Stdin) > 0)
 	if err != nil {
 		for i := range results {
 			results[i].PipelineErrCategory = PipelineFailureInternal
@@ -306,30 +323,26 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 	}
 
 	cmds := make([]*exec.Cmd, n)
+	invs := make([]*invocation, n)
 	starts := make([]time.Time, n)
 	for i, spec := range specs {
 		cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
-		killGroupOnCancel(cmd)
 		if spec.Cwd != "" {
 			cmd.Dir = spec.Cwd
 		}
-		if spec.Env != nil {
-			cmd.Env = spec.Env
-		}
-		if i == 0 {
-			if len(spec.Stdin) > 0 {
-				cmd.Stdin = bytes.NewReader(spec.Stdin)
-			}
-		} else {
+		cmd.Env = commandEnv(spec.Env, spec.InvocationID)
+		if pipes[i].inR != nil {
 			cmd.Stdin = pipes[i].inR
 		}
 		cmd.Stdout = pipes[i].outW
 		cmd.Stderr = pipes[i].errW
+		invs[i] = killGroupOnCancel(cmd, spec.InvocationID, pipes[i].out, pipes[i].errR, pipes[i].inW)
 
 		starts[i] = time.Now()
 		if err := cmd.Start(); err != nil {
 			results[i].LaunchErrCategory = classifyLaunchErr(err)
 		} else {
+			invs[i].started(ctx, cmd.Process.Pid)
 			cmds[i] = cmd
 		}
 		// The parent's copies of the ends the child now owns must go immediately: while the parent
@@ -345,6 +358,13 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 	stdoutCap := make([]capture, n)
 	stderrCap := make([]capture, n)
 	var wg sync.WaitGroup
+	if pipes[0].inW != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feedStdin(pipes[0].inW, specs[0].Stdin)
+		}()
+	}
 	for i := range n {
 		wg.Add(2)
 		go func() {
@@ -357,7 +377,7 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 				stdoutCap[i] = drainStream(pipes[i].out, maxCapture)
 				return
 			}
-			stdoutCap[i] = linkStream(pipes[i].out, pipes[i+1].inW, maxCapture)
+			stdoutCap[i] = linkStream(pipes[i].out, pipes[i+1].inW, maxCapture, invs[i])
 		}()
 		if cmds[i] == nil {
 			continue
@@ -365,12 +385,19 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			invs[i].awaitExit()
 			waitErr := cmds[i].Wait()
+			invs[i].exited()
 			results[i].Duration = time.Since(starts[i])
 			results[i].ExitCode = exitCodeAfterWait(cmds[i], waitErr)
 		}()
 	}
 	wg.Wait()
+	for i := range invs {
+		if cmds[i] != nil {
+			invs[i].finish()
+		}
+	}
 
 	for i := range results {
 		if results[i].LaunchErrCategory != "" {
@@ -382,13 +409,10 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		results[i].StderrTotal = stderrCap[i].total
 	}
 
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		for i := range results {
-			results[i].PipelineErrCategory = PipelineFailureCanceled
-		}
-		return results, fmt.Errorf("runner: pipeline canceled: %w", ctxErr)
-	}
+	return results, pipelineFailure(ctx.Err(), results, stdoutCap, stderrCap)
+}
 
+func pipelineFailure(ctxErr error, results []PipelineResult, stdoutCap, stderrCap []capture) error {
 	var pipelineErr error
 	for i := range results {
 		if stderrCap[i].err != nil {
@@ -397,13 +421,21 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		}
 		if stdoutCap[i].err != nil {
 			results[i].PipelineErrCategory = PipelineFailureCopy
-			if i+1 < n {
+			if i+1 < len(results) {
 				results[i+1].PipelineErrCategory = PipelineFailureCopy
 			}
 			pipelineErr = errors.Join(pipelineErr, fmt.Errorf("runner: stage %d stdout capture: %w", i, stdoutCap[i].err))
 		}
 	}
-	return results, pipelineErr
+	if ctxErr != nil {
+		for i := range results {
+			if results[i].PipelineErrCategory == "" {
+				results[i].PipelineErrCategory = PipelineFailureCanceled
+			}
+		}
+		pipelineErr = errors.Join(fmt.Errorf("runner: pipeline canceled: %w", ctxErr), pipelineErr)
+	}
+	return pipelineErr
 }
 
 func validatePipelineSpecs(specs []RunSpec) error {
@@ -423,7 +455,7 @@ func validatePipelineSpecs(specs []RunSpec) error {
 
 // stagePipes holds one stage's OS pipes. out/errR are the parent's read ends; outW/errW are the
 // child's write ends; inR is the child's stdin read end and inW the parent copier's write end, both
-// nil for the first stage, which takes RunSpec.Stdin instead.
+// nil for a first stage with no RunSpec.Stdin.
 type stagePipes struct {
 	out  *os.File
 	outW *os.File
@@ -433,7 +465,7 @@ type stagePipes struct {
 	inW  *os.File
 }
 
-func newStagePipes(n int) ([]stagePipes, error) {
+func newStagePipes(n int, firstStdin bool) ([]stagePipes, error) {
 	pipes := make([]stagePipes, n)
 	closeAll := func() {
 		for _, p := range pipes {
@@ -457,7 +489,7 @@ func newStagePipes(n int) ([]stagePipes, error) {
 			return nil, err
 		}
 		pipes[i].errR, pipes[i].errW = r, w
-		if i > 0 {
+		if i > 0 || firstStdin {
 			r, w, err = os.Pipe()
 			if err != nil {
 				closeAll()
@@ -489,7 +521,7 @@ func drainStream(src *os.File, maxCapture int) capture {
 			c.kept = appendCapped(c.kept, buf[:nr], maxCapture)
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrDeadlineExceeded) {
 				c.err = err
 			}
 			return c
@@ -500,7 +532,7 @@ func drainStream(src *os.File, maxCapture int) capture {
 // linkStream copies src into dst with the same bounded capture as drainStream. A write failing with
 // EPIPE means the downstream stage already exited, so src is closed and the upstream producer takes
 // SIGPIPE instead of writing forever into a stream nobody reads.
-func linkStream(src, dst *os.File, maxCapture int) capture {
+func linkStream(src, dst *os.File, maxCapture int, srcInv *invocation) capture {
 	defer func() { _ = dst.Close() }()
 	defer func() { _ = src.Close() }()
 	var c capture
@@ -510,18 +542,35 @@ func linkStream(src, dst *os.File, maxCapture int) capture {
 		if nr > 0 {
 			c.total += int64(nr)
 			c.kept = appendCapped(c.kept, buf[:nr], maxCapture)
+			began := time.Now()
 			if _, werr := dst.Write(buf[:nr]); werr != nil {
-				if !errors.Is(werr, syscall.EPIPE) && !errors.Is(werr, io.ErrClosedPipe) {
+				if !errors.Is(werr, syscall.EPIPE) && !errors.Is(werr, io.ErrClosedPipe) && !errors.Is(werr, os.ErrDeadlineExceeded) {
 					c.err = werr
 				}
 				return c
 			}
+			if time.Since(began) >= linkBackpressure {
+				srcInv.extendRead(src)
+			}
 		}
 		if rerr != nil {
-			if !errors.Is(rerr, io.EOF) {
+			if !errors.Is(rerr, io.EOF) && !errors.Is(rerr, os.ErrDeadlineExceeded) {
 				c.err = rerr
 			}
 			return c
+		}
+	}
+}
+
+func feedStdin(dst *os.File, data []byte) {
+	defer func() { _ = dst.Close() }()
+	_, _ = dst.Write(data)
+}
+
+func closeFiles(files ...*os.File) {
+	for _, f := range files {
+		if f != nil {
+			_ = f.Close()
 		}
 	}
 }
@@ -537,15 +586,113 @@ func appendCapped(kept, chunk []byte, maxCapture int) []byte {
 	return append(kept, chunk...)
 }
 
-func killGroupOnCancel(cmd *exec.Cmd) {
+const (
+	outputGrace      = 2 * time.Second
+	linkBackpressure = 100 * time.Millisecond
+)
+
+type invocation struct {
+	id         string
+	files      []*os.File
+	root       rootIdentity
+	ready      chan struct{}
+	done       chan struct{}
+	watcher    sync.WaitGroup
+	cleanup    sync.Once
+	cleanupErr error
+	armOnce    sync.Once
+	armed      atomic.Bool
+	canceled   atomic.Bool
+	mu         sync.Mutex
+	rootGone   bool
+}
+
+func killGroupOnCancel(cmd *exec.Cmd, invocationID string, files ...*os.File) *invocation {
+	inv := &invocation{id: invocationID, files: files, ready: make(chan struct{}), done: make(chan struct{})}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = outputGrace
 	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
+		<-inv.ready
+		return inv.cancel()
 	}
+	return inv
+}
+
+func (inv *invocation) started(ctx context.Context, pid int) {
+	inv.root = registerRoot(pid)
+	close(inv.ready)
+	if !observesRootExit {
+		return
+	}
+	inv.watcher.Add(1)
+	go func() {
+		defer inv.watcher.Done()
+		select {
+		case <-ctx.Done():
+			_ = inv.cancel()
+		case <-inv.done:
+		}
+	}()
+}
+
+func (inv *invocation) cancel() error {
+	inv.canceled.Store(true)
+	inv.cleanup.Do(func() {
+		inv.mu.Lock()
+		defer inv.mu.Unlock()
+		inv.cleanupErr = killEscaped(inv.root, inv.id, !inv.rootGone)
+	})
+	inv.arm()
+	return inv.cleanupErr
+}
+
+// awaitExit marks the root gone before cmd.Wait may reap it, because a reaped pid can name an
+// unrelated new process group and the group kill must never reach it.
+func (inv *invocation) awaitExit() {
+	if awaitRootExit(inv.root.pid) {
+		inv.exited()
+	}
+}
+
+func (inv *invocation) exited() {
+	inv.mu.Lock()
+	inv.rootGone = true
+	inv.mu.Unlock()
+	inv.arm()
+}
+
+func (inv *invocation) arm() {
+	inv.armOnce.Do(func() {
+		deadline := time.Now().Add(outputGrace)
+		for _, f := range inv.files {
+			if f != nil {
+				_ = f.SetDeadline(deadline)
+			}
+		}
+		inv.armed.Store(true)
+	})
+}
+
+// extendRead keeps a linked stage's remaining output flowing while a live downstream stage is still
+// consuming it slowly; only an idle wait for more output is bounded by the grace.
+func (inv *invocation) extendRead(f *os.File) {
+	if inv.armed.Load() && !inv.canceled.Load() {
+		_ = f.SetReadDeadline(time.Now().Add(outputGrace))
+	}
+}
+
+func (inv *invocation) finish() {
+	close(inv.done)
+	inv.watcher.Wait()
+	unregisterRoot(inv.root)
+}
+
+func killGroup(pid int) error {
+	err := syscall.Kill(-pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
 }
 
 func exitCodeAfterWait(cmd *exec.Cmd, waitErr error) int {

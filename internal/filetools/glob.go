@@ -1,6 +1,4 @@
-// Built-in structured glob tool: project-root-confined filename globbing with `**` recursive matching
-// via the pure-Go doublestar matcher, run over the shared hidden/ignore/symlink-safe walker, returning
-// project-relative paths in ascending order bounded by a per-tool limit.
+// Built-in glob tool: lists entries whose path matches a glob pattern.
 package filetools
 
 import (
@@ -43,12 +41,6 @@ var _ tools.Tool = (*GlobTool)(nil)
 
 func (t *GlobTool) SetBlockedPaths(blocked *permissions.BlockedPaths) { t.blocked = blocked }
 
-// NewGlobTool builds the glob tool bound to the run's ~ anchor (home), the process cwd accepted for
-// signature symmetry with the other file tools, the project root the search is confined to (via
-// ResolveReadTarget), and the tool-output byte cap (cache.MaxToolOutputBytes()) BoundedResult uses to
-// predict byte-cap truncation. The project root is symlink-resolved once here — mirroring
-// NewReadTool — so a launch through a symlinked project directory does not reject valid in-project paths;
-// ResolveReadTarget normalizes again, so the double normalization is idempotent.
 func NewGlobTool(home, processCWD, projectRoot string, outputCap int) *GlobTool {
 	return &GlobTool{home: home, processCWD: processCWD, projectRoot: normalizeRoot(projectRoot), outputCap: outputCap}
 }
@@ -64,7 +56,7 @@ func (t *GlobTool) SubjectKind() string { return "tool" }
 // it is advertised in Plan and auto-allowed in every mode.
 func (t *GlobTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description: "List project files whose path matches a glob pattern, including ** for recursive " +
+		Description: "List files inside or outside the project whose path matches a glob pattern, including ** for recursive " +
 			"matching across directories. pattern is required (e.g. \"**/*.go\"); path is the directory to " +
 			"search under (default project root); limit caps the paths returned (default " +
 			fmt.Sprintf("%d, max %d", GlobDefaultLimit, GlobMaxLimit) + "). Hidden (dot-prefixed) entries are " +
@@ -81,7 +73,7 @@ func (t *GlobTool) Advertise() tools.Metadata {
 				},
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to search under. Relative paths resolve against the project root and search normally; an explicitly named directory whose real location is outside the project is searched only after you approve it at the permission prompt. Defaults to the project root when omitted.",
+					"description": "Directory to search under. Defaults to the project root when omitted. Relative paths resolve against the project root. An explicitly named absolute or ~ directory outside the project is searched without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a search asks first. A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms and malformed paths.",
 				},
 				"limit": map[string]any{
 					"type":        "integer",
@@ -123,10 +115,6 @@ func (t *GlobTool) ResolveTarget(args map[string]any) (target string, scope stri
 	})
 }
 
-// ExternalReadScope reports whether scope (the search root ResolveTarget returned) is an explicit
-// out-of-project read target — the promptable case DispatchTool routes to a permission prompt while
-// bypassing the read-only mode auto-allow. False for an in-project search root, keeping in-project globs
-// on their existing no-prompt auto-allow.
 func (t *GlobTool) ExternalReadScope(scope string) bool {
 	return isExternalReadScope(scope, t.projectRoot)
 }
@@ -143,8 +131,6 @@ func (t *GlobTool) InvokeWithResolvedTarget(_ context.Context, args map[string]a
 // dispatch instead calls ResolveTarget then InvokeWithResolvedTarget; this keeps the tool a complete unit
 // for direct callers and tests. A target-resolution failure surfaces as the same in-band error result the
 // dispatcher would render, so the observable outcome matches either entry.
-// Standalone Invoke has no authorizer, so it refuses an explicit out-of-project search root
-// in-band: only the dispatch path can obtain the required approval. The in-project path is unchanged.
 func (t *GlobTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
@@ -186,9 +172,6 @@ func (t *GlobTool) glob(searchRoot string, args map[string]any) tools.Result {
 		return failResult("glob target rejected: search path is not a directory")
 	}
 
-	// Anchor emitted paths and the ignore matchers at the project root for an in-project search, or at the
-	// approved external search root for an out-of-project read, so external matches stay clean
-	// (project-root-relative paths would otherwise carry a ".." prefix) and the matchers see the same base.
 	anchor := readAnchor(searchRoot, t.projectRoot)
 
 	// Load the default codemeldignore filter set unless include_ignored disables it. A

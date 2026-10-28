@@ -45,7 +45,7 @@ func (t *ReadImageTool) Advertise() tools.Metadata {
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Path of the image file to read. Relative paths resolve against the project root and read normally; an explicitly named path whose real location is outside the project is read only after you approve it at the permission prompt. An explicit hidden (dot-prefixed) path is honored.",
+					"description": "Path of the image file to read. Relative paths resolve against the project root. An explicitly named absolute or ~ path outside the project is read without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a read asks first. A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms and malformed paths. An explicit hidden (dot-prefixed) path is honored.",
 				},
 			},
 			"required":             []string{"path"},

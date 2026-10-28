@@ -420,6 +420,8 @@ var builtinCommands = []Command{
 	{Name: "color", Description: "Recolor the input area for this run (red|green|yellow|blue|magenta|cyan)", ArgSig: ArgOneRequired, Phase: PhaseTwo, Handler: NewColorHandler(ColorDeps{})},
 	{Name: "fork", Description: "Fork the current session into a new one that continues from here", ArgSig: ArgNone, Phase: PhaseTwo, Handler: recordHandler},
 	{Name: "compact", Description: "Replace the conversation with a summary in a fresh child session", ArgSig: ArgNone, Phase: PhaseTwo, Handler: recordHandler},
+	{Name: "systemone", Description: "Show or set the System One read-only check (a validated model, or off)", ArgSig: ArgOneOptional, Phase: PhaseTwo, Handler: recordHandler},
+	{Name: "skills", Description: "List loaded skills and the ones not loaded, with the reason", ArgSig: ArgNone, Phase: PhaseOne, Handler: recordHandler},
 }
 
 // BuildRegistry assembles a built-in command registry from the source-of-truth

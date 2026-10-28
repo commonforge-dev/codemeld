@@ -1,6 +1,6 @@
 # How work happens here
 
-_Last updated: 2026-10-16_
+_Last updated: 2026-10-21_
 
 codemeld is built deliberately: a change starts from a clear, written description of the
 problem and the behavior you intend — not an ad-hoc request — and it lands with tests and a
@@ -161,8 +161,8 @@ fixture.
 
 ## Where the rules live
 
-- [`docs/architecture.md`](../docs/architecture.md) — cross-cutting design constraints and the
-  reasoning behind the invariants.
+- [`docs/architecture.md`](../docs/architecture.md) — a short overview of how codemeld is put
+  together and the cross-cutting rules a change must keep.
 - [setup.md](setup.md) — the toolchain, the build/test/lint commands, and the checks that fail
   on purpose.
 - [`ROADMAP.md`](../ROADMAP.md) — the public direction/status document: where

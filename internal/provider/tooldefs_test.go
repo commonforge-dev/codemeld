@@ -14,8 +14,8 @@ import (
 	"codemeld.dev/codemeld/internal/testsupport"
 )
 
-// BashToolDefinition carries the pinned `bash` name and a required single string
-// `command` property with no additional properties — the shape the dispatch decoder
+// BashToolDefinition carries the pinned `bash` name, a required string `command` and an
+// optional integer `timeout`, with no additional properties — the shape the dispatch decoder
 // (decodeBashCommand) expects.
 func TestBashToolDefinition_NameAndSchema(t *testing.T) {
 	d := BashToolDefinition()
@@ -23,7 +23,7 @@ func TestBashToolDefinition_NameAndSchema(t *testing.T) {
 		t.Fatalf("Name = %q, want %q (the pinned dispatch name)", d.Name, "bash")
 	}
 	const wantDesc = "Run a shell command and return its output. Structured tools come first: reach for bash only when no structured tool covers the operation, such as a build, a test run, or file inspection no structured tool provides. " +
-		"Issue independent operations as separate bash calls, in parallel where they do not depend on each other, instead of joining them into one command with `;`, and do not add `echo`/`printf` separator labels or exit-status wrappers such as `echo \"exit=$?\"`. " +
+		"Issue independent operations as separate bash calls, in parallel where they do not depend on each other, instead of joining them into one command with `;`, `&&` or `||` (a single leading `cd <folder> &&` is fine), and do not add `echo`/`printf` separator labels or exit-status wrappers such as `echo \"exit=$?\"`. " +
 		"Do not append `2>/dev/null` or other output redirections to hide stderr: stderr is returned to you with the result and is usually the part worth reading, and a redirection sends a command that would otherwise run directly through an extra `sh -c` layer."
 	if d.Description != wantDesc {
 		t.Errorf("Description =\n%s\nwant\n%s", d.Description, wantDesc)
@@ -41,6 +41,19 @@ func TestBashToolDefinition_NameAndSchema(t *testing.T) {
 	}
 	if cmd["type"] != "string" {
 		t.Fatalf("command.type = %v, want string", cmd["type"])
+	}
+	timeout, ok := props["timeout"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties[timeout] missing or wrong type: %T", props["timeout"])
+	}
+	if timeout["type"] != "integer" || timeout["minimum"] != 1 || timeout["maximum"] != 1800000 {
+		t.Fatalf("timeout = %v, want integer 1..1800000", timeout)
+	}
+	if desc, _ := timeout["description"].(string); !strings.Contains(desc, "600000") || !strings.Contains(desc, "1800000") {
+		t.Fatalf("timeout.description = %q, want the 600000 default and 1800000 maximum", desc)
+	}
+	if len(props) != 2 {
+		t.Fatalf("properties = %v, want only command and timeout", props)
 	}
 	if req, ok := d.Parameters["required"].([]string); !ok || !reflect.DeepEqual(req, []string{"command"}) {
 		t.Fatalf("Parameters[required] = %v, want [command]", d.Parameters["required"])

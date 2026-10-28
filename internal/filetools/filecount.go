@@ -1,11 +1,4 @@
-// Built-in structured file_count tool: project-confined, recursive counting of the entries under an
-// optional `path` (default project root), over the shared walker (directory symlinks not followed,
-// hidden/ignore filtering). The walked entries are filtered by `kinds` (which entry types to count) and by
-// `include_globs`/`exclude_globs`, then either totalled flat or aggregated by `group_by` (file extension,
-// top-level directory, parent directory, depth, or logical stem) into a deterministic, sorted breakdown. A `limit` caps
-// how many groups are shown; the remainder is folded into a trailing `other:` line so the visible group
-// counts plus `other` always equal the reported total. It is read-only, mirroring read/glob/grep/tree's
-// target-scoped resolution and external-read posture.
+// Built-in file_count tool: counts the entries under a directory, optionally filtered and grouped.
 package filetools
 
 import (
@@ -54,15 +47,6 @@ const (
 	groupKeyOther     = "other"  // folded remainder once `limit` truncates the visible groups
 )
 
-// FileCountTool is the built-in read-only file_count tool. It walks the directory structure under an
-// optional `path` (default project root) through the shared walker (hidden-skip by default, the ignore
-// seam, directory-symlink no-follow), keeps the entries whose kind is selected by `kinds` and whose
-// path passes the `include_globs`/`exclude_globs` filters, and reports either a flat total or — when
-// `group_by` is set — a deterministic breakdown sorted by descending count then ascending key, bounded by
-// `limit` with an `other:` remainder. It is read-only (Advertise().ReadOnly == true), so it auto-allows
-// without prompting in every mode. The run-scoped home, process cwd, project root, and the configured
-// tool-output byte cap are bound at construction so target resolution matches the permission path-scope
-// rules and the truncation indicator survives the same byte cap as every other tool output.
 type FileCountTool struct {
 	home        string
 	processCWD  string
@@ -75,12 +59,6 @@ var _ tools.Tool = (*FileCountTool)(nil)
 
 func (t *FileCountTool) SetBlockedPaths(blocked *permissions.BlockedPaths) { t.blocked = blocked }
 
-// NewFileCountTool builds the file_count tool bound to the run's ~ anchor (home), the process cwd accepted
-// for signature symmetry with the other file tools, the project root the count is confined to (via
-// ResolveReadTarget), and the tool-output byte cap (cache.MaxToolOutputBytes()) BoundedResult uses to
-// predict byte-cap truncation. The project root is symlink-resolved once here — mirroring
-// NewTreeTool/NewGlobTool — so a launch through a symlinked project directory does not reject valid
-// in-project paths; ResolveReadTarget normalizes again, so the double normalization is idempotent.
 func NewFileCountTool(home, processCWD, projectRoot string, outputCap int) *FileCountTool {
 	return &FileCountTool{home: home, processCWD: processCWD, projectRoot: normalizeRoot(projectRoot), outputCap: outputCap}
 }
@@ -89,14 +67,9 @@ func (t *FileCountTool) Name() string { return FileCountToolName }
 
 func (t *FileCountTool) SubjectKind() string { return "tool" }
 
-// Advertise returns the file_count tool's advertising metadata and read-only classification.
-// The parameter JSON-Schema is the OpenAI function-tool shape with additionalProperties:false so the
-// advertised contract matches the decoder exactly: every argument is optional. The public hidden-file flag
-// is `include_dotfiles` (not `include_hidden`). ReadOnly is true: file_count never mutates, so it is
-// advertised in Plan and auto-allowed in every mode.
 func (t *FileCountTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description: "Count filesystem entries under a path within the project. Prefer this over shell or Python " +
+		Description: "Count filesystem entries under a directory inside or outside the project. Prefer this over shell or Python " +
 			"(ls|wc, find, os.walk, glob) for any file-counting task its filters can express — path, kinds, " +
 			"include_globs, and exclude_globs cover most \"how many X files\" questions in one read-only call; reach " +
 			"for shell/Python only when the filter genuinely cannot be expressed here, or after a correctable " +
@@ -119,7 +92,7 @@ func (t *FileCountTool) Advertise() tools.Metadata {
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to walk. Relative paths resolve against the project root and walk normally; an explicitly named directory whose real location is outside the project is walked only after you approve it at the permission prompt. Defaults to the project root when omitted.",
+					"description": "Directory to walk. Defaults to the project root when omitted. Relative paths resolve against the project root. An explicitly named absolute or ~ directory outside the project is walked without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a walk asks first. Blocked entries beneath an allowed directory do not refuse the walk: they are left out of the count and reported as left out (blocked). A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms, malformed paths, and a path that is a symlink to a directory, even one named explicitly outside the project.",
 				},
 				"kinds": map[string]any{
 					"type":        "array",
@@ -180,10 +153,6 @@ func (t *FileCountTool) ResolveTarget(args map[string]any) (target string, scope
 	})
 }
 
-// ExternalReadScope reports whether scope (the directory ResolveTarget returned) is an explicit
-// out-of-project read target — the promptable case DispatchTool routes to a permission prompt while
-// bypassing the read-only mode auto-allow. False for an in-project directory, keeping in-project counts on
-// their existing no-prompt auto-allow.
 func (t *FileCountTool) ExternalReadScope(scope string) bool {
 	return isExternalReadScope(scope, t.projectRoot)
 }
@@ -200,8 +169,6 @@ func (t *FileCountTool) InvokeWithResolvedTarget(_ context.Context, args map[str
 // dispatch instead calls ResolveTarget then InvokeWithResolvedTarget; this keeps the tool a complete unit
 // for direct callers and tests. A target-resolution failure surfaces as the same in-band error result the
 // dispatcher would render, so the observable outcome matches either entry.
-// Standalone Invoke has no authorizer, so it refuses an explicit out-of-project directory in-band:
-// only the dispatch path can obtain the required approval. The in-project path is unchanged.
 func (t *FileCountTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
@@ -254,9 +221,6 @@ func (t *FileCountTool) count(dir string, args map[string]any) tools.Result {
 		return failResult(FileCountToolName + " target rejected: path is not a directory")
 	}
 
-	// Anchor the ignore matchers at the project root for an in-project walk, or at the approved external
-	// directory for an out-of-project read, so the matchers see the same base the walker emits paths
-	// against. Grouping keys are computed against dir directly (below), independent of this anchor.
 	anchor := readAnchor(dir, t.projectRoot)
 
 	var ignore []IgnoreMatcher

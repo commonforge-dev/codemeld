@@ -521,7 +521,7 @@ func TestHeadlessFreshSteps_InstructionDiscoveryIsIndependentOfTheTrustDecision(
 				t.Fatalf("decision = %#v, want trusted = %v", decision, tc.trusted)
 			}
 
-			entries, err := steps.LoadAgentInstructions(context.Background(), store, f.home, f.launch, nil, f.root, nil)
+			entries, err := steps.LoadAgentInstructions(context.Background(), store, f.home, f.launch, nil, f.root, nil, agentinstr.Selection{})
 			if err != nil {
 				t.Fatalf("LoadAgentInstructions: %v", err)
 			}

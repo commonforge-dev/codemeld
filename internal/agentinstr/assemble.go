@@ -1,6 +1,7 @@
 // Assembles the single synthetic system message sent on every provider request:
-// the active mode's product-authored base prompt, the environment block, and the
-// loaded AGENTS.md instructions, in that fixed order.
+// the active mode's product-authored base prompt, the active model's special instructions,
+// the environment block, the loaded skills list, and the loaded AGENTS.md instructions, in
+// that fixed order.
 // The per-mode base prompts are embedded markdown (shared core + one behavior block
 // per mode); assembly reads only in-memory inputs and performs no I/O.
 package agentinstr
@@ -8,8 +9,10 @@ package agentinstr
 import (
 	_ "embed"
 	"strings"
+	"unicode"
 
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/skills"
 )
 
 // The base prompt is a shared core fragment plus one mode-specific behavior block,
@@ -56,7 +59,8 @@ func behaviorBlock(m mode.Mode) string {
 
 // AssembleSystemMessage builds the single synthetic system message in the fixed order
 // (1) active mode base prompt, (2) the active model's special instructions, (3)
-// environment block, (4) concatenated loaded AGENTS.md instructions, sections joined by
+// environment block, (4) the model-invocable loaded skills, (5) concatenated loaded
+// AGENTS.md instructions, sections joined by
 // a single blank line. The base prompt and environment block are always
 // present, so the message is non-empty even with zero AGENTS.md files — superseding
 // the earlier empty prompt for an empty set. The special-instructions section is present only
@@ -67,8 +71,31 @@ func behaviorBlock(m mode.Mode) string {
 // no dangling separator. provider and modelID are plain strings (the active
 // Selection's provider id and model id) so this package stays free of an internal/model
 // import. It reads only the in-memory inputs and makes no outbound calls.
-func AssembleSystemMessage(m mode.Mode, provider, modelID string, env EnvironmentInputs, entries []LoadEntry) string {
-	return joinSections(BasePrompt(m), SpecialInstructions(provider, modelID), EnvironmentBlock(env), SystemPrompt(entries))
+func AssembleSystemMessage(m mode.Mode, provider, modelID string, env EnvironmentInputs, loaded []skills.Skill, entries []LoadEntry) string {
+	return joinSections(BasePrompt(m), SpecialInstructions(provider, modelID), EnvironmentBlock(env), skillsSection(loaded), SystemPrompt(entries))
+}
+
+func skillsSection(loaded []skills.Skill) string {
+	var b strings.Builder
+	for _, s := range loaded {
+		if !s.ModelInvocable {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("Skills:\nWhen a request matches a skill's description, call the skill tool to load it.")
+		}
+		b.WriteString("\n- " + s.Name + ": " + oneLine(s.Description))
+	}
+	return b.String()
+}
+
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && !unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)), " ")
 }
 
 // joinSections trims each section's surrounding newlines and joins the non-empty ones

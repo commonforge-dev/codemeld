@@ -46,6 +46,10 @@
       "type": "boolean",
       "description": "Whether outbound OpenRouter chat-completion requests identify codemeld via the HTTP-Referer, X-Title, and X-OpenRouter-Categories headers. Defaults to true when omitted, is global-only (a per-project settings file carrying it fails to load), and affects no other provider. The /settings overlay toggles it."
     },
+    "system_one": {
+      "enum": ["off", "openrouter:typesafe/jev-1.13", "venice:jev-latest", "openrouter:liquid/d1"],
+      "description": "Which validated System One model checks otherwise-prompted shell commands for read-only use, written <provider>:<model id>, or off. Defaults to off when omitted and is global-only (a per-project settings file carrying it fails to load). The /systemone command shows and changes it."
+    },
     "mode": {
       "type": "object",
       "additionalProperties": false,
@@ -137,11 +141,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["base_url", "api_key"],
-      "description": "A configured provider entry: connection configuration only (base_url, api_key, optional auth_header). The openrouter entry is the one exception: it also accepts an optional `routing` block (see openrouterProviderEntry). Selectable model ids come solely from the system-owned discovered cache (models.yaml), refreshed by /connect. The retired `models` key is rejected; no migration or compatibility parsing is provided.",
+      "description": "A configured provider entry: connection configuration (base_url, api_key, optional auth_header) plus optional `context_windows` declarations. The openrouter entry also accepts an optional `routing` block (see openrouterProviderEntry). Selectable model ids come solely from the system-owned discovered cache (models.yaml), refreshed by /connect. The retired `models` key is rejected; no migration or compatibility parsing is provided.",
       "properties": {
         "base_url": { "type": "string" },
         "api_key": { "type": "string" },
         "auth_header": { "$ref": "#/$defs/authHeader" },
+        "context_windows": { "$ref": "#/$defs/contextWindows" },
         "models": false
       }
     },
@@ -149,19 +154,25 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["base_url", "api_key"],
-      "description": "The openrouter provider entry: connection configuration (base_url, api_key, optional auth_header) plus an optional `routing` block of OpenRouter provider-routing preferences sent with every request. Selectable model ids come solely from the system-owned discovered cache (models.yaml), refreshed by /connect. The retired `models` key is rejected; no migration or compatibility parsing is provided.",
+      "description": "The openrouter provider entry: connection configuration (base_url, api_key, optional auth_header), optional `context_windows` declarations, and an optional `routing` block of OpenRouter provider-routing preferences sent with every request. Selectable model ids come solely from the system-owned discovered cache (models.yaml), refreshed by /connect. The retired `models` key is rejected; no migration or compatibility parsing is provided.",
       "properties": {
         "base_url": { "type": "string" },
         "api_key": { "type": "string" },
         "auth_header": { "$ref": "#/$defs/authHeader" },
+        "context_windows": { "$ref": "#/$defs/contextWindows" },
         "models": false,
         "routing": { "$ref": "#/$defs/openrouterRouting" }
       }
     },
+    "contextWindows": {
+      "type": "object",
+      "description": "Per-model context window sizes in tokens, keyed by the exact model id. Each value declares the window the server already uses, for display in /context; it adds no selectable model and changes no request or server setting.",
+      "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 10000000 }
+    },
     "openrouterRouting": {
       "type": "object",
       "additionalProperties": false,
-      "description": "OpenRouter provider-routing preferences. sort picks providers by throughput or latency instead of OpenRouter's default price-weighted routing, or best_value tries the cheapest providers first and moves providers slower than the median speed for the model to the end; data_collection deny restricts routing to providers that do not store or train on prompts; require_parameters true restricts routing to providers that support every request parameter; max_price caps, per exact model id, the prompt and completion price (US dollars per million tokens) a provider may charge. Absent keys keep OpenRouter's defaults.",
+      "description": "OpenRouter provider-routing preferences. sort picks providers by throughput or latency instead of OpenRouter's default price-weighted routing, or best_value asks for the fastest provider endpoint whose speed is at or above the median speed for the model and whose price is within 20% of the cheapest such endpoint, falling back to price-sorted routing when no endpoint can be picked; data_collection deny restricts routing to providers that do not store or train on prompts; require_parameters true restricts routing to providers that support every request parameter; max_price caps, per exact model id, the prompt and completion price (US dollars per million tokens) a provider may charge. Absent keys keep OpenRouter's defaults.",
       "properties": {
         "sort": { "type": "string", "enum": ["throughput", "latency", "best_value"] },
         "data_collection": { "type": "string", "enum": ["allow", "deny"] },

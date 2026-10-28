@@ -34,7 +34,8 @@ const (
 	// to set it, or the AuthDelete sentinel to remove it (logout).
 	KeyAuthOpenAIChatGPT = "auth.openai-chatgpt"
 	KeyAttribution       = "attribution"
-	KeyRetentionDays     = "sessions.retention_days"
+	KeySystemOne         = "system_one"
+	KeyRetentionDays    = "sessions.retention_days"
 	keyModelFavorites    = "model.favorites"
 )
 
@@ -67,6 +68,9 @@ type OpenRouterMaxPrice struct {
 }
 
 var errNoOpenRouterEntry = errors.New("config.RewriteKey: the settings file has no provider.openrouter entry")
+
+// The parser's message quotes source lines, which can hold api keys or session tokens.
+var errUnparseableRewrite = errors.New("config.RewriteKey: the rewritten settings file would not parse as YAML")
 
 // providerKey is the top-level container key holding the provider.<name> map.
 const providerKey = "provider"
@@ -173,6 +177,13 @@ func (r *settingsRewrite) read() ([]byte, bool, fsutil.AtomicWriteStep, fserrors
 }
 
 func (r *settingsRewrite) publish(body []byte) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	if _, err := parser.ParseBytes(body, parser.ParseComments); err != nil {
+		return fsutil.LoadStep, fserrors.IOError, errUnparseableRewrite
+	}
+	var root any
+	if err := yaml.Unmarshal(body, &root); err != nil {
+		return fsutil.LoadStep, fserrors.IOError, errUnparseableRewrite
+	}
 	r.published = append([]byte{}, body...)
 	if r.dir != nil {
 		step, cat, _, err := fsutil.WriteAtomicReplaceAt(r.dir, filepath.Base(r.path), r.published, settingsFileMode, nil, nil)
@@ -218,6 +229,12 @@ func rewriteKey(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWrit
 			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires a bool payload, got %T", key, newValue)
 		}
 		return setAttribution(r, on)
+	case KeySystemOne:
+		name, ok := newValue.(string)
+		if !ok {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires a string payload, got %T", key, newValue)
+		}
+		return setSystemOne(r, name)
 	case KeyRetentionDays:
 		days, ok := newValue.(int)
 		if !ok || days < 1 {
@@ -448,7 +465,18 @@ func rewritePermissions(r *settingsRewrite, entry permissions.PermissionEntry) (
 	permsMV := findMV(vals, "permissions")
 
 	if permsMV == nil {
-		body := appendBlockAtEnd(data, buildPermissionsBlock(entryLines, 0))
+		var entryMap yaml.MapSlice
+		if err := yaml.UnmarshalWithOptions(entryBytes, &entryMap, yaml.UseOrderedMap()); err != nil {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: re-decode permission entry: %w", err)
+		}
+		flow, err := flowYAML([]yaml.MapSlice{entryMap}, KeyPermissions)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		body, err := insertTopLevelEntry(data, doc, buildPermissionsBlock(entryLines, 0), KeyPermissions+": "+flow)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
 		return r.publish(body)
 	}
 
@@ -533,7 +561,11 @@ func removePermissionEntry(r *settingsRewrite, op *PermissionDeleteOp) (fsutil.A
 	// Removing the only entry would leave an empty sequence; drop the whole
 	// permissions: block instead of leaving `permissions: []` behind.
 	if len(seq.Values) == 1 {
-		return publish(removeTopLevelBlock(data, permsMV, vals))
+		body, rErr := removeTopLevelBlock(data, doc, permsMV, vals)
+		if rErr != nil {
+			return fsutil.LoadStep, "", rErr
+		}
+		return publish(body)
 	}
 
 	permsIdx := indexInValues(vals, permsMV)
@@ -706,6 +738,29 @@ func appendBlockAtEnd(data []byte, block string) []byte {
 	}
 	b.WriteString(block)
 	return b.Bytes()
+}
+
+func rootMapping(doc *ast.File) yamlMapping {
+	if doc == nil || len(doc.Docs) == 0 {
+		return yamlMapping{}
+	}
+	root, _ := asYAMLMapping(doc.Docs[0].Body)
+	return root
+}
+
+func insertTopLevelEntry(data []byte, doc *ast.File, block, flowEntry string) ([]byte, error) {
+	if root := rootMapping(doc); root.flow != nil {
+		return insertMappingEntry(data, root, nil, flowEntry)
+	}
+	return appendBlockAtEnd(data, block), nil
+}
+
+func flowYAML(v any, what string) (string, error) {
+	b, err := yaml.MarshalWithOptions(v, yaml.Flow(true))
+	if err != nil {
+		return "", fmt.Errorf("config.RewriteKey: marshal %s flow value failed", what)
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 // readExistingPermissions re-decodes the on-disk permissions: list into
@@ -923,7 +978,14 @@ func rewriteModelSubkey(r *settingsRewrite, sub string, newValue any) (fsutil.At
 	}
 	modelMV := findMV(vals, "model")
 	if modelMV == nil {
-		body := appendBlockAtEnd(data, buildModelBlock(sub, valueLines, 0))
+		flow, err := flowYAML(yaml.MapSlice{{Key: sub, Value: newValue}}, "model."+sub)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		body, err := insertTopLevelEntry(data, doc, buildModelBlock(sub, valueLines, 0), "model: "+flow)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
 		return r.publish(body)
 	}
 
@@ -1171,6 +1233,7 @@ func flowValueReplacement(data []byte, start int, value string) string {
 func flowMappingEnd(data []byte, start int) int {
 	depth := 0
 	var quote byte
+	node := flowNodeStart
 	for i := start; i < len(data); i++ {
 		c := data[i]
 		switch {
@@ -1180,15 +1243,19 @@ func flowMappingEnd(data []byte, start int) int {
 			if c == quote {
 				quote = 0
 			}
-		case c == '\'' || c == '"':
+		case (c == '\'' || c == '"') && node == flowNodeStart:
 			quote = c
 		case c == '{':
 			depth++
+			node = flowNodeStart
 		case c == '}':
 			depth--
 			if depth == 0 {
 				return i
 			}
+			node = flowNodeStart
+		default:
+			node = flowNodeAfter(data, i, len(data), node)
 		}
 	}
 	return len(data)
@@ -1200,6 +1267,7 @@ func flowValueEnd(data []byte, start, bound int) int {
 	}
 	depth := 0
 	var quote byte
+	node := flowNodeStart
 	for i := start; i < bound; i++ {
 		c := data[i]
 		switch {
@@ -1209,15 +1277,17 @@ func flowValueEnd(data []byte, start, bound int) int {
 			if c == quote {
 				quote = 0
 			}
-		case c == '\'' || c == '"':
+		case (c == '\'' || c == '"') && node == flowNodeStart:
 			quote = c
 		case c == '[' || c == '{':
 			depth++
+			node = flowNodeStart
 		case c == ']' || c == '}':
 			if depth == 0 {
 				return trimTrailingFlowSpace(data, start, i)
 			}
 			depth--
+			node = flowNodeStart
 		case depth == 0 && c == ',':
 			return trimTrailingFlowSpace(data, start, i)
 		case c == '#' && (i == start || isFlowSpace(data[i-1])):
@@ -1227,9 +1297,40 @@ func flowValueEnd(data []byte, start, bound int) int {
 			for i+1 < bound && data[i+1] != '\n' {
 				i++
 			}
+		default:
+			node = flowNodeAfter(data, i, bound, node)
 		}
 	}
 	return trimTrailingFlowSpace(data, start, bound)
+}
+
+const (
+	flowNodeStart = iota
+	flowInPlain
+	flowInProperty
+)
+
+func flowNodeAfter(data []byte, i, bound, node int) int {
+	c := data[i]
+	indicatorNext := i+1 >= bound || isFlowSpace(data[i+1]) || strings.IndexByte(",[]{}", data[i+1]) >= 0
+	switch {
+	case strings.IndexByte(",[]{}", c) >= 0:
+		return flowNodeStart
+	case isFlowSpace(c):
+		if node == flowInProperty {
+			return flowNodeStart
+		}
+		return node
+	case c == ':' && (node == flowNodeStart || indicatorNext):
+		return flowNodeStart
+	case node != flowNodeStart:
+		return node
+	case c == '?' && indicatorNext:
+		return flowNodeStart
+	case c == '!' || c == '&':
+		return flowInProperty
+	}
+	return flowInPlain
 }
 
 func trimTrailingFlowSpace(data []byte, start, end int) int {
@@ -1390,7 +1491,15 @@ func setAuthChatGPT(r *settingsRewrite, newValue any) (fsutil.AtomicWriteStep, f
 	}
 	authMV := findMV(vals, authKey)
 	if authMV == nil {
-		return r.publish(appendBlockAtEnd(data, buildAuthBlock(valueLines, 0)))
+		flow, err := flowYAML(yaml.MapSlice{{Key: authChatGPTSub, Value: newValue}}, KeyAuthOpenAIChatGPT)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		body, err := insertTopLevelEntry(data, doc, buildAuthBlock(valueLines, 0), authKey+": "+flow)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		return r.publish(body)
 	}
 
 	body, sErr := insertOrReplaceAuthSub(data, authMV, vals, valueLines)
@@ -1534,7 +1643,10 @@ func deleteAuthChatGPT(r *settingsRewrite) (fsutil.AtomicWriteStep, fserrors.Cat
 		return "", "", nil
 	}
 
-	body := removeTopLevelBlock(data, authMV, vals)
+	body, err := removeTopLevelBlock(data, doc, authMV, vals)
+	if err != nil {
+		return fsutil.LoadStep, "", err
+	}
 	return r.publish(body)
 }
 
@@ -1543,7 +1655,10 @@ func deleteAuthChatGPT(r *settingsRewrite) (fsutil.AtomicWriteStep, fserrors.Cat
 // to a prior key) through the next sibling's leading edge, or end-of-file. When
 // mv was the final block, the result is trimmed to end in a single trailing
 // newline so no dangling blank line remains.
-func removeTopLevelBlock(data []byte, mv *ast.MappingValueNode, siblings []*ast.MappingValueNode) []byte {
+func removeTopLevelBlock(data []byte, doc *ast.File, mv *ast.MappingValueNode, siblings []*ast.MappingValueNode) ([]byte, error) {
+	if root := rootMapping(doc); root.flow != nil {
+		return removeMappingEntry(data, root, mv)
+	}
 	idx := indexInValues(siblings, mv)
 	keyTok := mv.Key.GetToken()
 	start := startOfLine(data, tokenOffset(data, keyTok))
@@ -1552,7 +1667,7 @@ func removeTopLevelBlock(data []byte, mv *ast.MappingValueNode, siblings []*ast.
 	if end >= len(data) {
 		out = trimToSingleTrailingNewline(out)
 	}
-	return out
+	return out, nil
 }
 
 // trimToSingleTrailingNewline strips trailing whitespace-only bytes and, when any
@@ -1600,7 +1715,11 @@ func setAttribution(r *settingsRewrite, on bool) (fsutil.AtomicWriteStep, fserro
 	}
 	mv := findMV(vals, KeyAttribution)
 	if mv == nil {
-		return r.publish(appendBlockAtEnd(data, KeyAttribution+": "+scalar+"\n"))
+		body, err := insertTopLevelEntry(data, doc, KeyAttribution+": "+scalar+"\n", KeyAttribution+": "+scalar)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		return r.publish(body)
 	}
 
 	node, ok := mv.Value.(*ast.BoolNode)
@@ -1613,6 +1732,48 @@ func setAttribution(r *settingsRewrite, on bool) (fsutil.AtomicWriteStep, fserro
 	}
 	start := tokenOffset(data, tok)
 	return r.publish(spliceBytes(data, start, start+len(tok.Value), scalar))
+}
+
+func setSystemOne(r *settingsRewrite, name string) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	encoded, merr := yaml.Marshal(name)
+	if merr != nil {
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: marshal %s value: %w", KeySystemOne, merr)
+	}
+	rendered := strings.TrimSpace(string(encoded))
+
+	data, exists, step, cat, rerr := r.read()
+	if rerr != nil {
+		return step, cat, rerr
+	}
+	var body []byte
+	if !exists || len(bytes.TrimSpace(data)) == 0 {
+		body = []byte(KeySystemOne + ": " + rendered + "\n")
+	} else {
+		doc, perr := parser.ParseBytes(data, parser.ParseComments)
+		if perr != nil {
+			return fsutil.LoadStep, fserrors.IOError, perr
+		}
+		vals, verr := rootValues(doc)
+		if verr != nil {
+			return fsutil.LoadStep, "", verr
+		}
+		var root yamlMapping
+		if len(doc.Docs) > 0 {
+			root, _ = asYAMLMapping(doc.Docs[0].Body)
+		}
+		if findMV(vals, KeySystemOne) == nil && root.flow == nil {
+			body = appendBlockAtEnd(data, KeySystemOne+": "+rendered+"\n")
+		} else {
+			var err error
+			if body, err = setMappingScalar(data, root, KeySystemOne, rendered); err != nil {
+				return fsutil.LoadStep, "", err
+			}
+		}
+	}
+	if err := Validate(body, r.path); err != nil {
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %s failed schema validation: %w", KeySystemOne, err)
+	}
+	return r.publish(body)
 }
 
 func setNestedScalar(r *settingsRewrite, container, field, value string) (fsutil.AtomicWriteStep, fserrors.Category, error) {
@@ -1768,7 +1929,15 @@ func setProviderEntry(r *settingsRewrite, name string, newValue any) (fsutil.Ato
 	}
 	provMV := findMV(vals, providerKey)
 	if provMV == nil {
-		return r.publish(appendBlockAtEnd(data, entryDoc))
+		flowName, err := renderFlowValue(name)
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		body, err := insertTopLevelEntry(data, doc, entryDoc, providerKey+": {"+flowName+": "+flowEntry+"}")
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		return r.publish(body)
 	}
 
 	body, sErr := insertOrReplaceProviderSub(data, provMV, vals, name, valueLines, flowEntry)
@@ -2149,6 +2318,7 @@ func mergeOpenRouterConnection(data, valueYAML []byte) ([]byte, bool, error) {
 	if err := yaml.Unmarshal(valueYAML, &fields); err != nil {
 		return nil, false, errors.New("config.RewriteKey: decode provider entry value failed")
 	}
+	windows := false
 	for _, f := range fields {
 		key, ok := f.Key.(string)
 		if !ok {
@@ -2161,6 +2331,13 @@ func mergeOpenRouterConnection(data, valueYAML []byte) ([]byte, bool, error) {
 		if !found {
 			return nil, false, nil
 		}
+		if key == contextWindowsKey {
+			windows = true
+			if data, err = setContextWindows(data, entry, f.Value); err != nil {
+				return nil, false, err
+			}
+			continue
+		}
 		rendered, err := renderFlowValue(f.Value)
 		if err != nil {
 			return nil, false, err
@@ -2169,7 +2346,56 @@ func mergeOpenRouterConnection(data, valueYAML []byte) ([]byte, bool, error) {
 			return nil, false, err
 		}
 	}
+	if !windows {
+		entry, _, err := findOpenRouterEntry(data)
+		if err != nil {
+			return nil, false, err
+		}
+		if mv := findMV(entry.values, contextWindowsKey); mv != nil {
+			if data, err = removeMappingEntry(data, entry, mv); err != nil {
+				return nil, false, err
+			}
+		}
+	}
 	return data, true, nil
+}
+
+const contextWindowsKey = "context_windows"
+
+func setContextWindows(data []byte, m yamlMapping, value any) ([]byte, error) {
+	flow, err := renderFlowValue(value)
+	if err != nil {
+		return nil, err
+	}
+	block, err := yaml.Marshal(yaml.MapSlice{{Key: contextWindowsKey, Value: value}})
+	if err != nil {
+		return nil, errors.New("config.RewriteKey: marshal provider entry value failed")
+	}
+	blockLines := strings.Split(strings.TrimRight(string(block), "\n"), "\n")
+	mv := findMV(m.values, contextWindowsKey)
+	if mv == nil {
+		return insertMappingEntry(data, m, blockLines, contextWindowsKey+": "+flow)
+	}
+	if m.flow != nil {
+		return setMappingScalar(data, m, contextWindowsKey, flow)
+	}
+	if v, ok := yamlNodeValue(mv.Value).(*ast.MappingNode); ok && v.IsFlowStyle {
+		return spliceBytes(data, tokenOffset(data, v.Start), tokenOffset(data, v.End)+len("}"), flow), nil
+	}
+	start := startOfLine(data, tokenOffset(data, mv.Key.GetToken()))
+	end := lineEndAfter(data, subtreeEnd(data, mv))
+	indent := strings.Repeat(" ", mv.Key.GetToken().Position.Column-1)
+	var b strings.Builder
+	for _, ln := range blockLines {
+		b.WriteString(indent)
+		b.WriteString(ln)
+		b.WriteByte('\n')
+	}
+	rep := b.String()
+	if data[end-1] != '\n' {
+		rep = strings.TrimSuffix(rep, "\n")
+	}
+	return spliceBytes(data, start, end, rep), nil
 }
 
 func validateAndPublish(r *settingsRewrite, body []byte) (fsutil.AtomicWriteStep, fserrors.Category, error) {
@@ -2561,7 +2787,15 @@ func rewriteModelFavorites(r *settingsRewrite, op *favoriteToggleValue) (fsutil.
 		if mErr != nil {
 			return fsutil.LoadStep, "", mErr
 		}
-		return r.publish(appendBlockAtEnd(data, buildFavoritesBlock(valueLines, 0)))
+		flow, mErr := favoritesFlowValue(op.next, nil)
+		if mErr != nil {
+			return fsutil.LoadStep, "", mErr
+		}
+		body, err := insertTopLevelEntry(data, doc, buildFavoritesBlock(valueLines, 0), "model: {"+favoritesSub+": "+flow+"}")
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+		return r.publish(body)
 	}
 
 	body, sErr := insertOrReplaceFavoritesUnderModel(data, modelMV, vals, op.source, op.next)

@@ -31,6 +31,8 @@ import (
 	"codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/skills"
+	"codemeld.dev/codemeld/internal/skilltool"
 	"codemeld.dev/codemeld/internal/subagent"
 	"codemeld.dev/codemeld/internal/subagenttool"
 	"codemeld.dev/codemeld/internal/tools"
@@ -93,6 +95,7 @@ func (s *toolEventStore) Active() *sessions.Store {
 // those are available, without changing the persisted session schema.
 type toolRegistryFactory struct {
 	active any // the DetectVCS result: *ActiveVCS when a template matched, nil otherwise
+	skills skills.Set
 }
 
 // defaultBuildToolRegistry is the production step-6c BuildToolRegistry: it never fails and
@@ -113,7 +116,7 @@ func defaultBuildToolRegistry(active any) (any, error) {
 // /clear and /resume swaps), and cache.MaxToolOutputBytes() as the tool_exec_end truncation cap.
 // Missing VCS data, a nil template, or an empty repo root yields the edit-tool-only registry
 // rather than a launch failure, because VCS detection can legitimately return no active template.
-func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *sessions.Store, home, processCWD string, guard securitystate.Policy, delegate ...delegateBinding) (*tools.Registry, error) {
+func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *sessions.Store, home, processCWD string, guard securitystate.Policy, generalAgent ...generalAgentBinding) (*tools.Registry, error) {
 	reg := tools.NewRegistry()
 	// the built-in edit tool is registered for every launch, independent of VCS detection. It
 	// binds the run's ~ anchor, the default base for a relative target path, and the project root the
@@ -130,8 +133,7 @@ func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *ses
 	}
 	// The built-in delete tool is registered for every launch alongside edit/create,
 	// bound to the same home / process cwd / project root so its target resolution matches the permission
-	// path-scope rules. It is mutating but, unlike edit/create, is never auto-approved by any mode and
-	// never folds under the write capability — every delete needs an explicit grant or approval.
+	// path-scope rules. It is mutating and never folds under the write capability.
 	if err := reg.Register(tools.BuiltinSource, filetools.NewDeleteTool(home, processCWD, cache.ProjectRoot())); err != nil {
 		return nil, err
 	}
@@ -208,9 +210,9 @@ func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *ses
 		return nil, err
 	}
 	// Without a parent to inherit from there is no child to start, so an unbound realization
-	// registers no delegate at all.
-	if len(delegate) > 0 {
-		tool := subagenttool.New(delegate[0].deps(reg, cache, turnStore, home, processCWD, guard))
+	// registers no general_agent tool at all.
+	if len(generalAgent) > 0 {
+		tool := subagenttool.New(generalAgent[0].deps(reg, cache, turnStore, home, processCWD, guard))
 		if err := reg.Register(tools.BuiltinSource, tool); err != nil {
 			return nil, err
 		}
@@ -234,6 +236,12 @@ func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *ses
 			}
 		}
 	}
+	if len(f.skills.Loaded) > 0 {
+		skill := skilltool.New(f.skills.Loaded, cache.AgentInstructionsMaxFileBytes(), home, cache.ProjectRoot(), guard.Blocked, turnStore)
+		if err := reg.Register(tools.BuiltinSource, skill); err != nil {
+			return nil, err
+		}
+	}
 	av, ok := f.active.(*ActiveVCS)
 	if !ok || av == nil || av.Template == nil || av.RepoRoot == "" {
 		return reg, nil
@@ -249,8 +257,8 @@ func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *ses
 		registerVCSActions = vcs.RegisterActionsWithTrustedClasses
 	}
 	vcsRunner := newVCSActionRunner()
-	if len(delegate) > 0 && delegate[0].confinement != nil {
-		vcsRunner = &confinedRunner{inner: vcsRunner, conf: delegate[0].confinement, cap: cache.MaxToolOutputBytes()}
+	if len(generalAgent) > 0 && generalAgent[0].confinement != nil {
+		vcsRunner = &confinedRunner{inner: vcsRunner, conf: generalAgent[0].confinement, cap: cache.MaxToolOutputBytes()}
 	}
 	if err := registerVCSActions(reg, av.Template, av.RepoRoot, vcsRunner, emit, cache.MaxToolOutputBytes()); err != nil {
 		return nil, err
@@ -275,7 +283,7 @@ type parentTurnSnapshot struct {
 }
 
 // parentTurnHolder carries one turn's model, mode, and assembled system prompt from the
-// event-loop goroutine to the tool-dispatch goroutine a delegate call runs on. The run-scoped
+// event-loop goroutine to the tool-dispatch goroutine a general_agent call runs on. The run-scoped
 // model and mode active states cannot be read there: they have no synchronization and pickers
 // and slash commands mutate them on the event loop.
 type parentTurnHolder struct {
@@ -291,7 +299,7 @@ func (h *parentTurnHolder) publish(sel model.Selection, source model.Source, mod
 	h.published = true
 }
 
-// current reports false until a turn has published, so a delegate call outside any turn is
+// current reports false until a turn has published, so a general_agent call outside any turn is
 // told there is no parent rather than handed zero values.
 func (h *parentTurnHolder) current() (parentTurnSnapshot, bool) {
 	h.mu.RLock()
@@ -299,13 +307,14 @@ func (h *parentTurnHolder) current() (parentTurnSnapshot, bool) {
 	return h.snapshot, h.published
 }
 
-// delegateBinding reads the parent turn each child inherits from the run-scoped holder the
+// generalAgentBinding reads the parent turn each child inherits from the run-scoped holder the
 // turn publisher writes, so a model or mode change made while a turn is in flight reaches the
 // next turn's children rather than this turn's.
-type delegateBinding struct {
+type generalAgentBinding struct {
 	parent      *parentTurnHolder
 	notices     tui.NoticeRenderer
 	confinement *confinement
+	systemOne   *systemOneCheck
 }
 
 // The live child-agent surface is discovered on the notice renderer the binding already
@@ -313,7 +322,7 @@ type delegateBinding struct {
 // not implement it, keeps a nil sink.
 var _ subagent.ActivitySink = (*tui.App)(nil)
 
-func (b delegateBinding) deps(reg *tools.Registry, cache *config.Cache, turnStore func() *sessions.Store, home, processCWD string, guard securitystate.Policy) subagenttool.Deps {
+func (b generalAgentBinding) deps(reg *tools.Registry, cache *config.Cache, turnStore func() *sessions.Store, home, processCWD string, guard securitystate.Policy) subagenttool.Deps {
 	deps := subagenttool.Deps{
 		Home:        home,
 		LaunchDir:   processCWD,
@@ -354,9 +363,11 @@ func (b delegateBinding) deps(reg *tools.Registry, cache *config.Cache, turnStor
 			auth.declaredDelete = modeCtx.DeclaredDelete
 			auth.childAgent = modeCtx.ChildAgent
 			auth.childInvocationID = modeCtx.ChildInvocationID
-			auth.delegateWrite = modeCtx.DelegateWrite
+			auth.generalAgentWrite = modeCtx.GeneralAgentWrite
+			auth.generalAgentResolved = modeCtx.GeneralAgentResolved
 			auth.executionConstrained = b.confinement != nil && b.confinement.constrained
 			auth.blocked = guard.Blocked
+			auth.systemOne = b.systemOne
 			child := newProductionToolDispatcher(reg, newChildToolRunner(), childMoveAuthorizer{Authorizer: auth, moves: modeCtx.DeclaredMoves, dirs: modeCtx.DeclaredDirs},
 				home, processCWD, turnStore, cache.MaxToolOutputBytes(), guard)
 			child.childCeiling = modeCtx.ChildAgent
@@ -396,9 +407,9 @@ func (a childMoveAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 // turn-store accessor; any other handoff (nil from a degraded launch, or an unexpected
 // type) degrades to a bare non-nil registry so the dispatcher always has a registry to look
 // up against.
-func realizeToolRegistry(handoff any, cache *config.Cache, turnStore func() *sessions.Store, home, processCWD string, guard securitystate.Policy, delegate ...delegateBinding) (*tools.Registry, error) {
+func realizeToolRegistry(handoff any, cache *config.Cache, turnStore func() *sessions.Store, home, processCWD string, guard securitystate.Policy, generalAgent ...generalAgentBinding) (*tools.Registry, error) {
 	if f, ok := handoff.(*toolRegistryFactory); ok && f != nil {
-		return f.realize(cache, turnStore, home, processCWD, guard, delegate...)
+		return f.realize(cache, turnStore, home, processCWD, guard, generalAgent...)
 	}
 	return tools.NewRegistry(), nil
 }
@@ -423,7 +434,7 @@ type productionToolDispatcher struct {
 	askUser     func(context.Context, tui.QuestionRequest) (tui.QuestionResult, error)
 	guard       securitystate.Policy
 	// childCeiling marks the dispatcher a child agent's own calls run through, where the parent's
-	// declared write set is a ceiling every call is judged against — including a nested delegate whose
+	// declared write set is a ceiling every call is judged against — including a nested general_agent call whose
 	// declaration did not resolve, which denies rather than correcting the model.
 	childCeiling bool
 	// childInvocationID attributes this dispatcher's tool, structured-read and permission
@@ -488,34 +499,34 @@ func (f *eligibleReadFailure) recorded() error {
 }
 
 // Plan partitions a response instead of collapsing it: each maximal contiguous run of prepared
-// project-confined structured reads may overlap internally, a valid delegate call is its own
+// project-confined structured reads may overlap internally, a valid general_agent call is its own
 // segment ordered by the child's prepared write and delete targets, and every other call is a serial barrier
 // that the run before it precedes and the run after it follows. Authorization grouping is
 // assembled separately from that partition and changes neither: a group member keeps its serial
 // target and its dependencies, and only gains a pre-run that waits for the group's one approval.
 //
-// A delegate carries the child's targets rather than the synthetic serial one, so two children that
+// A general_agent call carries the child's targets rather than the synthetic serial one, so two children that
 // cannot reach the same path may overlap; everything it must not overlap becomes an explicit
 // dependency instead. Reads report their failures outside the scheduler (ContinueOnError), so a
-// dependency on a read does not stop a delegate and its pre-run repeats the barrier's guard on the
+// dependency on a read does not stop a general_agent call and its pre-run repeats the barrier's guard on the
 // recorded failure before authorizing or starting a child.
 func (d *productionToolDispatcher) Plan(calls []turn.AssembledToolCall, maxConcurrency int) turn.ToolPlan {
 	eligible := d.prepareStructuredReads(calls)
-	delegates := d.prepareDelegates(calls)
+	generalAgents := d.prepareGeneralAgents(calls)
 	groups := d.assembleAuthGroups(calls)
 	plan := turn.ToolPlan{Units: make([]turn.PlannedToolCall, len(calls))}
 	failure := &eligibleReadFailure{}
 	segments := &planSegments{}
 	for i, call := range calls {
 		group := groups[i]
-		if prepared, ok := delegates[i]; ok {
+		if prepared, ok := generalAgents[i]; ok {
 			plan.Units[i] = turn.PlannedToolCall{
 				Call:    call,
-				Deps:    segments.enterDelegate(call.ID),
-				Targets: prepared.DelegateSchedulerTargets(),
+				Deps:    segments.enterGeneralAgent(call.ID),
+				Targets: prepared.GeneralAgentSchedulerTargets(),
 				PreRun:  func(context.Context) error { return failure.recorded() },
 				Run: func(ctx context.Context) (turn.ToolResult, error) {
-					return d.dispatchPreparedDelegate(ctx, prepared)
+					return d.dispatchPreparedGeneralAgent(ctx, prepared)
 				},
 			}
 			continue
@@ -565,19 +576,19 @@ type planKind int
 const (
 	planStart planKind = iota
 	planReads
-	planDelegates
+	planGeneralAgents
 	planBarrier
 )
 
 // planSegments hands each call the dependencies that fence it from the kinds of work it must not
-// overlap. A run of reads and a run of delegates each accumulate until the other kind, or a barrier,
-// starts, so every delegate waits for the whole read run before it rather than only for the reads a
-// nearer delegate had not already claimed.
+// overlap. A run of reads and a run of general_agent calls each accumulate until the other kind, or a barrier,
+// starts, so every general_agent call waits for the whole read run before it rather than only for the reads a
+// nearer general_agent call had not already claimed.
 type planSegments struct {
-	reads     []string
-	delegates []string
-	barrier   string
-	kind      planKind
+	reads         []string
+	generalAgents []string
+	barrier       string
+	kind          planKind
 }
 
 func (s *planSegments) fence(extra []string) []string {
@@ -592,32 +603,32 @@ func (s *planSegments) enterRead(id string) []string {
 	if s.kind != planReads {
 		s.reads, s.kind = nil, planReads
 	}
-	deps := s.fence(s.delegates)
+	deps := s.fence(s.generalAgents)
 	s.reads = append(s.reads, id)
 	return deps
 }
 
-func (s *planSegments) enterDelegate(id string) []string {
-	if s.kind != planDelegates {
-		s.delegates, s.kind = nil, planDelegates
+func (s *planSegments) enterGeneralAgent(id string) []string {
+	if s.kind != planGeneralAgents {
+		s.generalAgents, s.kind = nil, planGeneralAgents
 	}
 	deps := s.fence(s.reads)
-	s.delegates = append(s.delegates, id)
+	s.generalAgents = append(s.generalAgents, id)
 	return deps
 }
 
 func (s *planSegments) enterBarrier(id string) []string {
-	deps := append(slices.Clone(s.reads), s.delegates...)
-	s.reads, s.delegates, s.barrier, s.kind = nil, nil, id, planBarrier
+	deps := append(slices.Clone(s.reads), s.generalAgents...)
+	s.reads, s.generalAgents, s.barrier, s.kind = nil, nil, id, planBarrier
 	return deps
 }
 
-// prepareDelegates canonicalizes each delegate declaration once, at planning time, so the targets
+// prepareGeneralAgents canonicalizes each general_agent declaration once, at planning time, so the targets
 // the scheduler orders on and the ceiling the child is built from are the same resolution. A
 // declaration that does not resolve is absent here and stays an ordinary serial barrier, keeping its
 // existing in-band validation result.
-func (d *productionToolDispatcher) prepareDelegates(calls []turn.AssembledToolCall) map[int]dispatch.PreparedTool {
-	var delegates map[int]dispatch.PreparedTool
+func (d *productionToolDispatcher) prepareGeneralAgents(calls []turn.AssembledToolCall) map[int]dispatch.PreparedTool {
+	var generalAgents map[int]dispatch.PreparedTool
 	for i, call := range calls {
 		if call.Name != subagenttool.ToolName {
 			continue
@@ -627,19 +638,19 @@ func (d *productionToolDispatcher) prepareDelegates(calls []turn.AssembledToolCa
 			continue
 		}
 		prepared, err := dispatch.PrepareTool(context.Background(), call.Name, args, d.home, d.processCWD, d.registry, d.guard)
-		if err != nil || !prepared.DelegatePrepared() {
+		if err != nil || !prepared.GeneralAgentPrepared() {
 			continue
 		}
-		if delegates == nil {
-			delegates = make(map[int]dispatch.PreparedTool, 1)
+		if generalAgents == nil {
+			generalAgents = make(map[int]dispatch.PreparedTool, 1)
 		}
-		delegates[i] = prepared
+		generalAgents[i] = prepared
 	}
-	return delegates
+	return generalAgents
 }
 
-func (d *productionToolDispatcher) dispatchPreparedDelegate(ctx context.Context, prepared dispatch.PreparedTool) (turn.ToolResult, error) {
-	res, derr := dispatch.DispatchPreparedDelegate(d.childCtx(ctx), prepared, d.authorizer, d.childCeiling)
+func (d *productionToolDispatcher) dispatchPreparedGeneralAgent(ctx context.Context, prepared dispatch.PreparedTool) (turn.ToolResult, error) {
+	res, derr := dispatch.DispatchPreparedGeneralAgent(d.childCtx(ctx), prepared, d.authorizer, d.childCeiling)
 	return d.adaptTool(subagenttool.ToolName, res, derr)
 }
 
@@ -1025,7 +1036,7 @@ func shellToolAdvice(command string) (string, bool) {
 func (d *productionToolDispatcher) Dispatch(ctx context.Context, call turn.AssembledToolCall) (turn.ToolResult, error) {
 	ctx = d.pinMode(ctx)
 	if call.Name == bashToolName {
-		command, err := decodeBashCommand(call.Arguments)
+		command, timeout, err := decodeBashCommand(call.Arguments)
 		if err != nil {
 			return inbandToolError(err), nil
 		}
@@ -1034,17 +1045,25 @@ func (d *productionToolDispatcher) Dispatch(ctx context.Context, call turn.Assem
 				return turn.ToolResult{Content: hint}, nil
 			}
 		}
-		run := &confinedShellRunner{
-			events: &shellEventRunner{inner: d.runner, active: d.active, cap: d.outputCap, childInvocationID: d.childInvocationID},
-			conf:   d.confinement,
-		}
+		shellRun := &shellEventRunner{inner: d.runner, active: d.active, cap: d.outputCap, childInvocationID: d.childInvocationID, timeout: timeout}
+		defer shellRun.releaseExecution()
+		run := &confinedShellRunner{events: shellRun, conf: d.confinement}
 		res, derr := dispatch.DispatchShell(ctx, command, d.home, d.processCWD, d.authorizer, run, d.guard)
 		var refusal *securitystate.Refusal
 		if errors.As(derr, &refusal) {
 			return d.denyProtectedState(refusal)
 		}
+		timedOut := derr == nil && shellRun.timedOut(ctx)
+		noteRoom := 0
+		if timedOut {
+			noteRoom = len("\n" + bashTimeoutNote(timeout))
+		}
 		if run.failureNoted {
-			res.Stderr = keepConfinedFailureNote(res.Stderr, d.outputCap)
+			res.Stderr = keepConfinedFailureNote(res.Stderr, d.outputCap-noteRoom)
+		}
+		if timedOut {
+			res.Stderr = withBashTimeoutNote(res.Stderr, d.outputCap, bashTimeoutNote(timeout))
+			res.ExitCode = -1
 		}
 		return d.adapt(res, derr, false)
 	}
@@ -1072,28 +1091,28 @@ func (d *productionToolDispatcher) Dispatch(ctx context.Context, call turn.Assem
 		return d.dispatchWrite(ctx, call.Name, args)
 	}
 	if call.Name == subagenttool.ToolName {
-		return d.dispatchDelegate(ctx, args)
+		return d.dispatchGeneralAgent(ctx, args)
 	}
 	res, derr := dispatch.DispatchTool(ctx, call.Name, args, d.home, d.processCWD, d.registry, d.authorizer, d.guard)
 	return d.adaptTool(call.Name, res, derr)
 }
 
-// dispatchDelegate runs the two halves of DispatchTool separately so a delegate call whose
+// dispatchGeneralAgent runs the two halves of DispatchTool separately so a general_agent call whose
 // declaration failed to resolve is answered by whoever owns the question. Under a child agent's
 // ceiling it is a permission question whatever it declares: the ceiling denies an unresolvable nested
 // declaration by declared scope before any grandchild starts, so the call still reaches
 // authorization carrying an empty candidate the containment check refuses. A top-level call is under
 // no such ceiling, so it must not reach authorization — its refusal is the tool's own corrective,
 // returned with no prompt and no permission event.
-func (d *productionToolDispatcher) dispatchDelegate(ctx context.Context, args map[string]any) (turn.ToolResult, error) {
+func (d *productionToolDispatcher) dispatchGeneralAgent(ctx context.Context, args map[string]any) (turn.ToolResult, error) {
 	prepared, perr := dispatch.PrepareTool(ctx, subagenttool.ToolName, args, d.home, d.processCWD, d.registry, d.guard)
 	if perr != nil {
 		return d.adaptTool(subagenttool.ToolName, tools.Result{}, perr)
 	}
-	if refusal := prepared.DelegateRefusal(); refusal != nil && !d.childCeiling {
+	if refusal := prepared.GeneralAgentRefusal(); refusal != nil && !d.childCeiling {
 		return d.adaptTool(subagenttool.ToolName, tools.Result{}, refusal)
 	}
-	res, derr := dispatch.DispatchPreparedDelegate(ctx, prepared, d.authorizer, d.childCeiling)
+	res, derr := dispatch.DispatchPreparedGeneralAgent(ctx, prepared, d.authorizer, d.childCeiling)
 	return d.adaptTool(subagenttool.ToolName, res, derr)
 }
 
@@ -1130,7 +1149,7 @@ func (d *productionToolDispatcher) adaptTool(name string, res tools.Result, derr
 	if errors.As(derr, &refusal) {
 		return d.denyProtectedState(refusal)
 	}
-	// A delegate call refused on its declaration never reached authorization, so it is a corrective
+	// A general_agent call refused on its declaration never reached authorization, so it is a corrective
 	// the model reads rather than a denial the loop routes.
 	var prepRefusal *subagenttool.PreparationError
 	if errors.As(derr, &prepRefusal) {

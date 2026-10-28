@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/ssestream"
 
@@ -741,7 +743,7 @@ func TestBuildTurnClient_OpenRouterMaxPriceReachesRequests(t *testing.T) {
 	}
 }
 
-func TestBuildTurnClient_OpenRouterBestValueSendsModelSpeedBar(t *testing.T) {
+func TestBuildTurnClient_OpenRouterBestValueSendsPickedEndpoint(t *testing.T) {
 	const model = "meta-llama/llama-3.3-70b-instruct"
 	var endpointHits atomic.Int32
 	var endpointAuth string
@@ -756,10 +758,10 @@ func TestBuildTurnClient_OpenRouterBestValueSendsModelSpeedBar(t *testing.T) {
 			endpointAuth = r.Header.Get("Authorization")
 			mu.Unlock()
 			_, _ = io.WriteString(w, `{"data":{"endpoints":[
-				{"provider_name":"a","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":90}},
-				{"provider_name":"b","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":30}},
-				{"provider_name":"c","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":null},
-				{"provider_name":"d","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":55.5}}
+				{"provider_name":"a","tag":"a/fp8","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":90}},
+				{"provider_name":"b","tag":"b","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":30}},
+				{"provider_name":"c","tag":"c","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":null},
+				{"provider_name":"d","tag":"d/fp4/us","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":55.5}}
 			]}}`)
 		case "/api/v1/chat/completions":
 			raw, _ := io.ReadAll(r.Body)
@@ -808,10 +810,11 @@ func TestBuildTurnClient_OpenRouterBestValueSendsModelSpeedBar(t *testing.T) {
 	if got := endpointHits.Load(); got != 0 {
 		t.Fatalf("endpoint requests after building the client = %d, want 0", got)
 	}
-	for range 2 {
+	for _, ignored := range [][]string{nil, {"a"}} {
 		if _, err := client.ChatCompletion(context.Background(), provider.Request{
-			Model:    model,
-			Messages: []provider.Message{{Role: "user", Content: "hi"}},
+			Model:            model,
+			Messages:         []provider.Message{{Role: "user", Content: "hi"}},
+			IgnoredProviders: ignored,
 		}); err != nil {
 			t.Fatalf("ChatCompletion() error = %v, want nil", err)
 		}
@@ -824,7 +827,13 @@ func TestBuildTurnClient_OpenRouterBestValueSendsModelSpeedBar(t *testing.T) {
 	if endpointAuth != "Bearer or-key" {
 		t.Fatalf("endpoints Authorization = %q, want the configured key", endpointAuth)
 	}
-	want := map[string]any{"sort": "price", "preferred_min_throughput": 55.5}
+	if len(chatBodies) != 2 {
+		t.Fatalf("chat requests = %d, want 2", len(chatBodies))
+	}
+	wants := []map[string]any{
+		{"order": []any{"a/fp8"}},
+		{"order": []any{"d/fp4/us"}, "ignore": []any{"a"}},
+	}
 	for i, b := range chatBodies {
 		var body struct {
 			Provider map[string]any `json:"provider"`
@@ -832,12 +841,9 @@ func TestBuildTurnClient_OpenRouterBestValueSendsModelSpeedBar(t *testing.T) {
 		if err := json.Unmarshal(b, &body); err != nil {
 			t.Fatalf("decode request body %d: %v\nbody = %s", i, err, b)
 		}
-		if !reflect.DeepEqual(body.Provider, want) {
-			t.Fatalf("turn %d provider object = %#v, want %#v", i+1, body.Provider, want)
+		if !reflect.DeepEqual(body.Provider, wants[i]) {
+			t.Fatalf("turn %d provider object = %#v, want %#v", i+1, body.Provider, wants[i])
 		}
-	}
-	if len(chatBodies) != 2 {
-		t.Fatalf("chat requests = %d, want 2", len(chatBodies))
 	}
 }
 
@@ -4219,4 +4225,345 @@ func TestTurnController_UnsentMessageReachesHookBeforeTurnEnded(t *testing.T) {
 			t.Fatalf("surface calls = %q, want %q", got, want)
 		}
 	})
+}
+
+const configuredWindowAdvice = " This is not one request's size. If individual requests approach the limit, check the server/model limit and match `context_windows`; the declaration does not raise capacity. For Ollama, check `OLLAMA_CONTEXT_LENGTH` or model `num_ctx`."
+
+func windowCache(t *testing.T, windows map[string]any) *config.Cache {
+	t.Helper()
+	cache, err := config.NewCache(map[string]any{"provider": map[string]any{
+		"openai": map[string]any{"base_url": "u", "api_key": "k", "models": []string{"gpt-5.5", "gpt-small", "gpt-unknown"}, "context_windows": windows},
+	}}, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	return cache
+}
+
+func discoveredWindowCache(t *testing.T, window int64) *config.Cache {
+	t.Helper()
+	settingsPath := SettingsPath(t.TempDir())
+	if err := config.UpdateDiscoveredModelsProvider(config.DiscoveredModelsPath(settingsPath), "openai", config.DiscoveredProvider{
+		Models: []config.DiscoveredModel{{ID: "gpt-5.5", ContextWindow: window}},
+	}); err != nil {
+		t.Fatalf("seed discovered models: %v", err)
+	}
+	cache, err := config.NewCache(map[string]any{"provider": map[string]any{
+		"openai": map[string]any{"base_url": "u", "api_key": "k"},
+	}}, t.TempDir(), []string{settingsPath})
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	return cache
+}
+
+type windowTurns struct {
+	ctl     *turnController
+	app     *tui.App
+	store   *sessions.Store
+	surface *recordingSurface
+}
+
+func newWindowTurns(t *testing.T, cache *config.Cache, modelID string) *windowTurns {
+	t.Helper()
+	app := tui.New(nil)
+	store := mkStore(t)
+	app.SetActiveStore(store)
+	surface := &recordingSurface{}
+	ctl := newTurnController(context.Background(), surface, cache, turnSelection("openai", modelID, model.EffortDefault), nil, nil)
+	ctl.setResponseObserver(newContextWindowNotice(app, cache))
+	return &windowTurns{ctl: ctl, app: app, store: store, surface: surface}
+}
+
+func (w *windowTurns) run(t *testing.T, client provider.Client) string {
+	t.Helper()
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	if err := w.ctl.dispatch(w.store, time.Time{}); err != nil {
+		t.Fatalf("dispatch error = %v, want nil", err)
+	}
+	turns.Wait()
+	return w.app.NoticeText()
+}
+
+func usageReply(in, out int64) *stubTurnClient {
+	return &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"), usageChunk(in, out))}, nil
+	}}
+}
+
+func toolRoundThenReply(first []byte, second ...[]byte) *stubTurnClient {
+	var round int32
+	return &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		if atomic.AddInt32(&round, 1) == 1 {
+			return provider.Response{Stream: newStream(toolCallsChunk(toolFrag(0, "call_1", "bash", `{"command":"ls"}`)), first)}, nil
+		}
+		return provider.Response{Stream: newStream(second...)}, nil
+	}}
+}
+
+func TestContextWindowNotice_WarnsFromTheTurnsInputAtNinetyPercent(t *testing.T) {
+	cases := []struct {
+		name    string
+		window  int64
+		modelID string
+		in, out int64
+		want    string
+	}{
+		{"exactly 90%", 1000, "gpt-5.5", 900, 1, "openai/gpt-5.5: 900 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice},
+		{"above 90%", 1000, "gpt-5.5", 999, 1, "openai/gpt-5.5: 999 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice},
+		{"just below 90%", 1000, "gpt-5.5", 899, 1, ""},
+		{"output tokens do not count", 1000, "gpt-5.5", 100, 5000, ""},
+		{"non-multiple of ten at the ceiling", 1005, "gpt-5.5", 905, 1, "openai/gpt-5.5: 905 recorded input tokens across rounds/retries; window 1005, 90% threshold 905." + configuredWindowAdvice},
+		{"non-multiple of ten below the ceiling", 1005, "gpt-5.5", 904, 1, ""},
+		{"maximum discovered window at the threshold", math.MaxInt64, "gpt-5.5", 8301034833169298227, 1, "openai/gpt-5.5: 8301034833169298227 recorded input tokens across rounds/retries; window 9223372036854775807, 90% threshold 8301034833169298227." + configuredWindowAdvice},
+		{"maximum discovered window below the threshold", math.MaxInt64, "gpt-5.5", 8301034833169298226, 1, ""},
+		{"unknown window", 1000, "gpt-unknown", 1 << 40, 1, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cache *config.Cache
+			if tc.window > 10000000 {
+				cache = discoveredWindowCache(t, tc.window)
+			} else {
+				cache = windowCache(t, map[string]any{"gpt-5.5": tc.window})
+			}
+			w := newWindowTurns(t, cache, tc.modelID)
+			if got := w.run(t, usageReply(tc.in, tc.out)); got != tc.want {
+				t.Fatalf("notice = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestContextWindowNotice_IgnoresPriorSessionUsage(t *testing.T) {
+	seed := func(t *testing.T) *windowTurns {
+		w := newWindowTurns(t, windowCache(t, map[string]any{"gpt-5.5": 1000}), "gpt-5.5")
+		if err := model.EmitModelResponse(w.store, "openai", "gpt-5.5", 950, 10, nil, false, nil, false, nil, ""); err != nil {
+			t.Fatalf("seed model_response: %v", err)
+		}
+		return w
+	}
+	t.Run("turn with no new response", func(t *testing.T) {
+		w := seed(t)
+		failing := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+			return provider.Response{}, &provider.HTTPError{Status: 400, Body: "boom", Surface: "provider openai returned HTTP 400"}
+		}}
+		if got := w.run(t, failing); got != "" {
+			t.Fatalf("notice = %q, want none when the turn recorded no response", got)
+		}
+	})
+	t.Run("small turn after a large session total", func(t *testing.T) {
+		w := seed(t)
+		if got := w.run(t, usageReply(200, 10)); got != "" {
+			t.Fatalf("notice = %q, want none for a 200-token turn whatever the session total", got)
+		}
+	})
+}
+
+func TestContextWindowNotice_LaterTurnWarnsAndTitleHookIsUnchanged(t *testing.T) {
+	w := newWindowTurns(t, windowCache(t, map[string]any{"gpt-5.5": 1000}), "gpt-5.5")
+	var titleCalls atomic.Int32
+	w.ctl.setTurnCompleteHook(func(context.Context, provider.Client, model.Selection, *sessions.Store, string, string) {
+		titleCalls.Add(1)
+	})
+	w.store.Append(sessions.Message{Role: "user", Content: sessions.TextContent("first"), Timestamp: testStart})
+	if got := w.run(t, usageReply(100, 10)); got != "" {
+		t.Fatalf("first-turn notice = %q, want none below the threshold", got)
+	}
+	w.store.Append(sessions.Message{Role: "user", Content: sessions.TextContent("second"), Timestamp: testStart})
+	want := "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice
+	if got := w.run(t, usageReply(950, 10)); got != want {
+		t.Fatalf("second-turn notice = %q, want %q", got, want)
+	}
+	if got := titleCalls.Load(); got != 1 {
+		t.Fatalf("title hook calls = %d, want 1 (first turn only)", got)
+	}
+}
+
+func TestContextWindowNotice_ObservesInterruptedAndDeniedTurns(t *testing.T) {
+	want := "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice
+	t.Run("interrupted", func(t *testing.T) {
+		w := newWindowTurns(t, windowCache(t, map[string]any{"gpt-5.5": 1000}), "gpt-5.5")
+		ready := make(chan struct{})
+		client := &stubTurnClient{fn: func(ctx context.Context, _ provider.Request) (provider.Response, error) {
+			return provider.Response{Stream: blockingStream(ctx, usageChunk(950, 1), ready)}, nil
+		}}
+		go func() {
+			<-ready
+			w.ctl.Cancel()
+		}()
+		if got := w.run(t, client); got != want {
+			t.Fatalf("notice = %q, want %q", got, want)
+		}
+		if got := w.surface.outcomeList(); !slices.Equal(got, []string{"interrupted"}) {
+			t.Fatalf("outcomes = %v, want [interrupted]", got)
+		}
+	})
+	t.Run("denied", func(t *testing.T) {
+		w := newWindowTurns(t, windowCache(t, map[string]any{"gpt-5.5": 1000}), "gpt-5.5")
+		w.ctl.setToolDispatcher(&fakeTurnDispatcher{results: map[string]turn.ToolResult{
+			"call_1": {Denied: true, Content: permissions.BuildDenyEnvelope("no")},
+		}})
+		if got := w.run(t, toolRoundThenReply(usageChunk(950, 1))); got != want {
+			t.Fatalf("notice = %q, want %q", got, want)
+		}
+		if got := w.surface.outcomeList(); !slices.Equal(got, []string{"turn_failed"}) {
+			t.Fatalf("outcomes = %v, want [turn_failed]", got)
+		}
+	})
+}
+
+func TestContextWindowNotice_SumsRoundsAndLabelsPartialUsage(t *testing.T) {
+	cases := []struct {
+		name          string
+		first, second []byte
+		want          string
+	}{
+		{"rounds each below 90% sum above it", usageChunk(500, 1), usageChunk(450, 1), "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice},
+		{"usage missing from a round at the threshold", usageChunk(900, 1), nil, "openai/gpt-5.5: at least 900 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice},
+		{"usage missing from a round below the threshold", usageChunk(899, 1), nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWindowTurns(t, windowCache(t, map[string]any{"gpt-5.5": 1000}), "gpt-5.5")
+			w.ctl.setToolDispatcher(&fakeTurnDispatcher{results: map[string]turn.ToolResult{"call_1": {Content: "done"}}})
+			second := [][]byte{contentChunk("ok"), finishChunk("stop")}
+			if tc.second != nil {
+				second = append(second, tc.second)
+			}
+			if got := w.run(t, toolRoundThenReply(tc.first, second...)); got != tc.want {
+				t.Fatalf("notice = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestContextWindowNotice_UsesTheCompletedResponsesModel(t *testing.T) {
+	w := newWindowTurns(t, windowCache(t, map[string]any{"gpt-small": 1000, "gpt-5.5": 100000}), "gpt-small")
+	switched := make(chan struct{})
+	client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		<-switched
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"), usageChunk(950, 1))}, nil
+	}}
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	if err := w.ctl.dispatch(w.store, time.Time{}); err != nil {
+		t.Fatalf("dispatch error = %v, want nil", err)
+	}
+	w.ctl.active.ApplyUserSelection(model.Selection{Provider: "openai", ID: "gpt-5.5", Effort: model.EffortDefault}, false)
+	close(switched)
+	turns.Wait()
+	want := "openai/gpt-small: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice
+	if got := w.app.NoticeText(); got != want {
+		t.Fatalf("notice = %q, want %q", got, want)
+	}
+}
+
+func TestContextWindowNotice_ChatGPTTemplate(t *testing.T) {
+	settingsPath := SettingsPath(t.TempDir())
+	if err := config.UpdateDiscoveredModelsProvider(config.DiscoveredModelsPath(settingsPath), "openai-chatgpt", config.DiscoveredProvider{
+		Models: []config.DiscoveredModel{{ID: "gpt-chat", ContextWindow: 1000}},
+	}); err != nil {
+		t.Fatalf("seed discovered models: %v", err)
+	}
+	cache, err := config.NewCache(map[string]any{}, t.TempDir(), []string{settingsPath})
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	app := tui.New(nil)
+	store := mkStore(t)
+	app.SetActiveStore(store)
+	newContextWindowNotice(app, cache)(store.SessionID(), events.ModelResponse{Provider: "openai-chatgpt", ModelID: "gpt-chat", InputTokens: 900, Anomaly: []string{"usage_missing"}})
+	want := "openai-chatgpt/gpt-chat: at least 900 recorded input tokens across rounds/retries; window 1000, 90% threshold 900. This is not one request's size. If individual requests approach the limit, start a shorter or new session, or switch to a larger-window model."
+	if got := app.NoticeText(); got != want {
+		t.Fatalf("notice = %q, want %q", got, want)
+	}
+}
+
+func TestContextWindowNotice_CapturedBeforeTheDrainReleases(t *testing.T) {
+	launched := make(chan func(), 1)
+	defer swapGoTurn(func(fn func()) { launched <- fn })()
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return usageReply(950, 1) })()
+
+	cache := windowCache(t, map[string]any{"gpt-5.5": 1000})
+	w := newWindowTurns(t, cache, "gpt-5.5")
+	w.surface.clearEntered = make(chan struct{})
+	w.surface.clearRelease = make(chan struct{})
+	if err := w.ctl.dispatch(w.store, time.Time{}); err != nil {
+		t.Fatalf("dispatch error = %v, want nil", err)
+	}
+	runTurn := <-launched
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); runTurn() }()
+
+	<-w.surface.clearEntered
+	w.ctl.WaitTurnDrained()
+	if err := model.EmitModelResponse(w.store, "openai", "gpt-5.5", 10, 1, nil, false, nil, false, nil, ""); err != nil {
+		t.Fatalf("append queued-turn response: %v", err)
+	}
+	close(w.surface.clearRelease)
+	<-runDone
+
+	want := "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice
+	if got := w.app.NoticeText(); got != want {
+		t.Fatalf("notice = %q, want %q", got, want)
+	}
+}
+
+func TestContextWindowNotice_OwnershipCheckedAtDelivery(t *testing.T) {
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	ready := make(chan struct{})
+	client := &stubTurnClient{fn: func(ctx context.Context, _ provider.Request) (provider.Response, error) {
+		return provider.Response{Stream: blockingStream(ctx, usageChunk(950, 1), ready)}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	cache := windowCache(t, map[string]any{"gpt-5.5": 1000})
+	app := tui.New(nil)
+	app.SetScreenFactoryForTest(func() (tcell.Screen, error) { return tcell.NewSimulationScreen("UTF-8"), nil })
+	store := mkStore(t)
+	app.SetActiveStore(store)
+	errc := make(chan error, 1)
+	go func() { errc <- app.Run() }()
+	defer func() {
+		app.Stop()
+		<-errc
+	}()
+	onEventLoop(t, app, func() {})
+
+	notice := newContextWindowNotice(app, cache)
+	queued := make(chan struct{})
+	ctl := newTurnController(context.Background(), &recordingSurface{}, cache, turnSelection("openai", "gpt-5.5", model.EffortDefault), nil, nil)
+	ctl.setResponseObserver(func(sessionID string, resp events.ModelResponse) {
+		notice(sessionID, resp)
+		close(queued)
+	})
+	if err := ctl.dispatch(store, time.Time{}); err != nil {
+		t.Fatalf("dispatch error = %v, want nil", err)
+	}
+	<-ready
+	fresh := storeAt(t, filepath.Join(t.TempDir(), "session.json"), "01890000-0000-7000-8000-00000000b001", "/proj")
+	onEventLoop(t, app, func() {
+		ctl.Cancel()
+		ctl.WaitTurnDrained()
+		<-queued
+		app.SetActiveStore(fresh)
+	})
+	turns.Wait()
+	waitTitleBackgroundDone(t)
+	if got := noticeOnEventLoop(t, app); got != "" {
+		t.Fatalf("notice = %q, want the swapped-away session's warning dropped", got)
+	}
+
+	onEventLoop(t, app, func() { app.SetActiveStore(store) })
+	notice(store.SessionID(), events.ModelResponse{Provider: "openai", ModelID: "gpt-5.5", InputTokens: 950})
+	waitTitleBackgroundDone(t)
+	want := "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900." + configuredWindowAdvice
+	if got := noticeOnEventLoop(t, app); got != want {
+		t.Fatalf("notice on returning to the unwarned session = %q, want %q", got, want)
+	}
 }

@@ -29,6 +29,7 @@ type queuedPrompt struct {
 	store           *sessions.Store
 	discardAppended bool
 	sending         bool
+	literal         bool
 }
 
 type unsentBatch struct {
@@ -55,9 +56,21 @@ func (a *App) holdPrompt(text string, parts []sessions.ContentPart, sending bool
 		draft:   a.input.snapshotDraft(),
 		store:   a.ActiveStore(),
 		sending: sending,
+		literal: a.literalHold,
 	})
 	a.suppressNextEcho = true
 	a.renderQueue()
+}
+
+func (a *App) SetLiteralPrompt(p PromptEntrypoint) { a.literalPrompt = p }
+
+func (a *App) SubmitLiteral(text string) bool {
+	if a.literalPrompt == nil {
+		return false
+	}
+	a.literalHold = true
+	defer func() { a.literalHold = false }()
+	return a.literalPrompt(text)
 }
 
 func (a *App) HasQueuedPrompt() bool {
@@ -210,12 +223,25 @@ func (a *App) turnEnded(outcome string) {
 }
 
 func (a *App) dispatchQueuedFront() {
-	if a.submit == nil {
+	n := len(a.queued)
+	for len(a.queued) > 0 && a.queued[0].discardAppended {
+		a.Append(neverSentPrefix + queuedPromptSummary(a.queued[0]))
+		a.queued = a.queued[1:]
+	}
+	if len(a.queued) < n {
+		a.renderQueue()
+	}
+	if a.submit == nil || len(a.queued) == 0 {
 		return
 	}
 	front := a.queued[0]
 	a.suppressNextEcho = false
-	accepted := a.submit(front.text, front.parts...)
+	var accepted bool
+	if front.literal {
+		accepted = a.SubmitLiteral(front.text)
+	} else {
+		accepted = a.submit(front.text, front.parts...)
+	}
 	suppress := a.suppressNextEcho
 	a.suppressNextEcho = false
 	if !accepted {

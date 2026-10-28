@@ -353,7 +353,7 @@ func TestF1210_PermissionsSettingsTab_TogglesAttributionThroughRealWiring(t *tes
 		t.Fatal("/settings rejected; the production registry did not bind the handler")
 	}
 
-	if row := app.ToggleAttributionForTest(); row != "openrouter attribution   off" {
+	if row := app.ToggleAttributionForTest(); row != "attribution   off" {
 		t.Fatalf("settings row after the toggle = %q, want it off in the live session", row)
 	}
 	if notice := app.NoticeText(); notice != "" {
@@ -368,7 +368,7 @@ func TestF1210_PermissionsSettingsTab_TogglesAttributionThroughRealWiring(t *tes
 		t.Fatalf("global settings =\n%q\nwant\n%q", got, want)
 	}
 
-	if row := app.ToggleAttributionForTest(); row != "openrouter attribution   on" {
+	if row := app.ToggleAttributionForTest(); row != "attribution   on" {
 		t.Fatalf("settings row after toggling back = %q, want it on", row)
 	}
 	got, err = os.ReadFile(global)
@@ -416,7 +416,7 @@ func TestF1210_PermissionsSettingsTab_FailedWriteKeepsSessionAndDisk(t *testing.
 	row := app.ToggleAttributionForTest()
 	restoreSync()
 
-	if row != "openrouter attribution   on" {
+	if row != "attribution   on" {
 		t.Errorf("settings row after a failed write = %q, want the unchanged on-disk value", row)
 	}
 	if notice := app.NoticeText(); !strings.Contains(notice, "couldn't change the openrouter attribution setting") {
@@ -432,6 +432,305 @@ func TestF1210_PermissionsSettingsTab_FailedWriteKeepsSessionAndDisk(t *testing.
 }
 
 const openRouterSettingsSeed = "provider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: or-key\n"
+
+const systemOneKeysSeed = "provider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: or-key\n  venice:\n    base_url: https://api.venice.ai/api/v1\n    api_key: v-key\n"
+
+func startSystemOneTUI(t *testing.T, seed string) (*tui.App, string, *sessions.Store) {
+	t.Helper()
+	home := t.TempDir()
+	global := writeGlobalSettings(t, home, seed, 0o600)
+	_, raw, _, err := config.LoadYAML(global)
+	if err != nil {
+		t.Fatalf("load seeded settings: %v", err)
+	}
+	composed, err := config.Compose(raw, nil)
+	if err != nil {
+		t.Fatalf("config.Compose: %v", err)
+	}
+	store := mkStore(t)
+	result := &BootstrapResult{
+		Home:             home,
+		LaunchDir:        "/launch",
+		Config:           composed,
+		ConfigLayerPaths: []string{global},
+		Session:          store,
+	}
+	app, restore := startCaptured(t, context.Background(), result, io.Discard)
+	t.Cleanup(restore)
+	return app, global, store
+}
+
+func systemOneOnDisk(t *testing.T, global string) any {
+	t.Helper()
+	_, raw, cat, err := config.LoadYAML(global)
+	if err != nil {
+		t.Fatalf("config.LoadYAML = (%q, %v)", cat, err)
+	}
+	return raw[config.KeySystemOne]
+}
+
+func TestSystemOneCommand_WritesGlobalFileAndShowsEachChange(t *testing.T) {
+	app, global, store := startSystemOneTUI(t, systemOneKeysSeed)
+
+	app.SubmitInput("/systemone")
+	if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, "System One: off; ") {
+		t.Fatalf("status = %q, want the off state", got)
+	}
+	app.HandleEsc()
+	for _, step := range []struct{ name, confirm, status string }{
+		{"venice:jev-latest", "System One set to venice:jev-latest", "System One: venice:jev-latest (provider venice, model jev-latest); "},
+		{"openrouter:liquid/d1", "System One set to openrouter:liquid/d1", "System One: openrouter:liquid/d1 (provider openrouter, model liquid/d1); "},
+		{"off", "System One turned off", "System One: off; "},
+	} {
+		if !app.SubmitInput("/systemone " + step.name) {
+			t.Fatalf("/systemone %s retained input; notice %q", step.name, app.NoticeText())
+		}
+		if got := app.NoticeText(); got != step.confirm {
+			t.Fatalf("notice = %q, want %q", got, step.confirm)
+		}
+		if got := systemOneOnDisk(t, global); got != step.name {
+			t.Fatalf("system_one on disk = %#v, want %q", got, step.name)
+		}
+		app.SubmitInput("/systemone")
+		if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, step.status) {
+			t.Fatalf("status after %s = %q, want prefix %q", step.name, got, step.status)
+		}
+		app.HandleEsc()
+	}
+
+	before := readFileString(t, global)
+	if app.SubmitInput("/systemone foo") {
+		t.Fatal("/systemone foo accepted")
+	}
+	usage := "usage: /systemone <off|openrouter:typesafe/jev-1.13|venice:jev-latest|openrouter:liquid/d1>"
+	if got := app.NoticeText(); got != usage {
+		t.Fatalf("notice = %q, want %q", got, usage)
+	}
+	if after := readFileString(t, global); after != before {
+		t.Fatalf("refusal changed the global file:\n%q\nwant\n%q", after, before)
+	}
+
+	var records []events.SlashCommand
+	for _, c := range diskSlashCommands(t, readSessionFile(t, store.Path())) {
+		if c.Name == "systemone" {
+			records = append(records, c)
+		}
+	}
+	if len(records) != 4 {
+		t.Fatalf("systemone records = %+v, want 4", records)
+	}
+	if ok := records[0]; ok.Outcome != "success" || ok.ErrorDetail != "" {
+		t.Errorf("selection record = %+v, want success with no detail", ok)
+	}
+	if bad := records[3]; bad.Outcome != "error" || bad.ErrorDetail != usage {
+		t.Errorf("refusal record = %+v, want error with the usage notice", bad)
+	}
+}
+
+func TestSystemOneCommand_RefusesMissingKeyWithoutWriting(t *testing.T) {
+	const seed = "provider:\n  venice:\n    base_url: https://api.venice.ai/api/v1\n    api_key: v-key\n"
+	app, global, _ := startSystemOneTUI(t, seed)
+	if app.SubmitInput("/systemone openrouter:typesafe/jev-1.13") {
+		t.Fatal("selection without a key accepted")
+	}
+	if got, want := app.NoticeText(), "System One: openrouter has no API key; run /connect openrouter"; got != want {
+		t.Fatalf("notice = %q, want %q", got, want)
+	}
+	if got := app.InputText(); got != "/systemone openrouter:typesafe/jev-1.13" {
+		t.Errorf("input = %q, want it retained", got)
+	}
+	if got := readFileString(t, global); got != seed {
+		t.Fatalf("refusal changed the global file:\n%q\nwant\n%q", got, seed)
+	}
+}
+
+func TestSystemOneCommand_FailedWritesKeepTheSessionSelection(t *testing.T) {
+	t.Run("pre-publication failure", func(t *testing.T) {
+		app, global, _ := startSystemOneTUI(t, systemOneKeysSeed)
+		sentinel := errors.New("forced temp-file sync failure")
+		restoreSync := fsutil.SetSyncFileForTest(func(*os.File) error { return sentinel })
+		accepted := app.SubmitInput("/systemone venice:jev-latest")
+		restoreSync()
+		if accepted || app.InputText() != "/systemone venice:jev-latest" {
+			t.Fatalf("accepted = %v, input = %q; want the input retained", accepted, app.InputText())
+		}
+		if got := app.NoticeText(); !strings.HasPrefix(got, "couldn't change the System One setting: ") {
+			t.Fatalf("notice = %q, want the setting-failure notice", got)
+		}
+		if got := readFileString(t, global); got != systemOneKeysSeed {
+			t.Fatalf("failed write changed the global file:\n%q", got)
+		}
+		app.SubmitInput("/systemone")
+		if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, "System One: off; ") {
+			t.Fatalf("status = %q, want the unchanged off selection", got)
+		}
+		app.HandleEsc()
+	})
+
+	t.Run("directory sync failure after rename", func(t *testing.T) {
+		app, global, store := startSystemOneTUI(t, systemOneKeysSeed)
+		sentinel := errors.New("forced parent dir sync failure")
+		restoreSync := fsutil.SetSyncDirForTest(func(*os.File) error { return sentinel })
+		accepted := app.SubmitInput("/systemone venice:jev-latest")
+		restoreSync()
+		if accepted || app.InputText() != "/systemone venice:jev-latest" {
+			t.Fatalf("accepted = %v, input = %q; want the input retained", accepted, app.InputText())
+		}
+		want := "couldn't change the System One setting: " + systemOneParentDirReason
+		if got := app.NoticeText(); got != want {
+			t.Fatalf("notice = %q, want %q", got, want)
+		}
+		if got := systemOneOnDisk(t, global); got != "venice:jev-latest" {
+			t.Fatalf("system_one on disk = %#v, want the already-published value", got)
+		}
+		cmds := diskSlashCommands(t, readSessionFile(t, store.Path()))
+		if last := cmds[len(cmds)-1]; last.Name != "systemone" || last.Outcome != "error" || last.ErrorDetail != want {
+			t.Fatalf("last record = %+v, want the failure as an error", last)
+		}
+		app.SubmitInput("/systemone")
+		if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, "System One: off; ") {
+			t.Fatalf("status = %q, want the unchanged live selection", got)
+		}
+		app.HandleEsc()
+	})
+}
+
+func TestSystemOneCommand_MalformedSettingsFailureHidesSettingsSource(t *testing.T) {
+	const credential = "sk-or-FAKE-b63-credential-7f3a"
+	for _, tc := range []struct{ name, body string }{
+		{"parse error", "provider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: \"" + credential + "\n"},
+		{"schema error", "provider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: [" + credential + "]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, global, store := startSystemOneTUI(t, systemOneKeysSeed)
+			if !app.SubmitInput("/systemone venice:jev-latest") {
+				t.Fatalf("valid selection retained; notice %q", app.NoticeText())
+			}
+			if err := os.WriteFile(global, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write malformed settings: %v", err)
+			}
+			if app.SubmitInput("/systemone off") {
+				t.Fatal("/systemone off accepted against malformed settings")
+			}
+			if got := app.InputText(); got != "/systemone off" {
+				t.Errorf("input = %q, want it retained", got)
+			}
+			notice := app.NoticeText()
+			if notice == "System One turned off" || !strings.HasPrefix(notice, "couldn't change the System One setting: ") {
+				t.Fatalf("notice = %q, want the setting-failure notice", notice)
+			}
+			if strings.Contains(notice, credential) {
+				t.Fatalf("notice leaks the settings source: %q", notice)
+			}
+			if strings.Contains(readFileString(t, store.Path()), credential) {
+				t.Fatal("session file holds the settings source")
+			}
+			cmds := diskSlashCommands(t, readSessionFile(t, store.Path()))
+			if last := cmds[len(cmds)-1]; last.Name != "systemone" || last.Outcome != "error" || last.ErrorDetail != notice {
+				t.Fatalf("last record = %+v, want the failure notice as an error", last)
+			}
+			app.SubmitInput("/systemone")
+			if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, "System One: venice:jev-latest ") {
+				t.Fatalf("status = %q, want the unchanged live selection", got)
+			}
+			app.HandleEsc()
+		})
+	}
+}
+
+func pickSystemOne(t *testing.T, app *tui.App, name string) {
+	t.Helper()
+	if !app.SubmitInput("/systemone") || !app.SystemOnePickerOpen() {
+		t.Fatal("bare /systemone did not open the picker")
+	}
+	if !app.SelectSystemOneRowForTest(name) {
+		t.Fatalf("picker has no %q row", name)
+	}
+	if app.SystemOnePickerOpen() {
+		t.Fatalf("picker still open after choosing %q", name)
+	}
+}
+
+func TestSystemOnePicker_ChoicesPersistToTheGlobalFile(t *testing.T) {
+	app, global, _ := startSystemOneTUI(t, systemOneKeysSeed)
+
+	pickSystemOne(t, app, "venice:jev-latest")
+	if got := app.NoticeText(); got != "System One set to venice:jev-latest" {
+		t.Fatalf("notice = %q, want the set confirmation", got)
+	}
+	if got := systemOneOnDisk(t, global); got != "venice:jev-latest" {
+		t.Fatalf("system_one on disk = %#v, want venice:jev-latest", got)
+	}
+
+	app.SubmitInput("/systemone")
+	if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, "System One: venice:jev-latest (provider venice, model jev-latest); ") {
+		t.Fatalf("reopened header = %q, want the new selection", got)
+	}
+	app.HandleEsc()
+
+	pickSystemOne(t, app, "off")
+	if got := app.NoticeText(); got != "System One turned off" {
+		t.Fatalf("notice = %q, want the off confirmation", got)
+	}
+	if got := systemOneOnDisk(t, global); got != "off" {
+		t.Fatalf("system_one on disk = %#v, want off", got)
+	}
+
+	before, seq := readFileString(t, global), app.NoticeSeq()
+	pickSystemOne(t, app, "off")
+	if !app.SubmitInput("/systemone") {
+		t.Fatal("bare /systemone rejected")
+	}
+	app.HandleEsc()
+	if app.SystemOnePickerOpen() {
+		t.Fatal("Esc did not close the picker")
+	}
+	if after := readFileString(t, global); after != before || app.NoticeSeq() != seq {
+		t.Fatalf("current choice or Esc wrote or notified: file changed = %v, notices %d -> %d", after != before, seq, app.NoticeSeq())
+	}
+}
+
+func TestSystemOnePicker_CurrentChoiceWithoutKeyClosesSilently(t *testing.T) {
+	const seed = "provider:\n  venice:\n    base_url: https://api.venice.ai/api/v1\n    api_key: v-key\nsystem_one: openrouter:typesafe/jev-1.13\n"
+	app, global, _ := startSystemOneTUI(t, seed)
+	seq := app.NoticeSeq()
+	pickSystemOne(t, app, "openrouter:typesafe/jev-1.13")
+	if got := readFileString(t, global); got != seed || app.NoticeSeq() != seq {
+		t.Fatalf("choosing the current no-key value wrote or notified: file %q, notice %q", got, app.NoticeText())
+	}
+}
+
+func TestSystemOnePicker_RefusalsWriteNothing(t *testing.T) {
+	t.Run("different model without key", func(t *testing.T) {
+		const seed = "provider:\n  venice:\n    base_url: https://api.venice.ai/api/v1\n    api_key: v-key\n"
+		app, global, _ := startSystemOneTUI(t, seed)
+		pickSystemOne(t, app, "openrouter:liquid/d1")
+		if got, want := app.NoticeText(), "System One: openrouter has no API key; run /connect openrouter"; got != want {
+			t.Fatalf("notice = %q, want %q", got, want)
+		}
+		if got := readFileString(t, global); got != seed {
+			t.Fatalf("refusal changed the global file:\n%q", got)
+		}
+	})
+
+	t.Run("failed write", func(t *testing.T) {
+		app, global, _ := startSystemOneTUI(t, systemOneKeysSeed)
+		restoreSync := fsutil.SetSyncFileForTest(func(*os.File) error { return errors.New("forced temp-file sync failure") })
+		pickSystemOne(t, app, "venice:jev-latest")
+		restoreSync()
+		if got := app.NoticeText(); !strings.HasPrefix(got, "couldn't change the System One setting: ") || strings.Contains(got, "forced temp-file sync failure") {
+			t.Fatalf("notice = %q, want the sanitized setting-failure notice", got)
+		}
+		if got := readFileString(t, global); got != systemOneKeysSeed {
+			t.Fatalf("failed write changed the global file:\n%q", got)
+		}
+		app.SubmitInput("/systemone")
+		if got := app.SystemOnePickerStatusText(); !strings.HasPrefix(got, "System One: off; ") {
+			t.Fatalf("status = %q, want the unchanged off selection", got)
+		}
+		app.HandleEsc()
+	})
+}
 
 func TestF1730_SettingsRetentionPersistsOnlyAcceptedWrites(t *testing.T) {
 	const seed = "# hand-written\nsessions:\n  retention_days: 30 # keep\n"
@@ -534,9 +833,9 @@ func fakeOpenRouterTurnServer(t *testing.T) (baseURL string, providerObject func
 		switch r.URL.Path {
 		case "/api/v1/models/m/endpoints":
 			_, _ = io.WriteString(w, `{"data":{"endpoints":[
-				{"provider_name":"a","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":20}},
-				{"provider_name":"b","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":90}},
-				{"provider_name":"c","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":50}}
+				{"provider_name":"a","tag":"a","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":20}},
+				{"provider_name":"b","tag":"b/fp8","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":90}},
+				{"provider_name":"c","tag":"c","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":50}}
 			]}}`)
 		case "/api/v1/chat/completions":
 			raw, _ := io.ReadAll(r.Body)
@@ -611,14 +910,14 @@ func TestF1570_PermissionsSettingsTab_RoutingRowsWriteGlobalFileAndReachRequests
 		sort    string
 		request map[string]any
 	}{
-		{app.ToggleDataCollectionForTest, "openrouter data collection   deny", map[string]any{"data_collection": "deny"}, "default", nil},
-		{app.ToggleDataCollectionForTest, "openrouter data collection   allow", map[string]any{"data_collection": "allow"}, "default", nil},
-		{app.StepSortForTest, "openrouter sort   throughput", map[string]any{"data_collection": "allow", "sort": "throughput"}, "throughput", nil},
+		{app.ToggleDataCollectionForTest, "data collection   deny", map[string]any{"data_collection": "deny"}, "default", nil},
+		{app.ToggleDataCollectionForTest, "data collection   allow", map[string]any{"data_collection": "allow"}, "default", nil},
+		{app.StepSortForTest, "sort   throughput", map[string]any{"data_collection": "allow", "sort": "throughput"}, "throughput", nil},
 		{
-			app.StepSortForTest, "openrouter sort   best value", map[string]any{"data_collection": "allow", "sort": "best_value"}, "best_value",
-			map[string]any{"data_collection": "allow", "sort": "price", "preferred_min_throughput": float64(50)},
+			app.StepSortForTest, "sort   best value", map[string]any{"data_collection": "allow", "sort": "best_value"}, "best_value",
+			map[string]any{"data_collection": "allow", "order": []any{"b/fp8"}},
 		},
-		{app.StepSortForTest, "openrouter sort   default", map[string]any{"data_collection": "allow"}, "default", nil},
+		{app.StepSortForTest, "sort   default", map[string]any{"data_collection": "allow"}, "default", nil},
 	} {
 		if row := step.act(); row != step.row {
 			t.Fatalf("settings row = %q, want %q", row, step.row)
@@ -651,8 +950,8 @@ func TestF1570_PermissionsSettingsTab_RoutingRowsWithoutOpenRouterChangeNothing(
 		row    string
 		notice string
 	}{
-		{app.ToggleDataCollectionForTest, "openrouter data collection   allow", "couldn't change the openrouter data collection setting: config: provider.openrouter.routing.data_collection needs a configured provider.openrouter entry"},
-		{app.StepSortForTest, "openrouter sort   default", "couldn't change the openrouter sort setting: config: provider.openrouter.routing.sort needs a configured provider.openrouter entry"},
+		{app.ToggleDataCollectionForTest, "data collection   allow", "couldn't change the openrouter data collection setting: config: provider.openrouter.routing.data_collection needs a configured provider.openrouter entry"},
+		{app.StepSortForTest, "sort   default", "couldn't change the openrouter sort setting: config: provider.openrouter.routing.sort needs a configured provider.openrouter entry"},
 	} {
 		if row := tc.act(); row != tc.row {
 			t.Errorf("settings row = %q, want the unchanged default %q", row, tc.row)
@@ -682,8 +981,8 @@ func TestF1570_PermissionsSettingsTab_FailedRoutingWriteKeepsDiskCacheAndRequest
 		row    string
 		notice string
 	}{
-		{app.ToggleDataCollectionForTest, "openrouter data collection   deny", "couldn't change the openrouter data collection setting: "},
-		{app.StepSortForTest, "openrouter sort   latency", "couldn't change the openrouter sort setting: "},
+		{app.ToggleDataCollectionForTest, "data collection   deny", "couldn't change the openrouter data collection setting: "},
+		{app.StepSortForTest, "sort   latency", "couldn't change the openrouter sort setting: "},
 	} {
 		restoreSync := fsutil.SetSyncFileForTest(func(*os.File) error { return errors.New("forced temp-file sync failure") })
 		row := tc.act()
@@ -720,14 +1019,14 @@ func settleOpenRouterEndpoints(t *testing.T, cache *config.Cache, model string) 
 	t.Cleanup(func() { openRouterEndpoints = prev })
 	entry, _ := cache.Provider("openrouter")
 	name, value := entry.ResolveAuthHeader()
-	openRouterEndpoints.SpeedBar(context.Background(), entry, name, value, model)
+	openRouterEndpoints.BestValueTag(context.Background(), entry, name, value, model, nil)
 }
 
 func TestF1630_PermissionsSettingsTab_MaxPriceReachesNextTurnClientConfig(t *testing.T) {
 	app, cache, global := startPermissionsSettingsTUIWithModel(t, openRouterSettingsSeed, &model.Selection{Provider: "openrouter", ID: "m", Effort: model.EffortDefault})
 	settleOpenRouterEndpoints(t, cache, "m")
 
-	if row := app.SetMaxPriceForTest("0.5", "2"); row != "openrouter max price (m)   input $0.5 / output $2 per M tokens" {
+	if row := app.SetMaxPriceForTest("0.5", "2"); row != "max price (m)   input $0.5 / output $2 per M tokens" {
 		t.Fatalf("max price row = %q", row)
 	}
 	if notice := app.NoticeText(); notice != "" {
@@ -741,7 +1040,7 @@ func TestF1630_PermissionsSettingsTab_MaxPriceReachesNextTurnClientConfig(t *tes
 		t.Fatalf("next request max_price = %#v, want prompt 0.5 and completion 2", got)
 	}
 
-	if row := app.SetMaxPriceForTest("", ""); row != "openrouter max price (m)   none" {
+	if row := app.SetMaxPriceForTest("", ""); row != "max price (m)   none" {
 		t.Fatalf("max price row after clearing = %q", row)
 	}
 	if _, ok := persistedProviderEntry(t, global, "openrouter")["routing"]; ok {
@@ -3148,9 +3447,7 @@ func TestBlocked_RemovingALocalRowWritesTheLocalFile(t *testing.T) {
 		Kind: securitystate.LayerLocal, Path: local, Present: true,
 		Raw: mustValidateLayer(t, local, config.ValidateLocalSettingsBytes),
 	})
-	if err := trust.Record(home, project); err != nil {
-		t.Fatalf("trust.Record: %v", err)
-	}
+	storeUnchanged := approvedRootsUnchanged(t, home, project)
 	decision := trust.Lookup(home, project)
 	if !decision.Trusted {
 		t.Fatalf("trust gate = %#v, want the recorded project admitted", decision)
@@ -3197,6 +3494,96 @@ func TestBlocked_RemovingALocalRowWritesTheLocalFile(t *testing.T) {
 	if got := mustReadFile(t, settings); got != globalBefore {
 		t.Fatalf("global settings = %q, want it byte-identical %q", got, globalBefore)
 	}
+	mustNotExist(t, projectSettingsPath(project), "a local /blocked removal must not create the shared settings file")
+	storeUnchanged()
+}
+
+func startLayeredSettingsTUI(t *testing.T, root, home string, kinds ...securitystate.LayerKind) (*tui.App, tcell.SimulationScreen) {
+	t.Helper()
+	paths := map[securitystate.LayerKind]string{securitystate.LayerProject: projectSettingsPath(root), securitystate.LayerLocal: config.LocalSettingsPath(root)}
+	layers := []securitystate.LayerSnapshot{{Kind: securitystate.LayerGlobal, Path: SettingsPath(home), Present: true, Raw: map[string]any{}}}
+	for _, kind := range kinds {
+		layers = append(layers, loadedLayer(t, kind, paths[kind]))
+	}
+	decision := trust.Lookup(home, root)
+	if !decision.Trusted || decision.Reason != trust.ReasonTrusted {
+		t.Fatalf("trust gate = %#v, want the listed root admitted", decision)
+	}
+	return startRunningOnScreen(t, &BootstrapResult{
+		Home: home, LaunchDir: root, ProjectRoot: root, Session: mkStore(t),
+		Config:         map[string]any{"discovery": map[string]any{"boundary": "project-root"}},
+		SettingsLayers: layers,
+		TrustDecision:  decision,
+	})
+}
+
+func TestSettingsShare_MovesOneLocalEntryToANewSharedFile(t *testing.T) {
+	root := mustCanonical(t, t.TempDir())
+	home := t.TempDir()
+	first, shared, host := folderGrant(root, "read_file"), folderGrant(root, "list_files"), projectHostGrant("web_fetch", "docs.example.com")
+	for _, e := range []permissions.PermissionEntry{first, shared, host} {
+		seedGrantFile(t, config.LocalSettingsPath(root), e)
+	}
+	storeUnchanged := approvedRootsUnchanged(t, home, root)
+	app, screen := startLayeredSettingsTUI(t, root, home, securitystate.LayerLocal)
+
+	var selected bool
+	app.RunOnEventLoopForTest(func() {
+		selected = app.SubmitInput("/settings") && app.SelectPermissionForTest(shared)
+	})
+	if !selected {
+		t.Fatal("the local grant was not selectable in the production /settings overlay")
+	}
+	screen.InjectKey(tcell.KeyRune, 's', tcell.ModNone)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(projectSettingsPath(root)); err == nil && !strings.Contains(mustReadFile(t, config.LocalSettingsPath(root)), "list_files") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("share did not finish: local file = %q", mustReadFile(t, config.LocalSettingsPath(root)))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	requireFileGrants(t, projectSettingsPath(root), root, shared)
+	requireFileGrants(t, config.LocalSettingsPath(root), root, first, host)
+	var notice string
+	app.RunOnEventLoopForTest(func() { notice = app.NoticeText() })
+	if want := tui.RenderProjectRootMarkerNotice(permissions.BoundPromptFact(projectSettingsPath(root))); notice != want {
+		t.Fatalf("notice = %q, want the project-root marker notice %q", notice, want)
+	}
+	storeUnchanged()
+}
+
+func TestSettingsSharedDelete_RemovesOneSharedEntry(t *testing.T) {
+	root := mustCanonical(t, t.TempDir())
+	home := t.TempDir()
+	other, removed, host := folderGrant(root, "list_files"), folderGrant(root, "read_file"), projectHostGrant("web_fetch", "docs.example.com")
+	for _, e := range []permissions.PermissionEntry{other, removed, host} {
+		seedGrantFile(t, projectSettingsPath(root), e)
+	}
+	seedGrantFile(t, config.LocalSettingsPath(root), folderGrant(root, "grep"))
+	localBefore := mustReadFile(t, config.LocalSettingsPath(root))
+	storeUnchanged := approvedRootsUnchanged(t, home, root)
+	app, _ := startLayeredSettingsTUI(t, root, home, securitystate.LayerProject, securitystate.LayerLocal)
+
+	var selected, revoked bool
+	app.RunOnEventLoopForTest(func() {
+		selected = app.SubmitInput("/settings") && app.SelectPermissionForTest(removed)
+		revoked = selected && app.RevokeHighlightedPermissionForTest()
+	})
+	if !selected || !revoked {
+		t.Fatalf("selected %v, revoked %v; want the shared grant removed through the production /settings overlay", selected, revoked)
+	}
+
+	requireFileGrants(t, projectSettingsPath(root), root, other, host)
+	if got := mustReadFile(t, config.LocalSettingsPath(root)); got != localBefore {
+		t.Fatalf("local settings = %q, want it byte-identical %q", got, localBefore)
+	}
+	storeUnchanged()
 }
 
 type estimateServer struct {
@@ -3326,7 +3713,7 @@ func (h *estimateTUI) showSettings() string {
 	h.t.Helper()
 	var row string
 	h.onLoop(func() {
-		if !h.app.ShowSettingsTabForTest() {
+		if !h.app.ShowOpenRouterTabForTest() {
 			h.t.Error("permissions overlay is not open")
 		}
 		row = h.app.SortRowForTest()
@@ -3353,7 +3740,7 @@ func (h *estimateTUI) awaitSortRow(want string) {
 func (h *estimateTUI) awaitStored(model string) {
 	entry, _ := h.cache.Provider("openrouter")
 	name, value := entry.ResolveAuthHeader()
-	openRouterEndpoints.SpeedBar(context.Background(), entry, name, value, model)
+	openRouterEndpoints.BestValueTag(context.Background(), entry, name, value, model, nil)
 }
 
 func (h *estimateTUI) switchModel(sel model.Selection) {
@@ -3373,15 +3760,15 @@ func TestF1660_SettingsTabEstimate_BackgroundFetchReachesOnlyConfiguredOpenRoute
 	}
 
 	srv.block()
-	if row := h.showSettings(); row != "openrouter sort   default" {
+	if row := h.showSettings(); row != "sort   default" {
 		t.Fatalf("sort row while the fetch is blocked = %q, want the mode alone", row)
 	}
 	<-srv.entered
-	if row := h.showSettings(); row != "openrouter sort   default" {
+	if row := h.showSettings(); row != "sort   default" {
 		t.Fatalf("sort row on a second open while the fetch is blocked = %q", row)
 	}
 	close(srv.release)
-	h.awaitSortRow("openrouter sort   default (about $0.1 / $0.2 per M)")
+	h.awaitSortRow("sort   default (about $0.1 / $0.2 per M)")
 
 	if got, want := srv.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key"}; !slices.Equal(got, want) {
 		t.Fatalf("endpoint requests = %v, want %v", got, want)
@@ -3402,11 +3789,11 @@ func TestF1660_SettingsTabEstimate_ReopenedOverlayRedrawsWhenTheFetchFinishes(t 
 	h.screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
 	h.awaitSortRow("")
 	h.reopen()
-	if row := h.showSettings(); row != "openrouter sort   default" {
+	if row := h.showSettings(); row != "sort   default" {
 		t.Fatalf("sort row on the reopened overlay while the fetch is blocked = %q", row)
 	}
 	close(srv.release)
-	h.awaitSortRow("openrouter sort   default (about $0.1 / $0.2 per M)")
+	h.awaitSortRow("sort   default (about $0.1 / $0.2 per M)")
 	if got, want := srv.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key"}; !slices.Equal(got, want) {
 		t.Fatalf("endpoint requests = %v, want %v", got, want)
 	}
@@ -3424,7 +3811,7 @@ func TestF1660_SettingsTabEstimate_ReopenedOverlayRedrawsWhenTheFetchFinishes(t 
 	time.Sleep(50 * time.Millisecond)
 	var row string
 	h.onLoop(func() { row = h.app.SortRowForTest() })
-	if row != "openrouter sort   default" {
+	if row != "sort   default" {
 		t.Fatalf("sort row after the model switched back during the fetch = %q, want the mode alone until the next render", row)
 	}
 }
@@ -3434,10 +3821,29 @@ func TestF1660_SettingsTabEstimate_NoEstimateCases(t *testing.T) {
 		srv := newEstimateServer(t, map[string][2]string{"gpt-5.5": {"0.000001", "0.000002"}})
 		client, rejected := guardedEstimateClient(srv)
 		h := startEstimateTUI(t, srv.srv.URL+"/api/v1", &model.Selection{Provider: "openai", ID: "gpt-5.5", Effort: model.EffortDefault}, &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
-		if row := h.showSettings(); row != "openrouter sort   default" {
+		if row := h.showSettings(); row != "sort   default" {
 			t.Fatalf("sort row = %q, want the mode alone", row)
 		}
 		h.reopen()
+		if got := srv.requests(); len(got) != 0 || rejected.Load() != 0 {
+			t.Fatalf("endpoint requests = %v, rejected dials = %d; want none", got, rejected.Load())
+		}
+	})
+	t.Run("retention-only settings tab makes no request", func(t *testing.T) {
+		srv := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}})
+		client, rejected := guardedEstimateClient(srv)
+		h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
+		var row string
+		h.onLoop(func() {
+			if !h.app.ShowSettingsTabForTest() {
+				t.Error("permissions overlay is not open")
+			}
+			row = h.app.SortRowForTest()
+		})
+		if row != "" {
+			t.Fatalf("sort row on the settings tab = %q, want none", row)
+		}
+		time.Sleep(50 * time.Millisecond)
 		if got := srv.requests(); len(got) != 0 || rejected.Load() != 0 {
 			t.Fatalf("endpoint requests = %v, rejected dials = %d; want none", got, rejected.Load())
 		}
@@ -3448,10 +3854,66 @@ func TestF1660_SettingsTabEstimate_NoEstimateCases(t *testing.T) {
 		h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, map[string]any{"sort": "latency"})
 		h.showSettings()
 		h.awaitStored("m")
-		if row := h.showSettings(); row != "openrouter sort   latency" {
+		if row := h.showSettings(); row != "sort   latency" {
 			t.Fatalf("sort row with stored prices = %q, want the mode alone", row)
 		}
 	})
+}
+
+func TestSettingsTabEstimate_BestValueRequestPickHonorsIgnoredProviders(t *testing.T) {
+	var mu sync.Mutex
+	var chatBody []byte
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/models/m/endpoints":
+			_, _ = io.WriteString(w, `{"data":{"endpoints":[
+				{"provider_name":"Slow","tag":"slow","pricing":{"prompt":"0.0000001","completion":"0.0000001"},"throughput_last_30m":{"p50":20}},
+				{"provider_name":"Wafer","tag":"wafer/nvfp4","pricing":{"prompt":"0.00000028","completion":"0.00000028"},"throughput_last_30m":{"p50":90}},
+				{"provider_name":"Relace","tag":"relace","pricing":{"prompt":"0.00000025","completion":"0.00000025"},"throughput_last_30m":{"p50":60}}
+			]}}`)
+		case "/api/v1/chat/completions":
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			chatBody = raw
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	h := startEstimateTUI(t, srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: srv.Client()}, map[string]any{"sort": "best_value"})
+	h.showSettings()
+	h.awaitSortRow("sort   best value (about $0.28 / $0.28 per M)")
+
+	defer swapTurnProviderClient(func(cfg provider.ClientConfig) provider.Client {
+		cfg.HTTPClient = srv.Client()
+		return provider.NewClient(cfg)
+	})()
+	client, ok := buildTurnClient("openrouter", provider.AuthKindConfigured, h.cache, nil, "")
+	if !ok {
+		t.Fatal("buildTurnClient(openrouter) ok = false, want a client")
+	}
+	if _, err := client.ChatCompletion(context.Background(), provider.Request{
+		Model:            "m",
+		Messages:         []provider.Message{{Role: "user", Content: "hi"}},
+		IgnoredProviders: []string{"wafer"},
+	}); err != nil {
+		t.Fatalf("ChatCompletion() error = %v, want nil", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var body struct {
+		Provider map[string]any `json:"provider"`
+	}
+	if err := json.Unmarshal(chatBody, &body); err != nil {
+		t.Fatalf("decode request body: %v\nbody = %s", err, chatBody)
+	}
+	if want := map[string]any{"order": []any{"relace"}, "ignore": []any{"wafer"}}; !reflect.DeepEqual(body.Provider, want) {
+		t.Fatalf("request provider object = %#v, want %#v", body.Provider, want)
+	}
+	h.awaitSortRow("sort   best value (about $0.28 / $0.28 per M)")
 }
 
 func TestF1660_SettingsTabEstimate_ReconnectUsesTheNewEntryAndKey(t *testing.T) {
@@ -3460,12 +3922,12 @@ func TestF1660_SettingsTabEstimate_ReconnectUsesTheNewEntryAndKey(t *testing.T) 
 	client, rejected := guardedEstimateClient(first, second)
 	h := startEstimateTUI(t, first.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
 	h.showSettings()
-	h.awaitSortRow("openrouter sort   default (about $0.1 / $0.2 per M)")
+	h.awaitSortRow("sort   default (about $0.1 / $0.2 per M)")
 
 	h.onLoop(func() { h.cache.SetOpenRouterConnection(second.srv.URL+"/api/v1", "or-key-2") })
 	h.reopen()
 	h.showSettings()
-	h.awaitSortRow("openrouter sort   default (about $3 / $4 per M)")
+	h.awaitSortRow("sort   default (about $3 / $4 per M)")
 
 	if got, want := first.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key"}; !slices.Equal(got, want) {
 		t.Fatalf("first provider requests = %v, want %v", got, want)
@@ -3485,7 +3947,7 @@ func TestF1660_SettingsTabEstimate_ModelSwitchFetchesOnlyOnOpen(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	store := &provider.OpenRouterEndpointStore{HTTPClient: client, Now: func() time.Time { return start.Add(time.Duration(offset.Load())) }}
 	h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), store, nil)
-	const priceM, priceN = "openrouter sort   default (about $0.1 / $0.2 per M)", "openrouter sort   default (about $1 / $2 per M)"
+	const priceM, priceN = "sort   default (about $0.1 / $0.2 per M)", "sort   default (about $1 / $2 per M)"
 	expectRequests := func(want ...string) {
 		t.Helper()
 		var paths []string

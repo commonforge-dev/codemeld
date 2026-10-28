@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"path/filepath"
 	"reflect"
@@ -35,6 +36,7 @@ const (
 	KindPermissionPromptShown   = "permission_prompt_shown"
 	KindPermissionDecision      = "permission_decision"
 	KindPermissionMatched       = "permission_matched"
+	KindPermissionPromptWait    = "permission_prompt_wait"
 	KindToolExecStart           = "tool_exec_start"
 	KindToolExecEnd             = "tool_exec_end"
 	KindAgentInstructionsLoaded = "agent_instructions_loaded"
@@ -91,6 +93,7 @@ const (
 	KindStructuredReadRefused     = "structured_read_refused"
 	KindTurnTerminal              = "turn_terminal"
 	KindPermissionRevokeRequested = "permission_revoke_requested"
+	KindPermissionSystemOneCheck  = "permission_system_one_check"
 	KindSecurityStateHalted       = "security_state_halted"
 	// child_agent_start and child_agent_end are the delegate lifecycle pair, linked by one
 	// invocation id the child's own tool and permission events also carry. Like the timing
@@ -100,6 +103,7 @@ const (
 	KindChildAgentEnd   = "child_agent_end"
 
 	KindExecutionCapability = "execution_capability"
+	KindSkillLoaded         = "skill_loaded"
 )
 
 // suggest_followup_debug stage labels. Each marks one observable point on
@@ -175,15 +179,16 @@ const (
 	outcomeSourceDeclaredCommand = "declared_command"
 	outcomeSourceOpenRead        = "open_read"
 	outcomeSourceConfined        = "confined"
+	outcomeSourceSystemOneCheck  = "system_one_check"
 )
 
-var knownOutcomeSources = set("cache", outcomeSourceGrant, "mode_auto", outcomeSourceDeclaredScope, outcomeSourceProtectedState, outcomeSourceBlockedPath, outcomeSourceDeclaredCommand, outcomeSourceOpenRead, outcomeSourceConfined)
+var knownOutcomeSources = set("cache", outcomeSourceGrant, "mode_auto", outcomeSourceDeclaredScope, outcomeSourceProtectedState, outcomeSourceBlockedPath, outcomeSourceDeclaredCommand, outcomeSourceOpenRead, outcomeSourceConfined, outcomeSourceSystemOneCheck)
 
 var openReadSubjects = set("read", "read_image", "grep", "glob", "list", "tree", "file_count")
 
 var hostOutcomeSources = set("cache", outcomeSourceGrant)
 
-var perCallOutcomeSources = set("mode_auto", outcomeSourceDeclaredScope)
+var perCallOutcomeSources = set("mode_auto", outcomeSourceDeclaredScope, outcomeSourceSystemOneCheck)
 
 // Mirrors the structured mutation tools and the closed vcs_<action> vocabulary internal/vcs
 // registers, both of which internal/securitystate's protected-state guard covers.
@@ -195,7 +200,7 @@ var protectedStateSubjects = set(
 )
 
 var blockedPathSubjects = set(
-	"read", "read_image", "grep", "glob", "list", "tree", "file_count",
+	"read", "read_image", "grep", "glob", "list", "tree", "file_count", "skill",
 	"edit", "create", "delete", "mkdir", "move",
 	"vcs_branch_switch", "vcs_restore_file", "vcs_stash", "vcs_stash_pop",
 )
@@ -246,7 +251,7 @@ var providerReasons = map[string]map[string]bool{
 	"tls":            set("tls_cert_invalid", "tls_cert_expired", "tls_handshake", "tls_other"),
 	"http":           set("http_no_body", "http_truncated", "http_error"),
 	"decode":         set("decode_error"),
-	"stream_drop":    set("stream_read_error", "stream_eof"),
+	"stream_drop":    set("stream_read_error", "stream_eof", "stream_no_output"),
 	"empty_response": set("no_choices", "null_content", "zero_delta_stream"),
 }
 
@@ -387,6 +392,27 @@ func (p PermissionPromptShown) validate() error {
 		return err
 	}
 	return requestPathScope(k, p.PathScope)
+}
+
+// Prompts counts the requests submitted to one prompt call, not the questions shown.
+type PermissionPromptWait struct {
+	WaitedMs int64  `json:"waited_ms"`
+	Prompts  int    `json:"prompts"`
+	Ended    string `json:"ended"`
+}
+
+var promptWaitEnds = map[string]bool{"answered": true, "cancelled": true, "failed": true}
+
+func (PermissionPromptWait) Kind() string { return KindPermissionPromptWait }
+func (p PermissionPromptWait) validate() error {
+	const k = KindPermissionPromptWait
+	if err := nonNegative(k, "waited_ms", p.WaitedMs); err != nil {
+		return err
+	}
+	if p.Prompts < 1 {
+		return fmt.Errorf("%s.prompts: must be >= 1, got %d", k, p.Prompts)
+	}
+	return enum(k, "ended", p.Ended, promptWaitEnds)
 }
 
 func (p PermissionPromptShown) validateDirectTokens() error {
@@ -646,12 +672,12 @@ func (p PermissionMatched) checkKnownSourceOutcome(known bool) error {
 			return fmt.Errorf("%s: outcome_source %s requires a read tool subject, not %q", k, outcomeSourceOpenRead, p.Subject)
 		}
 	}
-	if p.OutcomeSource == outcomeSourceConfined {
+	if p.OutcomeSource == outcomeSourceConfined || p.OutcomeSource == outcomeSourceSystemOneCheck {
 		if p.Outcome != "once" {
-			return fmt.Errorf("%s: outcome_source %s requires outcome once, not %s", k, outcomeSourceConfined, p.Outcome)
+			return fmt.Errorf("%s: outcome_source %s requires outcome once, not %s", k, p.OutcomeSource, p.Outcome)
 		}
 		if p.SubjectKind != subjectKindDirect && p.SubjectKind != "literal" {
-			return fmt.Errorf("%s: outcome_source %s requires subject_kind direct or literal, not %s", k, outcomeSourceConfined, p.SubjectKind)
+			return fmt.Errorf("%s: outcome_source %s requires subject_kind direct or literal, not %s", k, p.OutcomeSource, p.SubjectKind)
 		}
 	}
 	if p.OutcomeSource == outcomeSourceGrant && perCallOutcomes[p.Outcome] {
@@ -781,6 +807,106 @@ func classifyOutcomeSource(source string, valid map[string]bool, allowUnknown bo
 func literalArgumentHash(subject string) string {
 	sum := sha256.Sum256([]byte(subject))
 	return hex.EncodeToString(sum[:])
+}
+
+var (
+	systemOneSubjectKinds = set(subjectKindDirect, "literal")
+	systemOneProviders    = set("openrouter", "venice")
+	systemOneOutcomes     = set("allowed", "declined", "failed", "skipped")
+	systemOneEffects      = set("read_only", "writes_files", "deletes", "network", "runs_hidden_code", "changes_system")
+	systemOneReasons      = map[string]map[string]bool{
+		"failed":  set("credits", "auth", "rate_limited", "timeout", "server", "network", "malformed", "no_key"),
+		"skipped": set("paused", "text", "blocked_paths_unavailable", "substitution", "blocked_path", "wrapper", "program_location", "shell_shape"),
+	}
+)
+
+// The outcome is not re-derived from the probabilities and thresholds: they are audit data,
+// checked for shape only.
+type PermissionSystemOneCheck struct {
+	SubjectKind       string   `json:"subject_kind"`
+	Subject           string   `json:"subject"`
+	PathScope         string   `json:"path_scope,omitempty"`
+	Provider          string   `json:"provider"`
+	ModelID           string   `json:"model_id"`
+	Outcome           string   `json:"outcome"`
+	Reason            string   `json:"reason,omitempty"`
+	Effect            string   `json:"effect,omitempty"`
+	PReadOnly         *float64 `json:"p_read_only,omitempty"`
+	PSecrets          *float64 `json:"p_secrets,omitempty"`
+	PCode             *float64 `json:"p_code,omitempty"`
+	TReadOnly         *float64 `json:"t_read_only,omitempty"`
+	TSecrets          *float64 `json:"t_secrets,omitempty"`
+	TCode             *float64 `json:"t_code,omitempty"`
+	DurationMs        int64    `json:"duration_ms"`
+	ChildInvocationID string   `json:"child_invocation_id,omitempty"`
+}
+
+func (PermissionSystemOneCheck) Kind() string { return KindPermissionSystemOneCheck }
+
+func (p PermissionSystemOneCheck) validate() error {
+	const k = KindPermissionSystemOneCheck
+	if err := enum(k, "subject_kind", p.SubjectKind, systemOneSubjectKinds); err != nil {
+		return err
+	}
+	if err := required(k, "subject", p.Subject); err != nil {
+		return err
+	}
+	if p.PathScope != "" {
+		if err := absCleanPath(k, "path_scope", p.PathScope); err != nil {
+			return err
+		}
+	}
+	if err := enum(k, "provider", p.Provider, systemOneProviders); err != nil {
+		return err
+	}
+	if err := required(k, "model_id", p.ModelID); err != nil {
+		return err
+	}
+	if err := enum(k, "outcome", p.Outcome, systemOneOutcomes); err != nil {
+		return err
+	}
+	if err := nonNegative(k, "duration_ms", p.DurationMs); err != nil {
+		return err
+	}
+	if err := optionalV7(k, "child_invocation_id", p.ChildInvocationID); err != nil {
+		return err
+	}
+	scores := []struct {
+		field string
+		value *float64
+	}{
+		{"p_read_only", p.PReadOnly}, {"p_secrets", p.PSecrets}, {"p_code", p.PCode},
+		{"t_read_only", p.TReadOnly}, {"t_secrets", p.TSecrets}, {"t_code", p.TCode},
+	}
+	if reasons, ok := systemOneReasons[p.Outcome]; ok {
+		if err := enum(k, "reason", p.Reason, reasons); err != nil {
+			return err
+		}
+		if p.Effect != "" {
+			return fmt.Errorf("%s: effect must be absent when outcome is %s", k, p.Outcome)
+		}
+		for _, s := range scores {
+			if s.value != nil {
+				return fmt.Errorf("%s: %s must be absent when outcome is %s", k, s.field, p.Outcome)
+			}
+		}
+		return nil
+	}
+	if p.Reason != "" {
+		return fmt.Errorf("%s: reason must be absent when outcome is %s", k, p.Outcome)
+	}
+	if err := enum(k, "effect", p.Effect, systemOneEffects); err != nil {
+		return err
+	}
+	for _, s := range scores {
+		if s.value == nil {
+			return fmt.Errorf("%s.%s: required when outcome is %s", k, s.field, p.Outcome)
+		}
+		if v := *s.value; !(v >= 0 && v <= 1) {
+			return fmt.Errorf("%s.%s: must be a finite number in 0-1, got %v", k, s.field, v)
+		}
+	}
+	return nil
 }
 
 // PermissionRevokeRequested records that the /permissions revoke control asked for one stored
@@ -1238,6 +1364,8 @@ type ModelResponse struct {
 	CachedInputTokens *int64 `json:"cached_input_tokens,omitempty"`
 	// Written only as true, marking the present CachedInputTokens a known lower bound.
 	CachedInputTokensPartial bool     `json:"cached_input_tokens_partial,omitempty"`
+	CostUSD                  *float64 `json:"cost_usd,omitempty"`
+	CostUSDPartial           bool     `json:"cost_usd_partial,omitempty"`
 	Anomaly                  []string `json:"anomaly"`
 	UpstreamProvider         string   `json:"upstream_provider,omitempty"`
 }
@@ -1263,6 +1391,13 @@ func (p ModelResponse) validate() error {
 		}
 	} else if p.CachedInputTokensPartial {
 		return fmt.Errorf("%s: cached_input_tokens_partial requires cached_input_tokens", k)
+	}
+	if p.CostUSD != nil {
+		if err := nonNegativeFinite(k, "cost_usd", *p.CostUSD); err != nil {
+			return err
+		}
+	} else if p.CostUSDPartial {
+		return fmt.Errorf("%s: cost_usd_partial requires cost_usd", k)
 	}
 	seen := false
 	for i, a := range p.Anomaly {
@@ -1552,6 +1687,8 @@ type ProviderRoundTrip struct {
 	TurnID           string `json:"turn_id,omitempty"`
 	RoundID          string `json:"round_id,omitempty"`
 	UpstreamProvider string `json:"upstream_provider,omitempty"`
+	Chunks           int64  `json:"chunks,omitempty"`
+	ReasoningChars   int64  `json:"reasoning_chars,omitempty"`
 }
 
 func (ProviderRoundTrip) Kind() string { return KindProviderRoundTrip }
@@ -1564,6 +1701,12 @@ func (p ProviderRoundTrip) validate() error {
 		return err
 	}
 	if err := nonNegative(k, "duration_ms", p.DurationMs); err != nil {
+		return err
+	}
+	if err := nonNegative(k, "chunks", p.Chunks); err != nil {
+		return err
+	}
+	if err := nonNegative(k, "reasoning_chars", p.ReasoningChars); err != nil {
 		return err
 	}
 	if p.TurnID == "" && p.RoundID == "" {
@@ -2072,6 +2215,8 @@ func unmarshalPayload(kind string, raw json.RawMessage) (EventPayload, error) {
 		return decode[PermissionDecision](kind, raw)
 	case KindPermissionMatched:
 		return decode[PermissionMatched](kind, raw)
+	case KindPermissionPromptWait:
+		return decode[PermissionPromptWait](kind, raw)
 	case KindToolExecStart:
 		return decode[ToolExecStart](kind, raw)
 	case KindToolExecEnd:
@@ -2086,6 +2231,8 @@ func unmarshalPayload(kind string, raw json.RawMessage) (EventPayload, error) {
 		return decode[PermissionPersistFailed](kind, raw)
 	case KindPermissionRevokeRequested:
 		return decode[PermissionRevokeRequested](kind, raw)
+	case KindPermissionSystemOneCheck:
+		return decode[PermissionSystemOneCheck](kind, raw)
 	case KindModelTurn:
 		return decode[ModelTurn](kind, raw)
 	case KindModelResponse:
@@ -2134,6 +2281,8 @@ func unmarshalPayload(kind string, raw json.RawMessage) (EventPayload, error) {
 		return decode[ChildAgentStart](kind, raw)
 	case KindChildAgentEnd:
 		return decode[ChildAgentEnd](kind, raw)
+	case KindSkillLoaded:
+		return decode[SkillLoaded](kind, raw)
 	case KindTurnTerminal:
 		return decodeTurnTerminal(kind, raw)
 	case KindSecurityStateHalted:
@@ -2378,6 +2527,13 @@ func fixedOrderSubset(kind, field string, values, order []string) error {
 func nonNegative(kind, field string, value int64) error {
 	if value < 0 {
 		return fmt.Errorf("%s.%s: must be >= 0, got %d", kind, field, value)
+	}
+	return nil
+}
+
+func nonNegativeFinite(kind, field string, value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return fmt.Errorf("%s.%s: must be a finite number >= 0, got %v", kind, field, value)
 	}
 	return nil
 }

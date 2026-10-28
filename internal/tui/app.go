@@ -274,6 +274,11 @@ type App struct {
 	effortPickerPrev tview.Primitive
 	effortDeps       EffortDeps
 
+	systemOnePickerOpen   bool
+	systemOnePickerPrev   tview.Primitive
+	systemOnePickerStatus string
+	systemOneDeps         SystemOneDeps
+
 	// modeDeps is the mode-switch surface the shift+tab cycle key drives — the
 	// same ModeDeps BuildRegistry binds to the /mode command, so both
 	// surfaces switch through one seam. Injected by the production wiring via
@@ -487,6 +492,7 @@ type App struct {
 	// ResetTranscript during dispatch and consumed by submitCurrent on the same tview
 	// event-loop goroutine, so it needs no lock.
 	suppressNextEcho bool
+	echoOverride     string
 
 	// inputSelecting tracks an app-owned plain left-drag that began inside the input
 	// rect. TextArea's native mouse drag can degrade to click-only behavior in real
@@ -511,6 +517,9 @@ type App struct {
 	queueRows *tview.TextView
 	unsentMu  sync.Mutex
 	unsent    []*unsentBatch
+
+	literalPrompt PromptEntrypoint
+	literalHold   bool
 
 	// transcriptSel* give the conversation pane the same edge-hold auto-scroll the input
 	// has: a plain transcript drag held on the top or bottom visible row scrolls
@@ -1100,6 +1109,8 @@ func (a *App) handleStatusKey(ev *tcell.EventKey) *tcell.EventKey {
 // hooks.
 func (a *App) SetEffortDeps(d EffortDeps) { a.effortDeps = d }
 
+func (a *App) SetSystemOneDeps(d SystemOneDeps) { a.systemOneDeps = d }
+
 // SetModelPickerDeps installs the provider-aware surface the CTRL-M model picker
 // reads and applies through. The production wiring supplies the
 // implementations bound to the running app + bootstrap result; with none set the
@@ -1280,9 +1291,11 @@ func (a *App) submitCurrent() bool {
 	// Clear any stale suppression before dispatch so only this submission's handler
 	// can suppress its own echo (via ResetTranscript), then consume it once below.
 	a.suppressNextEcho = false
+	a.echoOverride = ""
 	accepted := a.submit(text, imageParts...)
-	suppress := a.suppressNextEcho
+	suppress, echo := a.suppressNextEcho, a.echoOverride
 	a.suppressNextEcho = false
+	a.echoOverride = ""
 	if !accepted {
 		return false
 	}
@@ -1295,12 +1308,16 @@ func (a *App) submitCurrent() bool {
 	// re-parses command type — so rejected/retained input is not echoed.
 	// Skipped when the handler reset the transcript (ResetTranscript): a successful
 	// clear or /new must not leave "> /clear" on the freshly-cleared pane.
-	if !suppress {
+	if !suppress && echo != "" {
+		a.transcript.append(userBlockLines(echo, nil))
+	} else if !suppress {
 		a.transcript.append(userBlockLines(text, imageParts))
 	}
 	a.input.SetText("")
 	return true
 }
+
+func (a *App) ReplaceNextEcho(text string) { a.echoOverride = text }
 
 // handleInputKey owns the input area's key contract while it is focused.
 // Plain Enter submits the whole (possibly multi-line) buffer

@@ -103,6 +103,22 @@ func TestFileCountTool_Advertise(t *testing.T) {
 	assertFileCountGuidance(t, md, props)
 }
 
+func TestFileCountTool_AdvertisePathContract(t *testing.T) {
+	md := newFileCountToolIn(t, t.TempDir()).Advertise()
+	assertReadPathContract(t, md)
+	desc := pathDescription(t, md)
+	for _, want := range []string{
+		"symlink to a directory, even one named explicitly outside the project",
+		"Blocked entries beneath an allowed directory do not refuse the walk",
+		"left out of the count and reported as left out (blocked)",
+		"Defaults to the project root when omitted",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("file_count path description missing %q; got %q", want, desc)
+		}
+	}
+}
+
 // containsStr reports whether want is in list.
 func containsStr(list []string, want string) bool {
 	for _, s := range list {

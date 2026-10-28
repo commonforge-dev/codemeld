@@ -13,8 +13,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,6 +41,7 @@ const (
 	helperReadLine  = "CODEMELD_RUNNER_READ_LINE"  // when "1", copy one stdin line to stdout, then exit (like head -n 1)
 	helperBlock     = "CODEMELD_RUNNER_BLOCK"      // when "1", block forever without reading or writing
 	helperTouch     = "CODEMELD_RUNNER_TOUCH"
+	helperDumpEnv   = "CODEMELD_RUNNER_DUMP_ENV" // when "1", write every environment entry to stderr, one per line
 )
 
 func TestMain(m *testing.M) {
@@ -68,6 +71,11 @@ func runHelper() {
 	if names := os.Getenv(helperPrintEnv); names != "" {
 		for name := range strings.SplitSeq(names, ",") {
 			_, _ = fmt.Fprintf(os.Stdout, "%s=%s\n", name, os.Getenv(name))
+		}
+	}
+	if os.Getenv(helperDumpEnv) == "1" {
+		for _, entry := range os.Environ() {
+			_, _ = fmt.Fprintln(os.Stderr, entry)
 		}
 	}
 	if n := os.Getenv(helperErrRepeat); n != "" {
@@ -1054,10 +1062,16 @@ func TestDirectExecRunner_CancelKillsProcessGroup(t *testing.T) {
 
 func TestKillGroupOnCancel_GoneGroupIsProcessDone(t *testing.T) {
 	cmd := exec.CommandContext(context.Background(), shPath(t), "-c", ":")
-	killGroupOnCancel(cmd)
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("Run: %v", err)
+	inv := killGroupOnCancel(cmd, ids.NewV7())
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
+	inv.started(context.Background(), cmd.Process.Pid)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	inv.exited()
+	inv.finish()
 	if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("Cancel on an exited group = %v, want os.ErrProcessDone", err)
 	}
@@ -1083,4 +1097,155 @@ func TestDirectExecRunner_NormalExitKeepsBackgroundChildDelayedOutput(t *testing
 		res, err := execBoundedWithin(t, 20*time.Second, RunSpec{InvocationID: r.NewInvocationID(), Argv: argv}, 1024)
 		check(t, res, err)
 	})
+	t.Run("Pipeline", func(t *testing.T) {
+		results, err := pipelineWithin(t, 20*time.Second, 1024, []RunSpec{
+			{InvocationID: r.NewInvocationID(), Argv: argv},
+			pipelineSpec(t, map[string]string{helperEchoStdin: "1"}),
+		})
+		check(t, RunResult{Stdout: results[1].Stdout, ExitCode: results[0].ExitCode}, err)
+	})
+}
+
+func waitPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				return pid
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no pid written to %s", path)
+	return 0
+}
+
+func procField(pid int, index int) (string, bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(data[bytes.LastIndexByte(data, ')')+1:]))
+	return fields[index], true
+}
+
+func processGone(pid int) bool {
+	state, ok := procField(pid, 0)
+	return !ok || state == "Z" || state == "X"
+}
+
+func TestDirectExecRunner_NormalExitBoundsDelayedWriter(t *testing.T) {
+	script := `printf early; (sleep 5; printf late) & echo $! > "$1"`
+	for _, api := range []string{"Exec", "ExecBounded", "Pipeline"} {
+		t.Run(api, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "writer")
+			spec := RunSpec{InvocationID: DirectExecRunner{}.NewInvocationID(), Argv: []string{shPath(t), "-c", script, "sh", file}}
+			r := DirectExecRunner{}
+			began := time.Now()
+			var stdout string
+			var exit int
+			switch api {
+			case "Exec":
+				res, err := r.Exec(context.Background(), spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stdout, exit = string(res.Stdout), res.ExitCode
+			case "ExecBounded":
+				res, err := execBoundedWithin(t, 20*time.Second, spec, 1024)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stdout, exit = string(res.Stdout), res.ExitCode
+			default:
+				results, err := pipelineWithin(t, 20*time.Second, 1024, []RunSpec{spec, pipelineSpec(t, map[string]string{helperEchoStdin: "1"})})
+				if err != nil {
+					t.Fatal(err)
+				}
+				stdout, exit = string(results[1].Stdout), results[0].ExitCode
+			}
+			if elapsed := time.Since(began); elapsed > outputGrace+1500*time.Millisecond {
+				t.Fatalf("%s returned after %v, want within the %v grace plus a margin", api, elapsed, outputGrace)
+			}
+			if stdout != "early" || exit != 0 {
+				t.Fatalf("stdout=%q exit=%d, want the early output and a successful root", stdout, exit)
+			}
+			if writer := waitPID(t, file); runtime.GOOS == "linux" && processGone(writer) {
+				t.Fatal("a normal exit killed the delayed writer")
+			}
+		})
+	}
+}
+
+func TestDirectExecRunner_UnreadStdinHolderDoesNotBlock(t *testing.T) {
+	script := `exec 3<&0; sleep 30 <&3 >/dev/null 2>&1 & echo $! > "$1"`
+	stdin := bytes.Repeat([]byte("i"), 1<<20)
+	for _, api := range []string{"ExecBounded", "Pipeline"} {
+		t.Run(api, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "holder")
+			spec := RunSpec{InvocationID: DirectExecRunner{}.NewInvocationID(), Argv: []string{shPath(t), "-c", script, "sh", file}, Stdin: stdin}
+			began := time.Now()
+			var exit int
+			if api == "ExecBounded" {
+				res, err := execBoundedWithin(t, 20*time.Second, spec, 1024)
+				if err != nil {
+					t.Fatal(err)
+				}
+				exit = res.ExitCode
+			} else {
+				results, err := pipelineWithin(t, 20*time.Second, 1024, []RunSpec{spec, pipelineSpec(t, map[string]string{helperEchoStdin: "1"})})
+				if err != nil {
+					t.Fatal(err)
+				}
+				exit = results[0].ExitCode
+			}
+			waitPID(t, file)
+			if elapsed := time.Since(began); elapsed > outputGrace+1500*time.Millisecond {
+				t.Fatalf("%s returned after %v, want within the %v grace plus a margin", api, elapsed, outputGrace)
+			}
+			if exit != 0 {
+				t.Fatalf("exit = %d, want 0", exit)
+			}
+		})
+	}
+}
+
+func TestDirectExecRunner_StalledPipelineCopierIsBounded(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "holder")
+	consumer := RunSpec{
+		InvocationID: DirectExecRunner{}.NewInvocationID(),
+		Argv:         []string{shPath(t), "-c", `exec 3<&0; sleep 30 <&3 >/dev/null 2>&1 & echo $! > "$1"`, "sh", file},
+	}
+	began := time.Now()
+	results, err := pipelineWithin(t, 20*time.Second, 1024, []RunSpec{pipelineSpec(t, map[string]string{helperSpew: "1"}), consumer})
+	if err != nil {
+		t.Fatalf("Pipeline error = %v, want a stalled copier to end without an error", err)
+	}
+	holder := waitPID(t, file)
+	if elapsed := time.Since(began); elapsed > outputGrace+1500*time.Millisecond {
+		t.Fatalf("Pipeline returned after %v, want within the %v grace plus a margin", elapsed, outputGrace)
+	}
+	if results[1].ExitCode != 0 {
+		t.Fatalf("consumer exit = %d, want 0", results[1].ExitCode)
+	}
+	if runtime.GOOS == "linux" && processGone(holder) {
+		t.Fatal("a normal exit killed the process holding stdin")
+	}
+}
+
+func TestPipelineFailure_KeepsCopyErrorsAlongsideCancellation(t *testing.T) {
+	results := make([]PipelineResult, 3)
+	copyErr := errors.New("copy broke")
+	err := pipelineFailure(context.DeadlineExceeded, results, []capture{{err: copyErr}, {}, {}}, make([]capture, 3))
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, copyErr) {
+		t.Fatalf("error = %v, want both the cancellation and the copy failure", err)
+	}
+	want := []PipelineStageFailure{PipelineFailureCopy, PipelineFailureCopy, PipelineFailureCanceled}
+	for i, res := range results {
+		if res.PipelineErrCategory != want[i] {
+			t.Fatalf("stage %d category = %q, want %q", i, res.PipelineErrCategory, want[i])
+		}
+	}
 }

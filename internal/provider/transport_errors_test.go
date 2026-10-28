@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -30,7 +31,7 @@ var providerClosedSet = map[string][]string{
 	"tls":            {"tls_cert_invalid", "tls_cert_expired", "tls_handshake", "tls_other"},
 	"http":           {"http_no_body", "http_truncated"},
 	"decode":         {"decode_error"},
-	"stream_drop":    {"stream_read_error", "stream_eof"},
+	"stream_drop":    {"stream_read_error", "stream_eof", "stream_no_output"},
 	"empty_response": {"no_choices", "null_content", "zero_delta_stream"},
 }
 
@@ -285,6 +286,25 @@ func TestEmptyStreamClassification(t *testing.T) {
 	}
 }
 
+func TestStreamNoOutputClassification(t *testing.T) {
+	got := StreamNoOutputClassification()
+	if got.Phase != "stream_drop" || got.Reason != "stream_no_output" {
+		t.Errorf("(phase, reason) = (%q, %q), want (stream_drop, stream_no_output)", got.Phase, got.Reason)
+	}
+	if !strings.Contains(got.ErrorDetail, "codemeld cancelled") {
+		t.Errorf("error_detail = %q, want it to say codemeld cancelled the stream", got.ErrorDetail)
+	}
+	if got.PartialResponseChars != 0 {
+		t.Errorf("partial_response_chars = %d, want 0", got.PartialResponseChars)
+	}
+	if got.HTTPStatus != nil {
+		t.Errorf("http_status = %v, want nil", *got.HTTPStatus)
+	}
+	if !Retryable(got) {
+		t.Error("Retryable = false, want true")
+	}
+}
+
 func TestNoBodyHTTPFailure(t *testing.T) {
 	got := NoBodyHTTPFailure(503)
 	if got.Phase != "http" || got.Reason != "http_no_body" {
@@ -336,6 +356,7 @@ func TestClassifierCoversClosedSet(t *testing.T) {
 		ClassifyStreamDrop(io.EOF, 1),
 		ClassifyStreamDrop(errors.New("reset"), 1),
 		EmptyStreamClassification(),
+		StreamNoOutputClassification(),
 		mustEmpty(t, nil),
 		mustEmpty(t, &openai.ChatCompletion{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{}}}}),
 	}

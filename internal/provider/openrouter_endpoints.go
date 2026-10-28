@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -25,6 +26,7 @@ const (
 
 type openRouterEndpoint struct {
 	ProviderName   string
+	Tag            string
 	PromptPerM     float64
 	CompletionPerM float64
 	Discount       float64
@@ -36,6 +38,7 @@ type openRouterEndpointsResponse struct {
 	Data struct {
 		Endpoints []struct {
 			ProviderName string `json:"provider_name"`
+			Tag          string `json:"tag"`
 			Pricing      struct {
 				Prompt     string  `json:"prompt"`
 				Completion string  `json:"completion"`
@@ -97,6 +100,7 @@ func fetchOpenRouterEndpoints(ctx context.Context, hc *http.Client, entry Provid
 		}
 		ep := openRouterEndpoint{
 			ProviderName:   e.ProviderName,
+			Tag:            e.Tag,
 			PromptPerM:     prompt,
 			CompletionPerM: completion,
 			Discount:       e.Pricing.Discount,
@@ -142,8 +146,60 @@ type OpenRouterEstimate struct {
 	Discount       float64
 }
 
-func openRouterEstimate(endpoints []openRouterEndpoint, sortMode string) (OpenRouterEstimate, bool) {
+func openRouterBestValue(endpoints []openRouterEndpoint, ignored []string) (openRouterEndpoint, bool) {
 	bar, hasBar := openRouterSpeedBar(endpoints)
+	if !hasBar {
+		return openRouterEndpoint{}, false
+	}
+	var eligible []*openRouterEndpoint
+	for i := range endpoints {
+		e := &endpoints[i]
+		if e.Tag != "" && e.HasThroughput && e.P50Throughput >= bar && !openRouterTagIgnored(e.Tag, ignored) {
+			eligible = append(eligible, e)
+		}
+	}
+	if len(eligible) == 0 {
+		return openRouterEndpoint{}, false
+	}
+	cheapest := openRouterPriceTotal(eligible[0])
+	for _, e := range eligible[1:] {
+		cheapest = min(cheapest, openRouterPriceTotal(e))
+	}
+	limit := new(big.Int).Mul(big.NewInt(6), big.NewInt(cheapest))
+	var pick *openRouterEndpoint
+	for _, e := range eligible {
+		total := openRouterPriceTotal(e)
+		if new(big.Int).Mul(big.NewInt(5), big.NewInt(total)).Cmp(limit) > 0 {
+			continue
+		}
+		if pick == nil || e.P50Throughput > pick.P50Throughput || e.P50Throughput == pick.P50Throughput && total < openRouterPriceTotal(pick) {
+			pick = e
+		}
+	}
+	if pick == nil {
+		return openRouterEndpoint{}, false
+	}
+	return *pick, true
+}
+
+func openRouterTagIgnored(tag string, ignored []string) bool {
+	base, _, _ := strings.Cut(tag, "/")
+	for _, slug := range ignored {
+		if slug == tag || slug == base {
+			return true
+		}
+	}
+	return false
+}
+
+func openRouterEstimate(endpoints []openRouterEndpoint, sortMode string) (OpenRouterEstimate, bool) {
+	if sortMode == openRouterSortBestValue {
+		pick, ok := openRouterBestValue(endpoints, nil)
+		if !ok {
+			return OpenRouterEstimate{}, false
+		}
+		return OpenRouterEstimate{PromptPerM: pick.PromptPerM, CompletionPerM: pick.CompletionPerM, Discount: pick.Discount}, true
+	}
 	var pick *openRouterEndpoint
 	cheaper := func(e *openRouterEndpoint) bool {
 		return pick == nil || openRouterPriceTotal(e) < openRouterPriceTotal(pick)
@@ -156,8 +212,6 @@ func openRouterEstimate(endpoints []openRouterEndpoint, sortMode string) (OpenRo
 			better = cheaper(e)
 		case "throughput":
 			better = e.HasThroughput && (pick == nil || e.P50Throughput > pick.P50Throughput)
-		case openRouterSortBestValue:
-			better = (!hasBar || e.HasThroughput && e.P50Throughput >= bar) && cheaper(e)
 		}
 		if better {
 			pick = e
@@ -190,8 +244,6 @@ type openRouterEndpointKey struct {
 type openRouterEndpointEntry struct {
 	fetched   time.Time
 	failed    bool
-	bar       float64
-	hasBar    bool
 	retained  bool
 	endpoints []openRouterEndpoint
 	pending   chan struct{}
@@ -224,8 +276,7 @@ func (s *OpenRouterEndpointStore) claim(key openRouterEndpointKey) *openRouterEn
 
 func (s *OpenRouterEndpointStore) fill(ctx context.Context, owned *openRouterEndpointEntry, entry ProviderEntry, authName, authValue, model string) (openRouterEndpointEntry, []func()) {
 	endpoints, err := fetchOpenRouterEndpoints(ctx, s.HTTPClient, entry, authName, authValue, model)
-	bar, hasBar := openRouterSpeedBar(endpoints)
-	filled := openRouterEndpointEntry{fetched: s.now(), failed: err != nil, bar: bar, hasBar: hasBar, retained: err == nil, endpoints: endpoints}
+	filled := openRouterEndpointEntry{fetched: s.now(), failed: err != nil, retained: err == nil, endpoints: endpoints}
 	s.mu.Lock()
 	pending, notify := owned.pending, owned.notify
 	*owned = filled
@@ -238,7 +289,7 @@ func openRouterKey(entry ProviderEntry, model string) openRouterEndpointKey {
 	return openRouterEndpointKey{baseURL: strings.TrimSuffix(entry.BaseURL, "/"), model: model}
 }
 
-func (s *OpenRouterEndpointStore) SpeedBar(ctx context.Context, entry ProviderEntry, authName, authValue, model string) (float64, bool) {
+func (s *OpenRouterEndpointStore) BestValueTag(ctx context.Context, entry ProviderEntry, authName, authValue, model string, ignored []string) string {
 	ctx, cancel := context.WithTimeout(ctx, openRouterSpeedBarTimeout)
 	defer cancel()
 	key := openRouterKey(entry, model)
@@ -252,19 +303,25 @@ func (s *OpenRouterEndpointStore) SpeedBar(ctx context.Context, entry ProviderEn
 			case <-pending:
 				continue
 			case <-ctx.Done():
-				return 0, false
+				return ""
 			}
 		}
 		if e != nil && s.fresh(e) {
+			endpoints := e.endpoints
 			s.mu.Unlock()
-			return e.bar, e.hasBar
+			return openRouterBestValueTag(endpoints, ignored)
 		}
 		owned := s.claim(key)
 		s.mu.Unlock()
 
 		filled, _ := s.fill(ctx, owned, entry, authName, authValue, model)
-		return filled.bar, filled.hasBar
+		return openRouterBestValueTag(filled.endpoints, ignored)
 	}
+}
+
+func openRouterBestValueTag(endpoints []openRouterEndpoint, ignored []string) string {
+	pick, _ := openRouterBestValue(endpoints, ignored)
+	return pick.Tag
 }
 
 func (s *OpenRouterEndpointStore) Estimate(entry ProviderEntry, authName, authValue, model, sortMode string, fetched func()) (OpenRouterEstimate, bool) {

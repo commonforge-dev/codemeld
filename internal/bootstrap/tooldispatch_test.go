@@ -8,7 +8,9 @@ package bootstrap
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,7 @@ import (
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/skills"
 	"codemeld.dev/codemeld/internal/subagenttool"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/tui"
@@ -1199,7 +1202,7 @@ func TestRealizeToolRegistry_SearchBackendKeyedAndKeylessDifferOnlyByTheKey(t *t
 // TestProductionDispatcher_DeleteToolEndToEndRemovesFileOnlyAfterGrant pins the delete tool on the
 // production dispatcher: a real delete-tool call round-trips through the production dispatcher's
 // authorization seam and execution path with no shell involved. Without an explicit grant (a denying
-// authorizer — delete is never mode-auto-allowed) the file survives and the model gets the deny; with an
+// authorizer) the file survives and the model gets the deny; with an
 // explicit grant the file is removed through the real dispatch path, with the resolved target carried in
 // the mode-authorization context.
 func TestProductionDispatcher_DeleteToolEndToEndRemovesFileOnlyAfterGrant(t *testing.T) {
@@ -1230,7 +1233,7 @@ func TestProductionDispatcher_DeleteToolEndToEndRemovesFileOnlyAfterGrant(t *tes
 	t.Run("no grant leaves the file in place", func(t *testing.T) {
 		auth, file, res := setup(t, deny(permissions.BuildDenyEnvelope("nope")))
 		if auth.callCount() != 1 {
-			t.Fatalf("authorizer calls = %d, want 1 (delete prompts, never mode-auto-allowed)", auth.callCount())
+			t.Fatalf("authorizer calls = %d, want 1 (the delete routes through Authorize)", auth.callCount())
 		}
 		if !res.Denied {
 			t.Fatalf("res.Denied = false, want true (no grant ⇒ delete denied); content=%q", res.Content)
@@ -1257,11 +1260,93 @@ func TestProductionDispatcher_DeleteToolEndToEndRemovesFileOnlyAfterGrant(t *tes
 	})
 }
 
+func TestRealizeToolRegistry_DeleteDescriptionStatesTheConditionalAllowance(t *testing.T) {
+	reg, err := (&toolRegistryFactory{active: nil}).realize(emptyCache(t, t.TempDir()), func() *sessions.Store { return mkStore(t) }, t.TempDir(), t.TempDir(), securitystate.Policy{})
+	if err != nil {
+		t.Fatalf("realize: %v", err)
+	}
+	tool, ok := reg.Lookup(filetools.DeleteToolName)
+	if !ok {
+		t.Fatal("delete not registered")
+	}
+	md := tool.Advertise()
+	if !strings.Contains(md.Description, "irreversible and may need approval first") {
+		t.Fatalf("delete description = %q, want it to say deletion may need approval", md.Description)
+	}
+	for _, stale := range []string{"always requires", "never auto-approved"} {
+		if strings.Contains(md.Description, stale) {
+			t.Fatalf("delete description = %q, still claims %q", md.Description, stale)
+		}
+	}
+	path, _ := md.Parameters["properties"].(map[string]any)["path"].(map[string]any)["description"].(string)
+	if !strings.Contains(path, "outside the project and every writable folder is allowed only after you approve it") {
+		t.Fatalf("delete path description = %q, want the outside-both-scopes approval rule", path)
+	}
+}
+
+func TestProductionDispatcher_ConstrainedAutoEditsDeleteRunsWithoutAsking(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	outside := declaredScopeDir(t)
+	projectFile := filepath.Join(l.project, "doomed.txt")
+	link := filepath.Join(l.project, "link.txt")
+	referent := filepath.Join(outside, "referent.txt")
+	victim := filepath.Join(outside, "victim.txt")
+	for _, path := range []string{projectFile, l.target, referent, victim} {
+		if err := os.WriteFile(path, []byte("keep\n"), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", path, err)
+		}
+	}
+	if err := os.Symlink(referent, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(l.project, "outlink")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	for i, path := range []string{projectFile, l.target, link} {
+		res, err := h.dispatcher.Dispatch(context.Background(), structuredCall(fmt.Sprintf("d%d", i), filetools.DeleteToolName, map[string]any{"path": path}))
+		if err != nil || res.Denied {
+			t.Fatalf("Dispatch(delete %s) = %+v, %v; want it removed", path, res, err)
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s still present after the delete: %v", path, err)
+		}
+	}
+	if h.prompts != 0 {
+		t.Fatalf("prompts = %d, want none for in-scope deletes", h.prompts)
+	}
+	if got := mustReadFile(t, referent); got != "keep\n" {
+		t.Fatalf("link referent = %q, want it untouched", got)
+	}
+	allows := h.modeAutoAllows(t)
+	if len(allows) != 3 {
+		t.Fatalf("mode_auto matches = %+v, want 3", allows)
+	}
+	for _, m := range allows {
+		if m.Subject != filetools.DeleteToolName || m.Outcome != "once" {
+			t.Fatalf("mode_auto match = %+v, want a delete allowed once", m)
+		}
+	}
+
+	h.deny = true
+	res, err := h.dispatcher.Dispatch(context.Background(), structuredCall("d3", filetools.DeleteToolName, map[string]any{"path": filepath.Join(l.project, "outlink", "victim.txt")}))
+	if err != nil || !res.Denied {
+		t.Fatalf("Dispatch(delete through outlink) = %+v, %v; want it refused at the prompt", res, err)
+	}
+	if h.prompts != 1 {
+		t.Fatalf("prompts = %d, want the outside delete to ask once", h.prompts)
+	}
+	if got := mustReadFile(t, victim); got != "keep\n" {
+		t.Fatalf("outside target = %q, want it intact", got)
+	}
+}
+
 // TestProductionDispatcher_MkdirToolEndToEndCreatesDirectoryUnderFolderGrant drives the production
 // dispatcher over the *realized* production registry and the *real* production authorizer: a mkdir call —
 // registered only through toolRegistryFactory.realize, never hand-registered — round-trips through the
-// production dispatch + authorization seam and creates the (nested) directory with no shell involved. mkdir
-// is never mode-auto-allowed, so it reaches the gated prompt; approving a concrete mkdir *folder* grant
+// production dispatch + authorization seam and creates the (nested) directory with no shell involved. Build
+// mode never auto-allows mkdir, so it reaches the gated prompt; approving a concrete mkdir *folder* grant
 // authorizes the create, the prompt carries the distinct "Create directory" action over the target path
 // (not a generic tool run), and the granted folder both short-circuits a later in-folder mkdir without
 // re-prompting and persists durably to the folder settings file. It fails if realize stops registering
@@ -1311,7 +1396,7 @@ func TestProductionDispatcher_MkdirToolEndToEndCreatesDirectoryUnderFolderGrant(
 		t.Fatalf("created dir %q: stat err %v isDir %v, want an existing directory (created through the real dispatch path)", wantTarget, statErr, fi != nil && fi.IsDir())
 	}
 	if shown != 1 {
-		t.Fatalf("prompt shown %d times, want 1 (mkdir is never mode-auto-allowed; it must reach the prompt)", shown)
+		t.Fatalf("prompt shown %d times, want 1 (Build mode never auto-allows mkdir; it must reach the prompt)", shown)
 	}
 	if gotReq.Action != dispatch.ActionCreateDirectory {
 		t.Fatalf("prompt action = %q, want the distinct directory-create label %q", gotReq.Action, dispatch.ActionCreateDirectory)
@@ -4369,16 +4454,16 @@ func TestProductionDispatcher_ShellCommandAboveABlockedPathAsks(t *testing.T) {
 	}
 
 	t.Run("a child dispatcher denies without running", func(t *testing.T) {
-		cache, home, project, active, modeActive := delegateFixture(t)
+		cache, home, project, active, modeActive := generalAgentFixture(t)
 		const marker = "home-listing-marker"
 		if err := os.WriteFile(filepath.Join(home, marker), nil, 0o600); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
 		file := seedBlockedSecret(t, project)
 		store := mkStore(t)
-		reg := delegateRegistry(t, cache, home, project, active, modeActive)
+		reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 		guard := mustProtectedStatePolicy(t, home, cache.ProjectRoot(), blockedGlobalLayers(t, home, project, filepath.Dir(file)))
-		deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, guard)
+		deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, guard)
 		child := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.Build)})
 
 		res, err := child.Dispatch(context.Background(), bashCall("c1", "ls "+home))
@@ -5792,7 +5877,7 @@ func (renamedImageTool) Name() string { return "smuggler" }
 
 // --- delegate registration ---------------------------------------------------
 
-func delegateFixture(t *testing.T) (*config.Cache, string, string, *model.ActiveState, *mode.ActiveState) {
+func generalAgentFixture(t *testing.T) (*config.Cache, string, string, *model.ActiveState, *mode.ActiveState) {
 	t.Helper()
 	project := readToolsProject(t)
 	home := t.TempDir()
@@ -5831,31 +5916,31 @@ func publishParentTurn(h *parentTurnHolder, active *model.ActiveState, modeActiv
 	h.publish(sel, source, string(m), "prompt for "+string(m)+"/"+sel.ID)
 }
 
-// delegateTestBinding binds a holder that has already published the states as they read now,
+// generalAgentTestBinding binds a holder that has already published the states as they read now,
 // so every test that only needs a resolvable parent has one.
-func delegateTestBinding(active *model.ActiveState, modeActive *mode.ActiveState) delegateBinding {
+func generalAgentTestBinding(active *model.ActiveState, modeActive *mode.ActiveState) generalAgentBinding {
 	parent := &parentTurnHolder{}
 	publishParentTurn(parent, active, modeActive)
-	return delegateBinding{parent: parent, notices: &recordingNotices{}}
+	return generalAgentBinding{parent: parent, notices: &recordingNotices{}}
 }
 
-func delegateRegistry(t *testing.T, cache *config.Cache, home, project string, active *model.ActiveState, modeActive *mode.ActiveState) *tools.Registry {
+func generalAgentRegistry(t *testing.T, cache *config.Cache, home, project string, active *model.ActiveState, modeActive *mode.ActiveState) *tools.Registry {
 	t.Helper()
 	store := mkStore(t)
 	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil),
-		delegateTestBinding(active, modeActive))
+		generalAgentTestBinding(active, modeActive))
 	if err != nil {
 		t.Fatalf("realizeToolRegistry: %v", err)
 	}
 	return reg
 }
 
-// TestRealizeToolRegistry_DelegateNeedsItsParentBinding pins that delegate is registered only
-// where a parent exists to inherit, and is advertised as mutating so Plan filters it out.
-func TestRealizeToolRegistry_DelegateNeedsItsParentBinding(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+// TestRealizeToolRegistry_GeneralAgentNeedsItsParentBinding pins that delegate is registered only
+// where a parent exists to inherit, and is advertised as mutating yet still offered in Plan.
+func TestRealizeToolRegistry_GeneralAgentNeedsItsParentBinding(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 	tool, ok := reg.Lookup(subagenttool.ToolName)
 	if !ok {
 		t.Fatal("a bound registry does not carry the delegate tool")
@@ -5872,11 +5957,11 @@ func TestRealizeToolRegistry_DelegateNeedsItsParentBinding(t *testing.T) {
 		t.Fatal("an unbound registry registered delegate, want none")
 	}
 
-	if got := toolNames(advertisedTools(reg, mode.Plan)); slices.Contains(got, subagenttool.ToolName) {
-		t.Fatalf("Plan advertised %v, want delegate filtered out", got)
+	if got := toolNames(advertisedTools(reg, mode.Plan)); !slices.Contains(got, subagenttool.ToolName) {
+		t.Fatalf("Plan advertised %v, want general_agent included for its read-only form", got)
 	}
 	if got := toolNames(advertisedTools(reg, mode.Build)); !slices.Contains(got, subagenttool.ToolName) {
-		t.Fatalf("Build advertised %v, want delegate included", got)
+		t.Fatalf("Build advertised %v, want general_agent included", got)
 	}
 }
 
@@ -5916,12 +6001,12 @@ func stubVCSActionRunner(t *testing.T, fact string) {
 	t.Cleanup(func() { newVCSActionRunner = prev })
 }
 
-func delegateVCSRegistry(t *testing.T, cache *config.Cache, home, project string, active *model.ActiveState, modeActive *mode.ActiveState, store *sessions.Store, repoRoot, fact string) *tools.Registry {
+func generalAgentVCSRegistry(t *testing.T, cache *config.Cache, home, project string, active *model.ActiveState, modeActive *mode.ActiveState, store *sessions.Store, repoRoot, fact string) *tools.Registry {
 	t.Helper()
 	stubVCSActionRunner(t, fact)
 	factory := &toolRegistryFactory{active: &ActiveVCS{Template: productVettedGitTemplate(t), RepoRoot: repoRoot}}
 	reg, err := realizeToolRegistry(factory, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil),
-		delegateTestBinding(active, modeActive))
+		generalAgentTestBinding(active, modeActive))
 	if err != nil {
 		t.Fatalf("realizeToolRegistry: %v", err)
 	}
@@ -5939,14 +6024,14 @@ func registeredMetadata(t *testing.T, registered []tools.Tool, name string) tool
 	return tools.Metadata{}
 }
 
-// TestDelegateBinding_SnapshotCarriesTheRealizedRegistry proves the production binding hands the
+// TestGeneralAgentBinding_SnapshotCarriesTheRealizedRegistry proves the production binding hands the
 // child selection the live registry entries and their realized metadata — the only thing that can
 // separate a read-only VCS action from a mutating one — rather than provider definitions.
-func TestDelegateBinding_SnapshotCarriesTheRealizedRegistry(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_SnapshotCarriesTheRealizedRegistry(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
-	reg := delegateVCSRegistry(t, cache, home, project, active, modeActive, store, project, "irrelevant")
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentVCSRegistry(t, cache, home, project, active, modeActive, store, project, "irrelevant")
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 	snap, ok := deps.Snapshot()
 	if !ok {
@@ -5971,12 +6056,12 @@ func TestDelegateBinding_SnapshotCarriesTheRealizedRegistry(t *testing.T) {
 	}
 }
 
-// TestDelegateBinding_ChildVCSCallKeepsInheritedModeAndResolvedCwd runs child VCS calls on the
+// TestGeneralAgentBinding_ChildVCSCallKeepsInheritedModeAndResolvedCwd runs child VCS calls on the
 // dispatcher the production binding builds. The read-only action is authorized on the shared path
 // with the inherited mode and its resolved repo cwd; the mutating action of the same template
 // reaches that same path and is refused there, because the child has no approver of its own and
 // Build never auto-allows a mutation.
-func TestDelegateBinding_ChildVCSCallKeepsInheritedModeAndResolvedCwd(t *testing.T) {
+func TestGeneralAgentBinding_ChildVCSCallKeepsInheritedModeAndResolvedCwd(t *testing.T) {
 	const fact = "CHILD-VCS-FACT-4711"
 	for _, tc := range []struct {
 		name    string
@@ -5988,11 +6073,11 @@ func TestDelegateBinding_ChildVCSCallKeepsInheritedModeAndResolvedCwd(t *testing
 		{"mutating action", "vcs_commit", map[string]any{"message": "take the repo"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cache, home, project, active, modeActive := delegateFixture(t)
+			cache, home, project, active, modeActive := generalAgentFixture(t)
 			store := mkStore(t)
 			repoRoot := project
-			reg := delegateVCSRegistry(t, cache, home, project, active, modeActive, store, repoRoot, fact)
-			deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+			reg := generalAgentVCSRegistry(t, cache, home, project, active, modeActive, store, repoRoot, fact)
+			deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 			d := deps.NewDispatcher(permissions.ModeContext{
 				Mode:          string(mode.Build),
@@ -6038,15 +6123,15 @@ func TestDelegateBinding_ChildVCSCallKeepsInheritedModeAndResolvedCwd(t *testing
 	}
 }
 
-// TestDelegateBinding_ChildVCSActionCarriesItsInvocationID covers the one admitted tool whose
+// TestGeneralAgentBinding_ChildVCSActionCarriesItsInvocationID covers the one admitted tool whose
 // tool_exec_* records are written by the shared registry's own event appender rather than by the
 // child dispatcher: the appender is bound once, before any child exists, so only the call can carry
 // the attribution.
-func TestDelegateBinding_ChildVCSActionCarriesItsInvocationID(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_ChildVCSActionCarriesItsInvocationID(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
-	reg := delegateVCSRegistry(t, cache, home, project, active, modeActive, store, project, "CHILD-VCS-FACT-8123")
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentVCSRegistry(t, cache, home, project, active, modeActive, store, project, "CHILD-VCS-FACT-8123")
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 	first, second := ids.NewV7(), ids.NewV7()
 	for _, child := range []string{first, second} {
@@ -6093,14 +6178,14 @@ func TestDelegateBinding_ChildVCSActionCarriesItsInvocationID(t *testing.T) {
 	}
 }
 
-// TestDelegateBinding_ChildStructuredReadCarriesItsInvocationID covers the read tools a child is
+// TestGeneralAgentBinding_ChildStructuredReadCarriesItsInvocationID covers the read tools a child is
 // permitted: they are recorded as structured_read_* rather than tool_exec_*, so this is the only
 // place their attribution can live.
-func TestDelegateBinding_ChildStructuredReadCarriesItsInvocationID(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_ChildStructuredReadCarriesItsInvocationID(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 	runRead := func(d turn.ToolDispatcher) {
 		t.Helper()
@@ -6142,13 +6227,13 @@ func TestDelegateBinding_ChildStructuredReadCarriesItsInvocationID(t *testing.T)
 	}
 }
 
-// TestDelegateBinding_ChildStructuredReadRefusalCarriesItsInvocationID covers the planning-time
+// TestGeneralAgentBinding_ChildStructuredReadRefusalCarriesItsInvocationID covers the planning-time
 // refusal record, which is child activity the parent's own refusals must stay distinguishable from.
-func TestDelegateBinding_ChildStructuredReadRefusalCarriesItsInvocationID(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_ChildStructuredReadRefusalCarriesItsInvocationID(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 	child := ids.NewV7()
 	outOfProject := filepath.Join(t.TempDir(), "elsewhere.go")
@@ -6171,9 +6256,9 @@ func TestDelegateBinding_ChildStructuredReadRefusalCarriesItsInvocationID(t *tes
 // TestProductionDispatcher_ReadOnlyVCSIsAlwaysASerialBarrier proves an admitted read-only VCS
 // action stays outside the concurrent project-confined read segment and fences the reads around it.
 func TestProductionDispatcher_ReadOnlyVCSIsAlwaysASerialBarrier(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
-	reg := delegateVCSRegistry(t, cache, home, project, active, modeActive, store, project, "fact")
+	reg := generalAgentVCSRegistry(t, cache, home, project, active, modeActive, store, project, "fact")
 	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()},
 		home, project, func() *sessions.Store { return store }, cache.MaxToolOutputBytes(), securitystate.Policy{})
 
@@ -6187,42 +6272,42 @@ func TestProductionDispatcher_ReadOnlyVCSIsAlwaysASerialBarrier(t *testing.T) {
 
 // --- delegate scheduling -----------------------------------------------------
 
-// delegateProbe stands in for the parent a child inherits and hands back no dispatcher, so a
+// generalAgentProbe stands in for the parent a child inherits and hands back no dispatcher, so a
 // scheduled delegate reaches the child-start boundary carrying its ceiling and stops there without a
 // provider round.
-type delegateProbe struct {
+type generalAgentProbe struct {
 	mu       sync.Mutex
 	starts   int
 	declared []map[string]bool
 }
 
-func (p *delegateProbe) snapshot() (subagenttool.Snapshot, bool) {
+func (p *generalAgentProbe) snapshot() (subagenttool.Snapshot, bool) {
 	p.mu.Lock()
 	p.starts++
 	p.mu.Unlock()
 	return subagenttool.Snapshot{Mode: string(mode.Build)}, true
 }
 
-func (p *delegateProbe) newDispatcher(modeCtx permissions.ModeContext) turn.ToolDispatcher {
+func (p *generalAgentProbe) newDispatcher(modeCtx permissions.ModeContext) turn.ToolDispatcher {
 	p.mu.Lock()
 	p.declared = append(p.declared, modeCtx.DeclaredWrite)
 	p.mu.Unlock()
 	return nil
 }
 
-func (p *delegateProbe) started() int {
+func (p *generalAgentProbe) started() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.starts
 }
 
-func (p *delegateProbe) ceilings() []map[string]bool {
+func (p *generalAgentProbe) ceilings() []map[string]bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.declared)
 }
 
-func delegateProbeDispatcher(t *testing.T) (*productionToolDispatcher, *delegateProbe, string) {
+func generalAgentProbeDispatcher(t *testing.T) (*productionToolDispatcher, *generalAgentProbe, string) {
 	t.Helper()
 	project := readToolsProject(t)
 	home := t.TempDir()
@@ -6232,7 +6317,7 @@ func delegateProbeDispatcher(t *testing.T) (*productionToolDispatcher, *delegate
 	if err != nil {
 		t.Fatalf("realize production registry: %v", err)
 	}
-	probe := &delegateProbe{}
+	probe := &generalAgentProbe{}
 	tool := subagenttool.New(subagenttool.Deps{
 		Home:          home,
 		LaunchDir:     project,
@@ -6242,14 +6327,14 @@ func delegateProbeDispatcher(t *testing.T) (*productionToolDispatcher, *delegate
 		Store:         func() *sessions.Store { return store },
 	})
 	if err := reg.Register(tools.BuiltinSource, tool); err != nil {
-		t.Fatalf("Register delegate: %v", err)
+		t.Fatalf("Register general_agent: %v", err)
 	}
 	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()},
 		home, project, func() *sessions.Store { return store }, cache.MaxToolOutputBytes(), securitystate.Policy{})
 	return d, probe, project
 }
 
-func plannedDelegateCall(id string, files ...string) turn.AssembledToolCall {
+func plannedGeneralAgentCall(id string, files ...string) turn.AssembledToolCall {
 	list := make([]any, len(files))
 	for i, f := range files {
 		list[i] = f
@@ -6257,14 +6342,14 @@ func plannedDelegateCall(id string, files ...string) turn.AssembledToolCall {
 	return structuredCall(id, subagenttool.ToolName, map[string]any{"instructions": "do it", "files": list})
 }
 
-const delegateHold = 30 * time.Millisecond
+const generalAgentHold = 30 * time.Millisecond
 
-func TestProductionDispatcher_DelegateIsFencedFromEveryReadSegment(t *testing.T) {
-	d, probe, project := delegateProbeDispatcher(t)
+func TestProductionDispatcher_GeneralAgentIsFencedFromEveryReadSegment(t *testing.T) {
+	d, probe, project := generalAgentProbeDispatcher(t)
 
 	calls := []turn.AssembledToolCall{
 		structuredCall("c1", filetools.ReadToolName, map[string]any{"path": "main.go"}),
-		plannedDelegateCall("c2", "out.txt"),
+		plannedGeneralAgentCall("c2", "out.txt"),
 		structuredCall("c3", filetools.ReadToolName, map[string]any{"path": "main.go"}),
 	}
 	plan := d.Plan(calls, 3)
@@ -6273,7 +6358,7 @@ func TestProductionDispatcher_DelegateIsFencedFromEveryReadSegment(t *testing.T)
 		t.Fatalf("delegate targets = %v, want the canonical declared leaf %v", plan.Units[1].Targets, want)
 	}
 
-	run, err := schedulePlanHeld(plan, 3, nil, delegateHold)
+	run, err := schedulePlanHeld(plan, 3, nil, generalAgentHold)
 	if err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
@@ -6285,7 +6370,7 @@ func TestProductionDispatcher_DelegateIsFencedFromEveryReadSegment(t *testing.T)
 	}
 }
 
-func TestProductionDispatcher_DisjointDelegatesOverlapUnderTheConfiguredCap(t *testing.T) {
+func TestProductionDispatcher_DisjointGeneralAgentsOverlapUnderTheConfiguredCap(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		concurrency int
@@ -6295,12 +6380,12 @@ func TestProductionDispatcher_DisjointDelegatesOverlapUnderTheConfiguredCap(t *t
 		{"cap 1 serializes", 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, probe, _ := delegateProbeDispatcher(t)
-			calls := []turn.AssembledToolCall{plannedDelegateCall("c1", "a.txt"), plannedDelegateCall("c2", "b.txt")}
+			d, probe, _ := generalAgentProbeDispatcher(t)
+			calls := []turn.AssembledToolCall{plannedGeneralAgentCall("c1", "a.txt"), plannedGeneralAgentCall("c2", "b.txt")}
 			plan := d.Plan(calls, tc.concurrency)
 			assertPartitionedPlan(t, plan, calls, "dd")
 
-			run, err := schedulePlanHeld(plan, tc.concurrency, nil, delegateHold)
+			run, err := schedulePlanHeld(plan, tc.concurrency, nil, generalAgentHold)
 			if err != nil {
 				t.Fatalf("Schedule: %v", err)
 			}
@@ -6314,7 +6399,7 @@ func TestProductionDispatcher_DisjointDelegatesOverlapUnderTheConfiguredCap(t *t
 	}
 }
 
-func TestProductionDispatcher_ConflictingDelegatesRunInModelOrder(t *testing.T) {
+func TestProductionDispatcher_ConflictingGeneralAgentsRunInModelOrder(t *testing.T) {
 	for _, tc := range []struct{ name, first, second string }{
 		{"equal leaves", "notes.txt", "notes.txt"},
 		{"ancestor and descendant", "dir", "dir/notes.txt"},
@@ -6322,12 +6407,12 @@ func TestProductionDispatcher_ConflictingDelegatesRunInModelOrder(t *testing.T) 
 		{"leaf-disjoint creates sharing a missing parent", "shared/a.txt", "shared/b.txt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, probe, _ := delegateProbeDispatcher(t)
-			calls := []turn.AssembledToolCall{plannedDelegateCall("c1", tc.first), plannedDelegateCall("c2", tc.second)}
+			d, probe, _ := generalAgentProbeDispatcher(t)
+			calls := []turn.AssembledToolCall{plannedGeneralAgentCall("c1", tc.first), plannedGeneralAgentCall("c2", tc.second)}
 			plan := d.Plan(calls, 2)
 			assertPartitionedPlan(t, plan, calls, "dd")
 
-			run, err := schedulePlanHeld(plan, 2, nil, delegateHold)
+			run, err := schedulePlanHeld(plan, 2, nil, generalAgentHold)
 			if err != nil {
 				t.Fatalf("Schedule: %v", err)
 			}
@@ -6346,7 +6431,7 @@ func TestProductionDispatcher_ConflictingDelegatesRunInModelOrder(t *testing.T) 
 
 // bash is included because the declared ceiling bounds file tools, not the shell, so ordering a
 // delegate against it cannot come from comparing paths.
-func TestProductionDispatcher_DelegateIsOrderedAgainstAdjacentExcludedWork(t *testing.T) {
+func TestProductionDispatcher_GeneralAgentIsOrderedAgainstAdjacentExcludedWork(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		sibling turn.AssembledToolCall
@@ -6355,12 +6440,12 @@ func TestProductionDispatcher_DelegateIsOrderedAgainstAdjacentExcludedWork(t *te
 		{"bash", bashCall("c2", "echo hi")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, _, _ := delegateProbeDispatcher(t)
-			calls := []turn.AssembledToolCall{plannedDelegateCall("c1", "declared.txt"), tc.sibling, plannedDelegateCall("c3", "other.txt")}
+			d, _, _ := generalAgentProbeDispatcher(t)
+			calls := []turn.AssembledToolCall{plannedGeneralAgentCall("c1", "declared.txt"), tc.sibling, plannedGeneralAgentCall("c3", "other.txt")}
 			plan := d.Plan(calls, 3)
 			assertPartitionedPlan(t, plan, calls, "dxd")
 
-			run, err := schedulePlanHeld(plan, 3, nil, delegateHold)
+			run, err := schedulePlanHeld(plan, 3, nil, generalAgentHold)
 			if err != nil {
 				t.Fatalf("Schedule: %v", err)
 			}
@@ -6374,18 +6459,18 @@ func TestProductionDispatcher_DelegateIsOrderedAgainstAdjacentExcludedWork(t *te
 	}
 }
 
-func TestProductionDispatcher_BarriersFenceDelegatesWithoutSerializingThem(t *testing.T) {
-	d, _, _ := delegateProbeDispatcher(t)
+func TestProductionDispatcher_BarriersFenceGeneralAgentsWithoutSerializingThem(t *testing.T) {
+	d, _, _ := generalAgentProbeDispatcher(t)
 	calls := []turn.AssembledToolCall{
 		bashCall("c1", "echo before"),
-		plannedDelegateCall("c2", "a.txt"),
-		plannedDelegateCall("c3", "b.txt"),
+		plannedGeneralAgentCall("c2", "a.txt"),
+		plannedGeneralAgentCall("c3", "b.txt"),
 		bashCall("c4", "echo after"),
 	}
 	plan := d.Plan(calls, 4)
 	assertPartitionedPlan(t, plan, calls, "xddx")
 
-	run, err := schedulePlanHeld(plan, 4, nil, delegateHold)
+	run, err := schedulePlanHeld(plan, 4, nil, generalAgentHold)
 	if err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
@@ -6401,18 +6486,18 @@ func TestProductionDispatcher_BarriersFenceDelegatesWithoutSerializingThem(t *te
 	}
 }
 
-func TestProductionDispatcher_ReadsFenceDelegatesWithoutSerializingThem(t *testing.T) {
-	d, probe, _ := delegateProbeDispatcher(t)
+func TestProductionDispatcher_ReadsFenceGeneralAgentsWithoutSerializingThem(t *testing.T) {
+	d, probe, _ := generalAgentProbeDispatcher(t)
 	calls := []turn.AssembledToolCall{
 		structuredCall("c1", filetools.ReadToolName, map[string]any{"path": "main.go"}),
 		structuredCall("c2", filetools.ListToolName, map[string]any{"path": "."}),
-		plannedDelegateCall("c3", "a.txt"),
-		plannedDelegateCall("c4", "b.txt"),
+		plannedGeneralAgentCall("c3", "a.txt"),
+		plannedGeneralAgentCall("c4", "b.txt"),
 	}
 	plan := d.Plan(calls, 4)
 	assertPartitionedPlan(t, plan, calls, "eedd")
 
-	run, err := schedulePlanHeld(plan, 4, nil, delegateHold)
+	run, err := schedulePlanHeld(plan, 4, nil, generalAgentHold)
 	if err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
@@ -6433,12 +6518,12 @@ func TestProductionDispatcher_ReadsFenceDelegatesWithoutSerializingThem(t *testi
 
 // ContinueOnError lets a failed read satisfy the dependency, so the delegate's own pre-run has to
 // consult the recorded failure before it authorizes or starts anything.
-func TestProductionDispatcher_FailedReadStartsNoDelegate(t *testing.T) {
+func TestProductionDispatcher_FailedReadStartsNoGeneralAgent(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		reads     []string
-		fails     string
-		delegates []string
+		name          string
+		reads         []string
+		fails         string
+		generalAgents []string
 	}{
 		{"one read, one delegate", []string{"a.go"}, "a.go", []string{"x.txt"}},
 		{"one of two reads fails, two disjoint delegates", []string{"a.go", "b.go"}, "b.go", []string{"x.txt", "y.txt"}},
@@ -6457,14 +6542,14 @@ func TestProductionDispatcher_FailedReadStartsNoDelegate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("realize production registry: %v", err)
 			}
-			probe := &delegateProbe{}
+			probe := &generalAgentProbe{}
 			if rerr := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
 				Home: home, LaunchDir: project, ProjectRoot: project,
 				Snapshot:      probe.snapshot,
 				NewDispatcher: probe.newDispatcher,
 				Store:         func() *sessions.Store { return store },
 			})); rerr != nil {
-				t.Fatalf("Register delegate: %v", rerr)
+				t.Fatalf("Register general_agent: %v", rerr)
 			}
 			readFailed := errors.New("read authorization failed")
 			auth := &orderedFailureAuthorizer{errs: map[string]error{filepath.Join(project, tc.fails): readFailed}}
@@ -6475,11 +6560,11 @@ func TestProductionDispatcher_FailedReadStartsNoDelegate(t *testing.T) {
 			for i, name := range tc.reads {
 				calls = append(calls, structuredCall(fmt.Sprintf("r%d", i), filetools.ReadToolName, map[string]any{"path": name}))
 			}
-			for i, file := range tc.delegates {
-				calls = append(calls, plannedDelegateCall(fmt.Sprintf("d%d", i), file))
+			for i, file := range tc.generalAgents {
+				calls = append(calls, plannedGeneralAgentCall(fmt.Sprintf("d%d", i), file))
 			}
 			plan := d.Plan(calls, len(calls))
-			assertPartitionedPlan(t, plan, calls, strings.Repeat("e", len(tc.reads))+strings.Repeat("d", len(tc.delegates)))
+			assertPartitionedPlan(t, plan, calls, strings.Repeat("e", len(tc.reads))+strings.Repeat("d", len(tc.generalAgents)))
 
 			run, serr := schedulePlanHeld(plan, len(calls), nil, 0)
 			if !errors.Is(serr, readFailed) {
@@ -6488,7 +6573,7 @@ func TestProductionDispatcher_FailedReadStartsNoDelegate(t *testing.T) {
 			if probe.started() != 0 {
 				t.Fatalf("children started = %d, want 0 after a failed eligible read", probe.started())
 			}
-			for i := range tc.delegates {
+			for i := range tc.generalAgents {
 				if id := fmt.Sprintf("d%d", i); slices.Contains(run.ids(), id) {
 					t.Fatalf("delegate %s ran after a failed read; executed %v", id, run.ids())
 				}
@@ -6497,20 +6582,20 @@ func TestProductionDispatcher_FailedReadStartsNoDelegate(t *testing.T) {
 	}
 }
 
-// An empty list is never a disjoint target set that could let two children overlap.
-func TestProductionDispatcher_InvalidDelegateStaysASerialBarrier(t *testing.T) {
+// An invalid declaration is never a disjoint target set that could let two children overlap.
+func TestProductionDispatcher_InvalidGeneralAgentStaysASerialBarrier(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args map[string]any
 		want string
 	}{
-		{"empty file list", map[string]any{"instructions": "do it", "files": []any{}}, "at least one path"},
+		{"null file list", map[string]any{"instructions": "do it", "files": nil}, "must be an array"},
 		{"absolute path", map[string]any{"instructions": "do it", "files": []any{"/etc/passwd"}}, "must be relative"},
 		{"out of project", map[string]any{"instructions": "do it", "files": []any{"../escaped.txt"}}, "outside the project"},
 		{"malformed argument", map[string]any{"instructions": "do it", "files": "out.txt"}, "must be an array"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, probe, _ := delegateProbeDispatcher(t)
+			d, probe, _ := generalAgentProbeDispatcher(t)
 			calls := []turn.AssembledToolCall{structuredCall("c1", subagenttool.ToolName, tc.args)}
 			plan := d.Plan(calls, 2)
 			assertPartitionedPlan(t, plan, calls, "x")
@@ -6532,9 +6617,9 @@ func TestProductionDispatcher_InvalidDelegateStaysASerialBarrier(t *testing.T) {
 // Between planning and execution the declared path's missing parent appears as a symlink out of the
 // project. The launch check resolves the planned canonical target, sees it moved, and refuses
 // before any authorization, so no child starts with a ceiling other than the planned one.
-func TestProductionDispatcher_DelegatePlanIsNotReresolvedBeforeTheChildStarts(t *testing.T) {
-	d, probe, project := delegateProbeDispatcher(t)
-	calls := []turn.AssembledToolCall{plannedDelegateCall("c1", "link/a.txt")}
+func TestProductionDispatcher_GeneralAgentPlanIsNotReresolvedBeforeTheChildStarts(t *testing.T) {
+	d, probe, project := generalAgentProbeDispatcher(t)
+	calls := []turn.AssembledToolCall{plannedGeneralAgentCall("c1", "link/a.txt")}
 	plan := d.Plan(calls, 2)
 
 	planned := []string{filepath.Join(project, "link"), filepath.Join(project, "link", "a.txt")}
@@ -6586,9 +6671,9 @@ func stringsAsAny(values []string) []any {
 	return out
 }
 
-func TestProductionDispatcher_DeleteDeclarationsOrderDelegates(t *testing.T) {
+func TestProductionDispatcher_DeleteDeclarationsOrderGeneralAgents(t *testing.T) {
 	t.Run("both forms are one deduplicated target set", func(t *testing.T) {
-		d, _, project := delegateProbeDispatcher(t)
+		d, _, project := generalAgentProbeDispatcher(t)
 		calls := []turn.AssembledToolCall{structuredCall("c1", subagenttool.ToolName, declarationArgs([]string{"both.txt"}, []string{"both.txt", "gone.txt"}))}
 		plan := d.Plan(calls, 2)
 		assertPartitionedPlan(t, plan, calls, "d")
@@ -6609,7 +6694,7 @@ func TestProductionDispatcher_DeleteDeclarationsOrderDelegates(t *testing.T) {
 		{"disjoint write and delete sets overlap", declarationArgs([]string{"a.txt"}, []string{"old-a.txt"}), declarationArgs([]string{"b.txt"}, []string{"old-b.txt"}), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, probe, _ := delegateProbeDispatcher(t)
+			d, probe, _ := generalAgentProbeDispatcher(t)
 			calls := []turn.AssembledToolCall{
 				structuredCall("c1", subagenttool.ToolName, tc.first),
 				structuredCall("c2", subagenttool.ToolName, tc.second),
@@ -6617,7 +6702,7 @@ func TestProductionDispatcher_DeleteDeclarationsOrderDelegates(t *testing.T) {
 			plan := d.Plan(calls, 2)
 			assertPartitionedPlan(t, plan, calls, "dd")
 
-			run, err := schedulePlanHeld(plan, 2, nil, delegateHold)
+			run, err := schedulePlanHeld(plan, 2, nil, generalAgentHold)
 			if err != nil {
 				t.Fatalf("Schedule: %v", err)
 			}
@@ -6634,16 +6719,16 @@ func TestProductionDispatcher_DeleteDeclarationsOrderDelegates(t *testing.T) {
 	}
 }
 
-// TestDelegateBinding_SnapshotsThePublishedParentTurn proves a child inherits the turn that
+// TestGeneralAgentBinding_SnapshotsThePublishedParentTurn proves a child inherits the turn that
 // emitted its call: the binding reports no parent before any turn publishes, then stays frozen
 // on the published model, source, mode, and prompt while a /model or /mode change moves the
 // run-scoped state on, and follows only the next publication.
-func TestDelegateBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+func TestGeneralAgentBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 	store := mkStore(t)
 	parent := &parentTurnHolder{}
-	deps := delegateBinding{parent: parent, notices: &recordingNotices{}}.deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	deps := generalAgentBinding{parent: parent, notices: &recordingNotices{}}.deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 	if _, ok := parent.current(); ok {
 		t.Fatal("an unread holder reported a parent, want the zero value withheld")
@@ -6695,11 +6780,11 @@ func TestDelegateBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
 	}
 }
 
-// TestTurnController_DispatchPublishesTheParentTurnForDelegate proves the TUI path publishes
+// TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent proves the TUI path publishes
 // the dispatched turn into the same holder the registry's delegate binding reads, and that a
 // /model or /mode change landing after dispatch does not move what a child started in that
 // turn inherits.
-func TestTurnController_DispatchPublishesTheParentTurnForDelegate(t *testing.T) {
+func TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent(t *testing.T) {
 	var turns sync.WaitGroup
 	defer swapGoTurn(waitableGoTurn(&turns))()
 
@@ -6708,11 +6793,11 @@ func TestTurnController_DispatchPublishesTheParentTurnForDelegate(t *testing.T) 
 	}}
 	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
 
-	cache, home, project, active, modeActive := delegateFixture(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 	store := mkStore(t)
 	parent := &parentTurnHolder{}
-	deps := delegateBinding{parent: parent, notices: &recordingNotices{}}.deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	deps := generalAgentBinding{parent: parent, notices: &recordingNotices{}}.deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
 	if _, ok := deps.Snapshot(); ok {
 		t.Fatal("a delegate call before the first dispatch resolved a parent, want none")
@@ -6723,7 +6808,7 @@ func TestTurnController_DispatchPublishesTheParentTurnForDelegate(t *testing.T) 
 		sel, _, _ := active.Current()
 		return "prompt for " + string(m) + "/" + sel.ID
 	}, nil)
-	ctl.setDelegateParent(parent)
+	ctl.setGeneralAgentParent(parent)
 	ctl.setDevDebug(false, func() string {
 		m, _ := modeActive.Current()
 		return string(m)
@@ -6762,7 +6847,7 @@ func TestRunHeadlessTurn_PublishesTheParentTurnItRuns(t *testing.T) {
 	}}
 	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
 
-	cache, home, _, active, _ := delegateFixture(t)
+	cache, home, _, active, _ := generalAgentFixture(t)
 	parent := &parentTurnHolder{}
 	var stdout, stderr strings.Builder
 	err := runHeadlessTurn(context.Background(), mkStore(t), cache, active, newHeadlessSurface(&stdout, &stderr), nil,
@@ -6798,7 +6883,7 @@ func childCeilingFixture(t *testing.T, declarations ...string) (turn.ToolDispatc
 
 func childScopesFixture(t *testing.T, write, remove []string) (turn.ToolDispatcher, *sessions.Store, string, string, map[string]bool, map[string]bool) {
 	t.Helper()
-	cache, home, project, active, modeActive := delegateFixture(t)
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	if err := os.MkdirAll(filepath.Join(project, "work"), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -6821,8 +6906,8 @@ func childScopesFixture(t *testing.T, write, remove []string) (turn.ToolDispatch
 		removable = map[string]bool{}
 	}
 	store := mkStore(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 	return deps.NewDispatcher(permissions.ModeContext{
 		Mode:           string(mode.Build),
 		ChildAgent:     true,
@@ -7082,17 +7167,17 @@ func TestChildCeiling_MkdirMoveAndDeleteNameTheMissingChildForm(t *testing.T) {
 		{
 			name: "delete",
 			call: structuredCall("d1", filetools.DeleteToolName, map[string]any{"path": "work/notes.txt"}),
-			form: "this delegate call did not supply files_delete",
+			form: "this general_agent call did not supply files_delete",
 		},
 		{
 			name: "mkdir",
 			call: structuredCall("d2", filetools.MkdirToolName, map[string]any{"path": "work/sub"}),
-			form: "this delegate call did not supply files_mkdir",
+			form: "this general_agent call did not supply files_mkdir",
 		},
 		{
 			name: "move",
 			call: structuredCall("d3", filetools.MoveToolName, map[string]any{"source": "work/notes.txt", "destination": "work/renamed.txt"}),
-			form: "this delegate call did not supply files_move",
+			form: "this general_agent call did not supply files_move",
 		},
 	}
 	for _, tc := range tests {
@@ -7119,8 +7204,8 @@ func TestChildCeiling_MkdirMoveAndDeleteNameTheMissingChildForm(t *testing.T) {
 	}
 }
 
-func TestChildCeiling_NestedDelegateIsDecidedBeforeTheGrandchildStarts(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestChildCeiling_NestedGeneralAgentIsDecidedBeforeTheGrandchildStarts(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	declared, _, err := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt", "b.txt"}, nil)
 	if err != nil {
 		t.Fatalf("ResolveDeclaredScopes: %v", err)
@@ -7145,12 +7230,12 @@ func TestChildCeiling_NestedDelegateIsDecidedBeforeTheGrandchildStarts(t *testin
 				t.Fatalf("Register: %v", regErr)
 			}
 			store := mkStore(t)
-			deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+			deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 			d := deps.NewDispatcher(permissions.ModeContext{
-				Mode:          string(mode.Build),
-				ChildAgent:    true,
-				DeclaredWrite: declared,
-				DelegateWrite: nested,
+				Mode:              string(mode.Build),
+				ChildAgent:        true,
+				DeclaredWrite:     declared,
+				GeneralAgentWrite: nested,
 			})
 
 			files := make([]any, len(tc.files))
@@ -7183,64 +7268,81 @@ func TestChildCeiling_NestedDelegateIsDecidedBeforeTheGrandchildStarts(t *testin
 			if deniedBy != "unattended" {
 				t.Fatalf("denied_by = %q, want unattended — a child has no approver", deniedBy)
 			}
-			if !strings.Contains(reason, "nested delegate call") {
+			if !strings.Contains(reason, "nested general_agent call") {
 				t.Fatalf("reason %q does not name the nested-declaration rule", reason)
 			}
 		})
 	}
 }
 
-// TestChildCeiling_AnUnresolvableNestedDelegateDeniesThroughDeclaredScope pins the child-ceiling contract on
+// TestChildCeiling_AnUnresolvableNestedGeneralAgentDeniesThroughDeclaredScope pins the child-ceiling contract on
 // the production path: a nested call whose declaration does not validate still reaches authorization,
 // carrying no candidate, and is denied by declared scope before any grandchild starts. Handing the
 // child the delegate tool's own corrective instead would answer a ceiling question outside the
 // authorizer and leave no permission_matched record of the refusal. The top-level case below is the
 // counterpart — no ceiling is judging it, so it stays a corrective.
-func TestChildCeiling_AnUnresolvableNestedDelegateDeniesThroughDeclaredScope(t *testing.T) {
+func TestChildCeiling_AnUnresolvableNestedGeneralAgentDeniesThroughDeclaredScope(t *testing.T) {
 	tests := []struct {
 		name string
 		args map[string]any
 	}{
-		{"an empty file list", map[string]any{"instructions": "do it", "files": []any{}}},
+		{"a null file list", map[string]any{"instructions": "do it", "files": nil}},
+		{"an empty path entry", map[string]any{"instructions": "do it", "files": []any{""}}},
 		{"an absolute path", map[string]any{"instructions": "do it", "files": []any{"/etc/passwd"}}},
 		{"a path outside the project", map[string]any{"instructions": "do it", "files": []any{"../escape.txt"}}},
 		{"an unknown argument", map[string]any{"instructions": "do it", "files": []any{"a.txt"}, "model": "sonnet"}},
 	}
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cache, home, project, active, modeActive := delegateFixture(t)
-			declared, _, rerr := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt", "b.txt"}, nil)
-			if rerr != nil {
-				t.Fatalf("ResolveDeclaredScopes: %v", rerr)
-			}
-			reg := delegateRegistry(t, cache, home, project, active, modeActive)
-			store := mkStore(t)
-			deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
-			d := deps.NewDispatcher(permissions.ModeContext{
-				Mode:          string(mode.Build),
-				ChildAgent:    true,
-				DeclaredWrite: declared,
-			})
+		for _, inherited := range []struct {
+			name     string
+			write    []string
+			resolved bool
+		}{
+			{"no inherited candidate", nil, false},
+			{"an inherited resolved empty candidate", nil, true},
+			{"an inherited resolved candidate", []string{"a.txt"}, true},
+		} {
+			t.Run(tc.name+"/"+inherited.name, func(t *testing.T) {
+				cache, home, project, active, modeActive := generalAgentFixture(t)
+				declared, _, rerr := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt", "b.txt"}, nil)
+				if rerr != nil {
+					t.Fatalf("ResolveDeclaredScopes: %v", rerr)
+				}
+				reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
+				store := mkStore(t)
+				deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+				inheritedWrite, _, ierr := filetools.ResolveDeclaredScopes(home, project, inherited.write, nil)
+				if ierr != nil {
+					t.Fatalf("ResolveDeclaredScopes: %v", ierr)
+				}
+				d := deps.NewDispatcher(permissions.ModeContext{
+					Mode:                 string(mode.Build),
+					ChildAgent:           true,
+					DeclaredWrite:        declared,
+					GeneralAgentWrite:    inheritedWrite,
+					GeneralAgentResolved: inherited.resolved,
+				})
 
-			res, derr := d.Dispatch(context.Background(), structuredCall("n1", subagenttool.ToolName, tc.args))
-			if derr != nil {
-				t.Fatalf("Dispatch error = %v, want nil", derr)
-			}
-			if !res.Denied {
-				t.Fatalf("result = %+v, want a declared-scope denial rather than the tool's corrective", res)
-			}
-			matched := decodePermissionMatched(t, store)
-			if len(matched) != 1 || matched[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope {
-				t.Fatalf("permission_matched = %+v, want exactly one declared_scope decision", matched)
-			}
-			deniedBy, reason := decodeDenyEnvelope(t, res.Content)
-			if deniedBy != "unattended" {
-				t.Fatalf("denied_by = %q, want unattended — a child has no approver", deniedBy)
-			}
-			if !strings.Contains(reason, "nested delegate call") {
-				t.Fatalf("reason %q does not name the nested-declaration rule", reason)
-			}
-		})
+				res, derr := d.Dispatch(context.Background(), structuredCall("n1", subagenttool.ToolName, tc.args))
+				if derr != nil {
+					t.Fatalf("Dispatch error = %v, want nil", derr)
+				}
+				if !res.Denied {
+					t.Fatalf("result = %+v, want a declared-scope denial rather than the tool's corrective", res)
+				}
+				matched := decodePermissionMatched(t, store)
+				if len(matched) != 1 || matched[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope {
+					t.Fatalf("permission_matched = %+v, want exactly one declared_scope decision", matched)
+				}
+				deniedBy, reason := decodeDenyEnvelope(t, res.Content)
+				if deniedBy != "unattended" {
+					t.Fatalf("denied_by = %q, want unattended — a child has no approver", deniedBy)
+				}
+				if !strings.Contains(reason, "nested general_agent call") {
+					t.Fatalf("reason %q does not name the nested-declaration rule", reason)
+				}
+			})
+		}
 	}
 }
 
@@ -7326,9 +7428,9 @@ func TestChildCeiling_DeleteRefusalNamesTheFilesDeleteForm(t *testing.T) {
 		remove []string
 		form   string
 	}{
-		{"files_delete omitted", nil, "this delegate call did not supply files_delete"},
-		{"files_delete supplied empty", []string{}, "this delegate call supplied an empty files_delete"},
-		{"files_delete missing the target", []string{"linked.txt"}, "this delegate call's files_delete does not list this target"},
+		{"files_delete omitted", nil, "this general_agent call did not supply files_delete"},
+		{"files_delete supplied empty", []string{}, "this general_agent call supplied an empty files_delete"},
+		{"files_delete missing the target", []string{"linked.txt"}, "this general_agent call's files_delete does not list this target"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -7340,7 +7442,7 @@ func TestChildCeiling_DeleteRefusalNamesTheFilesDeleteForm(t *testing.T) {
 			}
 			reason := assertChildScopeDenial(t, store, 0, res)
 			at := -1
-			for _, want := range []string{"a child agent may touch only the paths its delegate call declared", tc.form, "cannot widen while the child runs", "target="} {
+			for _, want := range []string{"a child agent may touch only the paths its general_agent call declared", tc.form, "cannot widen while the child runs", "target="} {
 				idx := strings.Index(reason, want)
 				if idx <= at {
 					t.Fatalf("reason %q is missing %q or has it out of order", reason, want)
@@ -7442,7 +7544,7 @@ func TestChildCeiling_DeleteAliasesOfTheDeclaredTargetDeleteAndBypassesDeny(t *t
 	}
 }
 
-func TestChildCeiling_NestedDelegateDeleteFormStaysWithinItsImmediateParent(t *testing.T) {
+func TestChildCeiling_NestedGeneralAgentDeleteFormStaysWithinItsImmediateParent(t *testing.T) {
 	tests := []struct {
 		name         string
 		parentWrite  []string
@@ -7458,13 +7560,13 @@ func TestChildCeiling_NestedDelegateDeleteFormStaysWithinItsImmediateParent(t *t
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cache, home, project, active, modeActive := delegateFixture(t)
+			cache, home, project, active, modeActive := generalAgentFixture(t)
 			write, remove, err := filetools.ResolveDeclaredScopes(home, project, tc.parentWrite, tc.parentDelete)
 			if err != nil {
 				t.Fatalf("ResolveDeclaredScopes: %v", err)
 			}
 			store := mkStore(t)
-			probe := &delegateProbe{}
+			probe := &generalAgentProbe{}
 			reg := tools.NewRegistry()
 			if rerr := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
 				Home: home, LaunchDir: project, ProjectRoot: project,
@@ -7472,9 +7574,9 @@ func TestChildCeiling_NestedDelegateDeleteFormStaysWithinItsImmediateParent(t *t
 				NewDispatcher: probe.newDispatcher,
 				Store:         func() *sessions.Store { return store },
 			})); rerr != nil {
-				t.Fatalf("Register delegate: %v", rerr)
+				t.Fatalf("Register general_agent: %v", rerr)
 			}
-			deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+			deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 			d := deps.NewDispatcher(permissions.ModeContext{
 				Mode:           string(mode.Build),
 				ChildAgent:     true,
@@ -7503,21 +7605,21 @@ func TestChildCeiling_NestedDelegateDeleteFormStaysWithinItsImmediateParent(t *t
 			if !tc.wantDenied {
 				return
 			}
-			if _, reason := decodeDenyEnvelope(t, res.Content); !strings.Contains(reason, "nested delegate call may declare in files_delete") {
+			if _, reason := decodeDenyEnvelope(t, res.Content); !strings.Contains(reason, "nested general_agent call may declare in files_delete") {
 				t.Fatalf("reason %q does not name the nested delete-declaration rule", reason)
 			}
 		})
 	}
 }
 
-func TestProductionDispatcher_MalformedTopLevelDelegateStaysInBand(t *testing.T) {
+func TestProductionDispatcher_MalformedTopLevelGeneralAgentStaysInBand(t *testing.T) {
 	tests := []struct {
 		name string
 		args map[string]any
 		want string
 	}{
-		{"no path list at all", map[string]any{"instructions": "do it"}, "at least one path"},
-		{"an empty file list", map[string]any{"instructions": "do it", "files": []any{}}, "at least one path"},
+		{"a null file list", map[string]any{"instructions": "do it", "files": nil}, "must be an array of strings"},
+		{"an empty path entry", map[string]any{"instructions": "do it", "files": []any{""}}, "must not be empty"},
 		{"an absolute path", map[string]any{"instructions": "do it", "files": []any{"/etc/passwd"}}, "must be relative"},
 		{"a home-relative path", map[string]any{"instructions": "do it", "files": []any{"~/secrets.txt"}}, "must not be home-relative"},
 		{"a path outside the project", map[string]any{"instructions": "do it", "files": []any{"../escape.txt"}}, "outside the project"},
@@ -7526,8 +7628,8 @@ func TestProductionDispatcher_MalformedTopLevelDelegateStaysInBand(t *testing.T)
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cache, home, project, active, modeActive := delegateFixture(t)
-			reg := delegateRegistry(t, cache, home, project, active, modeActive)
+			cache, home, project, active, modeActive := generalAgentFixture(t)
+			reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 			store := mkStore(t)
 			auth := &recordingAuthorizer{decision: allow()}
 			d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, auth, home, project,
@@ -7553,9 +7655,9 @@ func TestProductionDispatcher_MalformedTopLevelDelegateStaysInBand(t *testing.T)
 	}
 }
 
-func TestProductionDispatcher_TopLevelDelegateCandidateReachesAuthorization(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+func TestProductionDispatcher_TopLevelGeneralAgentCandidateReachesAuthorization(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 	store := mkStore(t)
 	auth := &recordingAuthorizer{decision: permissions.Decision{Outcome: "deny", DenyEnvelope: permissions.BuildDenyEnvelope("no")}}
 	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, auth, home, project,
@@ -7574,8 +7676,8 @@ func TestProductionDispatcher_TopLevelDelegateCandidateReachesAuthorization(t *t
 		filepath.Join(project, "dir", "b.txt"): true,
 	}
 	mc := auth.lastModeCtx(t)
-	if !reflect.DeepEqual(mc.DelegateWrite, want) {
-		t.Fatalf("DelegateWrite = %v, want the canonical candidate %v", mc.DelegateWrite, want)
+	if !reflect.DeepEqual(mc.GeneralAgentWrite, want) {
+		t.Fatalf("GeneralAgentWrite = %v, want the canonical candidate %v", mc.GeneralAgentWrite, want)
 	}
 	if mc.ChildAgent {
 		t.Fatal("ChildAgent = true, want a top-level call judged against the run's own ceiling")
@@ -7763,8 +7865,8 @@ func TestProductionDispatcher_DeleteTargetNamesTheAuthorizedDeleteApartFromWrite
 	}
 }
 
-func TestDelegateBinding_AChildDeleteReachesTheSessionAndBothChildBlocks(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_AChildDeleteReachesTheSessionAndBothChildBlocks(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	root, err := filepath.EvalSymlinks(project)
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
@@ -7788,7 +7890,7 @@ func TestDelegateBinding_AChildDeleteReachesTheSessionAndBothChildBlocks(t *test
 	parent := &parentTurnHolder{}
 	publishParentTurn(parent, active, modeActive)
 	live := tui.New(nil)
-	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil), delegateBinding{parent: parent, notices: live})
+	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil), generalAgentBinding{parent: parent, notices: live})
 	if err != nil {
 		t.Fatalf("realizeToolRegistry: %v", err)
 	}
@@ -7798,7 +7900,7 @@ func TestDelegateBinding_AChildDeleteReachesTheSessionAndBothChildBlocks(t *test
 		"instructions": "remove the old file", "files_delete": []any{"old.txt"},
 	}))
 	if derr != nil || res.Denied {
-		t.Fatalf("Dispatch(delegate) = %+v, %v; want the child to run", res, derr)
+		t.Fatalf("Dispatch(general_agent) = %+v, %v; want the child to run", res, derr)
 	}
 	if _, statErr := os.Lstat(target); !os.IsNotExist(statErr) {
 		t.Fatalf("old.txt still exists (err=%v); result=%q", statErr, res.Content)
@@ -7834,8 +7936,8 @@ func TestDelegateBinding_AChildDeleteReachesTheSessionAndBothChildBlocks(t *test
 	}
 }
 
-func TestDelegateBinding_AChildMoveReachesTheSessionAndBothChildBlocks(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_AChildMoveReachesTheSessionAndBothChildBlocks(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	root, err := filepath.EvalSymlinks(project)
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
@@ -7860,7 +7962,7 @@ func TestDelegateBinding_AChildMoveReachesTheSessionAndBothChildBlocks(t *testin
 	parent := &parentTurnHolder{}
 	publishParentTurn(parent, active, modeActive)
 	live := tui.New(nil)
-	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil), delegateBinding{parent: parent, notices: live})
+	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil), generalAgentBinding{parent: parent, notices: live})
 	if err != nil {
 		t.Fatalf("realizeToolRegistry: %v", err)
 	}
@@ -7870,7 +7972,7 @@ func TestDelegateBinding_AChildMoveReachesTheSessionAndBothChildBlocks(t *testin
 		"instructions": "rename the old file", "files_move": []any{map[string]any{"source": "old.txt", "destination": "new.txt"}},
 	}))
 	if derr != nil || res.Denied {
-		t.Fatalf("Dispatch(delegate) = %+v, %v; want the child to run", res, derr)
+		t.Fatalf("Dispatch(general_agent) = %+v, %v; want the child to run", res, derr)
 	}
 	if _, statErr := os.Lstat(source); !os.IsNotExist(statErr) {
 		t.Fatalf("old.txt still exists (err=%v); result=%q", statErr, res.Content)
@@ -7959,15 +8061,15 @@ func TestProductionDispatcher_CancelledContextStopsToolsBeforeInvocation(t *test
 	}
 }
 
-func TestDelegateBinding_ChildDispatcherAttributesItsToolExecEvents(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_ChildDispatcherAttributesItsToolExecEvents(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
 	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil),
-		delegateTestBinding(active, modeActive))
+		generalAgentTestBinding(active, modeActive))
 	if err != nil {
 		t.Fatalf("realizeToolRegistry: %v", err)
 	}
-	binding := delegateTestBinding(active, modeActive)
+	binding := generalAgentTestBinding(active, modeActive)
 	deps := binding.deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 	if deps.Store == nil || deps.Store() != store {
 		t.Fatal("delegate deps carry no accessor for the run's turn store, so no child record could reach the parent session")
@@ -8013,7 +8115,7 @@ func TestDelegateBinding_ChildDispatcherAttributesItsToolExecEvents(t *testing.T
 }
 
 func TestHeadlessAuthorizer_AttributesAChildsPermissionEvents(t *testing.T) {
-	cache, _, project, _, modeActive := delegateFixture(t)
+	cache, _, project, _, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
 	child := ids.NewV7()
 	target := filepath.Join(project, "main.go")
@@ -8049,20 +8151,20 @@ func TestHeadlessAuthorizer_AttributesAChildsPermissionEvents(t *testing.T) {
 // The live child-agent surface is discovered on the notice renderer the binding already
 // holds, so the TUI site needs no extra wiring: the app implements the sink and receives it,
 // while the headless stderr renderer does not and leaves the delegate exactly as it was.
-func TestDelegateBinding_ActivitySinkComesFromTheNoticeRenderer(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+func TestGeneralAgentBinding_ActivitySinkComesFromTheNoticeRenderer(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 	store := mkStore(t)
 	parent := &parentTurnHolder{}
 	turnStore := func() *sessions.Store { return store }
 
 	app := tui.New(nil)
-	withApp := delegateBinding{parent: parent, notices: app}.deps(reg, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	withApp := generalAgentBinding{parent: parent, notices: app}.deps(reg, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 	if sink, ok := withApp.Activity.(*tui.App); !ok || sink != app {
 		t.Fatalf("activity sink = %#v, want the app that already renders this run's notices", withApp.Activity)
 	}
 
-	headless := delegateBinding{parent: parent, notices: stderrNoticeRenderer{w: io.Discard}}.deps(reg, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	headless := generalAgentBinding{parent: parent, notices: stderrNoticeRenderer{w: io.Discard}}.deps(reg, cache, turnStore, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 	if headless.Activity != nil {
 		t.Fatalf("activity sink = %#v, want none: the headless renderer implements no live surface", headless.Activity)
 	}
@@ -8103,12 +8205,12 @@ func resolveMovePairs(t *testing.T, home, project string, pairs ...[2]string) ma
 
 func childMovesFixture(t *testing.T, pairs ...[2]string) (turn.ToolDispatcher, *sessions.Store, string, string, map[permissions.MovePair]bool) {
 	t.Helper()
-	cache, home, project, active, modeActive := delegateFixture(t)
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	seedChildMoveProject(t, project)
 	moves := resolveMovePairs(t, home, project, pairs...)
 	store := mkStore(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 	return deps.NewDispatcher(permissions.ModeContext{
 		Mode:          string(mode.Build),
 		ChildAgent:    true,
@@ -8256,7 +8358,7 @@ func TestChildCeiling_MoveBypassAttemptsDenyOnBothEndpoints(t *testing.T) {
 	})
 }
 
-func TestChildCeiling_NestedDelegateMovePairsMatchOnlyAsWholePairs(t *testing.T) {
+func TestChildCeiling_NestedGeneralAgentMovePairsMatchOnlyAsWholePairs(t *testing.T) {
 	renamed := [2]string{"work/notes.txt", "work/renamed.txt"}
 	second := [2]string{"second.txt", "work/second.txt"}
 	tests := []struct {
@@ -8272,14 +8374,14 @@ func TestChildCeiling_NestedDelegateMovePairsMatchOnlyAsWholePairs(t *testing.T)
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cache, home, project, active, modeActive := delegateFixture(t)
+			cache, home, project, active, modeActive := generalAgentFixture(t)
 			seedChildMoveProject(t, project)
 			write, _, err := filetools.ResolveDeclaredScopes(home, project, tc.parentWrite, nil)
 			if err != nil {
 				t.Fatalf("ResolveDeclaredScopes: %v", err)
 			}
 			store := mkStore(t)
-			probe := &delegateProbe{}
+			probe := &generalAgentProbe{}
 			reg := tools.NewRegistry()
 			if rerr := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
 				Home: home, LaunchDir: project, ProjectRoot: project,
@@ -8287,9 +8389,9 @@ func TestChildCeiling_NestedDelegateMovePairsMatchOnlyAsWholePairs(t *testing.T)
 				NewDispatcher: probe.newDispatcher,
 				Store:         func() *sessions.Store { return store },
 			})); rerr != nil {
-				t.Fatalf("Register delegate: %v", rerr)
+				t.Fatalf("Register general_agent: %v", rerr)
 			}
-			deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+			deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 			d := deps.NewDispatcher(permissions.ModeContext{
 				Mode:          string(mode.Build),
 				ChildAgent:    true,
@@ -8318,7 +8420,7 @@ func TestChildCeiling_NestedDelegateMovePairsMatchOnlyAsWholePairs(t *testing.T)
 			if !tc.wantDenied {
 				return
 			}
-			if _, reason := decodeDenyEnvelope(t, res.Content); !strings.Contains(reason, "nested delegate call may declare in files_move only whole move pairs") {
+			if _, reason := decodeDenyEnvelope(t, res.Content); !strings.Contains(reason, "nested general_agent call may declare in files_move only whole move pairs") {
 				t.Fatalf("reason %q does not name the nested move-pair rule", reason)
 			}
 		})
@@ -8355,14 +8457,14 @@ func TestProductionDispatcher_ConfinedBashRefusalIsInBand(t *testing.T) {
 	}
 }
 
-func confinedVCSRegistry(t *testing.T, conf *confinement, inner *confineInner) (*tools.Registry, delegateBinding, *config.Cache, string, string, *sessions.Store) {
+func confinedVCSRegistry(t *testing.T, conf *confinement, inner *confineInner) (*tools.Registry, generalAgentBinding, *config.Cache, string, string, *sessions.Store) {
 	t.Helper()
-	cache, home, project, active, modeActive := delegateFixture(t)
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
 	prev := newVCSActionRunner
 	newVCSActionRunner = func() cmdrunner.Runner { return inner }
 	t.Cleanup(func() { newVCSActionRunner = prev })
-	binding := delegateTestBinding(active, modeActive)
+	binding := generalAgentTestBinding(active, modeActive)
 	binding.confinement = conf
 	factory := &toolRegistryFactory{active: &ActiveVCS{Template: productVettedGitTemplate(t), RepoRoot: project}}
 	reg, err := realizeToolRegistry(factory, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil), binding)
@@ -8400,7 +8502,7 @@ func TestProductionDispatcher_ConfinedVCSSharesTheRealizedConfinement(t *testing
 		t.Fatalf("bounded/exec = %d/%d at cap %d, want one bounded run at the output cap", len(inner.bounded), len(inner.execs), inner.boundedCap)
 	}
 	got := inner.bounded[0]
-	want, err := cmdrunner.FixedEnvironment("", got.Cwd, "", conf.lookupPath, nil)
+	want, err := cmdrunner.FixedEnvironment(conf.blocked.Home(), got.Cwd, "", conf.lookupPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -8413,7 +8515,7 @@ func TestProductionDispatcher_ConfinedVCSSharesTheRealizedConfinement(t *testing
 	}
 }
 
-func TestDelegateBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
+func TestGeneralAgentBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 	lookup := t.TempDir()
 	for name, body := range map[string]string{"ls": "#!/bin/sh\necho CONFINED-LS\n", "git": "#!/bin/sh\n"} {
 		if err := os.WriteFile(filepath.Join(lookup, name), []byte(body), 0o755); err != nil {
@@ -8468,7 +8570,7 @@ func TestDelegateBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 	}
 }
 
-func TestDelegateBinding_ChildAuthorizerCarriesTheLaunchSelfTest(t *testing.T) {
+func TestGeneralAgentBinding_ChildAuthorizerCarriesTheLaunchSelfTest(t *testing.T) {
 	launches := map[string]func(t *testing.T) *confinement{
 		"headless": func(t *testing.T) *confinement {
 			d, _ := runHeadlessCapturingDispatcher(t, headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Plan, mode.SourceDefault)))
@@ -8489,9 +8591,9 @@ func TestDelegateBinding_ChildAuthorizerCarriesTheLaunchSelfTest(t *testing.T) {
 	}
 	child := func(t *testing.T, conf *confinement, inherited bool) (*headlessAuthorizer, *productionToolDispatcher) {
 		t.Helper()
-		cache, home, project, active, modeActive := delegateFixture(t)
+		cache, home, project, active, modeActive := generalAgentFixture(t)
 		store := mkStore(t)
-		binding := delegateTestBinding(active, modeActive)
+		binding := generalAgentTestBinding(active, modeActive)
 		binding.confinement = conf
 		deps := binding.deps(tools.NewRegistry(), cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 		d, ok := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.Plan), ExecutionConstrained: inherited}).(*productionToolDispatcher)
@@ -8529,12 +8631,12 @@ func TestDelegateBinding_ChildAuthorizerCarriesTheLaunchSelfTest(t *testing.T) {
 	}
 }
 
-func TestDelegateBinding_ChildFailsClosedOnConstrainedShellWhileSettingsAreBroken(t *testing.T) {
+func TestGeneralAgentBinding_ChildFailsClosedOnConstrainedShellWhileSettingsAreBroken(t *testing.T) {
 	f := newRereadFixture(t)
 	f.writeGlobal(t, "a")
 	guard := mustProtectedStatePolicy(t, f.home, f.project, f.layers(t, true))
 	store := mkStore(t)
-	binding := delegateBinding{parent: &parentTurnHolder{}, notices: &recordingNotices{}, confinement: &confinement{constrained: true}}
+	binding := generalAgentBinding{parent: &parentTurnHolder{}, notices: &recordingNotices{}, confinement: &confinement{constrained: true}}
 	deps := binding.deps(tools.NewRegistry(), emptyCache(t, f.project), func() *sessions.Store { return store }, f.home, f.project, guard)
 	d, ok := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.Plan)}).(*productionToolDispatcher)
 	if !ok {
@@ -8844,7 +8946,7 @@ func TestProductionDispatcher_EntryPinRespectsExistingPinsAndMissingModeSources(
 
 func childDirsFixture(t *testing.T, write []string, dirs ...string) (turn.ToolDispatcher, *sessions.Store, string, string, map[string]bool) {
 	t.Helper()
-	cache, home, project, active, modeActive := delegateFixture(t)
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	seedChildMoveProject(t, project)
 	declared, _, err := filetools.ResolveDeclaredScopes(home, project, write, nil)
 	if err != nil {
@@ -8863,8 +8965,8 @@ func childDirsFixture(t *testing.T, write []string, dirs ...string) (turn.ToolDi
 		declaredDirs[target] = true
 	}
 	store := mkStore(t)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 	return deps.NewDispatcher(permissions.ModeContext{
 		Mode:          string(mode.Build),
 		ChildAgent:    true,
@@ -9000,17 +9102,17 @@ func TestChildCeiling_ADeclaredWriteStillCreatesItsMissingParentsWithoutADirecto
 		t.Fatalf("Dispatch error = %v, want nil", err)
 	}
 	reason := assertChildScopeDenial(t, store, 1, res)
-	if !strings.Contains(reason, "this delegate call did not supply files_mkdir") {
+	if !strings.Contains(reason, "this general_agent call did not supply files_mkdir") {
 		t.Fatalf("reason %q does not name the absent directory declaration", reason)
 	}
 }
 
-func plannedDelegateArgsCall(id string, args map[string]any) turn.AssembledToolCall {
+func plannedGeneralAgentArgsCall(id string, args map[string]any) turn.AssembledToolCall {
 	args["instructions"] = "do it"
 	return structuredCall(id, subagenttool.ToolName, args)
 }
 
-func TestProductionDispatcher_DelegateDirectoriesOrderLikeEveryOtherForm(t *testing.T) {
+func TestProductionDispatcher_GeneralAgentDirectoriesOrderLikeEveryOtherForm(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		first, second map[string]any
@@ -9036,12 +9138,12 @@ func TestProductionDispatcher_DelegateDirectoriesOrderLikeEveryOtherForm(t *test
 			map[string]any{"files": []any{"two.txt"}, "files_mkdir": []any{"q"}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, probe, _ := delegateProbeDispatcher(t)
-			calls := []turn.AssembledToolCall{plannedDelegateArgsCall("c1", tc.first), plannedDelegateArgsCall("c2", tc.second)}
+			d, probe, _ := generalAgentProbeDispatcher(t)
+			calls := []turn.AssembledToolCall{plannedGeneralAgentArgsCall("c1", tc.first), plannedGeneralAgentArgsCall("c2", tc.second)}
 			plan := d.Plan(calls, 2)
 			assertPartitionedPlan(t, plan, calls, "dd")
 
-			run, err := schedulePlanHeld(plan, 2, nil, delegateHold)
+			run, err := schedulePlanHeld(plan, 2, nil, generalAgentHold)
 			if err != nil {
 				t.Fatalf("Schedule: %v", err)
 			}
@@ -9099,7 +9201,7 @@ type launchFixture struct {
 	d       *productionToolDispatcher
 	auth    *productionAuthorizer
 	turn    *permissions.TurnCache
-	probe   *delegateProbe
+	probe   *generalAgentProbe
 	prompts *launchPrompts
 	store   *sessions.Store
 	project string
@@ -9146,7 +9248,7 @@ func newLaunchFixture(t *testing.T, opts launchOptions) *launchFixture {
 	if err != nil {
 		t.Fatalf("realize production registry: %v", err)
 	}
-	probe := &delegateProbe{}
+	probe := &generalAgentProbe{}
 	if err := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
 		Home:          home,
 		LaunchDir:     project,
@@ -9155,7 +9257,7 @@ func newLaunchFixture(t *testing.T, opts launchOptions) *launchFixture {
 		NewDispatcher: probe.newDispatcher,
 		Store:         activeStore,
 	})); err != nil {
-		t.Fatalf("Register delegate: %v", err)
+		t.Fatalf("Register general_agent: %v", err)
 	}
 	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, auth, home, project, activeStore, 65536, guard)
 	return &launchFixture{d: d, auth: auth, turn: turnCache, probe: probe, prompts: prompts, store: store, project: project, home: home}
@@ -9205,13 +9307,13 @@ func (f *launchFixture) launchPromptsShown(t *testing.T) []launchPrompt {
 	out := make([]launchPrompt, len(shown))
 	for i, req := range shown {
 		if recorded[i].Subject == subagenttool.ToolName || req.Action == dispatch.ActionRunTool {
-			t.Fatalf("prompt %+v / %+v asks about the tool delegate", req, recorded[i])
+			t.Fatalf("prompt %+v / %+v asks about the tool general_agent", req, recorded[i])
 		}
 		out[i] = launchPrompt{action: req.Action, subject: req.Subject, scope: recorded[i].PathScope}
 	}
 	for _, m := range decodePermissionMatched(t, f.store) {
 		if m.Subject == subagenttool.ToolName {
-			t.Fatalf("permission_matched %+v decided the tool delegate", m)
+			t.Fatalf("permission_matched %+v decided the tool general_agent", m)
 		}
 	}
 	return out
@@ -9223,7 +9325,7 @@ func movePair(source, destination string) map[string]any {
 	return map[string]any{"source": source, "destination": destination}
 }
 
-func TestProductionDispatcher_TopLevelDelegateLaunchAuthorizesEachDeclaredOperation(t *testing.T) {
+func TestProductionDispatcher_TopLevelGeneralAgentLaunchAuthorizesEachDeclaredOperation(t *testing.T) {
 	folderGrant := func(subject, scope string) map[string]any {
 		return map[string]any{"kind": "tool", "subject": subject, "path_scope": scope, "grant_kind": "folder"}
 	}
@@ -9299,7 +9401,7 @@ func TestProductionDispatcher_TopLevelDelegateLaunchAuthorizesEachDeclaredOperat
 		{
 			name: "a delegate grant does not cover uncovered operations",
 			grants: func(string) []any {
-				return []any{map[string]any{"kind": "tool", "subject": "delegate", "path_scope": "*", "grant_kind": "global"}}
+				return []any{map[string]any{"kind": "tool", "subject": "general_agent", "path_scope": "*", "grant_kind": "global"}}
 			},
 			args:   map[string]any{"files": pathList("new.txt")},
 			answer: func(int) tui.PromptOption { return tui.OptionDeny },
@@ -9423,7 +9525,7 @@ func TestProductionDispatcher_TopLevelDelegateLaunchAuthorizesEachDeclaredOperat
 	}
 }
 
-func TestProductionDispatcher_PlanRefusesADelegateLaunchLikeTheDirectWrite(t *testing.T) {
+func TestProductionDispatcher_PlanRefusesAGeneralAgentLaunchLikeTheDirectWrite(t *testing.T) {
 	f := newLaunchFixture(t, launchOptions{mode: mode.Plan})
 
 	direct, err := f.d.Dispatch(context.Background(), structuredCall("c0", filetools.CreateToolName, map[string]any{"path": "new.txt", "content": "x"}))
@@ -9554,10 +9656,10 @@ func assertLaunchGrant(t *testing.T, entries []permissions.PermissionEntry, kind
 	t.Fatalf("grants = %+v, want the earlier %s grant for %q kept", entries, kind, scope)
 }
 
-func TestProductionDispatcher_ParallelDelegateLaunchesSerializeTheirPrompts(t *testing.T) {
+func TestProductionDispatcher_ParallelGeneralAgentLaunchesSerializeTheirPrompts(t *testing.T) {
 	f := newLaunchFixture(t, launchOptions{hold: 20 * time.Millisecond})
 	f.seed(t, "w1/", "w2/")
-	calls := []turn.AssembledToolCall{plannedDelegateCall("c1", "w1/a.txt"), plannedDelegateCall("c2", "w2/b.txt")}
+	calls := []turn.AssembledToolCall{plannedGeneralAgentCall("c1", "w1/a.txt"), plannedGeneralAgentCall("c2", "w2/b.txt")}
 	plan := f.d.Plan(calls, 2)
 	assertPartitionedPlan(t, plan, calls, "dd")
 
@@ -9588,8 +9690,8 @@ func TestProductionDispatcher_ParallelDelegateLaunchesSerializeTheirPrompts(t *t
 	}
 }
 
-func TestChildCeiling_PlannedNestedDelegateBuildsNoLaunchRequests(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestChildCeiling_PlannedNestedGeneralAgentBuildsNoLaunchRequests(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	declared, _, err := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt"}, nil)
 	if err != nil {
 		t.Fatalf("ResolveDeclaredScopes: %v", err)
@@ -9601,17 +9703,17 @@ func TestChildCeiling_PlannedNestedDelegateBuildsNoLaunchRequests(t *testing.T) 
 	if err != nil {
 		t.Fatalf("realize production registry: %v", err)
 	}
-	probe := &delegateProbe{}
+	probe := &generalAgentProbe{}
 	if err := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
 		Home: home, LaunchDir: project, ProjectRoot: project,
 		Snapshot: probe.snapshot, NewDispatcher: probe.newDispatcher, Store: activeStore,
 	})); err != nil {
-		t.Fatalf("Register delegate: %v", err)
+		t.Fatalf("Register general_agent: %v", err)
 	}
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, activeStore, home, project, guard)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, activeStore, home, project, guard)
 	d := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.Build), ChildAgent: true, DeclaredWrite: declared}).(*productionToolDispatcher)
 
-	calls := []turn.AssembledToolCall{plannedDelegateCall("n1", "a.txt")}
+	calls := []turn.AssembledToolCall{plannedGeneralAgentCall("n1", "a.txt")}
 	plan := d.Plan(calls, 2)
 	assertPartitionedPlan(t, plan, calls, "d")
 	if _, err := plan.Units[0].Run(context.Background()); err != nil {
@@ -9627,5 +9729,515 @@ func TestChildCeiling_PlannedNestedDelegateBuildsNoLaunchRequests(t *testing.T) 
 	}
 	if probe.started() != 1 {
 		t.Fatalf("grandchildren started = %d, want 1", probe.started())
+	}
+}
+
+func TestGeneralAgentBinding_ChildAuthorizerReadsTheLiveWritableFoldersUnderItsCeiling(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	cache, err := config.NewCache(l.composition.Config, l.project, l.layerPaths, l.home)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	store := mkStore(t)
+	binding := generalAgentBinding{parent: &parentTurnHolder{}, notices: &recordingNotices{}, confinement: &confinement{constrained: true}}
+	deps := binding.deps(tools.NewRegistry(), cache, func() *sessions.Store { return store }, l.home, l.project, mustProtectedStatePolicy(t, l.home, l.project, l.layers))
+	authorize := func(state string, modeCtx permissions.ModeContext, want string) {
+		t.Helper()
+		d, ok := deps.NewDispatcher(modeCtx).(*productionToolDispatcher)
+		if !ok {
+			t.Fatal("NewDispatcher did not return a production dispatcher")
+		}
+		move, _ := d.authorizer.(childMoveAuthorizer)
+		if _, ok := move.Authorizer.(*headlessAuthorizer); !ok {
+			t.Fatalf("child authorizer = %T, want the headless authorizer behind childMoveAuthorizer", d.authorizer)
+		}
+		req := writableEditRequest(l)
+		dec, err := d.authorizer.Authorize(context.Background(), req.Req, req.Display, req.ModeCtx)
+		if err != nil || dec.Outcome != want {
+			t.Fatalf("%s: decision = %+v, %v; want %s", state, dec, err, want)
+		}
+	}
+	auto := permissions.ModeContext{Mode: string(mode.AutoEdits)}
+	settings := projectSettingsPath(l.project)
+
+	authorize("declared", auto, "once")
+	rewriteSettings(t, settings, writableFoldersYAML())
+	authorize("removed", auto, "deny")
+	rewriteSettings(t, settings, declaringWritableFolder(l.folder))
+	authorize("restored", auto, "once")
+
+	other := filepath.Join(l.folder, "other.txt")
+	authorize("outside the child's declaration", permissions.ModeContext{Mode: string(mode.AutoEdits), ChildAgent: true, DeclaredWrite: map[string]bool{other: true}}, "deny")
+}
+
+func TestRunHeadless_PlanRunsAPathFreeGeneralAgentAndDeniesAPathDeclaringOne(t *testing.T) {
+	dir := declaredScopeDir(t)
+	script := newGeneralAgentScript(
+		func(provider.Request) []byte {
+			return toolCallsChunk(toolFrag(0, "call_1", subagenttool.ToolName, `{"instructions":"count the files"}`))
+		},
+		finalReply("3 files"),
+		func(provider.Request) []byte { return generalAgentCall("call_2", "write it", "report.txt") },
+		finalReply("done"),
+	)
+	defer script.install()()
+
+	driver := NewHeadlessDriver("count, then write", &bytes.Buffer{}, &bytes.Buffer{})
+	result := headlessResult(t, dir, mode.NewActiveState(mode.Plan, mode.SourceDefault))
+	if err := driver.Run(context.Background(), result); err != nil {
+		t.Fatalf("driver.Run: %v", err)
+	}
+	if got := script.count(); got != 4 {
+		t.Fatalf("provider rounds = %d, want 4 (parent, child, parent, parent)", got)
+	}
+	if names := toolNames(script.round(t, 0).Tools); !slices.Contains(names, subagenttool.ToolName) {
+		t.Fatalf("Plan advertised %v, want general_agent", names)
+	}
+	store := reloadStore(t, result.Session)
+	var launches []events.PermissionMatched
+	for _, m := range decodePermissionMatched(t, store) {
+		if m.Subject == subagenttool.ToolName && m.ChildInvocationID == "" {
+			launches = append(launches, m)
+		}
+	}
+	if len(launches) != 2 ||
+		launches[0].OutcomeSource != "mode_auto" || launches[0].Outcome != "once" ||
+		launches[1].OutcomeSource != "mode_auto" || launches[1].Outcome != "deny" {
+		t.Fatalf("general_agent decisions = %+v, want mode_auto once for the path-free call then mode_auto deny", launches)
+	}
+	starts := decodeStoreEvents[events.ChildAgentStart](t, store, events.KindChildAgentStart)
+	if len(starts) != 1 || len(starts[0].DeclaredPaths)+len(starts[0].DeclaredDeletePaths)+len(starts[0].DeclaredMovePairs)+len(starts[0].DeclaredDirs) != 0 {
+		t.Fatalf("child starts = %+v, want exactly one path-free child", starts)
+	}
+	toolMsgs := messagesByRole(store, "tool")
+	if len(toolMsgs) != 2 || !strings.Contains(toolMsgs[0].Content.Text(), "3 files") || !permissions.IsModeDenyEnvelope(toolMsgs[1].Content.Text()) {
+		t.Fatalf("tool messages = %+v, want the child's report then Plan's mode denial", toolMsgs)
+	}
+	mustNotExist(t, filepath.Join(dir, "report.txt"), "Plan starts no path-declaring child")
+}
+
+func TestChildCeiling_APreparedEmptyCandidateIsNotReplacedByTheInheritedOne(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	declared, _, err := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt"}, nil)
+	if err != nil {
+		t.Fatalf("ResolveDeclaredScopes: %v", err)
+	}
+	store := mkStore(t)
+	probe := &generalAgentProbe{}
+	reg := tools.NewRegistry()
+	if rerr := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{
+		Home: home, LaunchDir: project, ProjectRoot: project,
+		Snapshot:      probe.snapshot,
+		NewDispatcher: probe.newDispatcher,
+		Store:         func() *sessions.Store { return store },
+	})); rerr != nil {
+		t.Fatalf("Register general_agent: %v", rerr)
+	}
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	d := deps.NewDispatcher(permissions.ModeContext{
+		Mode:                 string(mode.Build),
+		ChildAgent:           true,
+		DeclaredWrite:        declared,
+		GeneralAgentWrite:    declared,
+		GeneralAgentResolved: true,
+	})
+
+	res, derr := d.Dispatch(context.Background(), structuredCall("n1", subagenttool.ToolName, map[string]any{"instructions": "just look"}))
+	if derr != nil || res.Denied {
+		t.Fatalf("Dispatch = %+v, %v, want the path-free grandchild allowed", res, derr)
+	}
+	matched := decodePermissionMatched(t, store)
+	if len(matched) != 1 || matched[0].OutcomeSource != "mode_auto" || matched[0].Outcome != "once" {
+		t.Fatalf("permission_matched = %+v, want one mode_auto once, not the inherited candidate's declared_scope", matched)
+	}
+	if probe.started() != 1 {
+		t.Fatalf("grandchild starts = %d, want 1", probe.started())
+	}
+	if ceilings := probe.ceilings(); len(ceilings) != 1 || len(ceilings[0]) != 0 {
+		t.Fatalf("grandchild ceilings = %v, want one empty write ceiling", ceilings)
+	}
+}
+
+func TestProductionDispatcher_ReadOnlyAndPathDeclaringSiblingsKeepTheirOwnToolSets(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	notes := filepath.Join(project, "notes.txt")
+	if err := os.WriteFile(notes, []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	const readOnlyInstruction, writerInstruction = "READ-ONLY SIBLING", "WRITER SIBLING"
+	writes := []string{
+		toolFrag(0, "w0", filetools.EditToolName, `{"path":"notes.txt","old_text":"hello","new_text":"changed"}`),
+		toolFrag(1, "w1", filetools.CreateToolName, `{"path":"made.txt","content":"x"}`),
+		toolFrag(2, "w2", filetools.DeleteToolName, `{"path":"notes.txt"}`),
+		toolFrag(3, "w3", filetools.MkdirToolName, `{"path":"newdir"}`),
+		toolFrag(4, "w4", filetools.MoveToolName, `{"source":"notes.txt","destination":"moved.txt"}`),
+	}
+	var mu sync.Mutex
+	requests := map[string][]provider.Request{}
+	client := &stubTurnClient{title: streamedTitle("t"), fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+		who, answered := "", false
+		for _, m := range req.Messages {
+			switch {
+			case m.Role == "user" && strings.Contains(m.Content, readOnlyInstruction):
+				who = readOnlyInstruction
+			case m.Role == "user" && strings.Contains(m.Content, writerInstruction):
+				who = writerInstruction
+			case m.Role == "tool":
+				answered = true
+			}
+		}
+		mu.Lock()
+		requests[who] = append(requests[who], req)
+		mu.Unlock()
+		switch {
+		case answered:
+			return provider.Response{Stream: newStream(contentChunk("done"))}, nil
+		case who == readOnlyInstruction:
+			return provider.Response{Stream: newStream(toolCallsChunk(writes...))}, nil
+		default:
+			return provider.Response{Stream: newStream(toolCallsChunk(toolFrag(0, "c0", filetools.CreateToolName, `{"path":"b.txt","content":"written\n"}`)))}, nil
+		}
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	store := mkStore(t)
+	storeFn := func() *sessions.Store { return store }
+	guard := mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil)
+	reg, err := realizeToolRegistry(&toolRegistryFactory{active: nil}, cache, storeFn, home, project, guard, generalAgentTestBinding(active, modeActive))
+	if err != nil {
+		t.Fatalf("realizeToolRegistry: %v", err)
+	}
+	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()}, home, project, storeFn, cache.MaxToolOutputBytes(), guard)
+	calls := []turn.AssembledToolCall{
+		structuredCall("ro", subagenttool.ToolName, map[string]any{"instructions": readOnlyInstruction}),
+		structuredCall("wr", subagenttool.ToolName, map[string]any{"instructions": writerInstruction, "files": []any{"b.txt"}}),
+	}
+	plan := d.Plan(calls, len(calls))
+	for i, unit := range plan.Units {
+		res, rerr := unit.Run(context.Background())
+		if rerr != nil || res.Denied {
+			t.Fatalf("unit %d = %+v, %v, want the child run", i, res, rerr)
+		}
+	}
+
+	mutating := []string{filetools.EditToolName, filetools.CreateToolName, filetools.DeleteToolName, filetools.MkdirToolName, filetools.MoveToolName}
+	readOnly, writer := requests[readOnlyInstruction], requests[writerInstruction]
+	if len(readOnly) != 2 || len(writer) != 2 {
+		t.Fatalf("child rounds = %d read-only / %d writer, want 2 each", len(readOnly), len(writer))
+	}
+	for _, name := range mutating {
+		if slices.Contains(toolNames(readOnly[0].Tools), name) {
+			t.Errorf("read-only sibling was offered %q", name)
+		}
+		if !slices.Contains(toolNames(writer[0].Tools), name) {
+			t.Errorf("path-declaring sibling lost %q", name)
+		}
+	}
+	refusals := 0
+	for _, m := range readOnly[1].Messages {
+		if m.Role == "tool" && strings.Contains(m.Content, "not available to a read-only child agent") {
+			refusals++
+		}
+	}
+	if refusals != len(writes) {
+		t.Fatalf("read-only refusals = %d, want one per attempted mutation (%d)", refusals, len(writes))
+	}
+	if body, rerr := os.ReadFile(notes); rerr != nil || string(body) != "hello\n" {
+		t.Fatalf("notes.txt = %q (err=%v), want it untouched", body, rerr)
+	}
+	for _, absent := range []string{"made.txt", "newdir", "moved.txt"} {
+		mustNotExist(t, filepath.Join(project, absent), "a read-only sibling changes nothing on disk")
+	}
+	if body, rerr := os.ReadFile(filepath.Join(project, "b.txt")); rerr != nil || string(body) != "written\n" {
+		t.Fatalf("b.txt = %q (err=%v), want the path-declaring sibling's write", body, rerr)
+	}
+	var childWrites []events.PermissionMatched
+	for _, m := range decodePermissionMatched(t, store) {
+		if m.ChildInvocationID != "" {
+			childWrites = append(childWrites, m)
+		}
+	}
+	if len(childWrites) != 1 || childWrites[0].Subject != filetools.CreateToolName ||
+		childWrites[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope || childWrites[0].Outcome != "once" {
+		t.Fatalf("child decisions = %+v, want the writer's create allowed by its own declared scope", childWrites)
+	}
+	if tool, _ := reg.Lookup(subagenttool.ToolName); tool.Advertise().ReadOnly {
+		t.Fatal("general_agent metadata became read-only after a read-only launch")
+	}
+}
+
+func TestChildCeiling_AnUnpreparedCallFallsBackToTheInheritedResolvedCandidate(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	declared, _, err := filetools.ResolveDeclaredScopes(home, project, []string{"a.txt"}, nil)
+	if err != nil {
+		t.Fatalf("ResolveDeclaredScopes: %v", err)
+	}
+	for _, resolved := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inherited resolved %v", resolved), func(t *testing.T) {
+			stub := &stubStructuredTool{name: subagenttool.ToolName, result: tools.Result{Stdout: []byte("grandchild ran\n")}}
+			reg := tools.NewRegistry()
+			if rerr := reg.Register(tools.BuiltinSource, stub); rerr != nil {
+				t.Fatalf("Register: %v", rerr)
+			}
+			store := mkStore(t)
+			deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+			d := deps.NewDispatcher(permissions.ModeContext{
+				Mode:                 string(mode.Build),
+				ChildAgent:           true,
+				DeclaredWrite:        declared,
+				GeneralAgentResolved: resolved,
+			})
+
+			res, derr := d.Dispatch(context.Background(), structuredCall("n1", subagenttool.ToolName, map[string]any{"instructions": "just look"}))
+			if derr != nil {
+				t.Fatalf("Dispatch error = %v, want nil", derr)
+			}
+			matched := decodePermissionMatched(t, store)
+			if len(matched) != 1 {
+				t.Fatalf("permission_matched = %+v, want exactly one decision", matched)
+			}
+			if resolved {
+				if res.Denied || stub.callCount() != 1 || matched[0].OutcomeSource != "mode_auto" || matched[0].Outcome != "once" {
+					t.Fatalf("result = %+v, calls = %d, permission_matched = %+v, want the inherited read-only candidate allowed", res, stub.callCount(), matched)
+				}
+				return
+			}
+			if !res.Denied || stub.callCount() != 0 || matched[0].OutcomeSource != permissions.OutcomeSourceDeclaredScope {
+				t.Fatalf("result = %+v, calls = %d, permission_matched = %+v, want an unresolved candidate denied by declared scope", res, stub.callCount(), matched)
+			}
+		})
+	}
+}
+
+type skillRun struct {
+	home       string
+	script     string
+	store      *sessions.Store
+	setStore   func(*sessions.Store)
+	auth       *recordingAuthorizer
+	dispatcher *productionToolDispatcher
+}
+
+func newSkillRun(t *testing.T, entries func(home string) []permissions.BlockedEntry) skillRun {
+	t.Helper()
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	global := filepath.Join(home, ".codemeld", "skills")
+	writeSkill(t, global, "deploy", "description: Deploy\n")
+	writeSkill(t, global, "release", "description: Release\ndisable-model-invocation: true\n")
+	script := filepath.Join(global, "deploy", "scripts", "run.sh")
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(script, []byte("echo deploy\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	var blocked []permissions.BlockedEntry
+	if entries != nil {
+		blocked = entries(home)
+	}
+	policy := securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, blocked)}
+	result := &BootstrapResult{Home: home, ProjectRoot: project, ToolRegistry: &toolRegistryFactory{}}
+	loadSkills(result, 65536)
+	store := mkStore(t)
+	active := store
+	storeFn := func() *sessions.Store { return active }
+	reg, err := realizeToolRegistry(result.ToolRegistry, emptyCache(t, project), storeFn, home, project, policy)
+	if err != nil {
+		t.Fatalf("realize: %v", err)
+	}
+	auth := &recordingAuthorizer{decision: allow()}
+	return skillRun{
+		home:       home,
+		script:     script,
+		store:      store,
+		setStore:   func(s *sessions.Store) { active = s },
+		auth:       auth,
+		dispatcher: newProductionToolDispatcher(reg, &fakeDispatchRunner{}, auth, home, project, storeFn, 65536, policy),
+	}
+}
+
+func TestRealizeToolRegistry_RegistersSkillToolOnlyForLoadedSkills(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		set    skills.Set
+		wanted bool
+	}{
+		{name: "empty", set: skills.Set{Skipped: []skills.Skipped{{Path: "/x", Reason: skills.BadName}}}},
+		{name: "model-invocable", set: skills.Set{Loaded: []skills.Skill{{Name: "deploy", ModelInvocable: true}}}, wanted: true},
+		{name: "slash-only", set: skills.Set{Loaded: []skills.Skill{{Name: "release"}}}, wanted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			factory := &toolRegistryFactory{skills: tc.set}
+			reg, err := factory.realize(emptyCache(t, t.TempDir()), func() *sessions.Store { return mkStore(t) }, t.TempDir(), t.TempDir(), securitystate.Policy{})
+			if err != nil {
+				t.Fatalf("realize: %v", err)
+			}
+			tool, ok := reg.Lookup("skill")
+			if ok != tc.wanted {
+				t.Fatalf("skill registered = %v, want %v", ok, tc.wanted)
+			}
+			if ok && (!tool.Advertise().ReadOnly || !tool.Advertise().Noncredential) {
+				t.Fatalf("skill metadata = %+v, want read-only and non-credential", tool.Advertise())
+			}
+		})
+	}
+}
+
+func TestLoadSkills_AttachesTheRecordToTheToolRegistryFactory(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	writeSkill(t, filepath.Join(home, ".codemeld", "skills"), "deploy", "description: Deploy\n")
+	factory := &toolRegistryFactory{}
+	result := &BootstrapResult{Home: home, ProjectRoot: project, ToolRegistry: factory}
+
+	loadSkills(result, 65536)
+
+	if len(result.Skills.Loaded) != 1 || !reflect.DeepEqual(factory.skills, result.Skills) {
+		t.Fatalf("factory skills = %+v, want the loaded record %+v", factory.skills, result.Skills)
+	}
+}
+
+func TestProductionDispatcher_SkillToolReadsAGlobalSkillFileTheReadToolRefuses(t *testing.T) {
+	run := newSkillRun(t, nil)
+
+	res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c1", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"}))
+	if err != nil || res.Denied || res.Content != "echo deploy" {
+		t.Fatalf("skill file read = (%+v, %v), want the script", res, err)
+	}
+	res, err = run.dispatcher.Dispatch(context.Background(), structuredCall("c2", "skill", map[string]any{"name": "deploy"}))
+	if err != nil || res.Denied || !strings.Contains(res.Content, "SKILL-BODY-MARKER") || !strings.Contains(res.Content, "- scripts/run.sh") {
+		t.Fatalf("skill body = (%+v, %v), want the body and its file list", res, err)
+	}
+
+	res, err = run.dispatcher.Dispatch(context.Background(), structuredCall("c3", filetools.ReadToolName, map[string]any{"path": run.script}))
+	if err != nil || !res.Denied || strings.Contains(res.Content, "echo deploy") {
+		t.Fatalf("read of the same path = (%+v, %v), want a denial", res, err)
+	}
+}
+
+func TestProductionDispatcher_SkillToolBlockedReadIsARecordedGuardDenial(t *testing.T) {
+	source := "/etc/codemeld-test/settings.yaml"
+	var scripts string
+	run := newSkillRun(t, func(home string) []permissions.BlockedEntry {
+		scripts = filepath.Join(home, ".codemeld", "skills", "deploy", "scripts")
+		return []permissions.BlockedEntry{{Path: scripts, Source: source}}
+	})
+
+	res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c1", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"}))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want an in-band denial", err)
+	}
+	if !res.Denied || !permissions.IsModeDenyEnvelope(res.Content) || strings.Contains(res.Content, "echo deploy") {
+		t.Fatalf("res = %+v, want a recoverable guard denial without the file", res)
+	}
+	if want := permissions.BuildBlockedPathDenyEnvelope(run.script, scripts, false); res.Content != want || strings.Contains(res.Content, source) {
+		t.Fatalf("res.Content = %q, want exactly %q with no settings path", res.Content, want)
+	}
+	if want := blockedSourceLine(scripts, source); res.Notice != want {
+		t.Fatalf("res.Notice = %q, want %q", res.Notice, want)
+	}
+	want := events.PermissionMatched{SubjectKind: "tool", Subject: "skill", PathScope: scripts, Outcome: "deny", OutcomeSource: "blocked_path", BlockedEntry: scripts, BlockedEntrySource: source}
+	if matched := decodePermissionMatched(t, reloadStore(t, run.store)); len(matched) != 1 || matched[0] != want {
+		t.Fatalf("durable permission_matched = %#v, want exactly one %#v", matched, want)
+	}
+}
+
+func skillDigest(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+func diskSkillLoads(t *testing.T, store *sessions.Store) []events.SkillLoaded {
+	t.Helper()
+	if _, _, err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("flush session: %v", err)
+	}
+	sess := readSessionFile(t, store.Path())
+	for _, r := range sess.Records {
+		if ev, ok := r.(sessions.Event); ok && ev.Kind == "skill_loaded" {
+			if err := events.ValidatePayload(ev.Kind, ev.Payload); err != nil {
+				t.Fatalf("skill_loaded payload %s: %v", ev.Payload, err)
+			}
+		}
+	}
+	return decodeDiskEvents[events.SkillLoaded](t, sess, "skill_loaded")
+}
+
+func TestProductionDispatcher_SkillToolLoadsReachTheTurnStoreWithTheCaller(t *testing.T) {
+	run := newSkillRun(t, nil)
+	body := events.SkillLoaded{Name: "deploy", Layer: "global", Via: "tool", Bytes: int64(len("SKILL-BODY-MARKER\n")), SHA256: skillDigest("SKILL-BODY-MARKER\n")}
+	file := events.SkillLoaded{Name: "deploy", Layer: "global", Via: "tool", File: "scripts/run.sh", Bytes: int64(len("echo deploy\n")), SHA256: skillDigest("echo deploy\n")}
+
+	if res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c1", "skill", map[string]any{"name": "deploy"})); err != nil || res.Denied {
+		t.Fatalf("body read = (%+v, %v), want success", res, err)
+	}
+	if got := diskSkillLoads(t, run.store); !reflect.DeepEqual(got, []events.SkillLoaded{body}) {
+		t.Fatalf("first store skill_loaded = %+v, want only the body load %+v", got, body)
+	}
+
+	swapped := mkStore(t)
+	run.setStore(swapped)
+	file.ChildInvocationID = ids.NewV7()
+	run.dispatcher.childInvocationID = file.ChildInvocationID
+	if res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c2", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"})); err != nil || res.Content != "echo deploy" {
+		t.Fatalf("child file read = (%+v, %v), want the script", res, err)
+	}
+	if got := diskSkillLoads(t, swapped); !reflect.DeepEqual(got, []events.SkillLoaded{file}) {
+		t.Fatalf("swapped store skill_loaded = %+v, want only the child file load %+v", got, file)
+	}
+	if got := diskSkillLoads(t, run.store); len(got) != 1 {
+		t.Fatalf("first store skill_loaded = %+v, want the second load kept out of it", got)
+	}
+}
+
+func TestProductionDispatcher_SkillToolWithoutAStoreStillReads(t *testing.T) {
+	run := newSkillRun(t, nil)
+	run.setStore(nil)
+
+	res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c1", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"}))
+	if err != nil || res.Content != "echo deploy" {
+		t.Fatalf("file read with no store = (%+v, %v), want the script", res, err)
+	}
+}
+
+func TestProductionDispatcher_SkillToolLoadRecordFailureIsAnError(t *testing.T) {
+	run := newSkillRun(t, nil)
+	run.dispatcher.childInvocationID = "not-a-uuid"
+
+	res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c1", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"}))
+	if err == nil || strings.Contains(res.Content, "echo deploy") {
+		t.Fatalf("file read with an unrecordable load = (%+v, %v), want an error and no content", res, err)
+	}
+	if got := diskSkillLoads(t, run.store); len(got) != 0 {
+		t.Fatalf("skill_loaded = %+v, want none", got)
+	}
+}
+
+func TestProductionDispatcher_SkillToolFailuresStayInBand(t *testing.T) {
+	run := newSkillRun(t, nil)
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		text string
+	}{
+		{name: "unknown name", args: map[string]any{"name": "nope"}, text: `no skill named "nope"; available skills: deploy`},
+		{name: "invalid arguments", args: map[string]any{"file": "scripts/run.sh"}, text: `argument "name"`},
+		{name: "refused body", args: map[string]any{"name": "release"}, text: "automatic loading of skill \"release\" is disabled"},
+		{name: "missing file", args: map[string]any{"name": "deploy", "file": "nope.txt"}, text: `file "nope.txt" does not exist`},
+	} {
+		res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c", "skill", tc.args))
+		if err != nil || res.Denied || !strings.Contains(res.Content, tc.text) || !strings.HasSuffix(res.Content, "exit status 1") {
+			t.Fatalf("%s = (%+v, %v), want a failed in-band result naming %q", tc.name, res, err, tc.text)
+		}
+	}
+	res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"}))
+	if err != nil || res.Content != "echo deploy" {
+		t.Fatalf("later call = (%+v, %v), want the dispatcher still serving", res, err)
 	}
 }

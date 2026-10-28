@@ -1,7 +1,6 @@
 // Built-in structured delete tool: irreversible removal of a single existing in-project file, symlink,
 // or empty directory, with pre-authorization target resolution and an fd-relative unlink that can neither
-// recurse nor land outside the authorized parent. Unlike edit/create it is never auto-approved by any
-// mode and never folds under the write capability.
+// recurse nor land outside the authorized parent. It never folds under the write capability.
 package filetools
 
 import (
@@ -20,14 +19,13 @@ import (
 // DeleteToolName is the exact dispatch name the structured delete tool registers under. Like `edit` and
 // `create` it is a fixed built-in name carrying no template namespace. It is deliberately absent from
 // permissions.capabilityMembers, so a `write` capability grant (which folds create/edit) never
-// authorizes a delete — every delete needs its own explicit grant or approval.
+// authorizes a delete.
 const DeleteToolName = "delete"
 
 // DeleteTool is the built-in mutating delete tool. It removes a single existing target — a regular file,
 // a final-component symlink (the link entry, never the file it points at), or an empty directory — and
 // refuses a non-empty directory in-band, with no recursive fallback. Deletion is irreversible, so it is
-// held to stronger guardrails than edit/create: it is never auto-approved by any mode (it is not in the
-// Auto edits in-scope class) and never folds under the write capability. The run-scoped home, process
+// held to stronger guardrails than edit/create: it never folds under the write capability. The run-scoped home, process
 // cwd, and project root are bound at construction so the same expansion/cleaning/symlink/containment
 // rules used for permission path scopes resolve the target, exactly as the create tool does.
 type DeleteTool struct {
@@ -59,23 +57,20 @@ func (t *DeleteTool) SubjectKind() string { return "tool" }
 
 // Advertise returns the delete tool's advertising metadata and mutating classification. The parameter
 // JSON-Schema is the OpenAI function-tool shape with additionalProperties:false so the advertised
-// contract matches the decoder exactly. ReadOnly is false: delete mutates the filesystem. Unlike create,
-// delete is never auto-approved — Plan denies it and Auto edits prompts for it — because it is not in the
-// Auto edits in-scope class (it is neither edit nor create); an explicit grant or approval is always
-// required.
+// contract matches the decoder exactly. ReadOnly is false: delete mutates the filesystem.
 func (t *DeleteTool) Advertise() tools.Metadata {
 	return tools.Metadata{
 		Description: "Delete a single existing file, symlink, or empty directory. The target must " +
 			"exist; a non-empty directory is refused (remove its contents first — there is no recursive " +
 			"delete) and a symlink is removed as a link without following it to its target. Deletion is " +
-			"irreversible and always requires explicit permission — it is never auto-approved. Use to " +
+			"irreversible and may need approval first. Use to " +
 			"remove one existing file or empty directory.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Path of the existing file, symlink, or empty directory to delete. Relative or in-project paths resolve against the working directory; a path whose real (symlink-resolved) location is outside the project is allowed only after you approve it at the permission prompt. A non-empty directory is refused. Deletion is irreversible.",
+					"description": "Path of the existing file, symlink, or empty directory to delete. Relative or in-project paths resolve against the working directory; a path whose real (symlink-resolved) location is outside the project and every writable folder is allowed only after you approve it at the permission prompt. A non-empty directory is refused. Deletion is irreversible.",
 				},
 			},
 			"required":             []string{"path"},

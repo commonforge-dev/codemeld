@@ -197,34 +197,50 @@ func listItems(l interface{ GetItemCount() int }, get func(int) string) []string
 	return out
 }
 
-func TestSettingsTabBar_HighlightsActiveTab(t *testing.T) {
-	globalActive := settingsTabBar(0)
-	if want := "[" + chromeOnFillText + ":" + accentTealHex + ":b] commands / tool grants [-:-:-]"; !strings.Contains(globalActive, want) {
-		t.Fatalf("global tab bar = %q, want active global pill %q", globalActive, want)
+func TestSettingsTabBar_DrawsEveryTabAsItsOwnChip(t *testing.T) {
+	labels := []string{"commands / tool grants", "folders", "project hosts", "openrouter", "settings"}
+	for active := range permTabCount {
+		chips := make([]string, len(labels))
+		for i, label := range labels {
+			chips[i] = "[" + chromeOnFillText + ":" + statusSegmentBody1 + ":]" + label + "[-:-:-]"
+			if i == active {
+				chips[i] = "[" + chromeOnFillText + ":" + accentTealHex + ":b]" + label + "[-:-:-]"
+			}
+		}
+		if got, want := settingsTabBar(active), strings.Join(chips, " │ "); got != want {
+			t.Errorf("tab bar with tab %d active = %q, want %q", active, got, want)
+		}
 	}
-	if strings.Contains(globalActive, "["+chromeOnFillText+":"+accentTealHex+":b] folders [-:-:-]") {
-		t.Fatalf("global tab bar = %q, folders should not be active", globalActive)
+}
+
+func TestSettingsTabBar_FitsOneRowOfAnEightyColumnOverlay(t *testing.T) {
+	plain := strings.Join([]string{permTabGlobal, permTabFolders, permTabHosts, permTabOpenRouter, permTabSettings}, " │ ")
+	for active := range permTabCount {
+		if got := tview.TaggedStringWidth(settingsTabBar(active)); got != 72 {
+			t.Errorf("tab bar width with tab %d active = %d cells, want 72", active, got)
+		}
 	}
 
-	foldersActive := settingsTabBar(permTabIndexFolders)
-	if want := "[" + chromeOnFillText + ":" + accentTealHex + ":b] folders [-:-:-]"; !strings.Contains(foldersActive, want) {
-		t.Fatalf("folders tab bar = %q, want active folders pill %q", foldersActive, want)
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
 	}
-
-	hostsActive := settingsTabBar(permTabIndexHosts)
-	if want := "[" + chromeOnFillText + ":" + accentTealHex + ":b] " + permTabHosts + " [-:-:-]"; !strings.Contains(hostsActive, want) {
-		t.Fatalf("hosts tab bar = %q, want active hosts pill %q", hostsActive, want)
-	}
-	if gi, fi, hi := strings.Index(hostsActive, permTabGlobal), strings.Index(hostsActive, permTabFolders), strings.Index(hostsActive, permTabHosts); gi >= fi || fi >= hi {
-		t.Errorf("tab order = %q, want global then folders then %q", hostsActive, permTabHosts)
-	}
-
-	settingsActive := settingsTabBar(permTabIndexSettings)
-	if want := "[" + chromeOnFillText + ":" + accentTealHex + ":b] " + permTabSettings + " [-:-:-]"; !strings.Contains(settingsActive, want) {
-		t.Fatalf("settings tab bar = %q, want active settings pill %q", settingsActive, want)
-	}
-	if hi, si := strings.Index(settingsActive, permTabHosts), strings.LastIndex(settingsActive, permTabSettings); hi >= si {
-		t.Errorf("tab order = %q, want %q last", settingsActive, permTabSettings)
+	screen.SetSize(80, 24)
+	a := New(nil)
+	openEntryPicker(a, permissionsFixture(), nil, nil)
+	for active := range permTabCount {
+		a.settingsPicker.activeTab = active
+		a.renderSettingsTab()
+		a.pages.SetRect(0, 0, 80, 24)
+		a.pages.Draw(screen)
+		screen.Show()
+		rows := screenRows(screen)
+		if !strings.Contains(rows[1], plain) {
+			t.Errorf("tab %d active: tab bar row = %q, want all five tabs %q unclipped", active, rows[1], plain)
+		}
+		if strings.Contains(rows[2], permTabSettings) {
+			t.Errorf("tab %d active: row below the tab bar = %q, want no wrapped tab text", active, rows[2])
+		}
 	}
 }
 
@@ -323,8 +339,12 @@ func TestSettingsPicker_HostTabListsToolAndHost(t *testing.T) {
 		}
 		a.stepSettingsTab(1)
 	}
+	if pp.activeTab != permTabIndexOpenRouter {
+		t.Fatalf("activeTab after the grant tabs = %d, want the openrouter tab %d", pp.activeTab, permTabIndexOpenRouter)
+	}
+	a.stepSettingsTab(1)
 	if pp.activeTab != permTabIndexSettings {
-		t.Fatalf("activeTab after the grant tabs = %d, want the settings tab %d", pp.activeTab, permTabIndexSettings)
+		t.Fatalf("activeTab after the openrouter tab = %d, want the settings tab %d", pp.activeTab, permTabIndexSettings)
 	}
 	a.stepSettingsTab(1)
 	if pp.activeTab != 0 {
@@ -427,6 +447,7 @@ func TestSettingsPicker_SortedRevokeKeepsRowIdentity(t *testing.T) {
 	})
 	a.stepSettingsTab(1)
 	a.stepSettingsTab(1)
+	a.stepSettingsTab(1)
 	assertRows(t, a, 0, wantUnorderedRowsByTab()[0])
 	a.stepSettingsTab(1)
 	assertRows(t, a, permTabIndexFolders, wantUnorderedRowsByTab()[1])
@@ -507,6 +528,7 @@ func TestSettingsPicker_RevokeHostRemovesOnlyThatEntry(t *testing.T) {
 	}
 	a.stepSettingsTab(1)
 	a.stepSettingsTab(1)
+	a.stepSettingsTab(1)
 	if rows := permissionsRowsOnTab(a); len(rows) != 2 {
 		t.Errorf("global rows after a host revoke = %v, want both path grants kept", rows)
 	}
@@ -545,9 +567,11 @@ func TestSettingsPicker_TabKeysNavigateBothDirections(t *testing.T) {
 	}{
 		{key: tcell.KeyTab, want: permTabIndexFolders},
 		{key: tcell.KeyRight, want: permTabIndexHosts},
-		{key: tcell.KeyRight, want: permTabIndexSettings},
+		{key: tcell.KeyRight, want: permTabIndexOpenRouter},
+		{key: tcell.KeyTab, want: permTabIndexSettings},
 		{key: tcell.KeyRight, want: 0},
 		{key: tcell.KeyLeft, want: permTabIndexSettings},
+		{key: tcell.KeyLeft, want: permTabIndexOpenRouter},
 		{key: tcell.KeyLeft, want: permTabIndexHosts},
 		{key: tcell.KeyLeft, want: permTabIndexFolders},
 		{key: tcell.KeyLeft, want: 0},
@@ -558,8 +582,12 @@ func TestSettingsPicker_TabKeysNavigateBothDirections(t *testing.T) {
 		if got := a.settingsPicker.activeTab; got != tc.want {
 			t.Fatalf("activeTab after %v = %d, want %d", tc.key, got, tc.want)
 		}
-		if tc.want == permTabIndexSettings {
-			assertRows(t, a, tc.want, []string{"openrouter attribution   on", "openrouter data collection   allow", "openrouter sort   default", maxPriceDisabledRow, retentionDefaultRow})
+		switch tc.want {
+		case permTabIndexOpenRouter:
+			assertRows(t, a, tc.want, []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow})
+			continue
+		case permTabIndexSettings:
+			assertRows(t, a, tc.want, []string{retentionDefaultRow})
 			continue
 		}
 		assertRows(t, a, tc.want, wantUnorderedRowsByTab()[tc.want])
@@ -1206,7 +1234,7 @@ type fakeOpenRouterSettings struct {
 }
 
 const (
-	maxPriceDisabledRow = "openrouter max price   active model is not an OpenRouter model"
+	maxPriceDisabledRow = "max price   active model is not an OpenRouter model"
 	retentionDefaultRow = "session retention (days)   default"
 )
 
@@ -1263,7 +1291,7 @@ func openSettingsTab(a *App, f *fakeOpenRouterSettings) {
 		a.openRouterSettings = f.seam()
 	}
 	openEntryPicker(a, permissionsFixture(), nil, nil)
-	a.settingsPicker.activeTab = permTabIndexSettings
+	a.settingsPicker.activeTab = permTabIndexOpenRouter
 	a.renderSettingsTab()
 }
 
@@ -1290,29 +1318,29 @@ func TestSettingsPicker_SettingsTabShowsLiveValues(t *testing.T) {
 	}{
 		{
 			fake: fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"},
-			want: []string{"openrouter attribution   on", "openrouter data collection   allow", "openrouter sort   default", maxPriceDisabledRow, retentionDefaultRow},
+			want: []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow},
 		},
 		{
 			fake: fakeOpenRouterSettings{on: false, dc: "deny", sort: "latency"},
-			want: []string{"openrouter attribution   off", "openrouter data collection   deny", "openrouter sort   latency", maxPriceDisabledRow, retentionDefaultRow},
+			want: []string{"attribution   off", "data collection   deny", "sort   latency", maxPriceDisabledRow},
 		},
 	} {
 		a := New(nil)
 		openSettingsTab(a, &tc.fake)
-		assertRows(t, a, permTabIndexSettings, tc.want)
+		assertRows(t, a, permTabIndexOpenRouter, tc.want)
 	}
 }
 
 func TestSettingsPicker_SettingsTabWithoutSeamShowsDefaultsAndIsInert(t *testing.T) {
 	a := New(nil)
 	openSettingsTab(a, nil)
-	want := []string{"openrouter attribution   on", "openrouter data collection   allow", "openrouter sort   default", maxPriceDisabledRow, retentionDefaultRow}
-	assertRows(t, a, permTabIndexSettings, want)
+	want := []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow}
+	assertRows(t, a, permTabIndexOpenRouter, want)
 
 	for row := range want {
 		pressEnterOnRow(t, a, row)
 	}
-	assertRows(t, a, permTabIndexSettings, want)
+	assertRows(t, a, permTabIndexOpenRouter, want)
 	if a.NoticeText() != "" {
 		t.Errorf("notice = %q, want none for an inert toggle", a.NoticeText())
 	}
@@ -1336,7 +1364,7 @@ func TestSettingsPicker_EnterTogglesAttributionThroughTheSeam(t *testing.T) {
 	openSettingsTab(a, f)
 
 	pressEnter(t, a)
-	if rows := permissionsRowsOnTab(a); rows[0] != "openrouter attribution   off" {
+	if rows := permissionsRowsOnTab(a); rows[0] != "attribution   off" {
 		t.Errorf("row after opting out = %q, want it off", rows[0])
 	}
 	if a.NoticeText() != "" {
@@ -1344,7 +1372,7 @@ func TestSettingsPicker_EnterTogglesAttributionThroughTheSeam(t *testing.T) {
 	}
 
 	pressEnter(t, a)
-	if rows := permissionsRowsOnTab(a); rows[0] != "openrouter attribution   on" {
+	if rows := permissionsRowsOnTab(a); rows[0] != "attribution   on" {
 		t.Errorf("row after opting back in = %q, want it on", rows[0])
 	}
 	if want := []string{"attribution=false", "attribution=true"}; !slices.Equal(f.wrote, want) {
@@ -1370,7 +1398,7 @@ func TestSettingsPicker_DataCollectionFlipsAndWritesExplicitAllow(t *testing.T) 
 
 	for _, want := range []string{"deny", "allow"} {
 		pressEnterOnRow(t, a, settingsRowDataCollection)
-		if rows := permissionsRowsOnTab(a); rows[settingsRowDataCollection] != "openrouter data collection   "+want {
+		if rows := permissionsRowsOnTab(a); rows[settingsRowDataCollection] != "data collection   "+want {
 			t.Errorf("data collection row = %q, want %q", rows[settingsRowDataCollection], want)
 		}
 	}
@@ -1390,7 +1418,7 @@ func TestSettingsPicker_SortCyclesBackToDefault(t *testing.T) {
 		{"default", sortHelpDefault},
 	} {
 		pressEnterOnRow(t, a, settingsRowSort)
-		if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "openrouter sort   "+want.row {
+		if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "sort   "+want.row {
 			t.Errorf("sort row = %q, want %q", rows[settingsRowSort], want.row)
 		}
 		if got := permissionsHelp(a); got != want.help {
@@ -1405,7 +1433,7 @@ func TestSettingsPicker_SortCyclesBackToDefault(t *testing.T) {
 const (
 	sortHelpDefault    = "OpenRouter's normal routing: healthy providers, cheaper ones picked more often"
 	sortHelpThroughput = "Fastest providers first, whatever the price"
-	sortHelpBestValue  = "Cheapest providers first; ones slower than this model's typical speed go last"
+	sortHelpBestValue  = "Fastest at typical speed or better, within 20% of the cheapest at that speed"
 	sortHelpOther      = "Set in the settings file; Enter switches to default"
 )
 
@@ -1423,7 +1451,7 @@ func TestSettingsPicker_SortRowShowsEachModeWithItsHelp(t *testing.T) {
 		a := New(nil)
 		openSettingsTab(a, &fakeOpenRouterSettings{on: true, dc: "allow", sort: tc.stored})
 		a.settingsPicker.list.SetCurrentItem(settingsRowSort)
-		if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "openrouter sort   "+tc.row {
+		if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "sort   "+tc.row {
 			t.Errorf("stored %s: sort row = %q, want %q", tc.stored, rows[settingsRowSort], tc.row)
 		}
 		if got := permissionsHelp(a); got != tc.help {
@@ -1439,7 +1467,7 @@ func TestSettingsPicker_HandSetLatencySortEnterGoesToDefault(t *testing.T) {
 
 	pressEnterOnRow(t, a, settingsRowSort)
 
-	if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "openrouter sort   default" {
+	if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "sort   default" {
 		t.Errorf("sort row = %q, want default", rows[settingsRowSort])
 	}
 	if got := permissionsHelp(a); got != sortHelpDefault {
@@ -1450,12 +1478,18 @@ func TestSettingsPicker_HandSetLatencySortEnterGoesToDefault(t *testing.T) {
 	}
 }
 
-func TestSettingsPicker_SortHelpOnlyOnTheSortRowOfTheSettingsTab(t *testing.T) {
+func TestSettingsPicker_HelpOnlyOnTheOpenRouterAndSettingsTabs(t *testing.T) {
 	a := New(nil)
 	a.openRouterSettings = (&fakeOpenRouterSettings{on: true, dc: "allow", sort: "throughput"}).seam()
 	openEntryPicker(a, permissionsUnorderedFixture(), nil, nil)
 	moveCursor := func(key tcell.Key) {
 		a.settingsPicker.list.InputHandler()(tcell.NewEventKey(key, 0, tcell.ModNone), func(tview.Primitive) {})
+	}
+	want := func(tab, row int) string {
+		if id, ok := settingsRowID(tab, row); ok {
+			return rowHelpWant(id, sortHelpThroughput)
+		}
+		return ""
 	}
 
 	for tab := range permTabCount {
@@ -1465,26 +1499,168 @@ func TestSettingsPicker_SortHelpOnlyOnTheSortRowOfTheSettingsTab(t *testing.T) {
 		for _, key := range []tcell.Key{tcell.KeyDown, tcell.KeyDown, tcell.KeyDown, tcell.KeyUp} {
 			moveCursor(key)
 			row := a.settingsPicker.list.GetCurrentItem()
-			want := ""
-			if tab == permTabIndexSettings && row == settingsRowSort {
-				want = sortHelpThroughput
-			}
-			if got := permissionsHelp(a); got != want {
-				t.Errorf("help on tab %d row %d = %q, want %q", tab, row, got, want)
+			if got, w := permissionsHelp(a), want(tab, row); got != w {
+				t.Errorf("help on tab %d row %d = %q, want %q", tab, row, got, w)
 			}
 		}
-		if tab == permTabIndexSettings && a.settingsPicker.list.GetCurrentItem() != settingsRowSort {
-			t.Fatalf("settings cursor = %d, want the walk to end on the sort row", a.settingsPicker.list.GetCurrentItem())
+		if tab == permTabIndexOpenRouter && a.settingsPicker.list.GetCurrentItem() != settingsRowSort {
+			t.Fatalf("openrouter cursor = %d, want the walk to end on the sort row", a.settingsPicker.list.GetCurrentItem())
 		}
 		a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
-		if got := permissionsHelp(a); got != "" {
-			t.Errorf("help after switching away from tab %d = %q, want empty", tab, got)
+		next := a.settingsPicker.activeTab
+		if got, w := permissionsHelp(a), want(next, a.settingsPicker.list.GetCurrentItem()); got != w {
+			t.Errorf("help after switching from tab %d to %d = %q, want %q", tab, next, got, w)
 		}
 	}
 }
 
+const (
+	helpAttribution    = "Identify codemeld to OpenRouter on chat requests (app URL, name, categories)"
+	helpDataCollection = "allow: may use providers that store or train on prompts; deny: avoid them"
+	helpMaxPrice       = "Input/output price caps per M tokens for OpenRouter models; empty: no cap"
+	helpRetention      = "Idle days before auto-deletion; pruning runs at a fresh launch, not on resume"
+)
+
+func rowHelpWant(id int, sortText string) string {
+	return map[int]string{
+		settingsRowAttribution:    helpAttribution,
+		settingsRowDataCollection: helpDataCollection,
+		settingsRowSort:           sortText,
+		settingsRowMaxPrice:       helpMaxPrice,
+		settingsRowRetention:      helpRetention,
+	}[id]
+}
+
+var sortHelpVariants = []struct{ stored, help string }{
+	{"default", sortHelpDefault},
+	{"throughput", sortHelpThroughput},
+	{"best_value", sortHelpBestValue},
+	{"latency", sortHelpOther},
+}
+
+func openSettingsPickerOnTab(a *App, sort string, tab int) {
+	NewSettingsPicker(a, (&fakeOpenRouterSettings{on: true, dc: "allow", sort: sort}).seam(), (&fakeRetention{days: 30}).seam()).
+		Present(unlayeredPermissionRows(permissionsFixture()), SettingsDeps{})
+	a.settingsPicker.activeTab = tab
+	a.renderSettingsTab()
+}
+
+func TestSettingsPicker_EveryListedSettingsRowHasHelp(t *testing.T) {
+	for _, tab := range []int{permTabIndexOpenRouter, permTabIndexSettings} {
+		a := New(nil)
+		openSettingsPickerOnTab(a, "default", tab)
+		n := a.settingsPicker.list.GetItemCount()
+		if n == 0 {
+			t.Fatalf("tab %d lists no rows", tab)
+		}
+		for i := range n {
+			a.settingsPicker.list.SetCurrentItem(i)
+			a.updateRowHelp(i)
+			if got := permissionsHelp(a); got == "" {
+				t.Errorf("tab %d row %d: help is empty", tab, i)
+			}
+		}
+	}
+}
+
+func TestSettingsPicker_RowHelpWording(t *testing.T) {
+	type place struct{ tab, row int }
+	type helpCase struct {
+		sort string
+		at   place
+		want string
+	}
+	cases := []helpCase{
+		{"default", place{permTabIndexOpenRouter, 0}, helpAttribution},
+		{"default", place{permTabIndexOpenRouter, 1}, helpDataCollection},
+		{"default", place{permTabIndexOpenRouter, 3}, helpMaxPrice},
+		{"default", place{permTabIndexSettings, 0}, helpRetention},
+	}
+	for _, v := range sortHelpVariants {
+		cases = append(cases, helpCase{v.stored, place{permTabIndexOpenRouter, 2}, v.help})
+	}
+	shown := map[place]string{}
+	for _, tc := range cases {
+		a := New(nil)
+		openSettingsPickerOnTab(a, tc.sort, tc.at.tab)
+		a.settingsPicker.list.SetCurrentItem(tc.at.row)
+		a.updateRowHelp(tc.at.row)
+		got := permissionsHelp(a)
+		if got != tc.want {
+			t.Errorf("sort %s, tab %d row %d: help = %q, want %q", tc.sort, tc.at.tab, tc.at.row, got, tc.want)
+		}
+		shown[tc.at] = got
+	}
+	if or, st := shown[place{permTabIndexOpenRouter, 0}], shown[place{permTabIndexSettings, 0}]; or == st {
+		t.Errorf("openrouter row 0 and settings row 0 both show help %q, want each its own", or)
+	}
+}
+
+func TestSettingsPicker_MaxPriceHelpIsTheSameWithOrWithoutAnOpenRouterModel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*App)
+	}{
+		{"active openrouter model", func(a *App) {
+			a.openRouterSettings = maxPriceSettings(nil).seam()
+		}},
+		{"no active model seam", func(a *App) {
+			a.openRouterSettings = maxPriceSettings(nil).seam()
+			a.openRouterSettings.ActiveModel = nil
+		}},
+		{"empty active model", func(a *App) {
+			a.openRouterSettings = (&fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"}).seam()
+		}},
+		{"non-openrouter provider", func(a *App) {
+			a.openRouterSettings = (&fakeOpenRouterSettings{on: true, dc: "allow", sort: "default", activeProvider: "anthropic", activeModel: "claude"}).seam()
+		}},
+	} {
+		a := New(nil)
+		tc.setup(a)
+		openEntryPicker(a, permissionsFixture(), nil, nil)
+		a.settingsPicker.activeTab = permTabIndexOpenRouter
+		a.renderSettingsTab()
+		_, i := settingsRowPlace(settingsRowMaxPrice)
+		a.settingsPicker.list.SetCurrentItem(i)
+		a.updateRowHelp(i)
+		if got := permissionsHelp(a); got != helpMaxPrice {
+			t.Errorf("%s: max price help = %q, want %q", tc.name, got, helpMaxPrice)
+		}
+	}
+}
+
+func TestSettingsPicker_RowHelpFitsTheHelpRowOfAnEightyColumnOverlay(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	screen.SetSize(80, 24)
+	check := func(sort string, id int, want string) {
+		t.Helper()
+		tab, i := settingsRowPlace(id)
+		a := New(nil)
+		openSettingsPickerOnTab(a, sort, tab)
+		a.settingsPicker.list.SetCurrentItem(i)
+		a.updateRowHelp(i)
+		a.pages.SetRect(0, 0, 80, 24)
+		a.pages.Draw(screen)
+		screen.Show()
+		rows := screenRows(screen)
+		help := []rune(rows[21])
+		if got := strings.TrimRight(string(help[1:79]), " "); got != want {
+			t.Errorf("sort %s, row %d: help row = %q, want the whole help %q", sort, id, string(help), want)
+		}
+	}
+	for _, id := range []int{settingsRowAttribution, settingsRowDataCollection, settingsRowMaxPrice, settingsRowRetention} {
+		check("default", id, rowHelpWant(id, ""))
+	}
+	for _, v := range sortHelpVariants {
+		check(v.stored, settingsRowSort, v.help)
+	}
+}
+
 func TestSettingsPicker_FailedSettingWriteKeepsRowsAndNotifies(t *testing.T) {
-	stored := []string{"openrouter attribution   on", "openrouter data collection   allow", "openrouter sort   default", maxPriceDisabledRow, retentionDefaultRow}
+	stored := []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow}
 	for row, label := range []string{"attribution", "data collection", "sort"} {
 		a := New(nil)
 		f := &fakeOpenRouterSettings{on: true, dc: "allow", sort: "default", err: errors.New("write_error: no\nspace left")}
@@ -1495,33 +1671,39 @@ func TestSettingsPicker_FailedSettingWriteKeepsRowsAndNotifies(t *testing.T) {
 		if len(f.wrote) != 1 {
 			t.Fatalf("row %d writes = %v, want exactly one attempt", row, f.wrote)
 		}
-		assertRows(t, a, permTabIndexSettings, stored)
+		assertRows(t, a, permTabIndexOpenRouter, stored)
 		if want := "couldn't change the openrouter " + label + " setting: write_error: no space left"; a.NoticeText() != want {
 			t.Errorf("notice = %q, want %q", a.NoticeText(), want)
 		}
 	}
 }
 
-func TestSettingsPicker_RevokeKeyIsInertOnSettingsTab(t *testing.T) {
-	a := New(nil)
-	grants := permissionsFixture()
-	revoke, relist, calls := removingRevoke(&grants)
-	a.openRouterSettings = (&fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"}).seam()
-	openEntryPicker(a, relist(), revoke, relist)
-	a.settingsPicker.activeTab = permTabIndexSettings
-	a.renderSettingsTab()
+func TestSettingsPicker_RevokeAndShareKeysAreInertOnNonGrantTabs(t *testing.T) {
+	for _, tab := range []int{permTabIndexOpenRouter, permTabIndexSettings} {
+		for _, key := range []rune{'r', 's'} {
+			var revoked, shared []PermissionRow
+			a := New(nil)
+			a.openRouterSettings = (&fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"}).seam()
+			a.openSettingsPicker(layeredRowsFixture(), SettingsDeps{
+				Rows:     layeredRowsFixture,
+				Revoke:   func(row PermissionRow) { revoked = append(revoked, row) },
+				Share:    func(row PermissionRow) ShareResult { shared = append(shared, row); return ShareResult{} },
+				Approved: true,
+			}, SessionSettings{})
+			a.settingsPicker.activeTab = tab
+			a.renderSettingsTab()
 
-	if ev := a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone)); ev != nil {
-		t.Fatal("r reached the list, want the picker to consume it")
+			if ev := a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyRune, key, tcell.ModNone)); ev != nil {
+				t.Fatalf("tab %d: %c reached the list, want the picker to consume it", tab, key)
+			}
+			if a.pages.HasPage(settingsDeletePage) {
+				t.Errorf("tab %d: %c opened a confirmation", tab, key)
+			}
+			if len(revoked) != 0 || len(shared) != 0 {
+				t.Errorf("tab %d: %c called revoke %v / share %v", tab, key, revoked, shared)
+			}
+		}
 	}
-
-	if a.pages.HasPage(settingsDeletePage) {
-		t.Error("r opened the revoke confirmation on the settings tab")
-	}
-	if len(*calls) != 0 {
-		t.Errorf("revoke seam called %v from the settings tab", *calls)
-	}
-	assertRows(t, a, permTabIndexSettings, []string{"openrouter attribution   on", "openrouter data collection   allow", "openrouter sort   default", maxPriceDisabledRow, retentionDefaultRow})
 }
 
 const maxPriceModelID = "meta-llama/llama-3.3-70b-instruct:free"
@@ -1549,7 +1731,7 @@ func maxPriceRow(t *testing.T, a *App) string {
 }
 
 func TestSettingsPicker_MaxPriceRowShowsActiveModelCaps(t *testing.T) {
-	const label = "openrouter max price (" + maxPriceModelID + ")   "
+	const label = "max price (" + maxPriceModelID + ")   "
 	for _, tc := range []struct {
 		name   string
 		prices map[string]provider.MaxPrice
@@ -1642,7 +1824,7 @@ func TestSettingsPicker_MaxPriceEditorSubmitWritesParsedValues(t *testing.T) {
 	if a.app.GetFocus() != a.settingsPicker.list || a.settingsPicker.list.GetCurrentItem() != settingsRowMaxPrice {
 		t.Fatal("submit did not return focus to the max price row")
 	}
-	if got, wantRow := maxPriceRow(t, a), "openrouter max price ("+maxPriceModelID+")   input $0.5 / output $2 per M tokens"; got != wantRow {
+	if got, wantRow := maxPriceRow(t, a), "max price ("+maxPriceModelID+")   input $0.5 / output $2 per M tokens"; got != wantRow {
 		t.Errorf("max price row = %q, want %q", got, wantRow)
 	}
 	if a.NoticeText() != "" {
@@ -1663,13 +1845,13 @@ func TestSettingsPicker_MaxPriceEditorBothEmptyRemovesTheCap(t *testing.T) {
 	if !slices.Equal(f.wrote, []string{maxPriceWrite(maxPriceModelID, provider.MaxPrice{})}) {
 		t.Fatalf("writes = %v, want one removal", f.wrote)
 	}
-	if got, want := maxPriceRow(t, a), "openrouter max price ("+maxPriceModelID+")   none"; got != want {
+	if got, want := maxPriceRow(t, a), "max price ("+maxPriceModelID+")   none"; got != want {
 		t.Errorf("max price row = %q, want %q", got, want)
 	}
 }
 
 func TestSettingsPicker_MaxPriceEditorRejectsInvalidInput(t *testing.T) {
-	stored := "openrouter max price (" + maxPriceModelID + ")   input $1 / output none per M tokens"
+	stored := "max price (" + maxPriceModelID + ")   input $1 / output none per M tokens"
 	for _, tc := range []struct{ prompt, completion, notice string }{
 		{"abc", "", `couldn't change the openrouter max price setting: input "abc" is not a number of at least 0`},
 		{"1", "-0.5", `couldn't change the openrouter max price setting: output "-0.5" is not a number of at least 0`},
@@ -1710,7 +1892,7 @@ func TestSettingsPicker_MaxPriceFailedWriteKeepsStoredRowAndNotifies(t *testing.
 	if len(f.wrote) != 1 {
 		t.Fatalf("writes = %v, want exactly one attempt", f.wrote)
 	}
-	if got, want := maxPriceRow(t, a), "openrouter max price ("+maxPriceModelID+")   none"; got != want {
+	if got, want := maxPriceRow(t, a), "max price ("+maxPriceModelID+")   none"; got != want {
 		t.Errorf("max price row = %q, want the stored %q", got, want)
 	}
 	if want := "couldn't change the openrouter max price setting: write_error: no space left"; a.NoticeText() != want {
@@ -1741,8 +1923,33 @@ func TestSettingsPicker_EscClosesOnlyTheMaxPriceEditor(t *testing.T) {
 	if len(f.wrote) != 0 {
 		t.Errorf("writes = %v, want none after ESC", f.wrote)
 	}
-	if got := maxPriceRow(t, a); got != "openrouter max price ("+maxPriceModelID+")   none" {
+	if got := maxPriceRow(t, a); got != "max price ("+maxPriceModelID+")   none" {
 		t.Errorf("max price row = %q, want it unchanged", got)
+	}
+}
+
+func settingsEditorTitle(t *testing.T, a *App) string {
+	t.Helper()
+	page, ok := a.pages.GetPage(settingsDeletePage).(*tview.Flex)
+	if !ok {
+		t.Fatal("no editor open")
+	}
+	return page.GetItem(1).(*tview.Flex).GetItem(1).(*tview.Flex).GetTitle()
+}
+
+func TestSettingsPicker_ShortRowLabelsKeepEditorTitles(t *testing.T) {
+	a := New(nil)
+	openSettingsTab(a, maxPriceSettings(nil))
+	openMaxPriceEditor(t, a)
+	if got, want := settingsEditorTitle(t, a), " openrouter max price per M tokens ("+maxPriceModelID+") "; got != want {
+		t.Errorf("max price editor title = %q, want %q", got, want)
+	}
+
+	b := New(nil)
+	openRetentionTab(t, b, &fakeRetention{days: 30})
+	pressEnterOnRow(t, b, 0)
+	if got, want := settingsEditorTitle(t, b), " session retention (days) "; got != want {
+		t.Errorf("retention editor title = %q, want %q", got, want)
 	}
 }
 
@@ -1776,12 +1983,12 @@ func openRetentionTab(t *testing.T, a *App, f *fakeRetention) {
 }
 
 func retentionRow(a *App) string {
-	return permissionsRowsOnTab(a)[settingsRowRetention]
+	return permissionsRowsOnTab(a)[0]
 }
 
 func submitRetentionEditor(t *testing.T, a *App, text string) {
 	t.Helper()
-	pressEnterOnRow(t, a, settingsRowRetention)
+	pressEnterOnRow(t, a, 0)
 	field := a.settingsPicker.retention
 	if !a.pages.HasPage(settingsDeletePage) || field == nil || a.app.GetFocus() != field {
 		t.Fatal("Enter on the retention row opened no focused editor")
@@ -1799,16 +2006,32 @@ func answerRetentionConfirm(t *testing.T, a *App, key tcell.Key) {
 	modal.InputHandler()(tcell.NewEventKey(key, 0, tcell.ModNone), func(p tview.Primitive) { a.app.SetFocus(p) })
 }
 
-func TestSettingsPicker_RetentionRowShowsCurrentValueAfterSettingsRows(t *testing.T) {
+func TestSettingsPicker_SettingsTabListsOnlyRetention(t *testing.T) {
 	a := New(nil)
 	openRetentionTab(t, a, &fakeRetention{days: 30})
-	rows := permissionsRowsOnTab(a)
-	if len(rows) != settingsRowRetention+1 || rows[settingsRowMaxPrice] != maxPriceDisabledRow {
-		t.Fatalf("settings rows = %q, want max price then retention last", rows)
+	assertRows(t, a, permTabIndexSettings, []string{"session retention (days)   30"})
+}
+
+func TestSettingsPicker_EnterOnRetentionNeverTogglesAttribution(t *testing.T) {
+	a := New(nil)
+	or := &fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"}
+	f := &fakeRetention{days: 30}
+	NewSettingsPicker(a, or.seam(), f.seam()).Present(unlayeredPermissionRows(permissionsFixture()), SettingsDeps{})
+	a.stepSettingsTab(-1)
+
+	pressEnterOnRow(t, a, 0)
+	if !a.pages.HasPage(settingsDeletePage) || a.settingsPicker.retention == nil {
+		t.Fatal("Enter on the retention row opened no retention editor")
 	}
-	if got := retentionRow(a); got != "session retention (days)   30" {
-		t.Errorf("retention row = %q, want the current value", got)
+	if len(or.wrote) != 0 || len(f.wrote) != 0 {
+		t.Errorf("Enter on the retention row wrote %v / %v, want nothing before submit", or.wrote, f.wrote)
 	}
+	a.cancelSettingsDelete()
+	submitRetentionEditor(t, a, "45")
+	if len(or.wrote) != 0 || !slices.Equal(f.wrote, []int{45}) {
+		t.Errorf("writes = %v / %v, want only retention 45", or.wrote, f.wrote)
+	}
+	assertRows(t, a, permTabIndexSettings, []string{"session retention (days)   45"})
 }
 
 func TestSettingsPicker_RetentionEditorRaisesWithoutConfirm(t *testing.T) {
@@ -1817,7 +2040,7 @@ func TestSettingsPicker_RetentionEditorRaisesWithoutConfirm(t *testing.T) {
 		f := &fakeRetention{days: 30}
 		openRetentionTab(t, a, f)
 
-		pressEnterOnRow(t, a, settingsRowRetention)
+		pressEnterOnRow(t, a, 0)
 		if got := a.settingsPicker.retention.GetText(); got != "30" {
 			t.Fatalf("editor text = %q, want the current value", got)
 		}
@@ -1834,7 +2057,7 @@ func TestSettingsPicker_RetentionEditorRaisesWithoutConfirm(t *testing.T) {
 		if got := retentionRow(a); got != "session retention (days)   "+want {
 			t.Errorf("retention row = %q, want %s", got, want)
 		}
-		if a.app.GetFocus() != a.settingsPicker.list || a.settingsPicker.list.GetCurrentItem() != settingsRowRetention {
+		if a.app.GetFocus() != a.settingsPicker.list || a.settingsPicker.list.GetCurrentItem() != 0 {
 			t.Error("submit did not return focus to the retention row")
 		}
 		if a.NoticeText() != "" {
@@ -1897,7 +2120,7 @@ func TestSettingsPicker_RetentionLoweringAsksFirst(t *testing.T) {
 	if got := retentionRow(a); got != "session retention (days)   14" {
 		t.Errorf("retention row after confirming = %q, want 14", got)
 	}
-	if a.app.GetFocus() != a.settingsPicker.list || a.settingsPicker.list.GetCurrentItem() != settingsRowRetention {
+	if a.app.GetFocus() != a.settingsPicker.list || a.settingsPicker.list.GetCurrentItem() != 0 {
 		t.Error("confirming did not return focus to the retention row")
 	}
 }
@@ -2022,6 +2245,7 @@ func TestSettingsPicker_ShareOfferedOnlyOnApprovedLocalRow(t *testing.T) {
 		{name: "global row", rows: layeredRowsFixture(), selected: &globalRow, approved: true, share: share},
 		{name: "unlayered session row", rows: layeredRowsFixture(), selected: &sessionRow, approved: true, share: share},
 		{name: "empty tab placeholder", rows: []PermissionRow{localFolderRow}, tab: permTabIndexHosts, approved: true, share: share},
+		{name: "openrouter tab", rows: layeredRowsFixture(), tab: permTabIndexOpenRouter, approved: true, share: share},
 		{name: "settings tab", rows: layeredRowsFixture(), tab: permTabIndexSettings, approved: true, share: share},
 		{name: "local row without an explicit approval", rows: layeredRowsFixture(), selected: &localFolderRow, share: share},
 		{name: "local row with no share seam", rows: layeredRowsFixture(), selected: &localFolderRow, approved: true},
@@ -2208,6 +2432,20 @@ func TestSettingsPicker_ShareConfirmCancelWritesNothingAndConfirmShares(t *testi
 	})
 	screen.InjectKey(tcell.KeyRune, 's', tcell.ModNone)
 	waitPage(true)
+	var confirm string
+	var sharedBeforeConfirm int
+	onLoop(func() {
+		if modal, ok := a.pages.GetPage(settingsDeletePage).(*tview.Modal); ok {
+			confirm = strings.Join(strings.Fields(strings.ReplaceAll(modalScreenText(t, modal), "║", " ")), " ")
+		}
+		sharedBeforeConfirm = len(shared)
+	})
+	for _, want := range []string{"It covers the folder /proj.", "Everyone who approves this repository receives it."} {
+		if !strings.Contains(confirm, want) || sharedBeforeConfirm != 0 || snapshot() != before {
+			a.app.Stop()
+			t.Fatalf("confirmation = %q with %d share calls, files changed %v; want %q shown before any write", confirm, sharedBeforeConfirm, snapshot() != before, want)
+		}
+	}
 	screen.InjectKey(tcell.KeyRight, 0, tcell.ModNone)
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 	waitPage(false)
@@ -2446,9 +2684,9 @@ func TestSettingsPicker_SortRowShowsEstimateForEachMode(t *testing.T) {
 		est    provider.OpenRouterEstimate
 		want   string
 	}{
-		{"default", provider.OpenRouterEstimate{PromptPerM: 0.04, CompletionPerM: 0.15, Discount: 0.8}, "openrouter sort   default (about $0.04 / $0.15 per M, 80% off)"},
-		{"throughput", provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2.5}, "openrouter sort   throughput (about $1 / $2.5 per M)"},
-		{"best_value", provider.OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.32}, "openrouter sort   best value (about $0.1 / $0.32 per M)"},
+		{"default", provider.OpenRouterEstimate{PromptPerM: 0.04, CompletionPerM: 0.15, Discount: 0.8}, "sort   default (about $0.04 / $0.15 per M, 80% off)"},
+		{"throughput", provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2.5}, "sort   throughput (about $1 / $2.5 per M)"},
+		{"best_value", provider.OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.32}, "sort   best value (about $0.1 / $0.32 per M)"},
 	} {
 		est := &fakeSortEstimates{ready: map[string]provider.OpenRouterEstimate{maxPriceModelID + " " + tc.stored: tc.est}}
 		a := New(nil)
@@ -2498,7 +2736,7 @@ func TestSettingsPicker_SortRowWithoutEstimateShowsModeAlone(t *testing.T) {
 			f.activeProvider, f.activeModel = tc.provider, tc.model
 			a := New(nil)
 			openSettingsTab(a, f)
-			if got := sortRow(a); got != "openrouter sort   default" {
+			if got := sortRow(a); got != "sort   default" {
 				t.Errorf("sort row = %q, want the mode alone", got)
 			}
 			if len(est.calls) != tc.wantCalls {
@@ -2513,7 +2751,7 @@ func TestSettingsPicker_FetchedEstimateRedrawsTheOpenSettingsTab(t *testing.T) {
 	a := New(nil)
 	openSettingsTab(a, estimateSettings("best_value", est))
 	a.settingsPicker.list.SetCurrentItem(settingsRowMaxPrice)
-	if got := sortRow(a); got != "openrouter sort   best value" {
+	if got := sortRow(a); got != "sort   best value" {
 		t.Fatalf("sort row before the fetch = %q", got)
 	}
 	if len(est.fetched) != 1 {
@@ -2522,7 +2760,7 @@ func TestSettingsPicker_FetchedEstimateRedrawsTheOpenSettingsTab(t *testing.T) {
 
 	est.ready = map[string]provider.OpenRouterEstimate{maxPriceModelID + " best_value": {PromptPerM: 0.1, CompletionPerM: 0.32}}
 	est.fetched[0]()
-	if got := sortRow(a); got != "openrouter sort   best value (about $0.1 / $0.32 per M)" {
+	if got := sortRow(a); got != "sort   best value (about $0.1 / $0.32 per M)" {
 		t.Fatalf("sort row after the fetch = %q", got)
 	}
 	if got := a.settingsPicker.list.GetCurrentItem(); got != settingsRowMaxPrice {
@@ -2543,7 +2781,7 @@ func TestSettingsPicker_FetchedEstimateIgnoresASwitchedModel(t *testing.T) {
 	}
 	calls := len(est.calls)
 	est.fetched[0]()
-	if got := sortRow(a); got != "openrouter sort   default" {
+	if got := sortRow(a); got != "sort   default" {
 		t.Errorf("sort row after the previous model's fetch = %q, want the mode alone", got)
 	}
 	if len(est.calls) != calls {
@@ -2567,7 +2805,22 @@ func TestSettingsPicker_FetchedEstimateAfterCloseOrTabChangeIsInert(t *testing.T
 			if len(est.calls) != calls {
 				t.Errorf("estimate calls after leaving the tab = %v, want none added", est.calls[calls:])
 			}
+			if a.settingsPicker != nil {
+				assertRows(t, a, permTabIndexSettings, []string{retentionDefaultRow})
+			}
 		})
+	}
+}
+
+func TestSettingsPicker_SettingsTabBuildsNoEstimate(t *testing.T) {
+	est := &fakeSortEstimates{}
+	a := New(nil)
+	a.openRouterSettings = estimateSettings("default", est).seam()
+	openEntryPicker(a, permissionsFixture(), nil, nil)
+	a.settingsPicker.activeTab = permTabIndexSettings
+	a.renderSettingsTab()
+	if len(est.calls) != 0 {
+		t.Errorf("estimate calls rendering the settings tab = %v, want none", est.calls)
 	}
 }
 
@@ -2585,8 +2838,8 @@ func TestSettingsPicker_EnterOnSortRowChangesTheEstimate(t *testing.T) {
 		"default (about $0.1 / $0.2 per M)",
 	} {
 		pressEnterOnRow(t, a, settingsRowSort)
-		if got := sortRow(a); got != "openrouter sort   "+want {
-			t.Errorf("sort row = %q, want %q", got, "openrouter sort   "+want)
+		if got := sortRow(a); got != "sort   "+want {
+			t.Errorf("sort row = %q, want %q", got, "sort   "+want)
 		}
 	}
 }

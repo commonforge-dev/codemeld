@@ -74,7 +74,7 @@ func TestEmitTurnStart_CleanTurn(t *testing.T) {
 	}
 
 	// A successful turn is finished by a model_response carrying no anomalies.
-	if err := EmitModelResponse(store, sel.Provider, sel.ID, 100, 50, nil, false, nil, ""); err != nil {
+	if err := EmitModelResponse(store, sel.Provider, sel.ID, 100, 50, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("EmitModelResponse() error = %v", err)
 	}
 	resps := kindEvents(t, store, events.KindModelResponse)
@@ -371,7 +371,7 @@ func TestUsageFromStreamUsage(t *testing.T) {
 			if err := json.Unmarshal([]byte(tt.chunk), &chunk); err != nil {
 				t.Fatalf("unmarshal chunk: %v", err)
 			}
-			in, out, cached, anoms := UsageFromStreamUsage(chunk.Usage, chunk.JSON.Usage.Valid())
+			in, out, cached, _, anoms := UsageFromStreamUsage(chunk.Usage, chunk.JSON.Usage.Valid())
 			if in != tt.wantIn || out != tt.wantOut {
 				t.Fatalf("tokens = (%d, %d), want (%d, %d)", in, out, tt.wantIn, tt.wantOut)
 			}
@@ -382,7 +382,7 @@ func TestUsageFromStreamUsage(t *testing.T) {
 				t.Fatalf("anomalies = %v, want %v", anoms, tt.wantAnoms)
 			}
 			// A zero-value usage with usageValid=false is the interrupted-stream fallback.
-			if err := EmitModelResponse(newTurnStore(), "openai", "gpt-5", in, out, cached, false, anoms, ""); err != nil {
+			if err := EmitModelResponse(newTurnStore(), "openai", "gpt-5", in, out, cached, false, nil, false, anoms, ""); err != nil {
 				t.Fatalf("EmitModelResponse() rejected normalized stream usage: %v", err)
 			}
 		})
@@ -456,7 +456,7 @@ func TestUsageAccumulator_CachedTotals(t *testing.T) {
 			for _, raw := range tt.rounds {
 				acc.Add(usageChunkOf(t, raw))
 			}
-			_, _, cached, partial, anoms, _ := acc.Totals()
+			_, _, cached, partial, _, _, anoms, _ := acc.Totals()
 			if !sameCached(cached, tt.wantCached) {
 				t.Fatalf("cached total = %s, want %s", showCached(cached), showCached(tt.wantCached))
 			}
@@ -475,7 +475,7 @@ func TestUsageAccumulator_MissingUsageRoundMarksCachedPartial(t *testing.T) {
 	acc.Add(usageChunkOf(t, cachedRoundJSON))
 	acc.Add(openai.CompletionUsage{}, false)
 
-	_, _, cached, partial, anoms, _ := acc.Totals()
+	_, _, cached, partial, _, _, anoms, _ := acc.Totals()
 	if !sameCached(cached, ptrInt64(80)) {
 		t.Fatalf("cached total = %s, want 80", showCached(cached))
 	}
@@ -487,15 +487,104 @@ func TestUsageAccumulator_MissingUsageRoundMarksCachedPartial(t *testing.T) {
 	}
 }
 
+func TestUsageFromStreamUsage_Cost(t *testing.T) {
+	tests := []struct {
+		name     string
+		cost     string
+		wantCost *float64
+	}{
+		{name: "reported", cost: `,"cost":0.00123`, wantCost: ptrFloat64(0.00123)},
+		{name: "reported-zero", cost: `,"cost":0`, wantCost: ptrFloat64(0)},
+		{name: "absent"},
+		{name: "string", cost: `,"cost":"0.5"`},
+		{name: "negative", cost: `,"cost":-0.5`},
+		{name: "null", cost: `,"cost":null`},
+		{name: "out-of-range", cost: `,"cost":1e400`},
+		{name: "bool", cost: `,"cost":true`},
+		{name: "object", cost: `,"cost":{}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := `{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12` + tt.cost + `}}`
+			_, _, _, cost, anoms := UsageFromStreamUsage(usageChunkOf(t, raw))
+			if !sameCost(cost, tt.wantCost) {
+				t.Fatalf("cost = %s, want %s", showCost(cost), showCost(tt.wantCost))
+			}
+			if anoms != nil {
+				t.Fatalf("anomalies = %v, want none (cost is never usage_missing)", anoms)
+			}
+		})
+	}
+}
+
+func costRoundJSON(cost string) string {
+	return `{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":` + cost + `}}`
+}
+
+func TestUsageAccumulator_CostTotals(t *testing.T) {
+	tests := []struct {
+		name        string
+		rounds      []string
+		noUsage     bool
+		wantCost    *float64
+		wantPartial bool
+	}{
+		{name: "empty"},
+		{name: "all-missing", rounds: []string{uncachedRoundJSON, uncachedRoundJSON}},
+		{name: "all-reported", rounds: []string{costRoundJSON("0.25"), costRoundJSON("0.5")}, wantCost: ptrFloat64(0.75)},
+		{name: "all-reported-zero", rounds: []string{costRoundJSON("0"), costRoundJSON("0")}, wantCost: ptrFloat64(0)},
+		{name: "one-missing", rounds: []string{costRoundJSON("0.25"), uncachedRoundJSON}, wantCost: ptrFloat64(0.25), wantPartial: true},
+		{name: "no-usage-round", rounds: []string{costRoundJSON("0.25")}, noUsage: true, wantCost: ptrFloat64(0.25), wantPartial: true},
+		{name: "overflow-keeps-subtotal", rounds: []string{costRoundJSON("1.7e308"), costRoundJSON("1.7e308")}, wantCost: ptrFloat64(1.7e308), wantPartial: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var acc UsageAccumulator
+			for _, raw := range tt.rounds {
+				acc.Add(usageChunkOf(t, raw))
+			}
+			if tt.noUsage {
+				acc.Add(openai.CompletionUsage{}, false)
+			}
+			_, _, _, _, cost, partial, anoms, _ := acc.Totals()
+			if !sameCost(cost, tt.wantCost) {
+				t.Fatalf("cost = %s, want %s", showCost(cost), showCost(tt.wantCost))
+			}
+			if partial != tt.wantPartial {
+				t.Fatalf("costPartial = %v, want %v", partial, tt.wantPartial)
+			}
+			if !tt.noUsage && anoms != nil {
+				t.Fatalf("anomalies = %v, want none", anoms)
+			}
+		})
+	}
+}
+
+func ptrFloat64(v float64) *float64 { return &v }
+
+func sameCost(got, want *float64) bool {
+	if got == nil || want == nil {
+		return got == nil && want == nil
+	}
+	return *got == *want
+}
+
+func showCost(v *float64) string {
+	if v == nil {
+		return "nil (not reported)"
+	}
+	return fmt.Sprintf("%v", *v)
+}
+
 func TestEmitModelResponse_CachedRoundTrip(t *testing.T) {
 	store := newTurnStore()
-	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, ptrInt64(0), false, nil, ""); err != nil {
+	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, ptrInt64(0), false, nil, false, nil, ""); err != nil {
 		t.Fatalf("EmitModelResponse() rejected a reported zero: %v", err)
 	}
-	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, ptrInt64(80), true, nil, ""); err != nil {
+	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, ptrInt64(80), true, nil, false, nil, ""); err != nil {
 		t.Fatalf("EmitModelResponse() rejected a partial total: %v", err)
 	}
-	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, nil, false, nil, ""); err != nil {
+	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("EmitModelResponse() rejected a not-reported total: %v", err)
 	}
 
@@ -532,10 +621,10 @@ func TestEmitModelResponse_UpstreamProviderRoundTrip(t *testing.T) {
 	store := sessions.New(path, &sessions.Session{Metadata: sessions.Metadata{
 		ID: ids.NewV7(), Folder: filepath.Dir(path), StartedAt: now, UpdatedAt: now, SchemaVersion: sessions.CurrentSchemaVersion,
 	}})
-	if err := EmitModelResponse(store, "openrouter", "m", 10, 5, nil, false, nil, "Groq"); err != nil {
+	if err := EmitModelResponse(store, "openrouter", "m", 10, 5, nil, false, nil, false, nil, "Groq"); err != nil {
 		t.Fatalf("EmitModelResponse() error = %v", err)
 	}
-	if err := EmitModelResponse(store, "openai", "gpt-5", 10, 5, nil, false, nil, ""); err != nil {
+	if err := EmitModelResponse(store, "openai", "gpt-5", 10, 5, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("EmitModelResponse() error = %v", err)
 	}
 	if _, _, err := store.Flush(context.Background()); err != nil {
@@ -573,13 +662,13 @@ func TestSumModelResponseTokens(t *testing.T) {
 	store := newTurnStore()
 	// Two completed turns plus an interrupted turn (no model_response) and an
 	// unrelated event: only the model_response records contribute.
-	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, nil, false, nil, ""); err != nil {
+	if err := EmitModelResponse(store, "openai", "gpt-5", 100, 50, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("EmitModelResponse() error = %v", err)
 	}
 	if err := EmitModelTurn(store, "openai", "gpt-5", EffortDefault, SourceProject); err != nil {
 		t.Fatalf("EmitModelTurn() error = %v", err)
 	}
-	if err := EmitModelResponse(store, "openai", "gpt-5", 7, 3, nil, false, []string{anomalyUsageMissing}, ""); err != nil {
+	if err := EmitModelResponse(store, "openai", "gpt-5", 7, 3, nil, false, nil, false, []string{anomalyUsageMissing}, ""); err != nil {
 		t.Fatalf("EmitModelResponse() error = %v", err)
 	}
 

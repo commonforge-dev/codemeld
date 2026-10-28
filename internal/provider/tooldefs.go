@@ -259,7 +259,7 @@ func BashToolDefinition() ToolDefinition {
 	return ToolDefinition{
 		Name: bashToolName,
 		Description: "Run a shell command and return its output. Structured tools come first: reach for bash only when no structured tool covers the operation, such as a build, a test run, or file inspection no structured tool provides. " +
-			"Issue independent operations as separate bash calls, in parallel where they do not depend on each other, instead of joining them into one command with `;`, and do not add `echo`/`printf` separator labels or exit-status wrappers such as `echo \"exit=$?\"`. " +
+			"Issue independent operations as separate bash calls, in parallel where they do not depend on each other, instead of joining them into one command with `;`, `&&` or `||` (a single leading `cd <folder> &&` is fine), and do not add `echo`/`printf` separator labels or exit-status wrappers such as `echo \"exit=$?\"`. " +
 			"Do not append `2>/dev/null` or other output redirections to hide stderr: stderr is returned to you with the result and is usually the part worth reading, and a redirection sends a command that would otherwise run directly through an extra `sh -c` layer.",
 		Parameters: map[string]any{
 			"type": "object",
@@ -267,6 +267,12 @@ func BashToolDefinition() ToolDefinition {
 				"command": map[string]any{
 					"type":        "string",
 					"description": "The shell command line to execute.",
+				},
+				"timeout": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"maximum":     1800000,
+					"description": "Time limit in milliseconds. Defaults to 600000 (10 minutes); the maximum is 1800000 (30 minutes). A command still running at the limit is killed and its output so far is returned.",
 				},
 			},
 			"required":             []string{"command"},

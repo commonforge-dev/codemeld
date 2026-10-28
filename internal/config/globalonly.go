@@ -53,6 +53,9 @@ func firstGlobalOnlyViolation(m map[string]any) (string, bool) {
 	if _, ok := m["attribution"]; ok {
 		return "attribution", true
 	}
+	if _, ok := m["system_one"]; ok {
+		return "system_one", true
+	}
 	if v, ok := m["confinement"]; ok {
 		return topLevelViolationKey("confinement", v), true
 	}

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"codemeld.dev/codemeld/internal/fserrors"
 	"codemeld.dev/codemeld/internal/fsutil"
@@ -596,14 +597,14 @@ func TestNewCache_WritableFoldersUseOnlyTheSuppliedHome(t *testing.T) {
 	}
 	for _, omitted := range [][]string{nil, {""}} {
 		c, out := writableCache(t, composed, "/proj", omitted...)
-		if len(c.WritableFolders()) != 0 || strings.Contains(out, "writable_folders") {
-			t.Fatalf("home %q: writableFolders = %q, stderr = %q; want none and no notice", omitted, c.WritableFolders(), out)
+		if len(c.writableFolders) != 0 || strings.Contains(out, "writable_folders") {
+			t.Fatalf("home %q: writableFolders = %q, stderr = %q; want none and no notice", omitted, c.writableFolders, out)
 		}
 	}
 
 	c, out := writableCache(t, composed, "/proj", home)
-	if want := []string{filepath.Join(home, "w"), home}; !reflect.DeepEqual(c.WritableFolders(), want) {
-		t.Fatalf("writableFolders = %q, want only the supplied home's %q", c.WritableFolders(), want)
+	if want := []string{filepath.Join(home, "w"), home}; !reflect.DeepEqual(c.writableFolders, want) {
+		t.Fatalf("writableFolders = %q, want only the supplied home's %q", c.writableFolders, want)
 	}
 	if strings.Count(out, "codemeld: writable_folders:") != 3 || !strings.Contains(out, `"~/": confined Auto commands`) ||
 		!strings.Contains(out, filepath.Join(home, ".codemeld")) || !strings.Contains(out, `"relative": must be an absolute path`) || strings.Contains(out, ambient) {
@@ -611,17 +612,17 @@ func TestNewCache_WritableFoldersUseOnlyTheSuppliedHome(t *testing.T) {
 	}
 }
 
-func TestCache_WritableFoldersReturnsACopy(t *testing.T) {
-	folder := resolvedTempDir(t)
-	composed, err := Compose(nil, map[string]any{writableFoldersKey: []any{folder}})
-	if err != nil {
-		t.Fatalf("Compose: %v", err)
-	}
-	c, _ := writableCache(t, composed, resolvedTempDir(t), resolvedTempDir(t))
-	got := c.WritableFolders()
-	got[0] = "/mutated"
-	if again := c.WritableFolders(); !reflect.DeepEqual(again, []string{folder}) {
-		t.Fatalf("WritableFolders() after mutating a returned slice = %q, want %q", again, []string{folder})
+func TestCache_LaunchHomeIsOnlyTheSuppliedHome(t *testing.T) {
+	home := resolvedTempDir(t)
+	t.Setenv("HOME", resolvedTempDir(t))
+	for _, tc := range []struct {
+		supplied []string
+		want     string
+	}{{nil, ""}, {[]string{""}, ""}, {[]string{home}, home}} {
+		c, _ := writableCache(t, map[string]any{}, "/proj", tc.supplied...)
+		if got := c.LaunchHome(); got != tc.want {
+			t.Fatalf("supplied %q: LaunchHome() = %q, want %q", tc.supplied, got, tc.want)
+		}
 	}
 }
 
@@ -925,8 +926,11 @@ func TestDiscoveredConfiguredModelsReconstructsModalities(t *testing.T) {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	layerPaths := []string{settings}
-	got := discoveredConfiguredModels(layerPaths)
+	store, err := ReadDiscoveredModels(modelsPath)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	got := discoveredConfiguredModels(store)
 	venice := got["venice"]
 	if len(venice) != 2 {
 		t.Fatalf("venice models = %+v, want two (blank id skipped)", venice)
@@ -948,7 +952,11 @@ func TestDiscoveredConfiguredModelsReconstructsModalities(t *testing.T) {
 	}
 
 	venice[0].InputModalities[0] = "tampered"
-	fresh := discoveredConfiguredModels(layerPaths)
+	again, err := ReadDiscoveredModels(modelsPath)
+	if err != nil {
+		t.Fatalf("re-read store: %v", err)
+	}
+	fresh := discoveredConfiguredModels(again)
 	if m := fresh["venice"][0].InputModalities[0]; m != "image" {
 		t.Errorf("fresh read modality = %q, want image (returned slice aliased the store)", m)
 	}
@@ -1255,6 +1263,243 @@ func TestCacheSetAttribution_WriteFailureLeavesDiskAndSessionUnchanged(t *testin
 	}
 	if after := readAt(t, global); after != seed {
 		t.Errorf("failed write changed bytes:\n%q\nwant\n%q", after, seed)
+	}
+}
+
+var validatedSystemOneNames = []string{"openrouter:typesafe/jev-1.13", "venice:jev-latest", "openrouter:liquid/d1"}
+
+func systemOneOnDisk(t *testing.T, path string) any {
+	t.Helper()
+	_, raw, cat, err := LoadYAML(path)
+	if cat != LoadOK || err != nil {
+		t.Fatalf("LoadYAML(%s) = (%q, %v)", path, cat, err)
+	}
+	return raw[KeySystemOne]
+}
+
+func TestCacheSystemOne_LoadsFromGlobalFile(t *testing.T) {
+	for _, name := range append([]string{"off"}, validatedSystemOneNames...) {
+		t.Run(name, func(t *testing.T) {
+			global := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, global, fmt.Sprintf("system_one: %q\n", name))
+			_, raw, cat, err := LoadYAML(global)
+			if cat != LoadOK || err != nil {
+				t.Fatalf("LoadYAML = (%q, %v)", cat, err)
+			}
+			if got := newCacheOrFatal(t, raw, "/r", []string{global}).SystemOne(); got != name {
+				t.Errorf("SystemOne() = %q, want %q", got, name)
+			}
+		})
+	}
+	if got := newCacheOrFatal(t, map[string]any{}, "/r", nil).SystemOne(); got != "off" {
+		t.Errorf("SystemOne() with the key absent = %q, want off", got)
+	}
+}
+
+func TestCacheSetSystemOne_WritesGlobalLayerAndPublishesToSession(t *testing.T) {
+	dir := t.TempDir()
+	global := filepath.Join(dir, "settings.yaml")
+	project := filepath.Join(dir, "project-settings.yaml")
+	writeAt(t, project, "model:\n  active:\n    provider: openai\n    id: gpt-5\n")
+	projectBefore := readAt(t, project)
+	const seed = "# keep me\nattribution: false # trailing note\n"
+	writeAt(t, global, seed)
+
+	c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global, project})
+	other := newCacheOrFatal(t, map[string]any{}, "/r", []string{global, project})
+
+	for _, name := range append(validatedSystemOneNames, "off") {
+		if reason, cat, err := c.SetSystemOne(name); reason != ReasonNone || err != nil {
+			t.Fatalf("SetSystemOne(%q) = (%q, %q, %v), want success", name, reason, cat, err)
+		}
+		if got := c.SystemOne(); got != name {
+			t.Errorf("SystemOne() after SetSystemOne(%q) = %q", name, got)
+		}
+		if got := systemOneOnDisk(t, global); got != name {
+			t.Errorf("system_one on disk = %#v, want %q", got, name)
+		}
+		if after := readAt(t, global); !strings.HasPrefix(after, seed) {
+			t.Errorf("unrelated bytes changed:\n%q\nwant prefix\n%q", after, seed)
+		}
+	}
+	if after := readAt(t, project); after != projectBefore {
+		t.Errorf("project layer changed by a global-only write:\n%q\nwant\n%q", after, projectBefore)
+	}
+	if reason, _, err := c.SetSystemOne("venice:jev-latest"); reason != ReasonNone || err != nil {
+		t.Fatalf("SetSystemOne = (%q, %v)", reason, err)
+	}
+	if got := other.SystemOne(); got != "off" {
+		t.Errorf("a second cache sharing the global file reloaded the write: %q", got)
+	}
+}
+
+func TestCacheSetSystemOne_NoGlobalLayerFailsClosed(t *testing.T) {
+	for _, layers := range [][]string{nil, {""}} {
+		c := newCacheOrFatal(t, map[string]any{}, "/r", layers)
+		reason, cat, err := c.SetSystemOne("venice:jev-latest")
+		if reason != ReasonRereadParseError || cat != "" || err == nil {
+			t.Fatalf("layers %q: = (%q, %q, %v), want (reread_parse_error, \"\", error)", layers, reason, cat, err)
+		}
+		if got := c.SystemOne(); got != "off" {
+			t.Errorf("layers %q: cached selection changed on a fail-closed write: %q", layers, got)
+		}
+	}
+}
+
+func TestCacheSetSystemOne_ConcurrentGetAndSet(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "settings.yaml")
+	c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global})
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if reason, _, err := c.SetSystemOne(validatedSystemOneNames[i%len(validatedSystemOneNames)]); reason != ReasonNone || err != nil {
+				t.Errorf("SetSystemOne = (%q, %v)", reason, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_ = c.SystemOne()
+		}()
+	}
+	wg.Wait()
+	if got := c.SystemOne(); got != systemOneOnDisk(t, global) {
+		t.Errorf("SystemOne() = %q, disk = %#v", got, systemOneOnDisk(t, global))
+	}
+}
+
+func TestCacheSetSystemOne_SecondSetterCannotOvertakeFirst(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "settings.yaml")
+	c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global})
+
+	const first = "venice:jev-latest"
+	paused, release, secondPersisting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	releaseFirst := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseFirst)
+	orig := beforeSystemOnePublish
+	t.Cleanup(func() { beforeSystemOnePublish = orig })
+	beforeSystemOnePublish = func(name string) {
+		if name == first {
+			close(paused)
+			<-release
+		}
+	}
+	setMergeWrite(t, func(dir *os.File, path string, source fsutil.FileSnapshot, key string, v any) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+		if v == "off" {
+			close(secondPersisting)
+		}
+		return rewriteKeyAt(dir, path, source, key, v)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if reason, _, err := c.SetSystemOne(first); reason != ReasonNone || err != nil {
+			t.Errorf("first SetSystemOne = (%q, %v)", reason, err)
+		}
+	}()
+	<-paused
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		if reason, _, err := c.SetSystemOne("off"); reason != ReasonNone || err != nil {
+			t.Errorf("second SetSystemOne = (%q, %v)", reason, err)
+		}
+	}()
+	select {
+	case <-secondPersisting:
+		t.Error("second setter entered persistence while the first was paused between Persist and publication")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseFirst()
+	<-done
+	<-secondDone
+
+	if got := c.SystemOne(); got != "off" {
+		t.Errorf("SystemOne() = %q, want the second selection", got)
+	}
+	if got := systemOneOnDisk(t, global); got != "off" {
+		t.Errorf("system_one on disk = %#v, want the second selection", got)
+	}
+}
+
+func TestCacheSetSystemOne_PrePublicationFailureLeavesDiskAndSessionUnchanged(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "settings.yaml")
+	const seed = "# keep me\nsystem_one: \"openrouter:liquid/d1\"\n"
+	writeAt(t, global, seed)
+	c := newCacheOrFatal(t, map[string]any{KeySystemOne: "openrouter:liquid/d1"}, "/r", []string{global})
+
+	sentinel := errors.New("forced temp-file sync failure")
+	restore := fsutil.SetSyncFileForTest(func(*os.File) error { return sentinel })
+	t.Cleanup(restore)
+	reason, cat, err := c.SetSystemOne("off")
+	restore()
+	if reason != ReasonWriteError || cat != fserrors.IOError || !errors.Is(err, sentinel) {
+		t.Fatalf("= (%q, %q, %v), want (write_error, io_error, wrap of sentinel)", reason, cat, err)
+	}
+	if got := c.SystemOne(); got != "openrouter:liquid/d1" {
+		t.Errorf("cached selection changed on a failed write: %q", got)
+	}
+	if after := readAt(t, global); after != seed {
+		t.Errorf("failed write changed bytes:\n%q\nwant\n%q", after, seed)
+	}
+}
+
+func TestCacheSetSystemOne_DirSyncFailureKeepsOldSessionSelection(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "settings.yaml")
+	writeAt(t, global, "system_one: \"off\"\n")
+	c := newCacheOrFatal(t, map[string]any{KeySystemOne: "off"}, "/r", []string{global})
+
+	sentinel := errors.New("forced parent dir sync failure")
+	restore := fsutil.SetSyncDirForTest(func(*os.File) error { return sentinel })
+	t.Cleanup(restore)
+	reason, cat, err := c.SetSystemOne("venice:jev-latest")
+	restore()
+	if reason != ReasonParentDirError || cat != fserrors.IOError || !errors.Is(err, sentinel) {
+		t.Fatalf("= (%q, %q, %v), want (parent_dir_error, io_error, wrap of sentinel)", reason, cat, err)
+	}
+	if got := c.SystemOne(); got != "off" {
+		t.Errorf("cached selection changed on a parent-sync failure: %q", got)
+	}
+	if got := systemOneOnDisk(t, global); got != "venice:jev-latest" {
+		t.Errorf("system_one on disk = %#v, want the already-published bytes", got)
+	}
+}
+
+func TestCacheSetSystemOne_InvalidValueLeavesDiskAndSessionUnchanged(t *testing.T) {
+	for _, value := range []string{
+		"openrouter:typesafe/jev-1.12",
+		"openrouter",
+		"",
+		"off\nattribution: false",
+		"venice:jev-latest # note",
+		"{system_one: off}",
+	} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			existing := filepath.Join(dir, "settings.yaml")
+			const seed = "# keep me\nattribution: true\n"
+			writeAt(t, existing, seed)
+			absent := filepath.Join(dir, "absent", "settings.yaml")
+
+			for _, global := range []string{existing, absent} {
+				c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global})
+				reason, _, err := c.SetSystemOne(value)
+				if reason != ReasonRereadParseError || err == nil {
+					t.Fatalf("%s: = (%q, %v), want (reread_parse_error, error)", global, reason, err)
+				}
+				if got := c.SystemOne(); got != "off" {
+					t.Errorf("%s: cached selection changed: %q", global, got)
+				}
+			}
+			if after := readAt(t, existing); after != seed {
+				t.Errorf("invalid value changed bytes:\n%q\nwant\n%q", after, seed)
+			}
+			if _, err := os.Stat(absent); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("invalid value created the absent global file: %v", err)
+			}
+		})
 	}
 }
 
@@ -1769,4 +2014,257 @@ func TestCacheOpenRouterRouting_WriteFailureLeavesCacheUnchanged(t *testing.T) {
 	if got := readAt(t, global); got != seed {
 		t.Errorf("failed write changed bytes:\n%s", got)
 	}
+}
+
+func seedVeniceWindows(t *testing.T, storePath string, models ...DiscoveredModel) {
+	t.Helper()
+	if err := UpdateDiscoveredModelsProvider(storePath, "venice", DiscoveredProvider{Models: models}); err != nil {
+		t.Fatalf("seed venice store: %v", err)
+	}
+}
+
+func veniceComposed(windows map[string]any) map[string]any {
+	entry := map[string]any{"base_url": "https://api.venice.ai/v1", "api_key": "vk-test"}
+	if windows != nil {
+		entry["context_windows"] = windows
+	}
+	return map[string]any{"provider": map[string]any{
+		"venice": entry,
+		"other":  map[string]any{"base_url": "https://other.example/v1", "api_key": "ok-test"},
+	}}
+}
+
+func TestCacheContextWindowLookup(t *testing.T) {
+	globalPath := filepath.Join(t.TempDir(), "settings.yaml")
+	storePath := DiscoveredModelsPath(globalPath)
+	if err := UpdateDiscoveredModelsProvider(storePath, provider.ChatGPTProviderID, DiscoveredProvider{
+		Models: []DiscoveredModel{{ID: "gpt-chat", ContextWindow: 400000}},
+	}); err != nil {
+		t.Fatalf("seed chatgpt store: %v", err)
+	}
+	seedVeniceWindows(t, storePath,
+		DiscoveredModel{ID: "v-disc", ContextWindow: 32768},
+		DiscoveredModel{ID: "v-zero"},
+		DiscoveredModel{ID: "v-neg", ContextWindow: -5},
+		DiscoveredModel{ID: "v-both", ContextWindow: 1000},
+	)
+	c := newCacheOrFatal(t, veniceComposed(map[string]any{
+		"v-conf": uint64(8192),
+		"v-both": uint64(4096),
+	}), t.TempDir(), []string{globalPath})
+
+	cases := []struct {
+		provider, model string
+		want            int64
+	}{
+		{provider.ChatGPTProviderID, "gpt-chat", 400000},
+		{"venice", "v-disc", 32768},
+		{"venice", "v-conf", 8192},
+		{"venice", "v-both", 4096},
+		{"venice", "v-zero", 0},
+		{"venice", "v-neg", 0},
+		{"venice", "v-missing", 0},
+		{"missing", "v-conf", 0},
+		{"other", "v-conf", 0},
+		{"other", "v-disc", 0},
+		{"venice", "gpt-chat", 0},
+		{provider.ChatGPTProviderID, "v-disc", 0},
+	}
+	for _, tc := range cases {
+		if got := c.ContextWindow(tc.provider, tc.model); got != tc.want {
+			t.Errorf("ContextWindow(%q, %q) = %d, want %d", tc.provider, tc.model, got, tc.want)
+		}
+	}
+
+	venice, ok := c.SelectableCatalog().Entry("venice")
+	if !ok {
+		t.Fatal("catalog missing venice")
+	}
+	if want := []string{"v-disc", "v-zero", "v-neg", "v-both"}; !reflect.DeepEqual(venice.Models, want) {
+		t.Errorf("venice catalog models = %v, want %v (window declarations add no model)", venice.Models, want)
+	}
+}
+
+func TestCacheContextWindowRebuilds(t *testing.T) {
+	globalPath := filepath.Join(t.TempDir(), "settings.yaml")
+	storePath := DiscoveredModelsPath(globalPath)
+	c := newCacheOrFatal(t, veniceComposed(nil), t.TempDir(), []string{globalPath})
+
+	seedVeniceWindows(t, storePath, DiscoveredModel{ID: "m1", ContextWindow: 2048})
+	if got := c.ContextWindow("venice", "m1"); got != 0 {
+		t.Fatalf("before reload ContextWindow = %d, want 0 (store read only on rebuild)", got)
+	}
+	c.ReloadDiscoveredCatalog()
+	if got := c.ContextWindow("venice", "m1"); got != 2048 {
+		t.Fatalf("after ReloadDiscoveredCatalog ContextWindow = %d, want 2048", got)
+	}
+
+	seedVeniceWindows(t, storePath, DiscoveredModel{ID: "m1", ContextWindow: 3072})
+	c.SetProvider("venice", provider.ProviderEntry{BaseURL: "u", APIKey: "k", ContextWindows: map[string]int64{"m2": 5000}})
+	if got := c.ContextWindow("venice", "m1"); got != 3072 {
+		t.Errorf("after SetProvider ContextWindow(m1) = %d, want 3072 re-read from the store", got)
+	}
+	if got := c.ContextWindow("venice", "m2"); got != 5000 {
+		t.Errorf("after SetProvider ContextWindow(m2) = %d, want the declared 5000", got)
+	}
+}
+
+func TestCacheContextWindowsIsolated(t *testing.T) {
+	c := newCacheOrFatal(t, map[string]any{}, t.TempDir(), nil)
+	want := map[string]int64{"m": 1000}
+	supplied := map[string]int64{"m": 1000}
+	c.SetProvider("venice", provider.ProviderEntry{BaseURL: "u", APIKey: "k", ContextWindows: supplied})
+
+	supplied["m"] = 99
+	supplied["x"] = 7
+	got, _ := c.Provider("venice")
+	if !reflect.DeepEqual(got.ContextWindows, want) || c.ContextWindow("venice", "m") != 1000 || c.ContextWindow("venice", "x") != 0 {
+		t.Fatalf("after mutating the SetProvider input, ContextWindows = %v, want %v", got.ContextWindows, want)
+	}
+
+	got.ContextWindows["m"] = 99
+	got.ContextWindows["x"] = 7
+	if again, _ := c.Provider("venice"); !reflect.DeepEqual(again.ContextWindows, want) {
+		t.Fatalf("after mutating the Provider result, ContextWindows = %v, want %v", again.ContextWindows, want)
+	}
+
+	all := c.Providers()
+	all["venice"].ContextWindows["m"] = 99
+	all["venice"].ContextWindows["x"] = 7
+	if again, _ := c.Provider("venice"); !reflect.DeepEqual(again.ContextWindows, want) {
+		t.Fatalf("after mutating the Providers result, ContextWindows = %v, want %v", again.ContextWindows, want)
+	}
+}
+
+func TestCacheContextWindowStoreFallback(t *testing.T) {
+	breakers := map[string]func(t *testing.T, path string){
+		"missing": func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"malformed": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("providers: [unclosed"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"unreadable": func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, breakStore := range breakers {
+		t.Run(name, func(t *testing.T) {
+			globalPath := filepath.Join(t.TempDir(), "settings.yaml")
+			storePath := DiscoveredModelsPath(globalPath)
+			seedVeniceWindows(t, storePath, DiscoveredModel{ID: "m1", ContextWindow: 2048})
+			c := newCacheOrFatal(t, veniceComposed(map[string]any{"m2": uint64(4096)}), t.TempDir(), []string{globalPath})
+			if got := c.ContextWindow("venice", "m1"); got != 2048 {
+				t.Fatalf("seeded ContextWindow = %d, want 2048", got)
+			}
+
+			breakStore(t, storePath)
+			c.ReloadDiscoveredCatalog()
+			if got := c.ContextWindow("venice", "m1"); got != 0 {
+				t.Errorf("after reload of a %s store ContextWindow(m1) = %d, want 0", name, got)
+			}
+			if got := c.ContextWindow("venice", "m2"); got != 4096 {
+				t.Errorf("after reload of a %s store ContextWindow(m2) = %d, want the declared 4096", name, got)
+			}
+			cat := c.SelectableCatalog()
+			if venice, _ := cat.Entry("venice"); len(venice.Models) != 0 {
+				t.Errorf("after reload of a %s store venice models = %v, want none", name, venice.Models)
+			}
+			if chatgpt, ok := cat.Entry(provider.ChatGPTProviderID); !ok || !chatgpt.Builtin {
+				t.Errorf("after reload of a %s store the built-in ChatGPT row = %+v, %v, want present", name, chatgpt, ok)
+			}
+
+			fresh := newCacheOrFatal(t, veniceComposed(nil), t.TempDir(), []string{globalPath})
+			if got := fresh.ContextWindow("venice", "m1"); got != 0 {
+				t.Errorf("NewCache over a %s store ContextWindow(m1) = %d, want 0", name, got)
+			}
+		})
+	}
+}
+
+func TestCacheRebuildUsesOneStoreSnapshot(t *testing.T) {
+	globalPath := filepath.Join(t.TempDir(), "settings.yaml")
+	storePath := DiscoveredModelsPath(globalPath)
+	seedVeniceWindows(t, storePath, DiscoveredModel{ID: "a", ContextWindow: 1000})
+	c := newCacheOrFatal(t, veniceComposed(nil), t.TempDir(), []string{globalPath})
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			m := DiscoveredModel{ID: "a", ContextWindow: 1000}
+			if i%2 == 0 {
+				m = DiscoveredModel{ID: "b", ContextWindow: 2000}
+			}
+			if err := UpdateDiscoveredModelsProvider(storePath, "venice", DiscoveredProvider{Models: []DiscoveredModel{m}}); err != nil {
+				t.Errorf("rewrite store: %v", err)
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		wg.Wait()
+	}()
+
+	want := map[string]int64{"a": 1000, "b": 2000}
+	for i := 0; i < 300; i++ {
+		c.ReloadDiscoveredCatalog()
+		venice, _ := c.SelectableCatalog().Entry("venice")
+		if len(venice.Models) != 1 {
+			t.Fatalf("reload %d: venice models = %v, want exactly one", i, venice.Models)
+		}
+		listed := venice.Models[0]
+		for id, w := range want {
+			expect := int64(0)
+			if id == listed {
+				expect = w
+			}
+			if got := c.ContextWindow("venice", id); got != expect {
+				t.Fatalf("reload %d: catalog lists %q but ContextWindow(%q) = %d, want %d (catalog and windows from different store reads)", i, listed, id, got, expect)
+			}
+		}
+	}
+}
+
+func TestCacheContextWindowRaceSafe(t *testing.T) {
+	globalPath := filepath.Join(t.TempDir(), "settings.yaml")
+	seedVeniceWindows(t, DiscoveredModelsPath(globalPath), DiscoveredModel{ID: "m1", ContextWindow: 2048})
+	c := newCacheOrFatal(t, veniceComposed(map[string]any{"m2": uint64(4096)}), t.TempDir(), []string{globalPath})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if got := c.ContextWindow("venice", "m1"); got != 2048 {
+					t.Errorf("concurrent ContextWindow(m1) = %d, want 2048", got)
+					return
+				}
+				_ = c.ContextWindow("venice", "m2")
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		c.SetProvider("venice", provider.ProviderEntry{BaseURL: "u", APIKey: "k", ContextWindows: map[string]int64{"m2": int64(4096 + i)}})
+		c.ReloadDiscoveredCatalog()
+	}
+	wg.Wait()
 }

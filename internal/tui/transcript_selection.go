@@ -74,7 +74,8 @@ func (v *transcriptView) ScrollToEnd() *transcriptView {
 // stripped displayed text. end excludes any trailing hard-break newline, so the
 // span covers exactly the visible cells of that row.
 type rowSpan struct {
-	start, end int
+	start, end  int
+	prefixWidth int
 }
 
 // tabCellWidth returns the cells a tab occupies starting at display column col,
@@ -104,16 +105,16 @@ func wrapRowsAt(text string, width, startColumn int) []rowSpan {
 		return nil
 	}
 	if text == "" {
-		return []rowSpan{{0, 0}}
+		return []rowSpan{{start: 0, end: 0}}
 	}
 	var rows []rowSpan
 	for start := 0; start < len(text); {
 		end, next := wrappedRowEnd(text, start, width, startColumn)
-		rows = append(rows, rowSpan{start, end})
+		rows = append(rows, rowSpan{start: start, end: end})
 		start = next
 	}
 	if strings.HasSuffix(text, "\n") {
-		rows = append(rows, rowSpan{len(text), len(text)})
+		rows = append(rows, rowSpan{start: len(text), end: len(text)})
 	}
 	return rows
 }
@@ -155,7 +156,7 @@ func wrappedRowEnd(text string, start, width, startColumn int) (int, int) {
 
 func transcriptRows(raw, text string, width int) []rowSpan {
 	if text == "" {
-		return []rowSpan{{0, 0}}
+		return []rowSpan{{start: 0, end: 0}}
 	}
 	var rows []rowSpan
 	start := 0
@@ -168,20 +169,14 @@ func transcriptRows(raw, text string, width int) []rowSpan {
 		} else {
 			end += start
 		}
-		line := text[start:end]
-		if lineNumber < len(rawLines) && strings.HasPrefix(rawLines[lineNumber], userRailPrefix) {
-			contentStart := start + len("▌ ")
-			for i, row := range wrapRowsAt(text[contentStart:end], width, userRailWidth) {
-				if i == 0 {
-					rows = append(rows, rowSpan{start: start, end: contentStart + row.end})
-				} else {
-					rows = append(rows, rowSpan{start: contentStart + row.start, end: contentStart + row.end})
-				}
-			}
-		} else {
-			for _, row := range wrapRowsAt(line, width, 0) {
-				rows = append(rows, rowSpan{start: start + row.start, end: start + row.end})
-			}
+		rawLine := ""
+		if lineNumber < len(rawLines) {
+			rawLine = rawLines[lineNumber]
+		}
+		for _, row := range lineRows(rawLine, text[start:end], width) {
+			row.start += start
+			row.end += start
+			rows = append(rows, row)
 		}
 		if end == len(text) {
 			break
@@ -190,13 +185,6 @@ func transcriptRows(raw, text string, width int) []rowSpan {
 		lineNumber++
 	}
 	return rows
-}
-
-func hasSyntheticRail(raw, text string, row rowSpan) bool {
-	lineStart := strings.LastIndexByte(text[:row.start], '\n') + 1
-	lineNumber := strings.Count(text[:lineStart], "\n")
-	rawLines := strings.Split(raw, "\n")
-	return row.start != lineStart && lineNumber < len(rawLines) && strings.HasPrefix(rawLines[lineNumber], userRailPrefix)
 }
 
 // offsetAt maps a screen coordinate to a byte offset into the stripped displayed
@@ -254,13 +242,8 @@ func (t *transcript) offsetRowAt(x, y int) (int, bool) {
 	if targetCol < 0 {
 		targetCol = 0
 	}
-	if hasSyntheticRail(raw, text, rows[rowIdx]) {
-		targetCol -= userRailWidth
-		if targetCol < 0 {
-			// The pointer is on the synthetic rail gutter, which is drawn but is not the
-			// row's own text.
-			return rows[rowIdx].start, false
-		}
+	if targetCol < rows[rowIdx].prefixWidth {
+		return rows[rowIdx].start, false
 	}
 	off := byteOffsetInRow(text, rows[rowIdx], targetCol)
 	return off, off < rows[rowIdx].end
@@ -273,7 +256,7 @@ func (t *transcript) offsetRowAt(x, y int) (int, bool) {
 // the TextView's own layout.
 func byteOffsetInRow(text string, row rowSpan, targetCol int) int {
 	seg := text[row.start:row.end]
-	col := 0
+	col := row.prefixWidth
 	pos := row.start
 	state := -1
 	for len(seg) > 0 {
@@ -441,10 +424,7 @@ func (t *transcript) drawSelectionHighlight(screen tcell.Screen) {
 		}
 		row := rows[rowIdx]
 		seg := text[row.start:row.end]
-		col := 0
-		if hasSyntheticRail(raw, text, row) {
-			col = userRailWidth
-		}
+		col := row.prefixWidth
 		pos := row.start
 		state := -1
 		for len(seg) > 0 {

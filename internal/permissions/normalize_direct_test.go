@@ -1101,7 +1101,6 @@ func TestNormalizeDirectStage_UnsupportedEnvGrammarStaysLiteral(t *testing.T) {
 		"env -- ls",
 		"env --debug ls",
 		"env -0 ls",
-		"env",
 		"env -i PATH=/usr/bin",
 		"env FOO=bar",
 		`env sh -c "ls"`,
@@ -1143,6 +1142,27 @@ func TestNormalizeDirectStage_UnsupportedEnvGrammarStaysLiteral(t *testing.T) {
 				t.Fatalf("NormalizeDirectStage(%q) reason = %q, want %q", stage, got.Reason, ReasonWrapperCommand)
 			}
 		})
+	}
+}
+
+func TestNormalizeDirectStage_ArgumentFreeEnvStaysDirect(t *testing.T) {
+	for _, ctx := range []StageContext{StageSolo, StageInCompound} {
+		got, err := NormalizeDirectStage("env", ctx)
+		if err != nil {
+			t.Fatalf("NormalizeDirectStage(env): %v", err)
+		}
+		if got.Route != RouteDirect || !slices.Equal(got.Tokens, []string{"env"}) || got.Assignments != nil || got.ClearEnvironment {
+			t.Fatalf("NormalizeDirectStage(env, %v) = %+v, want direct tokens [env] without assignments", ctx, got)
+		}
+	}
+	for _, stage := range []string{`"env"`, `e\nv`, "/usr/bin/env"} {
+		got, err := NormalizeDirectStage(stage, StageSolo)
+		if err != nil {
+			t.Fatalf("NormalizeDirectStage(%q): %v", stage, err)
+		}
+		if got.Route != RouteLiteral {
+			t.Fatalf("NormalizeDirectStage(%q) route = %v, want RouteLiteral", stage, got.Route)
+		}
 	}
 }
 

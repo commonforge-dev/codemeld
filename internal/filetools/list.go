@@ -1,7 +1,4 @@
-// Built-in structured list tool: project-confined, non-recursive listing of a directory's immediate
-// entries (default project root) — each entry's name and type (file / dir / symlink) in deterministic
-// ascending name order, bounded by a per-tool limit with the truncation signal, over the shared
-// walker in single-level mode so descendants are never traversed or counted.
+// Built-in list tool: lists a directory's immediate entries.
 package filetools
 
 import (
@@ -46,12 +43,6 @@ var _ tools.Tool = (*ListTool)(nil)
 
 func (t *ListTool) SetBlockedPaths(blocked *permissions.BlockedPaths) { t.blocked = blocked }
 
-// NewListTool builds the list tool bound to the run's ~ anchor (home), the process cwd accepted for
-// signature symmetry with the other file tools, the project root the listing is confined to (via
-// ResolveReadTarget), and the tool-output byte cap (cache.MaxToolOutputBytes()) BoundedResult uses to
-// predict byte-cap truncation. The project root is symlink-resolved once here — mirroring
-// NewReadTool/NewGlobTool — so a launch through a symlinked project directory does not reject valid
-// in-project paths; ResolveReadTarget normalizes again, so the double normalization is idempotent.
 func NewListTool(home, processCWD, projectRoot string, outputCap int) *ListTool {
 	return &ListTool{home: home, processCWD: processCWD, projectRoot: normalizeRoot(projectRoot), outputCap: outputCap}
 }
@@ -67,7 +58,7 @@ func (t *ListTool) SubjectKind() string { return "tool" }
 // Plan and auto-allowed in every mode.
 func (t *ListTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description: "List the immediate (non-recursive) entries of a directory within the project. path is " +
+		Description: "List the immediate (non-recursive) entries of a directory inside or outside the project. path is " +
 			"the directory to list (default project root); limit caps the entries returned (default " +
 			fmt.Sprintf("%d, max %d", ListDefaultLimit, ListMaxLimit) + "). Hidden (dot-prefixed) entries are " +
 			"skipped unless include_hidden is set. Each line is the entry type and name separated by a tab, as " +
@@ -79,7 +70,7 @@ func (t *ListTool) Advertise() tools.Metadata {
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to list. Relative paths resolve against the project root and list normally; an explicitly named directory whose real location is outside the project is listed only after you approve it at the permission prompt. Defaults to the project root when omitted.",
+					"description": "Directory to list. Defaults to the project root when omitted. Relative paths resolve against the project root. An explicitly named absolute or ~ directory outside the project is listed without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a listing asks first. A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms and malformed paths.",
 				},
 				"limit": map[string]any{
 					"type":        "integer",
@@ -107,7 +98,7 @@ func (t *ListTool) Advertise() tools.Metadata {
 // authorization and the directory actually listed cannot drift. It rejects unknown arguments, then
 // delegates to ResolveReadTarget in optional-path mode (an omitted/blank `path` defaults to the
 // project root). RejectDirectorySymlink is left false: list is non-recursive, so a symlinked
-// directory `path` is resolved to its real in-root target and listed (the resolver still rejects a symlink
+// directory `path` is resolved to its real target and listed (the resolver still rejects a symlink
 // that escapes the root), while a symlink *entry inside* the listed directory is reported as type symlink
 // and never descended. Numeric/boolean validation is deferred to invocation, as read/glob defer theirs.
 func (t *ListTool) ResolveTarget(args map[string]any) (target string, scope string, err error) {
@@ -122,10 +113,6 @@ func (t *ListTool) ResolveTarget(args map[string]any) (target string, scope stri
 	})
 }
 
-// ExternalReadScope reports whether scope (the directory ResolveTarget returned) is an explicit
-// out-of-project read target — the promptable case DispatchTool routes to a permission prompt while
-// bypassing the read-only mode auto-allow. False for an in-project directory, keeping in-project lists on
-// their existing no-prompt auto-allow.
 func (t *ListTool) ExternalReadScope(scope string) bool {
 	return isExternalReadScope(scope, t.projectRoot)
 }
@@ -142,8 +129,6 @@ func (t *ListTool) InvokeWithResolvedTarget(_ context.Context, args map[string]a
 // dispatch instead calls ResolveTarget then InvokeWithResolvedTarget; this keeps the tool a complete unit
 // for direct callers and tests. A target-resolution failure surfaces as the same in-band error result the
 // dispatcher would render, so the observable outcome matches either entry.
-// Standalone Invoke has no authorizer, so it refuses an explicit out-of-project directory in-band:
-// only the dispatch path can obtain the required approval. The in-project path is unchanged.
 func (t *ListTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
@@ -175,7 +160,7 @@ func (t *ListTool) list(dir string, args map[string]any) tools.Result {
 	includeIgnored, _ := optionalBoolArg(args, "include_ignored")
 
 	// Re-validate the resolved directory immediately before walking. ResolveReadTarget already followed any
-	// legitimate symlink `path` and returned the real in-root directory, so a symlink here can only be a
+	// legitimate symlink `path` and returned the real directory, so a symlink here can only be a
 	// post-authorization swap; Walk begins with os.ReadDir(dir), which follows a symlink root, so without
 	// this guard a swapped root would redirect the listing outside the authorized directory. A
 	// non-existent path surfaces as the lstat error (a normal not-found), and a non-directory path — a
@@ -191,9 +176,6 @@ func (t *ListTool) list(dir string, args map[string]any) tools.Result {
 		return failResult("list target rejected: path is not a directory")
 	}
 
-	// Anchor the ignore matchers and the walker's relative-path base at the project root for an in-project
-	// listing, or at the approved external directory for an out-of-project read, so the matchers see
-	// the same base. list emits only basenames, so this does not change in-project output.
 	anchor := readAnchor(dir, t.projectRoot)
 
 	// Load the default codemeldignore filter set unless include_ignored disables it. A

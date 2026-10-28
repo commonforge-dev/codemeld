@@ -111,9 +111,9 @@ type StageNormalization struct {
 // `/usr/bin/env` is recognized too. The argument-sensitive exceptions are the
 // bare `bash`/`sh` no-exec syntax-check grammar (noExecShellStage), the bare
 // `command -v <name>` and `type <name>` lookups (commandLookupStage,
-// typeLookupStage), and the solo-only bare `bash`/`sh` script invocation
-// (scriptInvocationStage), which stay on the direct route so dispatch answers
-// the exact invocation the classifier validated.
+// typeLookupStage), the solo-only bare `bash`/`sh` script invocation
+// (scriptInvocationStage), and an argument-free bare `env`, which stay on the
+// direct route so dispatch answers the exact invocation the classifier validated.
 var wrapperPrograms = map[string]bool{
 	"sh":      true,
 	"bash":    true,
@@ -206,7 +206,8 @@ func NormalizeDirectStage(stage string, ctx StageContext) (StageNormalization, e
 				path, isLookup = typeLookupStage(rest)
 			}
 			soloScript := ctx == StageSolo && scriptInvocationStage(rest)
-			if !isLookup && !noExecShellStage(rest) && !soloScript {
+			bareEnv := len(rest) == 1 && rest[0].Raw == "env"
+			if !isLookup && !noExecShellStage(rest) && !soloScript && !bareEnv {
 				return StageNormalization{Route: RouteLiteral, Reason: ReasonWrapperCommand}, nil
 			}
 			lookupPath = path

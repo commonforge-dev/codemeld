@@ -82,6 +82,7 @@ func TestListTool_AdvertiseMetadata(t *testing.T) {
 			t.Fatalf("Parameters.properties missing %q", key)
 		}
 	}
+	assertOutsideScanAdvertise(t, md, "directory outside the project is listed without asking", "such a listing asks first")
 }
 
 // TestListTool_ImmediateEntriesWithType pins Done-when 1+2: list returns the directory's immediate entries

@@ -48,8 +48,8 @@ recorded in.
 4. `codemeld sessions research <session-id|path>` — for a run that used the web: the searches,
    the sources fetched, and which of those addresses a later answer cited.
 5. `codemeld sessions summary <session-id|path>` — for the shape of the whole run: the durable
-   execution records, the permission path scopes they ran under, and the turn, round, and token
-   totals. Read its limits below before quoting a number from it.
+   execution records, the permission path scopes they ran under, the turn, round, and token
+   totals, and the provider-reported cost. Read its limits below before quoting a number from it.
 
 All six `sessions` commands are strictly read-only: they never write, lock, prune, fork, or
 refresh a session, so running them is always safe. They do print stored session content verbatim,
@@ -100,6 +100,44 @@ wider. Together they let an auditor re-run the same comparison the live matcher 
 It is also absent on every direct prompt written before the field existed: that absence means the
 tokens are **unknown**, not empty and not equal to `subject`. An absent value can never be treated
 as evidence that a stored grant covered the request.
+
+### `permission_prompt_wait`: how long a person was asked
+
+Each call that asks a person for approval appends one `permission_prompt_wait` after the call
+returns, whatever the result (`finishPromptCall` in `internal/permissions/orchestrate.go`). That
+covers a single request, a command pipeline asked as one question, and a group of independent
+calls. `waited_ms` is measured on the process's monotonic clock from just before the prompt call
+to just after it returned, so it includes time spent queued for the one-at-a-time prompt slot
+behind another request's prompt. It is time the run spent blocked on a person, and in
+`codemeld run --prompt-for-approval` it counts against `--time-limit`.
+
+`ended` is `cancelled` when the run's context was already done when the prompt returned — the time
+limit, an interrupt, or an answer typed after the limit, which authorizes nothing — `failed` for
+any other prompt error, and `answered` otherwise. A cancellation that lands after the prompt
+returned does not change an already appended `answered`, though the request is still refused.
+
+`prompts` counts the **requests** submitted to the call, not the questions shown and not records
+in the file: a pipeline asks one question for all its stages, and an independent group asks one
+question per distinct decision but submits every member. The rule that `permission_prompt_shown`
+and `permission_decision` counts match does not extend to this event: a cancelled or failed call
+has a wait and shown events but no decision.
+
+The record's `timestamp` is when it was appended, an approximation of the moment the wait ended,
+so the wait covered roughly `timestamp − waited_ms` to `timestamp`, at millisecond precision.
+Concurrent requests queue behind the same prompt slot, so their intervals overlap; adding up
+`waited_ms` across records counts the overlap more than once, and a total must merge the
+intervals instead.
+
+An unattended `codemeld run` (no `--prompt-for-approval`) and every child agent refuse through
+the same prompt step but ask nobody, so they write no wait record; their `permission_prompt_shown`
+and `permission_decision` are unchanged (`headlessAuthorizer.Authorize` in
+`internal/bootstrap/headless.go` binds the recorder only when a terminal approver exists).
+
+The record is appended in memory and becomes durable at the session's existing flush points,
+including the final flush after an interrupt. Nothing is written before the prompt call returns:
+a terminal read or TUI prompt that stays blocked after cancellation, a process that is killed
+outright, or a session switch that closed the store the prompt was recording into all leave no
+wait record.
 
 ### `permission_revoke_requested`: what a revocation record does and does not prove
 
@@ -326,12 +364,37 @@ completion, so it is left alone. And a request that is still running has not wri
 trip yet, so a live session in the middle of a turn reports clean rather than accusing the turn
 the user is still waiting on.
 
+**When codemeld cuts a stream itself: `stream_no_output`.** A round whose stream sends no
+assistant text and no tool call for 30 minutes is cancelled by codemeld, not by the provider. Its
+`turn_terminal` is `provider_failed` with phase `stream_drop`. When a retry follows,
+`provider_request_retry` carries reason `stream_no_output`; when none follows (retry off, or
+attempts or budget used up), `provider_request_retry_skipped` and `provider_request_failed` carry
+it, the failure with `partial_response_chars` 0 and an `error_detail` saying codemeld cancelled the
+stream. So under `stream_drop`, `stream_no_output` is a local cut before any usable output, while
+`stream_eof` and `stream_read_error` are transport failures, which can follow partial output.
+
+The 30 minutes start once the provider has returned the stream, so time spent opening the request
+does not count (`provider_round_trip.duration_ms` still covers the whole round). Reasoning text,
+empty chunks, and usage-only chunks are not output and do not restart the clock; the first
+non-empty assistant text or tool call turns the limit off for the rest of the round. Each retry
+starts a fresh 30 minutes, and the retry budget is checked only between attempts, so it never
+shortens an attempt that is still streaming. A user cancel or run time limit that lands first is
+recorded as `cancelled`, not as `stream_no_output`.
+
+`provider_round_trip` also counts what a streaming round received: `chunks` is every stream chunk
+the round read, including empty and usage-only ones and one read while the round was being cut,
+and `reasoning_chars` is the Unicode character count of the OpenRouter `reasoning` text captured in
+the round. `reasoning_chars` does not count `reasoning_details`, and only OpenRouter rounds fill it.
+The OpenAI ChatGPT adapter drops reasoning events before they reach the round, so even `chunks` 0
+and `reasoning_chars` 0 do not prove the provider sent nothing. Both are left out of the record
+when 0, and older records never have them, so a missing counter means 0 or not measured.
+
 **Nothing here is replayed.** The lifecycle records exist to make an interrupted turn *visible*,
 not to resume it. `doctor` is read-only — it never writes, repairs, re-sends, or re-runs anything
 it reports, and no other code path replays a recorded round. Recovering from an incomplete turn is
 the user's decision: read the diagnosis, then re-ask. The same boundary holds live in the TUI,
 where a provider that goes quiet for a long stretch is only *reported* as quiet — the request is
-never cancelled or retried on the user's behalf.
+not cancelled or retried on the user's behalf unless it reaches the `stream_no_output` limit above.
 
 ## Protected-settings halt records: format and inspection
 
@@ -446,11 +509,12 @@ codemeld sessions show <session-id|path> --kind model_response --last 1 --json
 `codemeld sessions doctor <id|path>` reports anomalies and incomplete turns (above),
 `codemeld sessions permissions <id|path>` lists the permission prompts a human was actually
 shown — in record order, each with its decision or `pending` — followed by a count of the
-authorizations that never prompted (`permission_matched`) grouped by `outcome_source` and then the
+authorizations that never prompted (`permission_matched`) grouped by `outcome_source`, then a
+separate block of [System One checks](system-one.md) (`permission_system_one_check`), and then the
 explicit revocation requests (`permission_revoke_requested`), and
 `codemeld sessions research <id|path>` reports the web-research funnel (below), and
 `codemeld sessions summary <id|path>` aggregates the durable execution records, the permission path
-scopes they ran under, and the turn, round, and token totals (below). These are
+scopes they ran under, the turn, round, and token totals, and the provider-reported cost (below). These are
 diagnostics, not the schema source — `internal/events/payloads.go` remains authoritative, and
 every line of the file is ordinary JSON if you would rather read it with a JSON tool.
 
@@ -473,6 +537,15 @@ same facts as one machine-readable document:
   direct prompt, is unknown legacy data: the row is left unflagged. The report never falls back to
   the requested subject or re-splits the flattened one — a false escalation claim, which reads as an
   accusation about a human's security decision, is worse than a missing one.
+- **What the System One check decided.** A command the check allowed is counted once among the
+  non-prompted authorizations, under the `system_one_check` source. The System One checks block
+  that follows counts every recorded check by outcome (`allowed`, `declined`, `failed`, `skipped`),
+  counts the failures by reason (including `no_key`), counts the skipped checks by reason (`paused`,
+  or a structural reason when the command could not qualify and no model was asked), and lists each
+  allowed command with its model, `p_read_only`, and the `t_read_only` threshold applied, so its
+  margin can be reviewed (`renderPermissions`, `internal/cli/sessions.go`). The event's fields,
+  validation rules and reason values are in `PermissionSystemOneCheck` and `systemOneReasons` in
+  `internal/events/payloads.go`.
 - **Which grants a human explicitly revoked.** The report ends with the `permission_revoke_requested`
   records, in record order, each naming the removed grant's own kind, subject, scope, and grant kind
   (and a literal grant's `argument_hash`). It counts them even when there are none, and it reads
@@ -576,7 +649,7 @@ carrying session content.
 
 `codemeld sessions summary <id|path>` aggregates records the session already stores — it adds no
 new event and derives no number the file does not support. `--json` emits the same facts as one
-machine-readable document, with the resolved path under `session`. Five limits decide how to read
+machine-readable document, with the resolved path under `session`. Six limits decide how to read
 it.
 
 **It is an execution-record summary, not a table of every tool call.** The file keeps two distinct
@@ -619,7 +692,7 @@ is counted in neither bucket and contributes only its duration and its provider/
 Provider/model pairs are the de-duplicated union of `provider_round_trip` and `model_response`, so a
 session recorded before round trips existed still shows what it ran on.
 
-**Cached tokens are reported as availability, not as a bare number.** Input and output tokens are
+**Cached tokens and cost are reported as availability, not as bare numbers.** Input and output tokens are
 plain sums of `model_response`. Cached input tokens are not: an absent `cached_input_tokens` means
 the provider did not report the value, and `cached_input_tokens_partial` marks a present value as a
 known lower bound. So the report shows an **exact** total only when every contributing response
@@ -627,9 +700,96 @@ reported a non-partial value (a reported zero counts as reported), a **lower bou
 soon as any response omitted it or marked it partial, and **unavailable** when no response reported
 it at all. This is the same accounting `/context` uses live.
 
+Provider-reported cost follows the same rules, from `cost_usd` and `cost_usd_partial` on each
+`model_response`. An absent `cost_usd` means the provider sent no cost for that turn (only
+OpenRouter among the built-in providers is known to send one); a reported zero is a real zero and
+counts as reported; `cost_usd_partial` means the turn spanned several provider rounds and at least
+one of them carried no cost, so its value is a lower bound. The cost is assumed to be USD, following
+OpenRouter's convention: a custom provider's `usage.cost` is recorded and summed the same way, and
+its currency is neither checked nor converted. **Exact** means every recorded `model_response`
+reported a complete, non-partial cost — not that the total matches the provider's bill. A request
+that recorded no cost can still be charged: an interrupted or failed attempt with no final usage,
+or a child agent's turns, which run on an in-memory session and are never recorded in this file. A
+failed tool turn can still record the cost of its completed rounds, so a failed turn does not
+always lack cost. Costs are stored and summed as float64, so the total carries ordinary
+floating-point rounding and is not exact to the credit; the text report prints the shortest
+decimal that round-trips the stored value.
+
+**Permission-prompt wait is the recorded wait coverage, not a sum and not a count of questions.**
+The `approval_*` totals come from `permission_prompt_wait` records (`buildSummaryReport` in
+`internal/cli/sessions_summary.go`). Each record is turned into the interval
+`timestamp − waited_ms` to `timestamp`, using the record's millisecond timestamp, and
+`approval_wait_ms` is the length of the **union** of those intervals: prompt calls that waited at
+the same time are counted once, so the total is never the plain sum of `waited_ms`. The record
+timestamp is taken when the record is appended after the prompt returned, not at the exact moment it
+returned, so this is the coverage of the recorded intervals, not a more precise measurement of real
+waiting. `approval_requests` sums each record's `prompts`: the requests submitted to a prompt call,
+not the questions or screens shown — one question can cover several requests, and a cancelled call
+can end before all its questions were displayed. `approval_waits_cancelled` counts records with
+`ended: cancelled`. A `failed` wait counts toward the duration and request totals and has no
+counter of its own, so a wait that was not cancelled was not necessarily answered. The text report
+prints `permission-prompt wait: <ms> ms across <requests> requests (<cancelled> waits cancelled)`
+whenever at least one wait record exists, even one that waited 0 ms.
+
+With no wait records all three totals are `0` and the text report omits that line. Zero then means
+no wait was *recorded*, not that no waiting happened: sessions written before wait records existed
+carry none, a session can span older and newer versions, and a prompt call interrupted before its
+record was saved contributes nothing, so even a nonzero total covers only recorded waits. The three
+totals cannot tell a run that never waited from one whose waits went unrecorded. To check, read the
+underlying records with `sessions show`: `permission_prompt_shown` records with no
+`permission_prompt_wait` records mean the timing is missing, not a wait that can be reconstructed.
+
 A session with no execution records, no rounds, or no model responses reports zeroes and exits 0.
 Like the other diagnostics, `summary` is read-only and prints stored subjects and path scopes
 verbatim, so treat its output as carrying session content.
+
+## Skill loads: what a `skill_loaded` record proves
+
+A `skill_loaded` record says that a skill's instructions, or one file from its folder, went to
+the model. `codemeld sessions show --kind skill_loaded <id|path>` lists only these records. A skill
+reaches the model in two ways, and `via` tells them apart:
+
+- **`slash`**: the user typed `/<skill>` in the TUI. The record is appended only once the message
+  was actually submitted, before that command's `slash_command` record, and both are saved by one
+  write. A command that sent nothing (an empty message, or a submission that was not accepted)
+  records no load.
+- **`tool`**: the model called the `skill` tool. Each successful read appends one record: a read of
+  the instructions, or a read of one file in the skill folder. A read that was refused or failed
+  (an unknown skill, bad arguments, automatic loading turned off, a blocked or missing file, a file
+  over the size limit) records nothing. The record goes to the session of the turn that made the
+  call, so a load in a turn started after `/clear` or `/resume` lands in the new session; if the
+  session was switched while that turn was still running, the closed session drops the record. It
+  is saved with the session's next write.
+
+**What is hashed.** `bytes` and `sha256` describe exactly what was loaded, never the skill text
+itself: the record holds the skill's name, its `layer` (`global` or `project`), a file path, a size,
+and a hash. When `file` is empty the subject is the skill's instructions as codemeld loaded them at
+startup: the `SKILL.md` text after its front matter. Both paths hash those same bytes, so a slash
+load and a tool load of the same skill carry the same hash. The tool's answer also contains the
+skill folder and a list of its other files, but neither is hashed, and an instructions read still
+records its load when that list is unavailable. A slash load hashes the instructions before the
+command's arguments are filled in. When `file` is set, the subject is the file's full contents as
+read.
+
+**The file path.** `file` is relative to the skill folder, uses `/` separators, and is written in
+its clean form: the tool accepts `./scripts//run.sh` and records `scripts/run.sh`. A slash load
+never carries a file.
+
+**Who loaded it.** A tool load made by a child agent carries that child's `child_invocation_id`; a
+load by the main agent carries none. A slash load is always the user's and never carries one.
+
+**What the record does not say.** It does not name the folder the skill was read from. When a skill
+folder, or the skills folder above it, is a symbolic link, the record cannot tell you where that
+link pointed at the time, and the disk today cannot either: the link may have been changed since.
+Compare `sha256` with the content you expect rather than with whatever the path holds now.
+
+**When the record cannot be saved.** The two paths fail differently, on purpose:
+
+- **`slash`**: the message has already been sent, so it stays sent. The TUI shows a notice that the
+  skill load record could not be saved.
+- **`tool`**: if the record is rejected, the tool call fails with an error and the model does not
+  get the content, so a load never reaches the model without its record. A tool that has no
+  session to write to records nothing and still reads.
 
 ## Why this doc has no field tables
 

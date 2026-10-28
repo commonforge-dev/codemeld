@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/events"
@@ -18,21 +20,48 @@ import (
 // shell command, not a structured registry lookup.
 const bashToolName = "bash"
 
-// decodeBashCommand pulls the command string out of a `bash` tool call's JSON arguments
-// (the conventional {"command":"..."} shape). Malformed JSON or a missing/blank command
-// (empty or whitespace-only) is returned as an error the caller surfaces in-band, so a bad
-// bash call never prompts or crashes.
-func decodeBashCommand(arguments string) (string, error) {
+const (
+	defaultBashTimeout = 10 * time.Minute
+	maxBashTimeoutMs   = 1800000
+)
+
+var errBashTimeout = errors.New("bash command timed out")
+
+// decodeBashCommand pulls the command string and its execution limit out of a `bash` tool call's
+// JSON arguments (the {"command":"...","timeout":ms} shape). Malformed JSON, a missing/blank command
+// (empty or whitespace-only) or an invalid timeout is returned as an error the caller surfaces
+// in-band, so a bad bash call never prompts or crashes.
+func decodeBashCommand(arguments string) (string, time.Duration, error) {
 	var decoded struct {
-		Command string `json:"command"`
+		Command string          `json:"command"`
+		Timeout json.RawMessage `json:"timeout"`
 	}
 	if err := json.Unmarshal([]byte(arguments), &decoded); err != nil {
-		return "", fmt.Errorf("invalid bash arguments: %w", err)
+		return "", 0, fmt.Errorf("invalid bash arguments: %w", err)
 	}
 	if strings.TrimSpace(decoded.Command) == "" {
-		return "", fmt.Errorf("invalid bash arguments: missing %q", "command")
+		return "", 0, fmt.Errorf("invalid bash arguments: missing %q", "command")
 	}
-	return decoded.Command, nil
+	if decoded.Timeout == nil {
+		return decoded.Command, defaultBashTimeout, nil
+	}
+	var ms int64
+	if err := json.Unmarshal(decoded.Timeout, &ms); err != nil || ms < 1 || ms > maxBashTimeoutMs {
+		return "", 0, fmt.Errorf("invalid bash arguments: %q must be an integer number of milliseconds from 1 to %d", "timeout", maxBashTimeoutMs)
+	}
+	return decoded.Command, time.Duration(ms) * time.Millisecond, nil
+}
+
+func bashTimeoutNote(limit time.Duration) string {
+	return fmt.Sprintf("codemeld: command timed out after %s; process cleanup was attempted", limit)
+}
+
+func withBashTimeoutNote(stderr []byte, cap int, note string) []byte {
+	kept := rawPrefixWithin(stderr, cap-len("\n"+note))
+	if len(kept) > 0 && kept[len(kept)-1] != '\n' {
+		kept = append(slices.Clip(kept), '\n')
+	}
+	return append(slices.Clip(kept), note...)
 }
 
 type shellEventRunner struct {
@@ -40,10 +69,35 @@ type shellEventRunner struct {
 	active            func() *sessions.Store
 	cap               int
 	childInvocationID string
+	timeout           time.Duration
+	execCtx           context.Context
+	release           context.CancelFunc
 	// pending carries the one preflighted pipeline from PreflightPipeline to the Pipeline call that
 	// follows it, so a session switch between the two cannot split a pipeline's start and end records
 	// across stores. Pipe groups run one at a time, so at most one is ever pending.
 	pending pendingPipeline
+}
+
+// ExecutionContext starts the command's execution budget at its first call, after authorization,
+// so time spent waiting for a permission prompt never counts against it.
+func (r *shellEventRunner) ExecutionContext(ctx context.Context) context.Context {
+	if r.execCtx == nil {
+		if r.timeout <= 0 {
+			return ctx
+		}
+		r.execCtx, r.release = context.WithTimeoutCause(ctx, r.timeout, errBashTimeout)
+	}
+	return r.execCtx
+}
+
+func (r *shellEventRunner) timedOut(ctx context.Context) bool {
+	return r.execCtx != nil && ctx.Err() == nil && errors.Is(context.Cause(r.execCtx), errBashTimeout)
+}
+
+func (r *shellEventRunner) releaseExecution() {
+	if r.release != nil {
+		r.release()
+	}
 }
 
 // pendingPipeline is the state a successful preflight leaves for the Pipeline call. store and starts
@@ -65,6 +119,7 @@ func (r *shellEventRunner) PreflightPipeline(ctx context.Context, specs []runner
 }
 
 func (r *shellEventRunner) preflightPrepared(ctx context.Context, subjects, specs []runner.RunSpec) error {
+	ctx = r.ExecutionContext(ctx)
 	r.pending = pendingPipeline{}
 	inner, ok := r.inner.(runner.PipelineRunner)
 	if !ok {
@@ -117,7 +172,10 @@ func (r *shellEventRunner) pipelinePrepared(ctx context.Context, subjects, specs
 	for _, rec := range pending.starts {
 		pending.store.Append(rec)
 	}
-	results, pipelineErr := pending.inner.Pipeline(ctx, specs, r.cap)
+	results, pipelineErr := pending.inner.Pipeline(r.ExecutionContext(ctx), specs, r.cap)
+	if pipelineErr != nil && r.timedOut(ctx) && onlyCanceled(results, len(specs)) && errors.Is(pipelineErr, context.DeadlineExceeded) {
+		pipelineErr = nil
+	}
 	if pending.store == nil {
 		return results, pipelineErr
 	}
@@ -158,7 +216,22 @@ func (r *shellEventRunner) pipelinePrepared(ctx context.Context, subjects, specs
 	return results, pipelineErr
 }
 
+// onlyCanceled reports whether every stage was affected by cancellation alone, so a copier or
+// internal failure that coincided with the bash deadline is never hidden behind it.
+func onlyCanceled(results []runner.PipelineResult, stages int) bool {
+	if len(results) != stages {
+		return false
+	}
+	for _, res := range results {
+		if res.PipelineErrCategory != "" && res.PipelineErrCategory != runner.PipelineFailureCanceled {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *shellEventRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
+	ctx = r.ExecutionContext(ctx)
 	kind, subject := shellExecSubject(spec.Argv)
 	if r.active != nil {
 		if err := events.EmitToolExecStart(r.active(), spec.InvocationID, kind, subject, spec.Cwd, r.childInvocationID); err != nil {
@@ -182,6 +255,7 @@ func (r *shellEventRunner) ExecBounded(ctx context.Context, spec runner.RunSpec,
 }
 
 func (r *shellEventRunner) execBoundedPrepared(ctx context.Context, original, spec runner.RunSpec, maxCapture int, confined bool) (runner.RunResult, error) {
+	ctx = r.ExecutionContext(ctx)
 	inner, ok := r.inner.(runner.BoundedExecRunner)
 	if !ok {
 		return runner.RunResult{}, errors.New("bootstrap: inner runner cannot bound command output")
@@ -219,6 +293,10 @@ func (r *shellEventRunner) execBoundedPrepared(ctx context.Context, original, sp
 		return runner.RunResult{}, errors.Join(runErr, endErr)
 	}
 	return res, nil
+}
+
+func (r *confinedShellRunner) ExecutionContext(ctx context.Context) context.Context {
+	return r.events.ExecutionContext(ctx)
 }
 
 func shellExecSubject(argv []string) (kind, subject string) {

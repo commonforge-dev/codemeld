@@ -732,7 +732,16 @@ func TestRun_RunHelp_AllForms(t *testing.T) {
 				"Only the final answer, or",
 				"the partial answer of an interrupted stream, goes to stdout",
 				"tool-call rounds goes to stderr alongside tool activity",
+				"[--no-agents | --no-dir-agent | --agents-file <absolute-path>] \"<prompt>\"",
+				"--time-limit, --prompt-for-approval without a terminal on stdin, an empty or relative",
+				"--agents-file, --agents-file with --no-agents or --no-dir-agent, or one of those three",
+				"flags placed before 'run');",
 			} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
+				}
+			}
+			for _, want := range agentsHelpWants {
 				if !strings.Contains(out, want) {
 					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
 				}
@@ -880,7 +889,7 @@ func lineAfter(t *testing.T, out, prefix string) string {
 // otherwise get wrong about the two flags: repetition, the sole-authorization ceiling, the
 // parent-directory consequence, the exact delete types, the shell exclusion, and that the
 // ceiling reaches delegation — a caller who reads it as file-tools-only would not expect a
-// delegate call to be refused for declaring a path outside the list.
+// general_agent call to be refused for declaring a path outside the list.
 func TestRun_FilesAuthorized_HelpDocuments(t *testing.T) {
 	for _, form := range [][]string{
 		{"codemeld", "run", "-h"},
@@ -910,9 +919,9 @@ func TestRun_FilesAuthorized_HelpDocuments(t *testing.T) {
 				"sandbox and do not authorize or confine shell writes. A shell command follows the",
 				"mode's OS sandbox when one is active; where none confines it (build mode, or a failed",
 				"or unsupported startup check), a shell command authorized by a grant can still write",
-				"A delegate call may declare only write paths",
+				"A general_agent call may declare only write paths",
 				"an uncovered declaration is refused ahead",
-				"nested delegate call may declare only paths its own parent already declared",
+				"nested general_agent call may declare only paths its own parent already declared",
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
@@ -942,14 +951,25 @@ func TestRun_Sandbox_HelpDocuments(t *testing.T) {
 			}
 			out := stdout.String()
 			for _, want := range []string{
-				"mutating call is denied by the mode. On Linux (amd64/arm64), when codemeld's startup",
+				"denies mutating tool calls. On Linux (amd64/arm64), when codemeld's startup",
 				"sandbox check passes, 'plan' and 'auto-edits' run shell commands inside an OS sandbox",
 				"with filesystem and process-access restrictions, and 'build' runs them outside it; if",
 				"the check fails or the platform is not supported, commands run outside the sandbox.",
+				"Under 'plan', with intact settings and a passing startup check on a supported host, a",
+				"shell command runs inside the sandbox, where writes and network access fail. Without",
+				"the sandbox, only read-only commands run under 'plan'; any other command is denied",
+				"without asking unless the opt-in System One check allows that one invocation. Broken",
+				"settings remove automatic sandbox permission: an otherwise-eligible command may still",
+				"get a grant-free, cache-free allow-once from the System One check; otherwise it needs",
+				"approval, or is refused in a non-prompting headless run. An unknown or degraded",
+				"blocked-path list makes a command ineligible for that check.",
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
 				}
+			}
+			if strings.Contains(out, "mutating call is denied by the mode") {
+				t.Fatalf("run help (%q) still says every mutating call is denied under 'plan':\n%s", form, out)
 			}
 			if strings.Contains(out, "isolat") {
 				t.Fatalf("run help (%q) overclaims the sandbox as isolation:\n%s", form, out)
@@ -976,7 +996,9 @@ func TestRun_TrustBoundary_HelpDocuments(t *testing.T) {
 				"contributes both its .codemeld/settings.yaml and .codemeld/settings.local.yaml",
 				"layers exactly as it does interactively; a project that is not approved contributes",
 				"neither. The gate covers those two settings layers and the project's VCS command",
-				"project is approved: the global one, any above the project root, and the project's own.",
+				"templates. AGENTS.md files are outside that gate: by default they load on their",
+				"ordinary discovery rules whether or not the project is approved, and the controls",
+				"below suppress or replace them the same way in either case.",
 				"input is often untrusted.",
 			} {
 				if !strings.Contains(out, want) {
@@ -984,6 +1006,7 @@ func TestRun_TrustBoundary_HelpDocuments(t *testing.T) {
 				}
 			}
 			for _, stale := range []string{
+				"project is approved: the global one, any above the project root, and the project's own.",
 				"always treats the",
 				"an interactive trust decision does not carry into it",
 				"it never changes what a headless run",
@@ -1092,6 +1115,8 @@ func TestRun_TimeLimit_HelpDocuments(t *testing.T) {
 				"Without --time-limit the run has no time limit",
 				"including one ended by --time-limit",
 				"an empty, malformed, zero, or negative\n   --time-limit",
+				"Time spent waiting on permission prompts counts",
+				"against the limit, and 'codemeld sessions summary' reports it.",
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
@@ -1185,5 +1210,95 @@ func TestRun_TurnLimitExitsZeroWithOneNoticeAndTheFinalAnswer(t *testing.T) {
 				t.Fatalf("stderr carries the notice %d times, want once: %q", n, stderr.String())
 			}
 		})
+	}
+}
+
+func headlessRoute(t *testing.T, flags []string) *agentsRouteCall {
+	call := &agentsRouteCall{}
+	stubHeadlessBootstrap(t, func(_ context.Context, cwd string, steps bootstrap.FreshSteps, _ *bootstrap.HeadlessDriver) ([]bootstrap.DeniedCall, error) {
+		*call = agentsRouteCall{true, cwd, steps.LoadAgentInstructions, steps.AgentInstructionsSelection}
+		return nil, nil
+	})
+	runAgentsRoute(t, append(append([]string{"codemeld", "run"}, flags...), "prompt"))
+	return call
+}
+
+func TestRun_AgentsFlags_HeadlessReachesTheBootstrapSeam(t *testing.T) {
+	checkAgentsFlagOutcomes(t, headlessRoute)
+}
+
+func TestRun_AgentsFlags_HeadlessInvalidFormsExit2BeforeBootstrap(t *testing.T) {
+	for _, form := range invalidAgentsFlagForms {
+		args := append(append([]string{"codemeld", "run"}, form...), "prompt")
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stubHeadlessBootstrap(t, func(context.Context, string, bootstrap.FreshSteps, *bootstrap.HeadlessDriver) ([]bootstrap.DeniedCall, error) {
+				t.Fatal("invalid form reached the headless bootstrap")
+				return nil, nil
+			})
+			stubNoGetwd(t)
+			assertUsageExit2(t, args, "codemeld: --agents-file")
+		})
+	}
+}
+
+func TestRun_AgentsFlags_ListedOnceInRunOptions(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"codemeld", "run", "-h"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr=%q)", code, stderr.String())
+	}
+	out := stdout.String()
+	_, options, ok := strings.Cut(out, "\nOPTIONS:\n")
+	if !ok {
+		t.Fatalf("run help has no OPTIONS section:\n%s", out)
+	}
+	options, global, ok := strings.Cut(options, "\nGLOBAL OPTIONS:\n")
+	if !ok {
+		t.Fatalf("run help has no GLOBAL OPTIONS section:\n%s", out)
+	}
+	count := func(section, flag string) int {
+		n := 0
+		for _, line := range strings.Split(section, "\n") {
+			if f := strings.Fields(line); len(f) > 0 && f[0] == flag {
+				n++
+			}
+		}
+		return n
+	}
+	for _, flag := range []string{"--no-agents", "--no-dir-agent", "--agents-file"} {
+		if n := count(options, flag); n != 1 {
+			t.Fatalf("OPTIONS lists %s %d times, want once:\n%s", flag, n, options)
+		}
+		if strings.Contains(global, flag) {
+			t.Fatalf("GLOBAL OPTIONS lists %s:\n%s", flag, global)
+		}
+	}
+}
+
+func TestPrintDenialSummary_AdvicePerDenialClass(t *testing.T) {
+	const (
+		scopeAdvice        = "    to authorize, name the path in --files-authorized or --files-authorized-delete when starting the run; a permission grant and --prompt-for-approval cannot widen a declared scope."
+		ordinaryAdvice     = "    to authorize, grant the command/tool (a permission grant in .codemeld/settings.local.yaml) or run codemeld interactively."
+		unattendedAdvice   = "    to authorize this exceptional action in sandboxed Auto edits, run codemeld interactively or restart with --prompt-for-approval and explicitly allow it once; saved grants are not used for this action by the current implementation."
+		alreadyAskedAdvice = "    this exceptional action was denied; it requires explicit allow-once approval in sandboxed Auto edits, and saved grants are not used for it by the current implementation."
+	)
+	var stderr bytes.Buffer
+	printDenialSummary(&stderr, []bootstrap.DeniedCall{
+		{Subject: "a.txt", Reason: "declared", Source: "declared_scope", Exceptional: true},
+		{Subject: "rm -rf build", Reason: "ordinary"},
+		{Subject: "curl https://example.com/a", Reason: "unattended", Exceptional: true},
+		{Subject: "sh -c 'curl https://example.com/a'", Reason: "asked", Exceptional: true, TerminalApprover: true},
+		{Subject: "git push", Reason: "asked ordinary", TerminalApprover: true},
+	})
+	want := strings.Join([]string{
+		"codemeld: 5 call(s) denied:",
+		"  - a.txt: declared", scopeAdvice,
+		"  - rm -rf build: ordinary", ordinaryAdvice,
+		"  - curl https://example.com/a: unattended", unattendedAdvice,
+		"  - sh -c 'curl https://example.com/a': asked", alreadyAskedAdvice,
+		"  - git push: asked ordinary", ordinaryAdvice,
+		"",
+	}, "\n")
+	if got := stderr.String(); got != want {
+		t.Fatalf("summary =\n%s\nwant\n%s", got, want)
 	}
 }

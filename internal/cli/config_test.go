@@ -521,3 +521,215 @@ func TestConfigCheck_UsageErrors(t *testing.T) {
 		t.Fatalf("stdout non-empty on usage error: %q", stdout)
 	}
 }
+
+func writeLocalSettings(t *testing.T, root, body string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".codemeld")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	path := filepath.Join(dir, "settings.local.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write local settings: %v", err)
+	}
+	return path
+}
+
+func localPathIn(t *testing.T, project string) string {
+	t.Helper()
+	return filepath.Join(canonicalDir(t, project), ".codemeld", "settings.local.yaml")
+}
+
+func assertNoApprovalRecorded(t *testing.T, home, project string) {
+	t.Helper()
+	if decision := trust.Lookup(home, canonicalDir(t, project)); decision.Trusted {
+		t.Fatalf("checking the layer approved the project: %#v", decision)
+	}
+	if _, err := os.Stat(trust.StorePath(home)); !os.IsNotExist(err) {
+		t.Fatalf("approval store stat err = %v, want no store written by a check", err)
+	}
+}
+
+func TestConfigCheck_NoArgumentReportsGlobalSharedAndLocalLayersInOrder(t *testing.T) {
+	t.Run("a valid approved local file passes after the other two", func(t *testing.T) {
+		home, project := t.TempDir(), t.TempDir()
+		writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+		marker := writeProjectSettings(t, project, "mode:\n  default: plan\n")
+		writeLocalSettings(t, project, "blocked_paths:\n  - /srv/secrets\n")
+		trustProject(t, home, project)
+		stubConfigEnv(t, home, project)
+
+		code, stdout, stderr := runConfig(t, "config", "check")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		want := strings.Join([]string{
+			bootstrap.SettingsPath(home) + " (global layer rules): ok",
+			canonicalMarker(t, marker) + " (project layer rules): ok",
+			localPathIn(t, project) + " (local layer rules): ok",
+		}, "\n") + "\n"
+		if stdout != want {
+			t.Fatalf("stdout =\n%s\nwant\n%s", stdout, want)
+		}
+	})
+
+	t.Run("an absent local file is reported and is not a failure", func(t *testing.T) {
+		home, project := t.TempDir(), t.TempDir()
+		writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+		marker := writeProjectSettings(t, project, "mode:\n  default: plan\n")
+		trustProject(t, home, project)
+		stubConfigEnv(t, home, project)
+
+		code, stdout, stderr := runConfig(t, "config", "check")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		want := strings.Join([]string{
+			bootstrap.SettingsPath(home) + " (global layer rules): ok",
+			canonicalMarker(t, marker) + " (project layer rules): ok",
+			localPathIn(t, project) + " (local layer rules): not present",
+		}, "\n") + "\n"
+		if stdout != want {
+			t.Fatalf("stdout =\n%s\nwant\n%s", stdout, want)
+		}
+	})
+}
+
+func TestConfigCheck_ApprovedLocalLayerUsesLaunchLocalRules(t *testing.T) {
+	for _, withShared := range []bool{true, false} {
+		t.Run(fmt.Sprintf("shared file present=%v", withShared), func(t *testing.T) {
+			home, project := t.TempDir(), t.TempDir()
+			writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+			if withShared {
+				writeProjectSettings(t, project, "vcs:\n  preferred: hg\n")
+			}
+			writeLocalSettings(t, project, "vcs:\n  preferred: hg\n")
+			trustProject(t, home, project)
+			stubConfigEnv(t, home, project)
+
+			code, stdout, stderr := runConfig(t, "config", "check")
+			if code == 0 {
+				t.Fatalf("exit = 0, want non-zero (stdout=%q stderr=%q)", stdout, stderr)
+			}
+			local := localPathIn(t, project)
+			mustContain(t, stdout,
+				local+" (local layer rules): failed to load",
+				"schema validation failed at vcs",
+				"codemeld would not start with this file in place",
+			)
+			if withShared {
+				mustContain(t, stdout, " (project layer rules): ok")
+			} else {
+				mustContain(t, stdout, " (project layer rules): not present")
+			}
+		})
+	}
+}
+
+func TestConfigCheck_UnapprovedLocalLayerIsNamedNotParsed(t *testing.T) {
+	for _, withShared := range []bool{true, false} {
+		t.Run(fmt.Sprintf("shared file present=%v", withShared), func(t *testing.T) {
+			home, project := t.TempDir(), t.TempDir()
+			writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+			if withShared {
+				writeProjectSettings(t, project, "mode:\n  default: plan\n")
+			}
+			path := writeLocalSettings(t, project, "vcs:\n  preferred: hg\nmode:\n  default: plan\n  default: build\n")
+			if err := os.Chmod(path, 0o000); err != nil {
+				t.Fatalf("chmod local settings: %v", err)
+			}
+			stubConfigEnv(t, home, project)
+
+			code, stdout, stderr := runConfig(t, "config", "check")
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+			}
+			local := localPathIn(t, project)
+			mustContain(t, stdout,
+				local+" (local layer rules): present, not approved",
+				"approve the project",
+				"codemeld config check "+local,
+			)
+			mustNotContain(t, stdout+stderr, "failed to load", "is not valid YAML", "set twice", "schema validation", "would not start")
+			assertNoApprovalRecorded(t, home, project)
+		})
+	}
+
+	t.Run("an absent local file is not present", func(t *testing.T) {
+		home, project := t.TempDir(), t.TempDir()
+		writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+		stubConfigEnv(t, home, project)
+
+		code, stdout, stderr := runConfig(t, "config", "check")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		mustContain(t, stdout, localPathIn(t, project)+" (local layer rules): not present")
+	})
+
+	t.Run("a metadata lookup error other than absence fails to load", func(t *testing.T) {
+		home, project := t.TempDir(), t.TempDir()
+		writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+		stubConfigEnv(t, home, project)
+		prev := osLstat
+		osLstat = func(string) (fs.FileInfo, error) { return nil, errors.New("LSTAT-DETAIL") }
+		t.Cleanup(func() { osLstat = prev })
+
+		code, stdout, stderr := runConfig(t, "config", "check")
+		if code != 1 {
+			t.Fatalf("exit = %d, want 1 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		mustContain(t, stdout,
+			localPathIn(t, project)+" (local layer rules): failed to load",
+			"settings file could not be read safely",
+			"codemeld would not start with this file in place",
+		)
+		mustNotContain(t, stdout+stderr, "LSTAT-DETAIL")
+	})
+}
+
+func TestConfigCheck_NamedLocalPathUsesLocalRules(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
+	local := writeLocalSettings(t, project, "vcs:\n  preferred: hg\n")
+	stubConfigEnv(t, home, project)
+
+	t.Run("absolute", func(t *testing.T) {
+		code, stdout, _ := runConfig(t, "config", "check", local)
+		if code == 0 {
+			t.Fatalf("exit = 0, want non-zero:\n%s", stdout)
+		}
+		mustContain(t, stdout, local+" (local layer rules): failed to load", "schema validation failed at vcs")
+		assertNoApprovalRecorded(t, home, project)
+	})
+
+	t.Run("relative", func(t *testing.T) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		if err := os.Chdir(project); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+		code, stdout, _ := runConfig(t, "config", "check", filepath.Join(".codemeld", "settings.local.yaml"))
+		if code == 0 {
+			t.Fatalf("exit = 0, want non-zero:\n%s", stdout)
+		}
+		mustContain(t, stdout, local+" (local layer rules): failed to load", "schema validation failed at vcs")
+		assertNoApprovalRecorded(t, home, project)
+	})
+
+	t.Run("outside a .codemeld directory keeps project rules", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "settings.local.yaml")
+		if err := os.WriteFile(outside, []byte("vcs:\n  preferred: hg\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		code, stdout, stderr := runConfig(t, "config", "check", outside)
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		mustContain(t, stdout, outside+" (project layer rules): ok")
+	})
+}

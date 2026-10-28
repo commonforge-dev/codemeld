@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -1006,7 +1008,7 @@ func TestWebSearchIntegration_FailedSearchContinuesToTheNextModelRound(t *testin
 			},
 			wantToolCalls: 2,
 			wantContent:   "exa: the search request failed",
-			leaks:         []string{webSearchKeySentinel, webSearchBodySentinel, exaSearchHost, "500"},
+			leaks:         []string{webSearchKeySentinel, webSearchBodySentinel, exaSearchHost, "request failed with status 500"},
 		},
 		{
 			name:          "no usable result",
@@ -1044,7 +1046,11 @@ func TestWebSearchIntegration_FailedSearchContinuesToTheNextModelRound(t *testin
 
 			var stdout, stderr bytes.Buffer
 			driver := NewHeadlessDriver("research this", &stdout, &stderr)
-			result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Build, mode.SourceDefault))
+			dir := filepath.Join(t.TempDir(), "project-500")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
 			result.Config = composed
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1079,6 +1085,9 @@ func TestWebSearchIntegration_FailedSearchContinuesToTheNextModelRound(t *testin
 			mu.Unlock()
 			if !strings.Contains(continuation, content) {
 				t.Fatalf("continuation request = %q, want the bounded failure in model context", continuation)
+			}
+			if wd := mustCanonical(t, dir); !strings.Contains(continuation, wd) {
+				t.Fatalf("continuation request = %q, want the working directory %q", continuation, wd)
 			}
 			for _, leak := range tc.leaks {
 				if strings.Contains(content, leak) || strings.Contains(surfaced, leak) || strings.Contains(continuation, leak) {

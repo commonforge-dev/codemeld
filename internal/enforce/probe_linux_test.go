@@ -19,6 +19,7 @@ import (
 	"time"
 	"unsafe"
 
+	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/runner"
 	"golang.org/x/sys/unix"
 )
@@ -506,10 +507,38 @@ func TestEnvironmentProbe(t *testing.T) {
 			{"extra variable", append(slices.Clone(env), "EXTRA=1"), probeFailed},
 			{"missing entry", env[1:], probeFailed},
 			{"wrong value", append(slices.Clone(env[:len(env)-1]), "LC_ALL=C"), probeFailed},
+			{"run marker", append(slices.Clone(env), runner.RunMarkerEnv+"="+ids.NewV7()), probeAllowed},
+			{"malformed run marker", append(slices.Clone(env), runner.RunMarkerEnv+"=not-a-uuid"), probeFailed},
+			{"run marker and an extra variable", append(slices.Clone(env), runner.RunMarkerEnv+"="+ids.NewV7(), "CODEMELD_OTHER=1"), probeFailed},
 		} {
 			if got := probeInChild(t, tc.env, "environment", home, root, tmpDir); got != tc.want {
 				t.Errorf("tmp %q, %s: exit %d, want %d", tmpDir, tc.name, got, tc.want)
 			}
 		}
+		if fixedEnvironmentSeen(append(slices.Clone(env), runner.RunMarkerEnv+"="+ids.NewV7(), runner.RunMarkerEnv+"="+ids.NewV7()), env) {
+			t.Errorf("tmp %q: two run markers accepted", tmpDir)
+		}
+	}
+}
+
+func TestEnvironmentProbeAcceptsTheProductionRunnerMarker(t *testing.T) {
+	home, root := "/home/u", t.TempDir()
+	env, err := runner.FixedEnvironment(home, root, "", runner.FixedPATH, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := runner.RunSpec{
+		InvocationID: ids.NewV7(),
+		Argv:         []string{os.Args[0], "-test.run=^TestProbeChild$", "--", "environment", home, root, ""},
+		Env:          env,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := runner.DirectExecRunner{}.ExecBounded(ctx, spec, 1<<16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(res.Stdout)+string(res.Stderr), fmt.Sprintf("probe exit=%d\n", probeAllowed)) {
+		t.Fatalf("environment probe through the runner did not pass:\n%s%s", res.Stdout, res.Stderr)
 	}
 }

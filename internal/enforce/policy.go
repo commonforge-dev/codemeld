@@ -28,6 +28,7 @@ type Policy struct {
 	BlockedPaths         []string `json:"blocked_paths"`
 	WriteRoots           []string `json:"write_roots"`
 	NoWritePaths         []string `json:"no_write_paths"`
+	ReadRoots            []string `json:"read_roots"`
 	TmpDir               string   `json:"tmp_dir"`
 }
 
@@ -97,7 +98,7 @@ func (p Policy) validate() error {
 	if len(p.BlockedPaths) == 0 {
 		return errors.New("policy: blocked_paths is empty")
 	}
-	for _, list := range [][]string{p.BlockedPaths, p.WriteRoots, p.NoWritePaths} {
+	for _, list := range [][]string{p.BlockedPaths, p.WriteRoots, p.NoWritePaths, p.ReadRoots} {
 		for _, path := range list {
 			if err := checkPolicyPath(path); err != nil {
 				return err

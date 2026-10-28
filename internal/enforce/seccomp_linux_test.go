@@ -245,8 +245,12 @@ func TestSeccompNetworkVariant(t *testing.T) {
 				t.Errorf("%s network socket family %#x: ret %#x, want EPERM", info.Name, family, got)
 			}
 		}
-		if got := net.run("socketpair", unix.AF_UNIX, unix.SOCK_STREAM); got != retAllow {
-			t.Errorf("%s network socketpair: ret %#x, want allow", info.Name, got)
+		for _, flags := range flagSets {
+			for _, typ := range []uint64{unix.SOCK_STREAM, unix.SOCK_SEQPACKET} {
+				if got := net.run("socketpair", unix.AF_UNIX, typ|flags); got != retAllow {
+					t.Errorf("%s network socketpair(AF_UNIX, %#x): ret %#x, want allow", info.Name, typ|flags, got)
+				}
+			}
 		}
 	}
 }
@@ -257,16 +261,20 @@ func TestSeccompSocketpair(t *testing.T) {
 		for name, p := range policies {
 			v := newSeccompVM(t, p, info)
 			for _, flags := range []uint64{0, unix.SOCK_NONBLOCK, unix.SOCK_CLOEXEC, unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC} {
-				if got := v.run("socketpair", unix.AF_UNIX, unix.SOCK_STREAM|flags); got != retAllow {
-					t.Errorf("%s %s socketpair(AF_UNIX, %#x): ret %#x, want allow", info.Name, name, unix.SOCK_STREAM|flags, got)
+				for _, typ := range []uint64{unix.SOCK_STREAM, unix.SOCK_SEQPACKET} {
+					if got := v.run("socketpair", unix.AF_UNIX, typ|flags); got != retAllow {
+						t.Errorf("%s %s socketpair(AF_UNIX, %#x): ret %#x, want allow", info.Name, name, typ|flags, got)
+					}
 				}
 			}
 			for _, family := range []uint64{unix.AF_UNSPEC, unix.AF_INET, unix.AF_INET6, unix.AF_NETLINK, unix.AF_TIPC, 1000} {
-				if got := v.run("socketpair", family, unix.SOCK_STREAM); got != retEPERM {
-					t.Errorf("%s %s socketpair(%d, SOCK_STREAM): ret %#x, want EPERM", info.Name, name, family, got)
+				for _, typ := range []uint64{unix.SOCK_STREAM, unix.SOCK_SEQPACKET} {
+					if got := v.run("socketpair", family, typ); got != retEPERM {
+						t.Errorf("%s %s socketpair(%d, %#x): ret %#x, want EPERM", info.Name, name, family, typ, got)
+					}
 				}
 			}
-			for _, typ := range []uint64{unix.SOCK_DGRAM, unix.SOCK_SEQPACKET, unix.SOCK_RAW, unix.SOCK_STREAM | 0x100, unix.SOCK_SEQPACKET | unix.SOCK_CLOEXEC} {
+			for _, typ := range []uint64{unix.SOCK_DGRAM, unix.SOCK_RAW, unix.SOCK_STREAM | 0x100, unix.SOCK_SEQPACKET | 0x100} {
 				if got := v.run("socketpair", unix.AF_UNIX, typ); got != retEPERM {
 					t.Errorf("%s %s socketpair(AF_UNIX, %#x): ret %#x, want EPERM", info.Name, name, typ, got)
 				}

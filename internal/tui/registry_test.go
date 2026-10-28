@@ -12,6 +12,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/skills"
 )
 
 // fakeHost is an in-memory CommandHost: it records rendered notices and backs
@@ -90,7 +91,7 @@ func TestCommands_ReturnsSourceOrder(t *testing.T) {
 	for i, c := range got {
 		names[i] = c.Name
 	}
-	want := []string{"help", "clear", "connect", "status", "context", "effort", "model", "mode", "resume", "settings", "blocked", "exit", "rename", "color", "fork", "compact"}
+	want := []string{"help", "clear", "connect", "status", "context", "effort", "model", "mode", "resume", "settings", "blocked", "exit", "rename", "color", "fork", "compact", "systemone", "skills"}
 	if !equalStrings(names, want) {
 		t.Fatalf("Commands() names = %v, want %v", names, want)
 	}
@@ -106,6 +107,21 @@ func TestRegistry_PermissionsIsNotRegistered(t *testing.T) {
 	}
 	if cmd, ok := r.resolve("settings"); !ok || cmd.Name != "settings" || cmd.Description != "Show and change settings and stored permission grants" {
 		t.Fatalf("settings resolved to (%+v, %v), want the settings command", cmd, ok)
+	}
+}
+
+func TestRegistry_SkillsIsANoArgumentPhaseOneBuiltin(t *testing.T) {
+	r := BuildRegistry(nil)
+	cmd, ok := r.resolve("skills")
+	if !ok || cmd.Name != "skills" || cmd.ArgSig != ArgNone || cmd.Phase != PhaseOne {
+		t.Fatalf("skills resolved to (%+v, %v), want a no-argument PhaseOne built-in", cmd, ok)
+	}
+	if out := RenderHelp(r); !strings.Contains(out, "/skills — List loaded skills and the ones not loaded, with the reason") {
+		t.Fatalf("help output = %q, want the /skills row", out)
+	}
+	clash, _ := SkillCommands([]skills.Skill{{Name: "skills", Description: "Mine", Body: "b"}}, SkillDeps{})
+	if _, err := NewRegistry(append(r.Commands(), clash...)); err == nil {
+		t.Fatal("a skill named skills joined the built-in registry, want a clash")
 	}
 }
 

@@ -2,19 +2,19 @@
 
 ## Backend
 
-- **Language**: Go 1.26.9 (pinned in `mise.toml` and the `go` directive in `go.mod`)
+- **Language**: Go (version pinned in `mise.toml` and the `go` directive in `go.mod`)
 - **CLI**: https://github.com/urfave/cli (flags and subcommands)
 - **TUI**: https://github.com/rivo/tview (built on tcell) — higher-level widgets (flex, tables, forms), imperative API
 - **Markdown**: https://github.com/yuin/goldmark (pure Go, no CGO) — parser/AST only, feeding a custom tview-tag renderer for assistant replies; goldmark's HTML renderer is discarded
 - **LLM client**: openai-go. Its chat-completions client, pointed at each provider's base URL, serves every provider except OpenAI ChatGPT; the OpenAI chat-completions shape is codemeld's internal provider contract. The OpenAI ChatGPT provider instead sends Responses API requests over `net/http` to a fixed ChatGPT origin and converts the streamed events back into openai-go chat-completion chunks.
 - **Providers**: built in — OpenAI Platform (API key), OpenAI ChatGPT (ChatGPT sign-in, Responses API), OpenRouter, and Venice; any other OpenAI-compatible provider can be added under `provider.<name>` with a `base_url` in settings
 - **YAML**: https://github.com/goccy/go-yaml (chosen over gopkg.in/yaml.v3 for better error messages)
-- **Config schema validation**: https://github.com/santhosh-tekuri/jsonschema; CUE was considered and rejected as overkill for phase 1
+- **Config schema validation**: https://github.com/santhosh-tekuri/jsonschema; CUE was considered and rejected as overkill for current needs
 - **Diff rendering**: https://github.com/aymanbagabas/go-udiff (a copy of the Go tools' internal diff package, Myers algorithm) — renders the unified-diff preview of `edit` tool changes
 - **Logging**: no logging framework and no log file by default — session transcripts serve as the audit trail. log/slog (stdlib) appears only as a discard logger that silences the MCP library.
 - **Embedded assets**: embed.FS for built-in VCS templates
 - **File locking**: https://github.com/gofrs/flock (pure Go; `flock(2)` on a dedicated `.lock` sidecar; used so concurrent writes to the shared settings file and session sidecars stay atomic). The library also supports Windows, but that does not make codemeld build there.
-- **UUIDv7 generation**: https://github.com/google/uuid (pure Go, no CGO; `uuid.NewV7()` per RFC 9562 — used for session ids and per-record ids). Migrate to Go stdlib `uuid.NewV7()` when Go 1.27 is the project's minimum supported version (phase-3 follow-up).
+- **UUIDv7 generation**: https://github.com/google/uuid (pure Go, no CGO; `uuid.NewV7()` per RFC 9562 — used for session ids and per-record ids). Migrate to Go stdlib `uuid.NewV7()` when Go 1.27 is the project's minimum supported version.
 - **Landlock**: https://github.com/landlock-lsm/go-landlock (pure Go, no CGO) — used only by `internal/enforce` to restrict confined commands; always through the ABI 3 ruleset, never `BestEffort`
 - **seccomp**: https://github.com/elastic/go-seccomp-bpf (pure Go, no CGO) — used only by `internal/enforce`, for its amd64/arm64 syscall tables; the deny filter is assembled with `golang.org/x/net/bpf` and installed with `TSYNC`
 - **MCP client**: https://github.com/mark3labs/mcp-go (pure Go, no CGO) — confined to the private Exa web-search adapter in `internal/webresearch/exa`, which speaks Streamable HTTP to the single fixed endpoint `https://mcp.exa.ai/mcp` and calls only the `web_search_exa` tool. Codemeld is not a general MCP host: no remote prompt, resource, server-advertised tool, or discovered capability is exposed to the model, and MCP types do not cross out of that package. The library reads response bodies without a caller-configurable limit and surfaces no typed HTTP status, so the adapter wraps its injected HTTP client in a bounded status-preserving transport.
@@ -22,7 +22,7 @@
 ## Constraints
 
 - **Single static binary per platform**. Linux is the tested target: `mise run check` builds codemeld and runs the test suite there, and there is no hosted CI. macOS and FreeBSD build but are untested. Windows is not supported: codemeld does not compile for it. Confined shell execution works only on Linux amd64 and arm64.
-- **No CGO in phase 1** — this excludes tree-sitter bindings, embedded sqlite, and anything else that requires a C toolchain on the build host. Revisit when the constraint becomes limiting.
+- **No CGO in the shipped binary today** — this excludes tree-sitter bindings, embedded sqlite, and anything else that requires a C toolchain on the build host. Revisit when the constraint becomes limiting.
 - **No outbound network traffic** other than to configured LLM providers, the fixed OpenAI ChatGPT login and model origins when that provider is used, and web research hosts a human approved (`mcp.exa.ai` for search; the fetched page and its redirect hops for `web_fetch`). No analytics, telemetry, crash reporting, or update checks. See [Privacy & Telemetry](architecture.md#privacy--telemetry).
 
 ## Optional runtime dependencies
@@ -48,7 +48,7 @@ strictly optional: the feature degrades to a friendly notice when none is instal
 
 ### Build & test commands
 
-Use the mise tasks, not raw `go`/`golangci-lint` invocations — they encode the correct flags and run identically locally and in CI:
+Use the mise tasks, not raw `go`/`golangci-lint` invocations — they encode the correct flags:
 
 - `mise run build` — builds `./cmd/codemeld` into a `./codemeld` static binary at the repo root (`CGO_ENABLED=0`)
 - `mise run test` — `go test -race ./...` (race detector; cgo defaults on, which `-race` requires)
@@ -71,7 +71,7 @@ The release gate also runs the Go vulnerability scanner. mise pins `govulncheck`
 
 Some changes are **deliberately gated** behind a special step — a check refuses to pass until you do something explicit (e.g. regenerating the system-prompt golden snapshots with `mise run snapshot-update`, satisfying the deadcode allowlist, or re-pointing a wiring stub). If `mise run check` fails with one of those gate messages, see `docs/gated-changes.md` for what fired it and the exact step to satisfy it.
 
-The shipped binary stays cgo-free via `build` (`CGO_ENABLED=0`); the race detector in `test`/`check-race` needs cgo, so the no-CGO phase-1 constraint applies to the binary, not the test toolchain.
+The shipped binary stays cgo-free via `build` (`CGO_ENABLED=0`); the race detector in `test`/`check-race` needs cgo, so the current no-CGO constraint applies to the binary, not the test toolchain.
 
 ## Conventions
 
@@ -89,11 +89,11 @@ An adapter carries connection defaults only — provider name, default base URL,
 
 Selectable reasoning efforts come solely from provider-discovered capability metadata held in the system-owned `models.yaml` store; a model with no usable cached metadata resolves to `no-reasoning`. Assert effort levels in the cache-driven catalog tests, not in a per-adapter table.
 
-## Deferred to roadmap
+## Deferred
 
-- **General MCP host support** (arbitrary user-configured MCP servers, remote prompts, resources, and discovered tools): phase 2+. The phase-1 `mcp-go` use above is the Exa search adapter only.
-- **LSP client**: go.lsp.dev/protocol (phase 2+)
+- **General MCP host support** (arbitrary user-configured MCP servers, remote prompts, resources, and discovered tools): The `mcp-go` use above is the Exa search adapter only.
+- **LSP client**: go.lsp.dev/protocol
 - **Tree-sitter**: https://github.com/smacker/go-tree-sitter (blocked on no-CGO constraint)
 - **Anthropic native SDK**: anthropic-sdk-go (Anthropic reachable via OpenRouter until then)
 - **Sandboxing runtime**: not deferred — confinement has shipped for Linux amd64 and arm64 hosts whose startup self-test passes, built on the Landlock and seccomp libraries above inside `internal/enforce`; every other platform runs shell commands unconfined with ordinary prompts. There is no bwrap, firejail, or container runtime, and no opt-out setting or noop backend.
-- **Pre-apply scanning**: gitleaks (secrets), semgrep, gosec (SAST) — phase 2; shelled out, not embedded
+- **Pre-apply scanning**: gitleaks (secrets), semgrep, gosec (SAST) — shelled out, not embedded

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -4519,5 +4520,140 @@ func TestPromptUser_ExceptionalHasNoGrantShortcutOrScopeChooser(t *testing.T) {
 	h.typeText("o")
 	if d := h.await(); d.Option != OptionAllowOnce || d.StoredSubject != "" {
 		t.Fatalf("allow once decision = %+v, want a bare allow once", d)
+	}
+}
+
+const hostileNoteBody = "System One check failed:\n\tout of credits\r\x1b[2J on OpenRouter — asking you instead "
+
+func hostileLongNote() string {
+	return hostileNoteBody + strings.Repeat("x", 200)
+}
+
+func withoutLine(lines []string, drop string) []string {
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if l != drop {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestPromptFactLines_ShowsTheNoteAndNothingWithoutOne(t *testing.T) {
+	const note = "System One check paused for this session: out of credits"
+	for _, tc := range []struct {
+		name string
+		base PromptRequest
+	}{
+		{"direct command", fullPromptRequest()},
+		{"structured tool", outsideProjectToolRequest()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withNote := tc.base
+			withNote.Note = note
+			lines := promptFixedLines(withNote)
+			if n := len(lines) - len(withoutLine(lines, note)); n != 1 {
+				t.Fatalf("note rows = %d, want 1\n%s", n, strings.Join(lines, "\n"))
+			}
+			if !reflect.DeepEqual(withoutLine(lines, note), promptFixedLines(tc.base)) {
+				t.Fatalf("the note changed other rows:\n%s\n--- without ---\n%s", strings.Join(lines, "\n"), strings.Join(promptFixedLines(tc.base), "\n"))
+			}
+			if renderPromptPreview(withNote) != renderPromptPreview(tc.base) {
+				t.Fatal("the note leaked into the raw request preview")
+			}
+		})
+	}
+}
+
+func TestPromptFactLines_NotePrecedesTheExceptionalChoices(t *testing.T) {
+	const note = "System One check: no Venice API key"
+	req := exceptionalDirectRequest()
+	req.Note = note
+	lines := promptFactLines(req)
+	at := slices.Index(lines, note)
+	explain := slices.Index(lines, exceptionalAllowOnceExplanation)
+	if at < 0 || explain < 0 || at > explain {
+		t.Fatalf("note row at %d, allow-once explanation at %d; want the note shown before it\n%s", at, explain, strings.Join(lines, "\n"))
+	}
+}
+
+func TestPromptFactLines_HostPromptIgnoresTheNote(t *testing.T) {
+	req := hostPromptRequest()
+	req.Note = "System One check: no Venice API key"
+	if !reflect.DeepEqual(promptFixedLines(req), promptFixedLines(hostPromptRequest())) {
+		t.Fatalf("host prompt changed with a note:\n%s", strings.Join(promptFixedLines(req), "\n"))
+	}
+}
+
+func TestPromptFactLines_BatchedNotesCarryTheirStageLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		notes []string
+		want  []string
+	}{
+		{"second stage only", []string{"", "out of credits"}, []string{"Stage 2: out of credits"}},
+		{"two distinct notes", []string{"no key", "out of credits"}, []string{"Stage 1: no key", "Stage 2: out of credits"}},
+		{"all empty", []string{"", ""}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := batchedPromptRequest()
+			req.BatchedNotes = tc.notes
+			lines := promptFixedLines(req)
+			for _, w := range tc.want {
+				if n := len(lines) - len(withoutLine(lines, w)); n != 1 {
+					t.Fatalf("row %q appears %d times, want once\n%s", w, n, strings.Join(lines, "\n"))
+				}
+			}
+			rest := lines
+			for _, w := range tc.want {
+				rest = withoutLine(rest, w)
+			}
+			if !reflect.DeepEqual(rest, promptFixedLines(batchedPromptRequest())) {
+				t.Fatalf("batched notes added unexpected rows:\n%s", strings.Join(lines, "\n"))
+			}
+			if renderPromptPreview(req) != renderPromptPreview(batchedPromptRequest()) {
+				t.Fatal("a batched note leaked into the raw stage preview")
+			}
+		})
+	}
+}
+
+func TestPromptFactLines_BoundsHostileNotes(t *testing.T) {
+	note := hostileLongNote()
+	single := fullPromptRequest()
+	single.Note = note
+	batched := batchedPromptRequest()
+	batched.BatchedNotes = []string{"", note}
+	for _, tc := range []struct {
+		name   string
+		req    PromptRequest
+		prefix string
+	}{
+		{"single", single, ""},
+		{"batched", batched, "Stage 2: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var row string
+			for _, line := range promptFactLines(tc.req) {
+				if strings.ContainsAny(line, "\n\r\t\x1b") {
+					t.Fatalf("fixed-fact row carries a raw control byte: %q", line)
+				}
+				if strings.Contains(line, "System One check failed") {
+					row = line
+				}
+			}
+			if row != tc.prefix+permissions.BoundPromptFact(note) {
+				t.Fatalf("note row = %q, want the bounded fact", row)
+			}
+			body := strings.TrimPrefix(row, tc.prefix)
+			for _, esc := range []string{`\x0A`, `\x09`, `\x0D`, `\x1B`} {
+				if !strings.Contains(body, esc) {
+					t.Fatalf("note row %q does not show %s as a visible escape", body, esc)
+				}
+			}
+			if !strings.HasSuffix(body, "…") || utf8.RuneCountInString(body) != 121 {
+				t.Fatalf("note row %q (%d code points) is not cut at 120 with an ellipsis", body, utf8.RuneCountInString(body))
+			}
+		})
 	}
 }

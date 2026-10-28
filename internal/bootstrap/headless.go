@@ -32,6 +32,7 @@ import (
 	"codemeld.dev/codemeld/internal/sessionfailures"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/sessionturn"
+	"codemeld.dev/codemeld/internal/trust"
 	"codemeld.dev/codemeld/internal/tui"
 	"codemeld.dev/codemeld/internal/turn"
 )
@@ -68,8 +69,8 @@ const maxRefusalsPerCall = 5
 func HeadlessFreshSteps(stderr io.Writer, modelOverride *model.Selection, modeKey string) FreshSteps {
 	steps := DefaultFreshSteps(stderr, stderr)
 	steps.GateTrust = headlessTrustGate(stderr)
-	steps.RecoverJournals = func(home, projectRoot string) {
-		recoverChildJournals(home, projectRoot, nil, stderr, false)
+	steps.RecoverJournals = func(home, projectRoot string, global map[string]any, decision trust.Decision) {
+		recoverChildJournals(home, projectRoot, global, decision, nil, stderr, false)
 	}
 	if modelOverride != nil {
 		steps.DetermineModel = overrideDetermineModelStep(*modelOverride)
@@ -225,9 +226,11 @@ func (d *HeadlessDriver) PromptForApprovalEnabled() bool { return d.promptForApp
 // summary tell a declared-scope refusal from an ordinary fail-closed one without reading the reason
 // text or checking which flags the run was started with.
 type DeniedCall struct {
-	Subject string
-	Reason  string
-	Source  string
+	Subject          string
+	Reason           string
+	Source           string
+	Exceptional      bool
+	TerminalApprover bool
 }
 
 // DeclaredScope reports whether the run's declared file scopes produced this denial — the one class
@@ -349,11 +352,12 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	// accessor every collaborator reads through is a constant.
 	storeAccessor := func() *sessions.Store { return session }
 
+	skillLines := loadSkills(result, cache.AgentInstructionsMaxFileBytes())
 	assemblePrompt := newSystemPromptAssembler(result, modeActive, active)
-	// One run-scoped holder for both the delegate binding below and the turn runHeadlessTurn
+	// One run-scoped holder for both the general_agent binding below and the turn runHeadlessTurn
 	// publishes, exactly as StartTUI does: realization precedes the turn, so it has to exist
 	// here for both sides to reference the same instance.
-	delegateParent := &parentTurnHolder{}
+	generalAgentParent := &parentTurnHolder{}
 	guard, err := protectedStatePolicy(result.Home, cache.ProjectRoot(), result.SettingsLayers)
 	if err != nil {
 		return fmt.Errorf("bootstrap: headless build blocked paths: %w", err)
@@ -380,9 +384,14 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	for _, line := range bigBlockedEntryWarnings(result.Home, blockedEntries, guard.Blocked.FoldCase()) {
 		_, _ = fmt.Fprintln(stderr, line)
 	}
-	conf := launchConfinement(execution, tmpDir, modeActive, cache, result.Home, guard)
+	for _, line := range skillLines {
+		stderr.line(line)
+	}
+	inherited, _ := runner.InheritedEnvironment(os.Environ())
+	conf := launchConfinement(execution, tmpDir, modeActive, cache, result.Home, guard, inherited)
+	systemOne := newSystemOneCheck(cache, guard.Blocked)
 	registry, err := realizeToolRegistry(result.ToolRegistry, cache, storeAccessor, result.Home, result.LaunchDir, guard,
-		delegateBinding{parent: delegateParent, notices: stderrNoticeRenderer{w: stderr}, confinement: conf})
+		generalAgentBinding{parent: generalAgentParent, notices: stderrNoticeRenderer{w: stderr}, confinement: conf, systemOne: systemOne})
 	if err != nil {
 		return fmt.Errorf("bootstrap: headless build tool registry: %w", err)
 	}
@@ -402,6 +411,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	authorizer.declaredDelete = declaredDelete
 	authorizer.executionConstrained = execution.SelfTestPassed
 	authorizer.blocked = guard.Blocked
+	authorizer.systemOne = systemOne
 	d.authorizer = authorizer
 
 	dispatcher := newProductionToolDispatcher(registry, newShellRunner(), authorizer, result.Home, result.LaunchDir, storeAccessor, cache.MaxToolOutputBytes(), guard)
@@ -434,7 +444,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	modeKey, _ := modeActive.Current()
 	persister := sessionturn.New(session, turnNoticeRenderer{surface: surface})
 	runErr := persister.PersistUserInputThenIssue(ctx, d.prompt, nil, func(submitStart time.Time) error {
-		return runHeadlessTurn(ctx, session, cache, active, surface, toolDispatcher, assemblePrompt, assembleTools, result.Home, submitStart, devDebug, string(modeKey), delegateParent)
+		return runHeadlessTurn(ctx, session, cache, active, surface, toolDispatcher, assemblePrompt, assembleTools, result.Home, submitStart, devDebug, string(modeKey), generalAgentParent)
 	})
 	stopDelivery()
 
@@ -496,9 +506,9 @@ func storeHeadlessModelTitle(ctx context.Context, session *sessions.Store, surfa
 // turn.NewToolLoop to a final answer. A run with no resolvable model issues no turn
 // (the picker-required case is converted to exit 2 in RunHeadless before this runs).
 //
-// delegateParent, when bound, is the run-scoped holder the registry's delegate binding reads
+// generalAgentParent, when bound, is the run-scoped holder the registry's general_agent binding reads
 // a child's inherited parent from; RunHeadless passes the same instance it bound there.
-func runHeadlessTurn(ctx context.Context, session *sessions.Store, cache *config.Cache, active *model.ActiveState, surface *headlessSurface, dispatcher turn.ToolDispatcher, assemblePrompt func() string, assembleTools func() []provider.ToolDefinition, home string, submitStart time.Time, devDebug bool, modeName string, delegateParent ...*parentTurnHolder) error {
+func runHeadlessTurn(ctx context.Context, session *sessions.Store, cache *config.Cache, active *model.ActiveState, surface *headlessSurface, dispatcher turn.ToolDispatcher, assemblePrompt func() string, assembleTools func() []provider.ToolDefinition, home string, submitStart time.Time, devDebug bool, modeName string, generalAgentParent ...*parentTurnHolder) error {
 	sel, source, ok := active.Current()
 	if !ok {
 		return nil
@@ -516,10 +526,10 @@ func runHeadlessTurn(ctx context.Context, session *sessions.Store, cache *config
 	snapshot := model.NewActiveState(&sel, source)
 	systemPrompt := assemblePrompt()
 
-	// Publish the very values this turn's Deps carry, before the loop can dispatch a delegate
+	// Publish the very values this turn's Deps carry, before the loop can dispatch a general_agent
 	// call, so the child's inherited parent cannot drift from the turn that emitted the call.
-	if len(delegateParent) > 0 {
-		delegateParent[0].publish(sel, source, modeName, systemPrompt)
+	if len(generalAgentParent) > 0 {
+		generalAgentParent[0].publish(sel, source, modeName, systemPrompt)
 	}
 
 	flush := headlessFlushHook(ctx, session, surface)
@@ -818,10 +828,12 @@ type headlessAuthorizer struct {
 	// childInvocationID attributes the permission events this authorizer emits to the child
 	// agent whose calls it is judging; it is empty for the run's own top-level calls.
 	childInvocationID    string
-	delegateWrite        map[string]bool
+	generalAgentWrite    map[string]bool
+	generalAgentResolved bool
 	executionConstrained bool
-	writableFolders      []string
+	writable             *writableFoldersReader
 	blocked              *permissions.BlockedPaths
+	systemOne            *systemOneCheck
 	localNotice          sync.Once
 
 	mu       sync.Mutex
@@ -861,7 +873,7 @@ func newHeadlessAuthorizer(cache *config.Cache, activeStore func() *sessions.Sto
 		localSettingsPath:  config.LocalSettingsPath(cache.ProjectRoot()),
 		notices:            notices,
 		declaredCommands:   cache.DeclaredCommands(),
-		writableFolders:    cache.WritableFolders(),
+		writable:           newWritableFoldersReader(cache),
 		seen:               map[DeniedCall]bool{},
 		refusals:           map[any]int{},
 	}
@@ -896,11 +908,14 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 	modeCtx.ChildInvocationID = a.childInvocationID
 	modeCtx.ExecutionConstrained = a.executionConstrained
 	modeCtx.SettingsBroken = a.executionConstrained && a.blocked.Current().Degraded()
-	modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, modeCtx.SettingsBroken, a.writableFolders)
-	// A prepared delegate call already carries the exact candidate its child would be built from.
-	if len(modeCtx.DelegateWrite) == 0 {
-		modeCtx.DelegateWrite = a.delegateWrite
+	modeCtx.WritableFolders = liveWritableFolders(a.executionConstrained, modeCtx.SettingsBroken, a.writable)
+	// A prepared general_agent call already carries the exact candidate its child would be built from.
+	if !modeCtx.GeneralAgentResolved && !modeCtx.GeneralAgentRefused && len(modeCtx.GeneralAgentWrite) == 0 {
+		modeCtx.GeneralAgentWrite = a.generalAgentWrite
+		modeCtx.GeneralAgentResolved = a.generalAgentResolved
 	}
+	texts := systemOneLiteralTexts{}
+	texts.add(req, disp.Subject)
 	disp = markExceptional(disp, req, modeCtx)
 	noApprover := headlessDenyReason
 	if disp.ExceptionalAuthority != "" {
@@ -908,11 +923,20 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 	}
 
 	store := a.activeStore()
+	var note string
+	prompt := a.promptFor(req, disp)
+	if a.terminal == nil {
+		prompt = func(ctx context.Context, esc permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+			note = esc.Note
+			return a.denyPrompt(ctx, esc)
+		}
+	}
 	deps := permissions.AuthorizeDeps{
-		Grants:       a.grants,
-		Cache:        a.grants,
-		Prompt:       a.promptFor(req, disp),
-		PersistGrant: a.persistGrant(store, req.PathScope),
+		Grants:         a.grants,
+		Cache:          a.grants,
+		Prompt:         prompt,
+		PersistGrant:   a.persistGrant(store, req.PathScope),
+		PrePromptCheck: a.systemOne.bind(store, texts),
 		EmitPromptShown: func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
 			return events.EmitPromptShownAttributed(store, subjectKind, subject, pathScope, directTokens, id.CommandSubject, id.RequestSubject, a.childInvocationID)
 		},
@@ -926,6 +950,9 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 			return events.EmitMatchedIdentityAttributed(store, subjectKind, subject, pathScope, grantKind, grantPathScope, outcome, outcomeSource, argumentHash, directRequestSubject, a.childInvocationID)
 		},
 	}
+	if a.terminal != nil {
+		deps.EmitPromptWait = promptWaitEmitter(store)
+	}
 	dec, err := permissions.Authorize(ctx, req, modeCtx, deps)
 	if err != nil {
 		return dec, err
@@ -936,15 +963,21 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 	// Recorded before the conversion below, because IsModeDenyEnvelope accepts an unattended
 	// envelope and the summary would then skip the denial it exists to report.
 	a.recordDenied(DeniedCall{
-		Subject: deniedSubjectLabel(disp, req),
-		Reason:  a.denialReason(dec, noApprover),
-		Source:  dec.DenialSource,
+		Subject:          deniedSubjectLabel(disp, req),
+		Reason:           a.denialReason(dec, noApprover),
+		Source:           dec.DenialSource,
+		Exceptional:      disp.ExceptionalAuthority != "",
+		TerminalApprover: a.terminal != nil,
 	})
 	if a.terminal != nil {
 		return dec, nil
 	}
 	reason := a.unattendedReason(dec, noApprover)
-	if reason == headlessDenyReason && (req.Kind == matchKindDirect || req.Kind == matchKindLiteral) {
+	hint := reason == headlessDenyReason
+	if note != "" {
+		reason += "; " + note
+	}
+	if hint && (req.Kind == matchKindDirect || req.Kind == matchKindLiteral) {
 		reason += " " + headlessReadOnlyHint
 		if advice, ok := shellToolAdvice(disp.Subject); ok {
 			reason += " " + advice + "."

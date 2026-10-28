@@ -3,6 +3,7 @@ package provider
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -32,10 +33,11 @@ type AuthHeader struct {
 // is held in plaintext at runtime. AuthHeader is non-nil after
 // ParseProviders, carrying the configured header or the Bearer default.
 type ProviderEntry struct {
-	BaseURL    string
-	APIKey     string
-	AuthHeader *AuthHeader
-	Routing    Routing
+	BaseURL        string
+	APIKey         string
+	AuthHeader     *AuthHeader
+	Routing        Routing
+	ContextWindows map[string]int64
 }
 
 type Routing struct {
@@ -117,13 +119,57 @@ func parseEntry(raw any) (ProviderEntry, error) {
 	if err != nil {
 		return ProviderEntry{}, err
 	}
+	windows, err := parseContextWindows(m)
+	if err != nil {
+		return ProviderEntry{}, err
+	}
 
 	return ProviderEntry{
-		BaseURL:    baseURL,
-		APIKey:     apiKey,
-		AuthHeader: auth,
-		Routing:    routing,
+		BaseURL:        baseURL,
+		APIKey:         apiKey,
+		AuthHeader:     auth,
+		Routing:        routing,
+		ContextWindows: windows,
 	}, nil
+}
+
+func parseContextWindows(m map[string]any) (map[string]int64, error) {
+	raw, ok := m["context_windows"]
+	if !ok {
+		return nil, nil
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("context_windows: expected object, got %T", raw)
+	}
+	if len(obj) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]int64, len(obj))
+	for model, v := range obj {
+		n, ok := tokenCount(v)
+		if !ok {
+			return nil, fmt.Errorf("context_windows.%s: expected an integer from 1 to %d, got %v", model, maxContextWindow, v)
+		}
+		out[model] = n
+	}
+	return out, nil
+}
+
+const maxContextWindow = 10000000
+
+func tokenCount(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), n >= 1 && n <= maxContextWindow
+	case int64:
+		return n, n >= 1 && n <= maxContextWindow
+	case uint64:
+		return int64(n), n >= 1 && n <= maxContextWindow
+	case float64:
+		return int64(n), n >= 1 && n <= maxContextWindow && n == math.Trunc(n)
+	}
+	return 0, false
 }
 
 func parseRouting(m map[string]any) (Routing, error) {

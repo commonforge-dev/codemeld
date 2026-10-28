@@ -18,6 +18,7 @@ import (
 	"codemeld.dev/codemeld/internal/permissions"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
+	"codemeld.dev/codemeld/internal/subagenttool"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/vcs"
 )
@@ -87,10 +88,10 @@ func (f *fakeTargetTool) Invoke(context.Context, map[string]any) (tools.Result, 
 	return f.result, nil
 }
 
-// fakeDelegateTool stands in for the real delegate tool so the dispatch ordering (prepare →
+// fakeGeneralAgentTool stands in for the real delegate tool so the dispatch ordering (prepare →
 // authorize the candidate → invoke from it) is testable without starting a child agent. It records
 // what invocation received so a test can prove no second resolution of the raw declaration ran.
-type fakeDelegateTool struct {
+type fakeGeneralAgentTool struct {
 	name            string
 	instruction     string
 	declared        map[string]bool
@@ -109,20 +110,20 @@ type fakeDelegateTool struct {
 	invokedDirs     map[string]bool
 }
 
-var _ tools.Tool = (*fakeDelegateTool)(nil)
+var _ tools.Tool = (*fakeGeneralAgentTool)(nil)
 
-func (f *fakeDelegateTool) Name() string              { return f.name }
-func (f *fakeDelegateTool) SubjectKind() string       { return "tool" }
-func (f *fakeDelegateTool) Advertise() tools.Metadata { return tools.Metadata{} }
+func (f *fakeGeneralAgentTool) Name() string              { return f.name }
+func (f *fakeGeneralAgentTool) SubjectKind() string       { return "tool" }
+func (f *fakeGeneralAgentTool) Advertise() tools.Metadata { return tools.Metadata{} }
 
-func (f *fakeDelegateTool) PrepareDelegate(map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, []string, error) {
+func (f *fakeGeneralAgentTool) PrepareGeneralAgent(map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, []string, error) {
 	if f.prepareErr != nil {
 		return "", nil, nil, nil, nil, nil, f.prepareErr
 	}
 	return f.instruction, f.declared, f.remove, f.moves, f.dirs, f.targets, nil
 }
 
-func (f *fakeDelegateTool) InvokeWithPreparedDelegate(_ context.Context, instruction string, declared, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error) {
+func (f *fakeGeneralAgentTool) InvokeWithPreparedGeneralAgent(_ context.Context, instruction string, declared, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error) {
 	f.invoked = true
 	f.invokedInstr = instruction
 	f.invokedDeclared = declared
@@ -132,9 +133,9 @@ func (f *fakeDelegateTool) InvokeWithPreparedDelegate(_ context.Context, instruc
 	return f.result, nil
 }
 
-// Invoke is the Tool-interface fallback; dispatch routes a preparedDelegateTool through
-// InvokeWithPreparedDelegate, so reaching this would be a second resolution of the raw arguments.
-func (f *fakeDelegateTool) Invoke(context.Context, map[string]any) (tools.Result, error) {
+// Invoke is the Tool-interface fallback; dispatch routes a preparedGeneralAgentTool through
+// InvokeWithPreparedGeneralAgent, so reaching this would be a second resolution of the raw arguments.
+func (f *fakeGeneralAgentTool) Invoke(context.Context, map[string]any) (tools.Result, error) {
 	f.invoked, f.invokedArgs = true, true
 	return f.result, nil
 }
@@ -1817,22 +1818,22 @@ func TestDispatchPreparedTool_UnpreparedCallRefusedBeforeAuthorizing(t *testing.
 	}
 }
 
-func delegateArgs() map[string]any {
+func generalAgentArgs() map[string]any {
 	return map[string]any{"instructions": "do it", "files": []any{"a.txt"}}
 }
 
-func TestPrepareTool_DelegateCandidateReachesAuthorizationWithoutStartingAChild(t *testing.T) {
+func TestPrepareTool_GeneralAgentCandidateReachesAuthorizationWithoutStartingAChild(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	declared := map[string]bool{filepath.Join(cwd, "a.txt"): true}
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: declared}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: declared}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -1840,11 +1841,29 @@ func TestPrepareTool_DelegateCandidateReachesAuthorizationWithoutStartingAChild(
 		t.Fatal("PrepareTool started the child, want preparation only")
 	}
 	_, _, modeCtx := prepared.authorizationInputs()
-	if !reflect.DeepEqual(modeCtx.DelegateWrite, declared) {
-		t.Fatalf("mode context DelegateWrite = %v, want the canonical candidate %v", modeCtx.DelegateWrite, declared)
+	if !reflect.DeepEqual(modeCtx.GeneralAgentWrite, declared) {
+		t.Fatalf("mode context GeneralAgentWrite = %v, want the canonical candidate %v", modeCtx.GeneralAgentWrite, declared)
 	}
 	if prepared.Scope() != cwd {
 		t.Fatalf("prepared Scope = %q, want the process cwd %q", prepared.Scope(), cwd)
+	}
+}
+
+func TestDispatchTool_RenamedChildAgentToolRefusesItsFormerName(t *testing.T) {
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{}}
+	reg := tools.NewRegistry()
+	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+
+	_, err := DispatchTool(context.Background(), "delegate", generalAgentArgs(), t.TempDir(), t.TempDir(), reg, auth)
+	var noSuch *NoSuchToolError
+	if !errors.As(err, &noSuch) || noSuch.Name != "delegate" {
+		t.Fatalf("DispatchTool(delegate) error = %v, want *NoSuchToolError for delegate", err)
+	}
+	if len(auth.requests) != 0 || fd.invoked {
+		t.Fatalf("requests = %+v, invoked = %v, want no authorization and no child", auth.requests, fd.invoked)
 	}
 }
 
@@ -1852,28 +1871,28 @@ func TestPrepareTool_DelegateCandidateReachesAuthorizationWithoutStartingAChild(
 // caller can let a ceiling answer first — dispatch does not know whether one is judging the call. The
 // candidate stays empty either way (an unresolvable declaration is an unbounded child, not a subset
 // of anything) and no child starts on any of the three paths out.
-func TestPrepareTool_MalformedDelegateCarriesItsRefusalWithNoCandidate(t *testing.T) {
+func TestPrepareTool_MalformedGeneralAgentCarriesItsRefusalWithNoCandidate(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
-	wantErr := errors.New(`delegate: argument "files" must name at least one path the child may write`)
+	wantErr := errors.New(`general_agent: argument "files" must name at least one path the child may write`)
 	malformed := map[string]any{"instructions": "do it"}
 
-	fd := &fakeDelegateTool{name: "delegate", prepareErr: wantErr}
+	fd := &fakeGeneralAgentTool{name: "general_agent", prepareErr: wantErr}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	prepared, err := PrepareTool(context.Background(), "delegate", malformed, home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", malformed, home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool error = %v, want the refusal carried on the prepared call", err)
 	}
-	if !errors.Is(prepared.DelegateRefusal(), wantErr) {
-		t.Fatalf("DelegateRefusal = %v, want the tool's own refusal", prepared.DelegateRefusal())
+	if !errors.Is(prepared.GeneralAgentRefusal(), wantErr) {
+		t.Fatalf("GeneralAgentRefusal = %v, want the tool's own refusal", prepared.GeneralAgentRefusal())
 	}
 	_, _, modeCtx := prepared.authorizationInputs()
-	if len(modeCtx.DelegateWrite) != 0 {
-		t.Fatalf("mode context DelegateWrite = %v, want an empty candidate for a ceiling to refuse", modeCtx.DelegateWrite)
+	if len(modeCtx.GeneralAgentWrite) != 0 {
+		t.Fatalf("mode context GeneralAgentWrite = %v, want an empty candidate for a ceiling to refuse", modeCtx.GeneralAgentWrite)
 	}
 	if fd.invoked {
 		t.Fatal("preparation started the child")
@@ -1891,8 +1910,8 @@ func TestPrepareTool_MalformedDelegateCarriesItsRefusalWithNoCandidate(t *testin
 	})
 
 	t.Run("an authorized call surfaces the refusal and starts nothing", func(t *testing.T) {
-		auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"delegate": {decision: grantDecision()}}}
-		_, err := DispatchTool(context.Background(), "delegate", malformed, home, cwd, reg, auth)
+		auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"general_agent": {decision: grantDecision()}}}
+		_, err := DispatchTool(context.Background(), "general_agent", malformed, home, cwd, reg, auth)
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("error = %v, want the preparation refusal surfaced", err)
 		}
@@ -1904,17 +1923,17 @@ func TestPrepareTool_MalformedDelegateCarriesItsRefusalWithNoCandidate(t *testin
 
 // A filesystem ancestor or symlink swap that would make the raw declaration re-resolve elsewhere
 // must not reach invocation.
-func TestInvokeDecided_DelegateStartsTheChildFromThePreparedDeclaration(t *testing.T) {
+func TestInvokeDecided_GeneralAgentStartsTheChildFromThePreparedDeclaration(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	declared := map[string]bool{filepath.Join(cwd, "a.txt"): true}
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: declared, result: tools.Result{Stdout: []byte("child ran")}}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: declared, result: tools.Result{Stdout: []byte("child ran")}}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -1942,7 +1961,7 @@ func TestInvokeDecided_DelegateStartsTheChildFromThePreparedDeclaration(t *testi
 
 // Maps and slices are reference types, so an authorizer that writes to the declaration it is asked
 // to judge would otherwise decide what the child is built from and how it is scheduled.
-func TestPrepareTool_DelegateDeclarationSurvivesAMutatingAuthorizer(t *testing.T) {
+func TestPrepareTool_GeneralAgentDeclarationSurvivesAMutatingAuthorizer(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	leaf := filepath.Join(cwd, "a.txt")
@@ -1950,12 +1969,12 @@ func TestPrepareTool_DelegateDeclarationSurvivesAMutatingAuthorizer(t *testing.T
 	declared := map[string]bool{leaf: true}
 	targets := []string{leaf, filepath.Join(cwd, "missing")}
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: declared, targets: targets}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: declared, targets: targets}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -1965,15 +1984,15 @@ func TestPrepareTool_DelegateDeclarationSurvivesAMutatingAuthorizer(t *testing.T
 	targets[0] = widened
 
 	req := prepared.IndependentRequest()
-	req.ModeCtx.DelegateWrite[widened] = true
-	delete(req.ModeCtx.DelegateWrite, leaf)
+	req.ModeCtx.GeneralAgentWrite[widened] = true
+	delete(req.ModeCtx.GeneralAgentWrite, leaf)
 
-	seen := prepared.DelegateSchedulerTargets()
+	seen := prepared.GeneralAgentSchedulerTargets()
 	seen[0] = widened
 
-	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"delegate": {decision: grantDecision()}}}
+	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"general_agent": {decision: grantDecision()}}}
 	auth.onAuthorize = func(permissions.MatchRequest) {
-		auth.modeCtxs[len(auth.modeCtxs)-1].DelegateWrite[widened] = true
+		auth.modeCtxs[len(auth.modeCtxs)-1].GeneralAgentWrite[widened] = true
 	}
 	if _, err := DispatchPreparedTool(context.Background(), prepared, auth); err != nil {
 		t.Fatalf("DispatchPreparedTool: %v", err)
@@ -1984,27 +2003,27 @@ func TestPrepareTool_DelegateDeclarationSurvivesAMutatingAuthorizer(t *testing.T
 		t.Fatalf("invoked declaration = %v, want the prepared leaves %v", fd.invokedDeclared, want)
 	}
 	wantTargets := []string{leaf, filepath.Join(cwd, "missing")}
-	if !slices.Equal(prepared.DelegateSchedulerTargets(), wantTargets) {
-		t.Fatalf("scheduler targets = %v, want %v", prepared.DelegateSchedulerTargets(), wantTargets)
+	if !slices.Equal(prepared.GeneralAgentSchedulerTargets(), wantTargets) {
+		t.Fatalf("scheduler targets = %v, want %v", prepared.GeneralAgentSchedulerTargets(), wantTargets)
 	}
-	if !reflect.DeepEqual(prepared.DelegateDeclaredWrite(), want) {
-		t.Fatalf("declared write = %v, want %v", prepared.DelegateDeclaredWrite(), want)
+	if !reflect.DeepEqual(prepared.GeneralAgentDeclaredWrite(), want) {
+		t.Fatalf("declared write = %v, want %v", prepared.GeneralAgentDeclaredWrite(), want)
 	}
-	if !prepared.DelegatePrepared() {
+	if !prepared.GeneralAgentPrepared() {
 		t.Fatal("a resolved declaration reports no prepared delegate")
 	}
 }
 
-func TestInvokeDecided_DeniedDelegateStartsNoChild(t *testing.T) {
+func TestInvokeDecided_DeniedGeneralAgentStartsNoChild(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -2019,7 +2038,7 @@ func TestInvokeDecided_DeniedDelegateStartsNoChild(t *testing.T) {
 	}
 }
 
-func TestPrepareTool_DelegateDeleteDeclarationSurvivesAMutatingAuthorizer(t *testing.T) {
+func TestPrepareTool_GeneralAgentDeleteDeclarationSurvivesAMutatingAuthorizer(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	write := map[string]bool{filepath.Join(cwd, "a.txt"): true}
@@ -2027,12 +2046,12 @@ func TestPrepareTool_DelegateDeleteDeclarationSurvivesAMutatingAuthorizer(t *tes
 	widened := filepath.Join(cwd, "widened.txt")
 	remove := map[string]bool{old: true}
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: write, remove: remove}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: write, remove: remove}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -2040,14 +2059,14 @@ func TestPrepareTool_DelegateDeleteDeclarationSurvivesAMutatingAuthorizer(t *tes
 
 	want := map[string]bool{old: true}
 	_, _, modeCtx := prepared.authorizationInputs()
-	if !reflect.DeepEqual(modeCtx.DelegateDelete, want) {
-		t.Fatalf("mode context DelegateDelete = %v, want the canonical delete candidate %v", modeCtx.DelegateDelete, want)
+	if !reflect.DeepEqual(modeCtx.GeneralAgentDelete, want) {
+		t.Fatalf("mode context GeneralAgentDelete = %v, want the canonical delete candidate %v", modeCtx.GeneralAgentDelete, want)
 	}
-	modeCtx.DelegateDelete[widened] = true
+	modeCtx.GeneralAgentDelete[widened] = true
 
-	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"delegate": {decision: grantDecision()}}}
+	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"general_agent": {decision: grantDecision()}}}
 	auth.onAuthorize = func(permissions.MatchRequest) {
-		auth.modeCtxs[len(auth.modeCtxs)-1].DelegateDelete[widened] = true
+		auth.modeCtxs[len(auth.modeCtxs)-1].GeneralAgentDelete[widened] = true
 	}
 	if _, err := DispatchPreparedTool(context.Background(), prepared, auth); err != nil {
 		t.Fatalf("DispatchPreparedTool: %v", err)
@@ -2060,7 +2079,7 @@ func TestPrepareTool_DelegateDeleteDeclarationSurvivesAMutatingAuthorizer(t *tes
 	}
 }
 
-func TestPrepareTool_DelegateDeleteFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
+func TestPrepareTool_GeneralAgentDeleteFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		remove  map[string]bool
@@ -2072,18 +2091,18 @@ func TestPrepareTool_DelegateDeleteFormKeepsOmittedApartFromSuppliedEmpty(t *tes
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			cwd := t.TempDir()
-			fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, remove: tc.remove}
+			fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, remove: tc.remove}
 			reg := tools.NewRegistry()
 			if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 				t.Fatalf("Register: %v", err)
 			}
-			prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+			prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 			if err != nil {
 				t.Fatalf("PrepareTool: %v", err)
 			}
 			_, _, modeCtx := prepared.authorizationInputs()
-			if got := modeCtx.DelegateDelete == nil; got != tc.wantNil || len(modeCtx.DelegateDelete) != 0 {
-				t.Fatalf("mode context DelegateDelete = %#v, want nil=%v and empty", modeCtx.DelegateDelete, tc.wantNil)
+			if got := modeCtx.GeneralAgentDelete == nil; got != tc.wantNil || len(modeCtx.GeneralAgentDelete) != 0 {
+				t.Fatalf("mode context GeneralAgentDelete = %#v, want nil=%v and empty", modeCtx.GeneralAgentDelete, tc.wantNil)
 			}
 			if _, err := InvokeDecided(context.Background(), prepared, grantDecision()); err != nil {
 				t.Fatalf("InvokeDecided: %v", err)
@@ -3178,19 +3197,19 @@ func TestInvokeDecided_OnlyMutatingFileToolsCarryTheAuthorizedScope(t *testing.T
 	}
 }
 
-func TestPrepareTool_DelegateMovePairsSurviveAMutatingCaller(t *testing.T) {
+func TestPrepareTool_GeneralAgentMovePairsSurviveAMutatingCaller(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	pair := permissions.MovePair{Source: filepath.Join(cwd, "a.txt"), Destination: filepath.Join(cwd, "b.txt")}
 	widened := permissions.MovePair{Source: filepath.Join(cwd, "a.txt"), Destination: filepath.Join(cwd, "elsewhere.txt")}
 	moves := map[permissions.MovePair]bool{pair: true}
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", moves: moves}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", moves: moves}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -3198,10 +3217,10 @@ func TestPrepareTool_DelegateMovePairsSurviveAMutatingCaller(t *testing.T) {
 
 	want := map[permissions.MovePair]bool{pair: true}
 	_, _, modeCtx := prepared.authorizationInputs()
-	if !reflect.DeepEqual(modeCtx.DelegateMoves, want) {
-		t.Fatalf("mode context DelegateMoves = %v, want the canonical move candidate %v", modeCtx.DelegateMoves, want)
+	if !reflect.DeepEqual(modeCtx.GeneralAgentMoves, want) {
+		t.Fatalf("mode context GeneralAgentMoves = %v, want the canonical move candidate %v", modeCtx.GeneralAgentMoves, want)
 	}
-	modeCtx.DelegateMoves[widened] = true
+	modeCtx.GeneralAgentMoves[widened] = true
 
 	if _, err := InvokeDecided(context.Background(), prepared, grantDecision()); err != nil {
 		t.Fatalf("InvokeDecided: %v", err)
@@ -3211,7 +3230,7 @@ func TestPrepareTool_DelegateMovePairsSurviveAMutatingCaller(t *testing.T) {
 	}
 }
 
-func TestPrepareTool_DelegateMoveFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
+func TestPrepareTool_GeneralAgentMoveFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		moves   map[permissions.MovePair]bool
@@ -3223,18 +3242,18 @@ func TestPrepareTool_DelegateMoveFormKeepsOmittedApartFromSuppliedEmpty(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			cwd := t.TempDir()
-			fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, moves: tc.moves}
+			fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, moves: tc.moves}
 			reg := tools.NewRegistry()
 			if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 				t.Fatalf("Register: %v", err)
 			}
-			prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+			prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 			if err != nil {
 				t.Fatalf("PrepareTool: %v", err)
 			}
 			_, _, modeCtx := prepared.authorizationInputs()
-			if got := modeCtx.DelegateMoves == nil; got != tc.wantNil || len(modeCtx.DelegateMoves) != 0 {
-				t.Fatalf("mode context DelegateMoves = %#v, want nil=%v and empty", modeCtx.DelegateMoves, tc.wantNil)
+			if got := modeCtx.GeneralAgentMoves == nil; got != tc.wantNil || len(modeCtx.GeneralAgentMoves) != 0 {
+				t.Fatalf("mode context GeneralAgentMoves = %#v, want nil=%v and empty", modeCtx.GeneralAgentMoves, tc.wantNil)
 			}
 			if _, err := InvokeDecided(context.Background(), prepared, grantDecision()); err != nil {
 				t.Fatalf("InvokeDecided: %v", err)
@@ -3246,7 +3265,7 @@ func TestPrepareTool_DelegateMoveFormKeepsOmittedApartFromSuppliedEmpty(t *testi
 	}
 }
 
-func TestPrepareTool_DelegateDirectoriesSurviveAMutatingCaller(t *testing.T) {
+func TestPrepareTool_GeneralAgentDirectoriesSurviveAMutatingCaller(t *testing.T) {
 	home := t.TempDir()
 	cwd := t.TempDir()
 	dir := filepath.Join(cwd, "x", "y")
@@ -3254,12 +3273,12 @@ func TestPrepareTool_DelegateDirectoriesSurviveAMutatingCaller(t *testing.T) {
 	dirs := map[string]bool{dir: true}
 	targets := []string{filepath.Join(cwd, "a.txt"), filepath.Join(cwd, "x"), dir}
 
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, dirs: dirs, targets: targets}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, dirs: dirs, targets: targets}
 	reg := tools.NewRegistry()
 	if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, cwd, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
@@ -3268,19 +3287,19 @@ func TestPrepareTool_DelegateDirectoriesSurviveAMutatingCaller(t *testing.T) {
 
 	want := map[string]bool{dir: true}
 	req := prepared.IndependentRequest()
-	if !reflect.DeepEqual(req.ModeCtx.DelegateDirs, want) {
-		t.Fatalf("authorization request DelegateDirs = %v, want the prepared candidate %v", req.ModeCtx.DelegateDirs, want)
+	if !reflect.DeepEqual(req.ModeCtx.GeneralAgentDirs, want) {
+		t.Fatalf("authorization request GeneralAgentDirs = %v, want the prepared candidate %v", req.ModeCtx.GeneralAgentDirs, want)
 	}
-	req.ModeCtx.DelegateDirs[widened] = true
-	prepared.DelegateSchedulerTargets()[2] = widened
+	req.ModeCtx.GeneralAgentDirs[widened] = true
+	prepared.GeneralAgentSchedulerTargets()[2] = widened
 
-	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"delegate": {decision: grantDecision()}}}
+	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"general_agent": {decision: grantDecision()}}}
 	auth.onAuthorize = func(permissions.MatchRequest) {
 		mc := auth.modeCtxs[len(auth.modeCtxs)-1]
-		if !reflect.DeepEqual(mc.DelegateDirs, want) {
-			t.Errorf("authorizer saw DelegateDirs = %v, want %v", mc.DelegateDirs, want)
+		if !reflect.DeepEqual(mc.GeneralAgentDirs, want) {
+			t.Errorf("authorizer saw GeneralAgentDirs = %v, want %v", mc.GeneralAgentDirs, want)
 		}
-		mc.DelegateDirs[widened] = true
+		mc.GeneralAgentDirs[widened] = true
 	}
 	if _, err := DispatchPreparedTool(context.Background(), prepared, auth); err != nil {
 		t.Fatalf("DispatchPreparedTool: %v", err)
@@ -3289,12 +3308,12 @@ func TestPrepareTool_DelegateDirectoriesSurviveAMutatingCaller(t *testing.T) {
 		t.Fatalf("invoked directory declaration = %v, want the prepared %v", fd.invokedDirs, want)
 	}
 	wantTargets := []string{filepath.Join(cwd, "a.txt"), filepath.Join(cwd, "x"), dir}
-	if !slices.Equal(prepared.DelegateSchedulerTargets(), wantTargets) {
-		t.Fatalf("scheduler targets = %v, want %v", prepared.DelegateSchedulerTargets(), wantTargets)
+	if !slices.Equal(prepared.GeneralAgentSchedulerTargets(), wantTargets) {
+		t.Fatalf("scheduler targets = %v, want %v", prepared.GeneralAgentSchedulerTargets(), wantTargets)
 	}
 }
 
-func TestPrepareTool_DelegateDirectoryFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
+func TestPrepareTool_GeneralAgentDirectoryFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		dirs    map[string]bool
@@ -3305,18 +3324,18 @@ func TestPrepareTool_DelegateDirectoryFormKeepsOmittedApartFromSuppliedEmpty(t *
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cwd := t.TempDir()
-			fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, dirs: tc.dirs}
+			fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, dirs: tc.dirs}
 			reg := tools.NewRegistry()
 			if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 				t.Fatalf("Register: %v", err)
 			}
-			prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), t.TempDir(), cwd, reg)
+			prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), t.TempDir(), cwd, reg)
 			if err != nil {
 				t.Fatalf("PrepareTool: %v", err)
 			}
 			_, _, modeCtx := prepared.authorizationInputs()
-			if got := modeCtx.DelegateDirs == nil; got != tc.wantNil || len(modeCtx.DelegateDirs) != 0 {
-				t.Fatalf("mode context DelegateDirs = %#v, want nil=%v and empty", modeCtx.DelegateDirs, tc.wantNil)
+			if got := modeCtx.GeneralAgentDirs == nil; got != tc.wantNil || len(modeCtx.GeneralAgentDirs) != 0 {
+				t.Fatalf("mode context GeneralAgentDirs = %#v, want nil=%v and empty", modeCtx.GeneralAgentDirs, tc.wantNil)
 			}
 			if _, err := InvokeDecided(context.Background(), prepared, grantDecision()); err != nil {
 				t.Fatalf("InvokeDecided: %v", err)
@@ -3379,7 +3398,7 @@ func TestDispatchTool_MoveCancelledDuringAuthorizationDoesNotInvoke(t *testing.T
 	}
 }
 
-func launchRegistry(t *testing.T, home, project string, delegate *fakeDelegateTool) *tools.Registry {
+func launchRegistry(t *testing.T, home, project string, generalAgent *fakeGeneralAgentTool) *tools.Registry {
 	t.Helper()
 	reg := tools.NewRegistry()
 	for _, tool := range []tools.Tool{
@@ -3388,7 +3407,7 @@ func launchRegistry(t *testing.T, home, project string, delegate *fakeDelegateTo
 		filetools.NewDeleteTool(home, project, project),
 		filetools.NewMoveTool(home, project, project),
 		filetools.NewMkdirTool(home, project, project),
-		delegate,
+		generalAgent,
 	} {
 		if err := reg.Register(tools.BuiltinSource, tool); err != nil {
 			t.Fatalf("Register: %v", err)
@@ -3432,7 +3451,7 @@ func recordedLaunchRequests(auth *fakeAuthorizer) []launchRequest {
 	return out
 }
 
-func TestDispatchPreparedDelegate_LaunchRequestsMatchTheDirectCalls(t *testing.T) {
+func TestDispatchPreparedGeneralAgent_LaunchRequestsMatchTheDirectCalls(t *testing.T) {
 	home := t.TempDir()
 	project := launchDir(t)
 	outside := launchDir(t)
@@ -3449,8 +3468,8 @@ func TestDispatchPreparedDelegate_LaunchRequestsMatchTheDirectCalls(t *testing.T
 		t.Fatalf("Mkdir: %v", err)
 	}
 
-	fd := &fakeDelegateTool{
-		name:        "delegate",
+	fd := &fakeGeneralAgentTool{
+		name:        "general_agent",
 		instruction: "do it",
 		declared:    map[string]bool{edited: true, outsideEdit: true, created: true},
 		remove:      map[string]bool{deleted: true},
@@ -3458,19 +3477,19 @@ func TestDispatchPreparedDelegate_LaunchRequestsMatchTheDirectCalls(t *testing.T
 		dirs:        map[string]bool{made: true},
 	}
 	reg := launchRegistry(t, home, project, fd)
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, project, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, project, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
 	launch := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
-	if _, err := DispatchPreparedDelegate(context.Background(), prepared, launch, false); err != nil {
-		t.Fatalf("DispatchPreparedDelegate: %v", err)
+	if _, err := DispatchPreparedGeneralAgent(context.Background(), prepared, launch, false); err != nil {
+		t.Fatalf("DispatchPreparedGeneralAgent: %v", err)
 	}
 	if !fd.invoked {
 		t.Fatal("an approved launch did not start the child")
 	}
 	got := recordedLaunchRequests(launch)
-	if got[0].req.Subject != "delegate" {
+	if got[0].req.Subject != "general_agent" {
 		t.Fatalf("first request = %+v, want the delegate's own refusal check", got[0].req)
 	}
 
@@ -3505,29 +3524,29 @@ func TestDispatchPreparedDelegate_LaunchRequestsMatchTheDirectCalls(t *testing.T
 	}
 }
 
-func TestDispatchPreparedDelegate_PreparationFailuresRefuseBeforeAuthorization(t *testing.T) {
+func TestDispatchPreparedGeneralAgent_PreparationFailuresRefuseBeforeAuthorization(t *testing.T) {
 	tests := []struct {
 		name    string
-		declare func(project string) *fakeDelegateTool
+		declare func(project string) *fakeGeneralAgentTool
 		want    string
 	}{
 		{
 			name: "an existing directory in files gets the edit preparation error",
-			declare: func(project string) *fakeDelegateTool {
+			declare: func(project string) *fakeGeneralAgentTool {
 				if err := os.Mkdir(filepath.Join(project, "dir"), 0o755); err != nil {
 					t.Fatalf("Mkdir: %v", err)
 				}
-				return &fakeDelegateTool{declared: map[string]bool{filepath.Join(project, "dir"): true}}
+				return &fakeGeneralAgentTool{declared: map[string]bool{filepath.Join(project, "dir"): true}}
 			},
 			want: "edit target rejected: target names a directory, not a file",
 		},
 		{
 			name: "a declaration whose missing parent became a symlink",
-			declare: func(project string) *fakeDelegateTool {
+			declare: func(project string) *fakeGeneralAgentTool {
 				if err := os.Symlink(launchDir(t), filepath.Join(project, "link")); err != nil {
 					t.Fatalf("Symlink: %v", err)
 				}
-				return &fakeDelegateTool{declared: map[string]bool{filepath.Join(project, "link", "a.txt"): true}}
+				return &fakeGeneralAgentTool{declared: map[string]bool{filepath.Join(project, "link", "a.txt"): true}}
 			},
 			want: "no longer resolves",
 		},
@@ -3537,15 +3556,15 @@ func TestDispatchPreparedDelegate_PreparationFailuresRefuseBeforeAuthorization(t
 			home := t.TempDir()
 			project := launchDir(t)
 			fd := tc.declare(project)
-			fd.name, fd.instruction = "delegate", "do it"
+			fd.name, fd.instruction = "general_agent", "do it"
 			reg := launchRegistry(t, home, project, fd)
-			prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, project, reg)
+			prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, project, reg)
 			if err != nil {
 				t.Fatalf("PrepareTool: %v", err)
 			}
 			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
 
-			_, err = DispatchPreparedDelegate(context.Background(), prepared, auth, false)
+			_, err = DispatchPreparedGeneralAgent(context.Background(), prepared, auth, false)
 
 			var target *filetools.TargetError
 			if !errors.As(err, &target) || !strings.Contains(err.Error(), tc.want) {
@@ -3558,41 +3577,98 @@ func TestDispatchPreparedDelegate_PreparationFailuresRefuseBeforeAuthorization(t
 	}
 }
 
-func TestDispatchPreparedDelegate_ChildCeilingKeepsTheSingleDelegateDecision(t *testing.T) {
+func TestDispatchPreparedGeneralAgent_ChildCeilingKeepsTheSingleGeneralAgentDecision(t *testing.T) {
 	home := t.TempDir()
 	project := launchDir(t)
-	fd := &fakeDelegateTool{name: "delegate", instruction: "do it", declared: map[string]bool{filepath.Join(project, "a.txt"): true}}
+	fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(project, "a.txt"): true}}
 	reg := launchRegistry(t, home, project, fd)
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, project, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, project, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
 	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
 
-	if _, err := DispatchPreparedDelegate(context.Background(), prepared, auth, true); err != nil {
-		t.Fatalf("DispatchPreparedDelegate: %v", err)
+	if _, err := DispatchPreparedGeneralAgent(context.Background(), prepared, auth, true); err != nil {
+		t.Fatalf("DispatchPreparedGeneralAgent: %v", err)
 	}
-	if len(auth.requests) != 1 || auth.requests[0].Subject != "delegate" || !fd.invoked {
+	if len(auth.requests) != 1 || auth.requests[0].Subject != "general_agent" || !fd.invoked {
 		t.Fatalf("requests = %+v, invoked = %v, want one delegate decision and the child started", auth.requests, fd.invoked)
 	}
 }
 
-func TestDispatchPreparedDelegate_TopLevelRefusalIsReturnedWithoutAuthorization(t *testing.T) {
+func TestDispatchPreparedGeneralAgent_TopLevelRefusalIsReturnedWithoutAuthorization(t *testing.T) {
 	home := t.TempDir()
 	project := launchDir(t)
-	wantErr := errors.New("delegate: bad declaration")
-	fd := &fakeDelegateTool{name: "delegate", prepareErr: wantErr}
+	wantErr := errors.New("general_agent: bad declaration")
+	fd := &fakeGeneralAgentTool{name: "general_agent", prepareErr: wantErr}
 	reg := launchRegistry(t, home, project, fd)
-	prepared, err := PrepareTool(context.Background(), "delegate", delegateArgs(), home, project, reg)
+	prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, project, reg)
 	if err != nil {
 		t.Fatalf("PrepareTool: %v", err)
 	}
 	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
 
-	if _, err := DispatchPreparedDelegate(context.Background(), prepared, auth, false); !errors.Is(err, wantErr) {
+	if _, err := DispatchPreparedGeneralAgent(context.Background(), prepared, auth, false); !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want the preparation refusal", err)
 	}
 	if len(auth.requests) != 0 || fd.invoked {
 		t.Fatalf("requests = %+v, invoked = %v, want neither", auth.requests, fd.invoked)
+	}
+}
+
+func TestPrepareTool_GeneralAgentIsReadOnlyOnlyWhenItResolvesWithNoPath(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "src.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	reg := tools.NewRegistry()
+	if err := reg.Register(tools.BuiltinSource, subagenttool.New(subagenttool.Deps{Home: home, LaunchDir: root, ProjectRoot: root})); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	pair := []any{map[string]any{"source": "src.txt", "destination": "dst.txt"}}
+	tests := []struct {
+		name         string
+		args         map[string]any
+		wantReadOnly bool
+	}{
+		{"every list omitted", map[string]any{"instructions": "x"}, true},
+		{"every list empty", map[string]any{"instructions": "x", "files": []any{}, "files_delete": []any{}, "files_move": []any{}, "files_mkdir": []any{}}, true},
+		{"a write path", map[string]any{"instructions": "x", "files": []any{"a.txt"}}, false},
+		{"an empty path entry", map[string]any{"instructions": "x", "files": []any{""}}, false},
+		{"the launch directory as a file", map[string]any{"instructions": "x", "files": []any{"."}}, false},
+		{"a directory only", map[string]any{"instructions": "x", "files_mkdir": []any{"made"}}, false},
+		{"one move pair only", map[string]any{"instructions": "x", "files_move": pair}, false},
+		{"a delete only", map[string]any{"instructions": "x", "files_delete": []any{"src.txt"}}, false},
+		{"a null file list", map[string]any{"instructions": "x", "files": nil}, false},
+		{"a null delete list beside an empty file list", map[string]any{"instructions": "x", "files": []any{}, "files_delete": nil}, false},
+		{"empty lists beside one real path", map[string]any{"instructions": "x", "files": []any{}, "files_move": []any{}, "files_mkdir": []any{}, "files_delete": []any{"src.txt"}}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := PrepareTool(context.Background(), subagenttool.ToolName, tc.args, home, root, reg)
+			if err != nil {
+				t.Fatalf("PrepareTool error = %v, want any refusal carried on the prepared call", err)
+			}
+			_, _, mc := prepared.authorizationInputs()
+			want := permissions.ClassMutating
+			if tc.wantReadOnly {
+				want = permissions.ClassReadOnly
+			}
+			if mc.Class != want {
+				t.Fatalf("Class = %q, want %q", mc.Class, want)
+			}
+			refused := prepared.GeneralAgentRefusal() != nil
+			if mc.GeneralAgentRefused != refused || mc.GeneralAgentResolved == refused {
+				t.Fatalf("GeneralAgentResolved = %v, GeneralAgentRefused = %v, want them to follow the refusal %v",
+					mc.GeneralAgentResolved, mc.GeneralAgentRefused, prepared.GeneralAgentRefusal())
+			}
+			if tc.wantReadOnly && refused {
+				t.Fatalf("refusal = %v, want a valid read-only declaration", prepared.GeneralAgentRefusal())
+			}
+		})
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/runner"
 	"golang.org/x/sys/unix"
 )
@@ -57,12 +58,14 @@ var probes = map[string]probe{
 		return fdProbe(unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0))
 	}},
 	"socketpair": {0, func([]string) int {
-		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-		if err != nil {
-			return probeExit(err)
+		for _, typ := range []int{unix.SOCK_STREAM, unix.SOCK_SEQPACKET} {
+			fds, err := unix.Socketpair(unix.AF_UNIX, typ|unix.SOCK_CLOEXEC, 0)
+			if err != nil {
+				return probeExit(err)
+			}
+			_ = unix.Close(fds[0])
+			_ = unix.Close(fds[1])
 		}
-		_ = unix.Close(fds[0])
-		_ = unix.Close(fds[1])
 		return probeAllowed
 	}},
 	"io-uring-setup": {0, func([]string) int {
@@ -241,16 +244,26 @@ func setflagsProbe(a []string) int {
 
 func environmentProbe(a []string) int {
 	want, err := runner.FixedEnvironment(a[0], a[1], a[2], runner.FixedPATH, nil)
-	if err != nil {
-		return probeFailed
-	}
-	got := os.Environ()
-	slices.Sort(want)
-	slices.Sort(got)
-	if !slices.Equal(got, want) {
+	if err != nil || !fixedEnvironmentSeen(os.Environ(), want) {
 		return probeFailed
 	}
 	return probeAllowed
+}
+
+// fixedEnvironmentSeen accepts the fixed table alone, as a startup helper launch passes it, or the
+// table plus exactly one well-formed run marker, as the production runner adds it.
+func fixedEnvironmentSeen(got, want []string) bool {
+	got = slices.Clone(got)
+	if i := slices.IndexFunc(got, func(e string) bool {
+		id, ok := strings.CutPrefix(e, runner.RunMarkerEnv+"=")
+		return ok && ids.IsValidV7(id)
+	}); i >= 0 {
+		got = slices.Delete(got, i, i+1)
+	}
+	want = slices.Clone(want)
+	slices.Sort(want)
+	slices.Sort(got)
+	return slices.Equal(got, want)
 }
 
 func noNewPrivsProbe([]string) int {

@@ -165,6 +165,24 @@ type PipelineRunner interface {
 	Pipeline(ctx context.Context, specs []runner.RunSpec) ([]runner.PipelineResult, error)
 }
 
+// ExecutionClock is the optional capability a Runner may also implement to own one execution budget
+// per shell command. ExecutionContext starts the budget on its first call, which dispatch makes only
+// after authorization, and returns the context every later execution of the command shares.
+type ExecutionClock interface {
+	ExecutionContext(ctx context.Context) context.Context
+}
+
+func executionExpired(ctx context.Context, run Runner) (bool, error) {
+	clock, ok := run.(ExecutionClock)
+	if !ok {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return clock.ExecutionContext(ctx).Err() != nil, nil
+}
+
 // UnsupportedConstructError reports a shell command rejected by pipeline splitting because it uses a construct
 // outside the allowlist: `$`, a backtick, or a bare newline. Bare simple compounds route onto the
 // literal/compound path, so `&&`, `;`, and `||` are absent here.
@@ -530,6 +548,11 @@ func dispatchStaged(ctx context.Context, stages []permissions.StageNormalization
 			start = end
 			continue
 		}
+		if expired, err := executionExpired(ctx, run); err != nil {
+			return tools.Result{}, err
+		} else if expired {
+			return toResult(stdout, stderr, -1, duration), nil
+		}
 		group, err := runPipeGroup(ctx, stages[start:end], auto[start:end], scope, home, run)
 		if err != nil {
 			return tools.Result{}, err
@@ -862,6 +885,12 @@ func runStagesSequentially(ctx context.Context, plans []stagePlan, run Runner) (
 	var group pipeGroupResult
 	var stdin []byte
 	for _, plan := range plans {
+		if expired, err := executionExpired(ctx, run); err != nil {
+			return pipeGroupResult{}, err
+		} else if expired {
+			group.exitCode = -1
+			return group, nil
+		}
 		res := plan.result
 		if !plan.builtin {
 			spec := plan.spec

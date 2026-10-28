@@ -165,6 +165,7 @@ func (d connectDeps) connectDiscovered(id, baseURL, apiKey string) error {
 	for i, m := range discovered {
 		models[i] = config.DiscoveredModel{ID: m.ID, InputModalities: m.InputModalities, Capabilities: m.Capabilities}
 	}
+	session, _ := d.cache.Provider(id)
 	persistFailureNotice := ""
 	if err := config.UpdateDiscoveredModelsProviderThen(modelsPath, id, config.DiscoveredProvider{
 		Source: connectDiscoverSource,
@@ -178,6 +179,9 @@ func (d connectDeps) connectDiscovered(id, baseURL, apiKey string) error {
 		value := yaml.MapSlice{
 			{Key: "base_url", Value: baseURL},
 			{Key: "api_key", Value: apiKey},
+		}
+		if session.ContextWindows != nil {
+			value = append(value, yaml.MapItem{Key: "context_windows", Value: session.ContextWindows})
 		}
 		reason, cat, err := config.Persist(settingsPath, config.KeyProviderPrefix+id, value)
 		if err != nil {
@@ -200,6 +204,6 @@ func (d connectDeps) connectDiscovered(id, baseURL, apiKey string) error {
 		d.cache.SetOpenRouterConnection(baseURL, apiKey)
 		return nil
 	}
-	d.cache.SetProvider(id, provider.ProviderEntry{BaseURL: baseURL, APIKey: apiKey})
+	d.cache.SetProvider(id, provider.ProviderEntry{BaseURL: baseURL, APIKey: apiKey, ContextWindows: session.ContextWindows})
 	return nil
 }

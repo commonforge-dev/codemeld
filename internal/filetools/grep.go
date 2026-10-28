@@ -1,7 +1,4 @@
-// Built-in structured grep tool: project-root-confined RE2 content search over the shared
-// hidden/ignore/symlink-safe walker, with a basename include glob, case-insensitivity, merged context
-// windows, binary-file skip, files-only mode, and a match-count limit, returning deterministic
-// path:line:match/context output bounded by the truncation indicator.
+// Built-in grep tool: searches file contents for an RE2 regular expression.
 package filetools
 
 import (
@@ -49,12 +46,6 @@ var _ tools.Tool = (*GrepTool)(nil)
 
 func (t *GrepTool) SetBlockedPaths(blocked *permissions.BlockedPaths) { t.blocked = blocked }
 
-// NewGrepTool builds the grep tool bound to the run's ~ anchor (home), the process cwd accepted for
-// signature symmetry with the other file tools, the project root the search is confined to (via
-// ResolveReadTarget), and the tool-output byte cap (cache.MaxToolOutputBytes()) BoundedResult uses to
-// predict byte-cap truncation. The project root is symlink-resolved once here — mirroring
-// NewGlobTool/NewReadTool — so a launch through a symlinked project directory does not reject valid
-// in-project paths; ResolveReadTarget normalizes again, so the double normalization is idempotent.
 func NewGrepTool(home, processCWD, projectRoot string, outputCap int) *GrepTool {
 	return &GrepTool{home: home, processCWD: processCWD, projectRoot: normalizeRoot(projectRoot), outputCap: outputCap}
 }
@@ -70,7 +61,7 @@ func (t *GrepTool) SubjectKind() string { return "tool" }
 // mode.
 func (t *GrepTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description: "Search the contents of project files for a regular-expression pattern (Go RE2 syntax). " +
+		Description: "Search the contents of files inside or outside the project for a regular-expression pattern (Go RE2 syntax). " +
 			"pattern is required; path is the directory to search under (default project root) or a single file " +
 			"to search; include is a glob on file names (e.g. \"*.go\"); case_insensitive matches without case; context is the number " +
 			"of lines shown before and after each match; limit caps the number of matches (default " +
@@ -78,7 +69,7 @@ func (t *GrepTool) Advertise() tools.Metadata {
 			"file paths. Hidden (dot-prefixed) entries are skipped unless include_hidden is set. Output is " +
 			"ordered by ascending project-relative path then line number, with match and context lines " +
 			"distinguished; when more match than the limit, the result signals truncation. Binary files are " +
-			"skipped. Use to find where text or code appears across the project.",
+			"skipped. Use to find where text or code appears.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -89,7 +80,7 @@ func (t *GrepTool) Advertise() tools.Metadata {
 				},
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to search under, or a single file to search. include, include_hidden and include_ignored do not filter out a named file. Relative paths resolve against the project root and search normally; an explicitly named directory or file whose real location is outside the project is searched only after you approve it at the permission prompt. Defaults to the project root when omitted.",
+					"description": "Directory to search under, or a single file to search. include, include_hidden and include_ignored do not filter out a named file. Defaults to the project root when omitted. Relative paths resolve against the project root. An explicitly named absolute or ~ directory or file outside the project is searched without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a search asks first. A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms and malformed paths.",
 				},
 				"include": map[string]any{
 					"type":        "string",
@@ -147,10 +138,6 @@ func (t *GrepTool) ResolveTarget(args map[string]any) (target string, scope stri
 	})
 }
 
-// ExternalReadScope reports whether scope (the search root ResolveTarget returned) is an explicit
-// out-of-project read target — the promptable case DispatchTool routes to a permission prompt while
-// bypassing the read-only mode auto-allow. False for an in-project search root, keeping in-project greps
-// on their existing no-prompt auto-allow.
 func (t *GrepTool) ExternalReadScope(scope string) bool {
 	return isExternalReadScope(scope, t.projectRoot)
 }
@@ -167,8 +154,6 @@ func (t *GrepTool) InvokeWithResolvedTarget(_ context.Context, args map[string]a
 // dispatch instead calls ResolveTarget then InvokeWithResolvedTarget; this keeps the tool a complete unit
 // for direct callers and tests. A target-resolution failure surfaces as the same in-band error result the
 // dispatcher would render, so the observable outcome matches either entry.
-// Standalone Invoke has no authorizer, so it refuses an explicit out-of-project search root
-// in-band: only the dispatch path can obtain the required approval. The in-project path is unchanged.
 func (t *GrepTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
@@ -241,9 +226,6 @@ func (t *GrepTool) grep(searchRoot string, args map[string]any) tools.Result {
 		return failResult("grep target rejected: search path is not a directory")
 	}
 
-	// Anchor emitted paths and the ignore matchers at the project root for an in-project search, or at the
-	// approved external search root for an out-of-project read, so external matches stay clean
-	// (project-root-relative paths would otherwise carry a ".." prefix) and the matchers see the same base.
 	anchor := readAnchor(searchRoot, t.projectRoot)
 
 	// Load the default codemeldignore filter set unless include_ignored disables it. A

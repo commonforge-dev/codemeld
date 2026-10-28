@@ -28,6 +28,7 @@ import (
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/filetools"
+	"codemeld.dev/codemeld/internal/locks"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/permissions"
@@ -796,8 +797,8 @@ func TestProductionAuthorizer_WebToolNeverAutoAllowedEndToEnd(t *testing.T) {
 					if env.DeniedBy != "user" {
 						t.Fatalf("denied_by = %q, want \"user\" (the denial comes from the prompt, not a mode policy)", env.DeniedBy)
 					}
-					if kinds := permissionEventKinds(store); !slices.Equal(kinds, []string{events.KindPermissionPromptShown, events.KindPermissionDecision}) {
-						t.Fatalf("permission event stream = %v in %s, want [permission_prompt_shown permission_decision]", kinds, m.name)
+					if kinds := permissionEventKinds(store); !slices.Equal(kinds, []string{events.KindPermissionPromptShown, events.KindPermissionPromptWait, events.KindPermissionDecision}) {
+						t.Fatalf("permission event stream = %v in %s, want [permission_prompt_shown permission_prompt_wait permission_decision]", kinds, m.name)
 					}
 				})
 			}
@@ -2018,6 +2019,9 @@ func TestProductionAuthorizer_ConcurrentIdenticalBatchesPromptOnce(t *testing.T)
 	if n := len(cache.Permissions()); n != 1 {
 		t.Fatalf("grant table holds %d entries, want 1 (the duplicate batch must not record a second grant)", n)
 	}
+	if waits := decodeStoreEvents[events.PermissionPromptWait](t, store, events.KindPermissionPromptWait); len(waits) != 1 || waits[0].Prompts != 1 || waits[0].Ended != "answered" {
+		t.Fatalf("prompt waits = %+v, want one answered wait for the one batch that prompted", waits)
+	}
 }
 
 // recordingNotices captures the one-line notices RevokeGrant surfaces so a test can assert the
@@ -2215,6 +2219,49 @@ func TestInteractiveAuthorizer_FolderGrantWritesOnlyTheLocalSettingsFile(t *test
 		t.Fatalf("local settings not created: %v", err)
 	}
 	mustNotExist(t, projectSettingsPath(project), "a grant write must not create the shared project settings file")
+}
+
+func TestInteractiveAuthorizer_UnapprovedProjectWithholdsTheProjectChoice(t *testing.T) {
+	home := t.TempDir()
+	project := mustCanonical(t, trustProject(t, "model: {}\n"))
+	sharedBefore := mustReadFile(t, projectSettingsPath(project))
+
+	var gate strings.Builder
+	decision := gateTrust(home, project, project, strings.NewReader("n\n"), &gate, true)
+	if decision.Trusted || !strings.Contains(gate.String(), approvePrompt) {
+		t.Fatalf("gate = %#v, stderr = %q, want the asked project left unapproved", decision, gate.String())
+	}
+	trustStoreAbsent(t, home)
+
+	auth, _ := interactiveAuthorizerFor(t, &BootstrapResult{Home: home, LaunchDir: project, ProjectRoot: project, TrustDecision: decision})
+	var reqs []tui.PromptRequest
+	auth.prompts = newPromptGateBuilder(func(req tui.PromptRequest) (tui.PromptDecision, error) {
+		reqs = append(reqs, req)
+		return tui.PromptDecision{Option: tui.OptionAllowOnce}, nil
+	})
+	req := permissions.MatchRequest{Kind: "tool", Subject: "read_file", PathScope: project}
+	if _, err := auth.Authorize(context.Background(), req, dispatch.PromptDisplay{Action: dispatch.ActionRunTool, Subject: "read_file"}, permissions.ModeContext{}); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+
+	if len(reqs) != 1 {
+		t.Fatalf("prompts = %d, want exactly one", len(reqs))
+	}
+	got := reqs[0]
+	if !got.ProjectUntrusted || tui.OmitFolderOption(got.RunFolder, got.ProjectRoot, got.OutOfRootFileWrite, got.ProjectUntrusted) != tui.FolderOptionUntrusted {
+		t.Fatalf("prompt request = %+v, want the project grant withheld for the unapproved project", got)
+	}
+	if after := mustReadFile(t, projectSettingsPath(project)); after != sharedBefore {
+		t.Fatalf("shared settings = %q, want it byte-identical %q", after, sharedBefore)
+	}
+	mustNotExist(t, config.LocalSettingsPath(project), "no project grant was accepted")
+	mustNotExist(t, SettingsPath(home), "no global grant was accepted")
+	trustStoreAbsent(t, home)
+
+	var next strings.Builder
+	if again := gateTrust(home, project, project, strings.NewReader(""), &next, true); again.Trusted || !strings.Contains(next.String(), approvePrompt) {
+		t.Fatalf("next launch = %#v, stderr = %q, want it asked again", again, next.String())
+	}
 }
 
 func TestInteractiveAuthorizer_ShellPromptsCarryShellSubjectKind(t *testing.T) {
@@ -4008,6 +4055,36 @@ func TestBuildIndependentPromptRequest_KeepsTheQuestionsOwnEscalation(t *testing
 	}
 }
 
+func TestBuildIndependentPromptRequest_EachQuestionCarriesItsOwnNote(t *testing.T) {
+	const credits = "System One check failed: out of credits on OpenRouter — asking you instead"
+	const noKey = "System One check: no Venice API key"
+	prompts, displays, targets := independentPrompts(t,
+		[2]string{"read", "/work/sub/a.go"},
+		[2]string{"read", "/work/sub/b.go"},
+		[2]string{"read", "/work/sub/c.go"},
+	)
+	prompts[0].Escalation.Note = credits
+	prompts[1].Escalation.Note = noKey
+	prompts[2].Escalation.Note = credits
+
+	questions := independentQuestions(prompts, displays)
+	if !reflect.DeepEqual(questions, [][]int{{0, 2}, {1}}) {
+		t.Fatalf("questions = %#v, want equal notes merged and the different note asked on its own", questions)
+	}
+	for i, want := range []string{credits, noKey} {
+		pr, err := buildIndependentPromptRequest(prompts, displays, targets, questions[i])
+		if err != nil {
+			t.Fatalf("buildIndependentPromptRequest: %v", err)
+		}
+		if pr.Note != want {
+			t.Fatalf("question %d note = %q, want %q", i, pr.Note, want)
+		}
+		if len(pr.BatchedNotes) != 0 {
+			t.Fatalf("question %d populated pipeline notes: %#v", i, pr.BatchedNotes)
+		}
+	}
+}
+
 func TestIndependentQuestions_EveryDistinctEffectSplitsTheQuestion(t *testing.T) {
 	base := func(index int) (permissions.BatchPromptRequest, PromptDisplay) {
 		return permissions.BatchPromptRequest{
@@ -4025,6 +4102,9 @@ func TestIndependentQuestions_EveryDistinctEffectSplitsTheQuestion(t *testing.T)
 		{"host", func(p *permissions.BatchPromptRequest, _ *PromptDisplay) { p.Req.Host = "example.test" }},
 		{"clear environment", func(p *permissions.BatchPromptRequest, _ *PromptDisplay) { p.Req.ClearEnvironment = true }},
 		{"scope escalation", func(p *permissions.BatchPromptRequest, _ *PromptDisplay) { p.Escalation.NarrowerScope = "/work/sub" }},
+		{"pre-prompt note", func(p *permissions.BatchPromptRequest, _ *PromptDisplay) {
+			p.Escalation.Note = "System One check: no Venice API key"
+		}},
 		{"action", func(_ *permissions.BatchPromptRequest, d *PromptDisplay) { d.Action = "Edit file" }},
 		{"stored grant capability", func(_ *permissions.BatchPromptRequest, d *PromptDisplay) { d.GrantStoredSubject = "" }},
 		{"out-of-root write", func(_ *permissions.BatchPromptRequest, d *PromptDisplay) { d.OutOfRootFileWrite = true }},
@@ -4222,6 +4302,10 @@ func TestProductionAuthorizer_IndependentGroupAsksOnceForOneSharedDecision(t *te
 	if len(recorded) != len(reqs) {
 		t.Fatalf("recorded decisions = %d, want one per member call (%d)", len(recorded), len(reqs))
 	}
+	waits := decodeStoreEvents[events.PermissionPromptWait](t, reloadStore(t, store), events.KindPermissionPromptWait)
+	if len(waits) != 1 || waits[0].Prompts != 5 || waits[0].Ended != "answered" {
+		t.Fatalf("prompt waits = %+v, want one answered wait counting all 5 requests behind the one question", waits)
+	}
 }
 
 func TestProductionAuthorizer_IndependentCallsThatDifferAreAskedSeparately(t *testing.T) {
@@ -4395,6 +4479,7 @@ func TestBuildIndependentPromptRequest_SummaryDescribesOnlyItsOwnQuestion(t *tes
 func TestProductionAuthorizer_PermanentApprovalWritesTheLocalSettingsFile(t *testing.T) {
 	cwd := mustCanonical(t, t.TempDir())
 	home := t.TempDir()
+	storeUnchanged := approvedRootsUnchanged(t, home, cwd)
 	store := mkStore(t)
 	app := tui.New(nil)
 	app.SetActiveStore(store)
@@ -4443,6 +4528,7 @@ func TestProductionAuthorizer_PermanentApprovalWritesTheLocalSettingsFile(t *tes
 	if len(notices.texts) != 1 {
 		t.Fatalf("notices after a second permanent approval = %v, want the ignore notice emitted once per project", notices.texts)
 	}
+	storeUnchanged()
 }
 
 func TestProductionAuthorizer_ExistingLocalSettingsFileAnnouncesNothing(t *testing.T) {
@@ -4547,7 +4633,12 @@ func TestProductionAuthorizer_LocalGrantLeavesSharedProjectSettingsByteIdentical
 	shared := seedSharedProjectSettings(t, cwd, permissions.PermissionEntry{
 		Kind: "tool", Subject: "list_files", PathScope: cwd, GrantKind: "folder",
 	})
-	auth, _ := interactiveAuthorizerFor(t, &BootstrapResult{Home: home, LaunchDir: cwd, ProjectRoot: cwd})
+	storeUnchanged := approvedRootsUnchanged(t, home, cwd)
+	decision := trust.Lookup(home, cwd)
+	if !decision.Trusted || decision.Reason != trust.ReasonTrusted {
+		t.Fatalf("trust gate = %#v, want the listed root admitted", decision)
+	}
+	auth, _ := interactiveAuthorizerFor(t, &BootstrapResult{Home: home, LaunchDir: cwd, ProjectRoot: cwd, TrustDecision: decision})
 
 	folder := permissions.PermissionEntry{Kind: "tool", Subject: "read_file", PathScope: cwd, GrantKind: "folder"}
 	host := projectHostGrant("web_fetch", "docs.example.com")
@@ -4556,6 +4647,7 @@ func TestProductionAuthorizer_LocalGrantLeavesSharedProjectSettingsByteIdentical
 			t.Fatalf("persistGrant %+v: %v", entry, err)
 		}
 		requireSharedProjectSettingsUnchanged(t, cwd, shared, "a local grant write")
+		storeUnchanged()
 	}
 
 	localTarget := config.LocalSettingsPath(cwd)
@@ -4720,10 +4812,10 @@ func approvedRootsUnchanged(t *testing.T, home, root string) func() {
 		t.Helper()
 		after, err := os.Stat(path)
 		if err != nil {
-			t.Fatalf("stat approved-roots store after share: %v", err)
+			t.Fatalf("stat approved-roots store after the write: %v", err)
 		}
 		if got := mustReadFile(t, path); got != data || !after.ModTime().Equal(before.ModTime()) {
-			t.Fatalf("approved-roots store changed across a share: bytes %q -> %q, mtime %v -> %v", data, got, before.ModTime(), after.ModTime())
+			t.Fatalf("approved-roots store changed across a settings write: bytes %q -> %q, mtime %v -> %v", data, got, before.ModTime(), after.ModTime())
 		}
 	}
 }
@@ -5376,8 +5468,8 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 		{"direct network", "curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "curl https://example.com" && pr.Pipeline == "" && !pr.WholeCommand
 		}},
-		{"direct deletion", "rm -f out.txt", "file deletion", func(pr tui.PromptRequest) bool {
-			return pr.Subject == "rm -f out.txt" && pr.Pipeline == ""
+		{"direct history rewrite", "git rebase main", "VCS history rewrite", func(pr tui.PromptRequest) bool {
+			return pr.Subject == "git rebase main" && pr.Pipeline == ""
 		}},
 		{"pipeline with a later exceptional stage", "sort data.txt | curl -d @- https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "curl -d @- https://example.com" && pr.Pipeline == "sort data.txt | curl -d @- https://example.com" && pr.BatchedStages == nil
@@ -5385,11 +5477,11 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 		{"literal network", "sh -c 'curl https://example.com'", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "sh -c 'curl https://example.com'" && pr.WholeCommand
 		}},
-		{"literal deletion", "sh -c 'rm -f out.txt'", "file deletion", func(pr tui.PromptRequest) bool {
-			return pr.Subject == "sh -c 'rm -f out.txt'" && pr.WholeCommand
+		{"literal history rewrite", "sh -c 'git rebase main'", "VCS history rewrite", func(pr tui.PromptRequest) bool {
+			return pr.Subject == "sh -c 'git rebase main'" && pr.WholeCommand
 		}},
-		{"staged deletion then network", "rm -f out.txt && curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
-			return pr.Subject == "" && slices.Equal(pr.BatchedStages, []string{"rm -f out.txt", "curl https://example.com"})
+		{"staged history rewrite then network", "git rebase main && curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
+			return pr.Subject == "" && slices.Equal(pr.BatchedStages, []string{"git rebase main", "curl https://example.com"})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5634,8 +5726,8 @@ func requireUnapprovedLaunchWithholdsFolders(t *testing.T, l writableLaunch, cac
 	if _, ok := l.composition.Config["writable_folders"]; ok {
 		t.Fatalf("composed config = %+v, want no writable_folders", l.composition.Config)
 	}
-	if folders := cache.WritableFolders(); len(folders) != 0 {
-		t.Fatalf("cache writable folders = %v, want none", folders)
+	if folders := newWritableFoldersReader(cache).current(); len(folders) != 0 {
+		t.Fatalf("live writable folders = %v, want none", folders)
 	}
 }
 
@@ -5646,6 +5738,7 @@ type writableHarness struct {
 	cache      *config.Cache
 	prompts    int
 	answer     bool
+	deny       bool
 }
 
 func newWritableHarness(t *testing.T, l writableLaunch, resolution enforce.Resolution) *writableHarness {
@@ -5660,6 +5753,9 @@ func newWritableHarness(t *testing.T, l writableLaunch, resolution enforce.Resol
 	app.SetActiveStore(h.store)
 	show := func(tui.PromptRequest) (tui.PromptDecision, error) {
 		h.prompts++
+		if h.deny {
+			return tui.PromptDecision{Option: tui.OptionDeny}, nil
+		}
 		if !h.answer {
 			return tui.PromptDecision{}, errors.New("no prompt expected")
 		}
@@ -5719,8 +5815,8 @@ func writableEditRequest(l writableLaunch) dispatch.BatchAuthRequest {
 func TestProductionAuthorizer_WritableFolderEditIsAutoAllowedUnderAConstrainedLaunch(t *testing.T) {
 	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
 	h := newWritableHarness(t, l, constrainedLaunch)
-	if got := h.cache.WritableFolders(); !slices.Equal(got, []string{l.folder}) {
-		t.Fatalf("cache writable folders = %v, want [%s]", got, l.folder)
+	if got := h.auth.writable.current(); !slices.Equal(got, []string{l.folder}) {
+		t.Fatalf("live writable folders = %v, want [%s]", got, l.folder)
 	}
 
 	h.edit(t, l.target, 0)
@@ -5757,8 +5853,8 @@ func TestProductionAuthorizer_WritableFolderEditFollowsBrokenSettingsUntilFixed(
 	if live.Capability != enforce.Refused || live.Reason != "settings file is broken" {
 		t.Fatalf("displayed capability = %+v, want refused with %q", live, "settings file is broken")
 	}
-	if len(h.auth.writableFolders) == 0 {
-		t.Fatal("the cached writable-folder snapshot is empty")
+	if len(h.auth.writable.current()) == 0 {
+		t.Fatal("the live writable-folder list is empty")
 	}
 	h.edit(t, l.target, 1)
 	if n := len(h.modeAutoAllows(t)); n != 1 {
@@ -5813,8 +5909,8 @@ func TestProductionAuthorizer_AbsentOrEmptyWritableFoldersKeepTheOutOfRootPrompt
 		t.Run(tc.name, func(t *testing.T) {
 			l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, tc.yaml)
 			h := newWritableHarness(t, l, constrainedLaunch)
-			if !l.decision.Trusted || len(h.cache.WritableFolders()) != 0 || len(h.auth.writableFolders) != 0 {
-				t.Fatalf("decision = %+v, cache folders = %v, authorizer folders = %v; want a trusted project with none", l.decision, h.cache.WritableFolders(), h.auth.writableFolders)
+			if !l.decision.Trusted || len(h.auth.writable.current()) != 0 {
+				t.Fatalf("decision = %+v, live folders = %v; want a trusted project with none", l.decision, h.auth.writable.current())
 			}
 
 			h.edit(t, l.target, 1)
@@ -5843,4 +5939,327 @@ func TestProductionAuthorizer_UnapprovedProjectWritableFoldersHaveNoEffect(t *te
 	if allows := h.modeAutoAllows(t); len(allows) != 0 {
 		t.Fatalf("mode_auto matches = %+v, want none", allows)
 	}
+}
+
+func TestProductionAuthorizer_AFolderRemovedMidSessionPromptsOnTheNextEdit(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+
+	h.edit(t, l.target, 0)
+	rewriteSettings(t, projectSettingsPath(l.project), writableFoldersYAML())
+	h.edit(t, l.target, 1)
+
+	if n := len(h.modeAutoAllows(t)); n != 1 {
+		t.Fatalf("mode_auto matches = %d, want only the edit made before the removal", n)
+	}
+}
+
+func TestProductionAuthorizer_AFolderAddedMidSessionIsAutoAllowedOnTheNextEdit(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, func(string) string { return writableFoldersYAML() })
+	h := newWritableHarness(t, l, constrainedLaunch)
+
+	h.edit(t, l.target, 1)
+	rewriteSettings(t, projectSettingsPath(l.project), declaringWritableFolder(l.folder))
+	h.edit(t, l.target, 0)
+
+	want := events.PermissionMatched{SubjectKind: "tool", Subject: filetools.EditToolName, PathScope: l.folder, Outcome: "once", OutcomeSource: "mode_auto"}
+	if allows := h.modeAutoAllows(t); len(allows) != 1 || allows[0] != want {
+		t.Fatalf("mode_auto matches on disk = %+v, want exactly %+v", allows, want)
+	}
+}
+
+func TestProductionAuthorizer_ADeletedProjectSettingsFileWithdrawsFoldersButKeepsBlockedEntries(t *testing.T) {
+	project := declaredScopeDir(t)
+	secret := filepath.Join(project, "secret.txt")
+	l := gateWritableLaunch(t, declaredScopeDir(t), project, true, func(folder string) string {
+		return blockedYAML(secret) + writableFoldersYAML(folder)
+	})
+	h := newWritableHarness(t, l, constrainedLaunch)
+	file := projectSettingsPath(l.project)
+	content := mustReadFile(t, file)
+
+	h.edit(t, l.target, 0)
+	if err := os.Remove(file); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	h.edit(t, l.target, 1)
+	if h.auth.settingsBroken() {
+		t.Fatal("SettingsBroken = true after deleting a healthy project settings file, want false")
+	}
+	if !slices.ContainsFunc(h.auth.blocked.Entries(), func(e permissions.BlockedEntry) bool { return e.Path == secret }) {
+		t.Fatalf("blocked entries = %+v, want the last valid %s kept", h.auth.blocked.Entries(), secret)
+	}
+
+	writeProjectSettings(t, l.project, content)
+	h.edit(t, l.target, 0)
+	if n := len(h.modeAutoAllows(t)); n != 2 {
+		t.Fatalf("mode_auto matches = %d, want the edits before the deletion and after the restore", n)
+	}
+}
+
+var writableBatchSites = map[string]func(*productionAuthorizer, []dispatch.BatchAuthRequest) ([]permissions.Decision, error){
+	"AuthorizeBatch": func(a *productionAuthorizer, reqs []dispatch.BatchAuthRequest) ([]permissions.Decision, error) {
+		return a.AuthorizeBatch(context.Background(), reqs)
+	},
+	"AuthorizeIndependent": func(a *productionAuthorizer, reqs []dispatch.BatchAuthRequest) ([]permissions.Decision, error) {
+		independent := make([]dispatch.IndependentAuthRequest, len(reqs))
+		for i, r := range reqs {
+			independent[i] = dispatch.IndependentAuthRequest{Req: r.Req, Display: r.Display, ModeCtx: r.ModeCtx}
+		}
+		return a.AuthorizeIndependent(context.Background(), independent)
+	},
+}
+
+func writableToolRequest(l writableLaunch, tool, target string) dispatch.BatchAuthRequest {
+	return dispatch.BatchAuthRequest{
+		Req:     permissions.MatchRequest{Kind: "tool", Subject: tool, PathScope: l.folder},
+		Display: dispatch.PromptDisplay{Action: dispatch.ActionRunTool, Subject: tool},
+		ModeCtx: permissions.ModeContext{Class: permissions.ClassMutating, ToolName: tool, TargetPath: target},
+	}
+}
+
+func TestProductionAuthorizer_BatchSeamsShareOneLiveFolderReadPerInvocation(t *testing.T) {
+	for site, call := range writableBatchSites {
+		t.Run(site, func(t *testing.T) {
+			l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+			h := newWritableHarness(t, l, constrainedLaunch)
+			reqs := []dispatch.BatchAuthRequest{
+				writableToolRequest(l, filetools.EditToolName, l.target),
+				writableToolRequest(l, filetools.CreateToolName, filepath.Join(l.folder, "new.txt")),
+				writableToolRequest(l, filetools.MkdirToolName, filepath.Join(l.folder, "sub")),
+			}
+			// The blocked-path reader shares the settings read; settling it first leaves only the live read.
+			h.auth.settingsBroken()
+			reads, _ := countSettingsReads(t)
+			counted := readHeldSettings
+			readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+				readHeldSettings = counted
+				data, info, err := counted(parent, name)
+				if err := bumpSettings(projectSettingsPath(l.project), writableFoldersYAML()); err != nil {
+					t.Errorf("remove the folder after the read: %v", err)
+				}
+				return data, info, err
+			}
+			t.Cleanup(func() { readHeldSettings = counted })
+			invoke := func(state string, wantPrompted bool, wantAllows int) {
+				t.Helper()
+				h.auth.resetTurnCache()
+				h.answer = wantPrompted
+				before := h.prompts
+				decs, err := call(h.auth, reqs)
+				if err != nil || len(decs) != len(reqs) {
+					t.Fatalf("%s: decisions = %+v, %v; want one per member", state, decs, err)
+				}
+				for i, dec := range decs {
+					if dec.Outcome != "once" {
+						t.Fatalf("%s: member %d decision = %+v, want an allow", state, i, dec)
+					}
+				}
+				if prompted := h.prompts > before; prompted != wantPrompted {
+					t.Fatalf("%s: prompted = %v, want %v", state, prompted, wantPrompted)
+				}
+				if n := len(h.modeAutoAllows(t)); n != wantAllows {
+					t.Fatalf("%s: mode_auto matches = %d, want %d", state, n, wantAllows)
+				}
+			}
+			invoke("folder declared at the read", false, len(reqs))
+			if got := reads.Load(); got != 1 {
+				t.Fatalf("live settings reads in one invocation = %d, want 1", got)
+			}
+			invoke("folder removed after the previous read", true, len(reqs))
+		})
+	}
+}
+
+func TestProductionAuthorizer_LiveFoldersGrantNothingOutsideAutoEditsOrToMove(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	h.answer = true
+	cases := []struct {
+		mode mode.Mode
+		req  dispatch.BatchAuthRequest
+	}{
+		{mode.Build, writableEditRequest(l)},
+		{mode.Plan, writableEditRequest(l)},
+		{mode.Build, writableToolRequest(l, filetools.DeleteToolName, l.target)},
+		{mode.Plan, writableToolRequest(l, filetools.DeleteToolName, l.target)},
+		{mode.AutoEdits, writableToolRequest(l, filetools.MoveToolName, l.target)},
+	}
+	for _, tc := range cases {
+		h.auth.modeActive.ApplyUserCommand(tc.mode)
+		for site, call := range authorizerSites {
+			h.auth.resetTurnCache()
+			if _, err := call(h.auth, tc.req); err != nil {
+				t.Fatalf("%s %s %s: %v", tc.mode, tc.req.ModeCtx.ToolName, site, err)
+			}
+		}
+	}
+	for _, m := range h.modeAutoAllows(t) {
+		if m.Outcome != "deny" {
+			t.Fatalf("mode_auto match = %+v, want no allow", m)
+		}
+	}
+}
+
+func writableDeleteRequest(target string) dispatch.BatchAuthRequest {
+	return dispatch.BatchAuthRequest{
+		Req:     permissions.MatchRequest{Kind: "tool", Subject: filetools.DeleteToolName, PathScope: filepath.Dir(target)},
+		Display: dispatch.PromptDisplay{Action: dispatch.ActionRunTool, Subject: filetools.DeleteToolName},
+		ModeCtx: permissions.ModeContext{Class: permissions.ClassMutating, ToolName: filetools.DeleteToolName, TargetPath: target},
+	}
+}
+
+func (h *writableHarness) deleteAtEverySite(t *testing.T, state, target string, wantPrompts int, wantOutcome string) {
+	t.Helper()
+	for site, call := range authorizerSites {
+		h.auth.resetTurnCache()
+		h.answer = wantPrompts > 0
+		before, allowsBefore := h.prompts, len(h.modeAutoAllows(t))
+		dec, err := call(h.auth, writableDeleteRequest(target))
+		if err != nil || dec.Outcome != wantOutcome || dec.Grant != nil {
+			t.Fatalf("%s %s: decision = %+v, %v; want %s with no grant", state, site, dec, err, wantOutcome)
+		}
+		if got := h.prompts - before; got != wantPrompts {
+			t.Fatalf("%s %s: prompts = %d, want %d", state, site, got, wantPrompts)
+		}
+		allows := h.modeAutoAllows(t)
+		if wantPrompts > 0 || wantOutcome != "once" {
+			for _, m := range allows[allowsBefore:] {
+				if m.Outcome != "deny" {
+					t.Fatalf("%s %s: new mode_auto match = %+v, want no allow", state, site, m)
+				}
+			}
+			continue
+		}
+		want := events.PermissionMatched{SubjectKind: "tool", Subject: filetools.DeleteToolName, PathScope: filepath.Dir(target), Outcome: "once", OutcomeSource: "mode_auto"}
+		if len(allows) != allowsBefore+1 || allows[allowsBefore] != want {
+			t.Fatalf("%s %s: new mode_auto matches = %+v, want exactly %+v", state, site, allows[allowsBefore:], want)
+		}
+	}
+}
+
+func TestProductionAuthorizer_ConstrainedAutoEditsDeleteIsAllowedOnceInBothScopes(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	outside := filepath.Join(declaredScopeDir(t), "other.txt")
+
+	h.deleteAtEverySite(t, "project file", filepath.Join(l.project, "a.txt"), 0, "once")
+	h.deleteAtEverySite(t, "writable-folder file", l.target, 0, "once")
+	h.deleteAtEverySite(t, "outside both", outside, 1, "once")
+	h.deleteAtEverySite(t, "project root", l.project, 1, "once")
+	h.deleteAtEverySite(t, "writable root", l.folder, 1, "once")
+	h.auth.modeActive.ApplyUserCommand(mode.Build)
+	h.deleteAtEverySite(t, "build", l.target, 1, "once")
+	h.auth.modeActive.ApplyUserCommand(mode.Plan)
+	h.deleteAtEverySite(t, "plan", l.target, 0, "deny")
+}
+
+func TestProductionAuthorizer_DeleteAsksWithoutAPassedSelfTest(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, failedSelfTest)
+
+	h.deleteAtEverySite(t, "project file", filepath.Join(l.project, "a.txt"), 1, "once")
+	h.deleteAtEverySite(t, "writable-folder file", l.target, 1, "once")
+}
+
+func TestProductionAuthorizer_DeleteAsksWhileSettingsAreBroken(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	global := SettingsPath(l.home)
+	projectFile := filepath.Join(l.project, "a.txt")
+
+	rewriteSettings(t, global, "blocked_paths: [\n")
+	h.deleteAtEverySite(t, "broken project file", projectFile, 1, "once")
+	h.deleteAtEverySite(t, "broken writable-folder file", l.target, 1, "once")
+	rewriteSettings(t, global, blockedYAML())
+	h.deleteAtEverySite(t, "fixed", projectFile, 0, "once")
+}
+
+func TestProductionAuthorizer_DeleteFollowsWritableFolderRefreshes(t *testing.T) {
+	cases := map[string]func(t *testing.T, file, valid string) (restore func()){
+		"removal saved": func(t *testing.T, file, valid string) func() {
+			rewriteSettings(t, file, writableFoldersYAML())
+			return func() { rewriteSettings(t, file, valid) }
+		},
+		"failed refresh": func(t *testing.T, file, valid string) func() {
+			_, fail := countSettingsReads(t)
+			fail.Store(true)
+			rewriteSettings(t, file, valid)
+			return func() {
+				fail.Store(false)
+				rewriteSettings(t, file, valid)
+			}
+		},
+		"locked refresh": func(t *testing.T, file, valid string) func() {
+			release, reason, err := locks.TryAcquire(file + ".lock")
+			if release == nil {
+				t.Fatalf("TryAcquire = %q, %v; want the lock", reason, err)
+			}
+			t.Cleanup(release)
+			rewriteSettings(t, file, valid)
+			return func() {
+				release()
+				rewriteSettings(t, file, valid)
+			}
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+			h := newWritableHarness(t, l, constrainedLaunch)
+			file := projectSettingsPath(l.project)
+			valid := declaringWritableFolder(l.folder)
+
+			h.deleteAtEverySite(t, "before", l.target, 0, "once")
+			restore := change(t, file, valid)
+			h.deleteAtEverySite(t, "changed", l.target, 1, "once")
+			restore()
+			h.deleteAtEverySite(t, "recovered", l.target, 0, "once")
+		})
+	}
+}
+
+func distinctWritableRequests(t *testing.T, l writableLaunch, n int) []dispatch.BatchAuthRequest {
+	t.Helper()
+	reqs := make([]dispatch.BatchAuthRequest, n)
+	keys := map[inflightKey]bool{}
+	for i := range reqs {
+		target := filepath.Join(l.folder, fmt.Sprintf("f%d.txt", i))
+		reqs[i] = writableToolRequest(l, filetools.CreateToolName, target)
+		reqs[i].Req.PathScope = target
+		keys[inflightKeyOf(reqs[i].Req)] = true
+	}
+	if len(keys) != n {
+		t.Fatalf("distinct in-flight keys = %d, want %d", len(keys), n)
+	}
+	return reqs
+}
+
+func TestProductionAuthorizer_ConcurrentDistinctAuthorizationsShareTheLiveReader(t *testing.T) {
+	l := gateWritableLaunch(t, declaredScopeDir(t), declaredScopeDir(t), true, declaringWritableFolder)
+	h := newWritableHarness(t, l, constrainedLaunch)
+	h.answer = true
+	file := projectSettingsPath(l.project)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 5 {
+			if err := bumpSettings(file, declaringWritableFolder(l.folder)+strings.Repeat("\n", i)); err != nil {
+				t.Errorf("rewrite: %v", err)
+			}
+		}
+	}()
+	for i, req := range distinctWritableRequests(t, l, 8) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			call := authorizerSites[[]string{"Authorize", "AuthorizeBatch", "AuthorizeIndependent"}[i%3]]
+			dec, err := call(h.auth, req)
+			if err != nil || dec.Outcome != "once" {
+				t.Errorf("authorization %d = %+v, %v; want an allow", i, dec, err)
+			}
+		}()
+	}
+	wg.Wait()
 }

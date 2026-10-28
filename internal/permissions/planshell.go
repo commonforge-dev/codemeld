@@ -106,6 +106,12 @@ var commandPolicies = map[string]commandPolicy{
 		denyFlags:  []string{"--sync"}, // `df --sync` runs sync(2) and flushes dirty buffers
 		abbrevLong: true,
 	},
+	"diff": {
+		denyFlags:         []string{"-l", "--paginate"}, // pipes the output through `pr` found on PATH
+		clusterShortFlags: true,
+		abbrevLong:        true,
+		platforms:         linuxOnly,
+	},
 	"tail": {
 		denyFlags: []string{
 			"-f", // follow mode reads without bound, so it is never a safe read-only diagnostic
@@ -292,6 +298,7 @@ var commandPolicies = map[string]commandPolicy{
 	"awk":        {argSensitive: true, validator: awkStageReadOnly},
 	"bash":       {argSensitive: true, validator: noExecShellTokens},
 	"sh":         {argSensitive: true, validator: noExecShellTokens},
+	"env":        {argSensitive: true, validator: bareEnvTokens},
 	"command":    {argSensitive: true, validator: commandLookupTokens},
 	"type":       {argSensitive: true, validator: typeLookupTokens},
 	"test":       {argSensitive: true, validator: testStageReadOnly},
@@ -1766,6 +1773,10 @@ func commandLookupTokens(tokens []string) bool {
 	return len(tokens) == 3 && tokens[0] == "command" && tokens[1] == "-v" && plainProgramName(tokens[2])
 }
 
+func bareEnvTokens(tokens []string) bool {
+	return len(tokens) == 1 && tokens[0] == "env"
+}
+
 func typeLookupTokens(tokens []string) bool {
 	return len(tokens) == 2 && tokens[0] == "type" && plainProgramName(tokens[1])
 }
@@ -1792,9 +1803,9 @@ func plainProgramName(name string) bool {
 // stageIsShellProgram reports whether a stage's canonical program is a wrapper. The no-exec and
 // `command -v` exceptions hold only on the direct and staged routes, which perform the exact
 // validated invocation; the literal route hands its text back to `sh -c`, so a wrapper stage there
-// stays mutating.
+// stays mutating. Bare `env` runs no other program, so it is not a wrapper on any route.
 func stageIsShellProgram(tokens []string) bool {
-	return len(tokens) > 0 && wrapperPrograms[tokens[0]]
+	return len(tokens) > 0 && wrapperPrograms[tokens[0]] && !bareEnvTokens(tokens)
 }
 
 // stageNeedsOwnedArgv reports whether a stage may auto-allow only where dispatch can rewrite its
@@ -1918,6 +1929,82 @@ func stripNullRedirects(canonical string) (string, bool) {
 	}
 	b.WriteString(canonical[kept:])
 	return b.String(), true
+}
+
+// A here-string only feeds an inert word to stdin, so removing it leaves the programs that run
+// unchanged; any span whose word or boundaries could mean more is rejected, never guessed at.
+func stripClassifierHereStrings(subject string) (string, bool) {
+	mask, err := bareMask(subject)
+	if err != nil {
+		return "", false
+	}
+	var b strings.Builder
+	kept := 0
+	for i := 0; i < len(subject); i++ {
+		if !mask[i] || subject[i] != '<' {
+			continue
+		}
+		opEnd := i
+		for opEnd < len(subject) && mask[opEnd] && subject[opEnd] == '<' {
+			opEnd++
+		}
+		if opEnd-i < 3 {
+			i = opEnd - 1
+			continue
+		}
+		start, end, ok := hereStringSpan(subject, mask, i, opEnd)
+		if !ok {
+			return "", false
+		}
+		b.WriteString(subject[kept:start])
+		kept = end
+		i = end - 1
+	}
+	b.WriteString(subject[kept:])
+	return b.String(), true
+}
+
+func hereStringSpan(s string, mask []bool, op, opEnd int) (start, end int, ok bool) {
+	if opEnd-op != 3 || strings.ContainsAny(s, "\n\r") || op == 0 || !mask[op-1] || !isShellSpace(s[op-1]) {
+		return 0, 0, false
+	}
+	prev := op - 1
+	for prev >= 0 && mask[prev] && isShellSpace(s[prev]) {
+		prev--
+	}
+	if prev < 0 || (mask[prev] && strings.IndexByte(";|&(){}<>!", s[prev]) >= 0) {
+		return 0, 0, false
+	}
+	word := opEnd
+	for word < len(s) && mask[word] && isShellSpace(s[word]) {
+		word++
+	}
+	if word == len(s) {
+		return 0, 0, false
+	}
+	end = word
+	if s[word] == '\'' {
+		end = word + 1 + strings.IndexByte(s[word+1:], '\'') + 1
+	} else {
+		for end < len(s) && mask[end] && !runeNeedsQuote(rune(s[end])) {
+			end++
+		}
+		if end == word {
+			return 0, 0, false
+		}
+	}
+	if end < len(s) && (!mask[end] || (!isShellSpace(s[end]) && strings.IndexByte(";|&", s[end]) < 0)) {
+		return 0, 0, false
+	}
+	return op - 1, end, true
+}
+
+func stripLiteralForClassification(canonical string) (string, bool) {
+	remainder, ok := stripClassifierHereStrings(canonical)
+	if !ok {
+		return "", false
+	}
+	return stripNullRedirects(remainder)
 }
 
 func nullRedirectSpan(s string, mask []bool, i int) (start, end int, ok bool) {
@@ -2067,7 +2154,7 @@ func LiteralRunsPS(canonical string) bool {
 }
 
 func literalRunsProgram(canonical, program string) bool {
-	stripped, ok := stripNullRedirects(canonical)
+	stripped, ok := stripLiteralForClassification(canonical)
 	if !ok {
 		return false
 	}
@@ -2113,7 +2200,7 @@ type literalBreakdown struct {
 }
 
 func breakDownLiteral(canonical string) (literalBreakdown, bool) {
-	stripped, ok := stripNullRedirects(canonical)
+	stripped, ok := stripLiteralForClassification(canonical)
 	if !ok {
 		return literalBreakdown{}, false
 	}
@@ -2142,7 +2229,7 @@ func classifyLiteralCompound(canonical string) OperationClass {
 	stripped, wrapped, stages, operators := literal.stripped, literal.wrapped, literal.stages, literal.operators
 	reparsedByShell := stripped != canonical
 	if !literal.compound {
-		if !reparsedByShell {
+		if !reparsedByShell && !bareEnvTokens(stages[0].Tokens) {
 			return ClassMutating
 		}
 		return classifyStrippedSingleStage(stages)
@@ -2166,7 +2253,7 @@ func classifyLiteralCompound(canonical string) OperationClass {
 		if stageIsShellProgram(stage.Tokens) || stageNeedsOwnedArgv(stage.Tokens) || !stageTokensReadOnly(stage.Tokens) {
 			return ClassMutating
 		}
-		argSensitive = argSensitive || stageArgSensitive(stage.Tokens)
+		argSensitive = argSensitive || (stageArgSensitive(stage.Tokens) && !bareEnvTokens(stage.Tokens))
 		argDependent = argDependent || stageArgDependent(stage.Tokens)
 	}
 	if wrapped {

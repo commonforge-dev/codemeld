@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -1403,5 +1404,256 @@ func TestRun_RoutingExhaustionSurfacesOnceWithFilters(t *testing.T) {
 	prf := findProviderRequestFailed(t, recs)
 	if prf.Phase != "http" || prf.Reason != "http_error" || prf.ErrorDetail != body || prf.HTTPStatus == nil || *prf.HTTPStatus != 404 {
 		t.Fatalf("provider_request_failed = %+v, want http/http_error with the raw body and status 404", prf)
+	}
+}
+
+func kindCount(recs []sessions.Record, kind string) int {
+	n := 0
+	for _, k := range eventKinds(recs) {
+		if k == kind {
+			n++
+		}
+	}
+	return n
+}
+
+func assertBlankAttemptRecords(t *testing.T, recs []sessions.Record, attempts int, recovered bool, retryKind string) {
+	t.Helper()
+	if rounds := providerRoundTripEvents(t, recs); len(rounds) != attempts {
+		t.Fatalf("provider_round_trip = %d, want %d (one per attempt); kinds = %v", len(rounds), attempts, eventKinds(recs))
+	}
+	terminals := turnTerminalEvents(t, recs)
+	if len(terminals) != attempts {
+		t.Fatalf("turn_terminal = %d, want %d (one per attempt); kinds = %v", len(terminals), attempts, eventKinds(recs))
+	}
+	failed := terminals
+	if recovered {
+		failed = terminals[:attempts-1]
+		if last := terminals[attempts-1]; last.Outcome != events.TurnOutcomeCompleted {
+			t.Fatalf("recovered attempt terminal = %+v, want completed", last)
+		}
+	}
+	for i, term := range failed {
+		if term.Outcome != events.TurnOutcomeProviderFailed || term.FailurePhase != "empty_response" || term.DispatchStarted {
+			t.Fatalf("terminal[%d] = %+v, want provider_failed/empty_response with no dispatch", i, term)
+		}
+	}
+	round, terminal, retry := kindIndex(recs, events.KindProviderRoundTrip), kindIndex(recs, events.KindTurnTerminal), kindIndex(recs, retryKind)
+	if round < 0 || terminal < round || retry < terminal {
+		t.Fatalf("record order (round=%d, terminal=%d, %s=%d), want timing, then terminal, then %s; kinds = %v",
+			round, terminal, retryKind, retry, retryKind, eventKinds(recs))
+	}
+}
+
+func TestToolLoop_BlankSuggestOnlyRoundRetriesBeforeFailure(t *testing.T) {
+	textCall := `{"name":"suggest_followup","arguments":` + suggestArgs + `}`
+	for _, tc := range []struct {
+		name      string
+		round     [][]byte
+		rollbacks int
+	}{
+		{"structured empty", [][]byte{toolCallsChunk(toolFrag(0, "call_s", "suggest_followup", suggestArgs)), usageChunk(100, 10)}, 0},
+		{"structured whitespace", [][]byte{contentChunk(" \n\t"), toolCallsChunk(toolFrag(0, "call_s", "suggest_followup", suggestArgs)), usageChunk(100, 10)}, 1},
+		{"parsed text", [][]byte{contentChunk(textCall), finishChunk("stop"), usageChunk(100, 10)}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noSleep(t)
+			store := storeAt(t.TempDir() + "/session.json")
+			store.Append(textMsg("user", "summarize"))
+			client := &scriptedClient{rounds: [][][]byte{tc.round, {contentChunk("done"), finishChunk("stop"), usageChunk(200, 20)}}}
+			var suggests, rollbacks int
+			var notices []string
+			loop := NewToolLoop(Deps{
+				Active:          selectedState("openai", "gpt-x", model.EffortDefault),
+				Store:           store,
+				Client:          client,
+				Retry:           retryOn(),
+				SuggestFollowup: func(string, string) { suggests++ },
+				Notice:          func(text string) { notices = append(notices, text) },
+				RollbackPartial: func() { rollbacks++ },
+				Flush:           storeFlush(store),
+			}, &fakeDispatcher{}, 3)
+
+			if err := loop.Run(context.Background()); err != nil {
+				t.Fatalf("ToolLoop.Run() error = %v, want nil (the re-issued round answered)", err)
+			}
+			if client.callCount() != 2 {
+				t.Fatalf("provider calls = %d, want 2", client.callCount())
+			}
+			if suggests != 0 || len(notices) != 0 {
+				t.Fatalf("suggestions = %d, notices = %q, want none from the rejected round", suggests, notices)
+			}
+			if rollbacks != tc.rollbacks {
+				t.Fatalf("RollbackPartial calls = %d, want %d", rollbacks, tc.rollbacks)
+			}
+			recs := diskRecords(t, store)
+			retries := findProviderRequestRetry(t, recs)
+			if len(retries) != 1 || retries[0].Phase != "empty_response" || retries[0].Reason != "zero_delta_stream" ||
+				retries[0].Attempt != 1 || retries[0].PartialCharsDiscarded != 0 {
+				t.Fatalf("provider_request_retry = %+v, want one attempt-1 empty_response/zero_delta_stream with 0 discarded", retries)
+			}
+			if skipped := findProviderRequestRetrySkipped(t, recs); len(skipped) != 0 {
+				t.Fatalf("provider_request_retry_skipped = %+v, want none", skipped)
+			}
+			if hasKind(recs, "provider_request_failed") {
+				t.Fatalf("provider_request_failed recorded for a recovered turn; kinds = %v", eventKinds(recs))
+			}
+			assertBlankAttemptRecords(t, recs, 2, true, events.KindProviderRequestRetry)
+			if n := kindCount(recs, "model_response"); n != 1 {
+				t.Fatalf("model_response = %d, want 1", n)
+			}
+			if mr := decodeModelResponse(t, recs); mr.InputTokens != 300 || mr.OutputTokens != 30 {
+				t.Fatalf("model_response tokens = (%d, %d), want both attempts' (300, 30)", mr.InputTokens, mr.OutputTokens)
+			}
+			if final := lastAssistantText(recs); final != "done" {
+				t.Fatalf("assistant text = %q, want the re-issued answer", final)
+			}
+		})
+	}
+}
+
+func TestToolLoop_BlankSuggestOnlyRoundExhaustedRecordsSkipBeforeFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		retry  RetryPolicy
+		calls  int
+		skip   string
+		notice string
+	}{
+		{"max attempts", RetryPolicy{Enabled: true, MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: time.Second}, 2, "max_attempts_reached", "retry 2: "},
+		{"disabled", RetryPolicy{}, 1, "retry_disabled", "plain: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noSleep(t)
+			store := storeAt(t.TempDir() + "/session.json")
+			store.Append(textMsg("user", "summarize"))
+			client := &scriptedClient{rounds: [][][]byte{{contentChunk("\n"), toolCallsChunk(toolFrag(0, "call_s", "suggest_followup", suggestArgs)), usageChunk(100, 10)}}}
+			var suggests int
+			var notices []string
+			loop := NewToolLoop(Deps{
+				Active:          selectedState("openai", "gpt-x", model.EffortDefault),
+				Store:           store,
+				Client:          client,
+				Retry:           tc.retry,
+				SuggestFollowup: func(string, string) { suggests++ },
+				Notice:          func(text string) { notices = append(notices, text) },
+				RenderNotice:    func(verbatim, _, _ string, _ int) string { return "plain: " + verbatim },
+				RenderRetryNotice: func(verbatim, _, _ string, _, attempts int) string {
+					return fmt.Sprintf("retry %d: %s", attempts, verbatim)
+				},
+				RollbackPartial: func() {},
+				Flush:           storeFlush(store),
+			}, &fakeDispatcher{}, 3)
+
+			if err := loop.Run(context.Background()); err == nil {
+				t.Fatal("ToolLoop.Run() error = nil, want the blank-round failure")
+			}
+			if client.callCount() != tc.calls {
+				t.Fatalf("provider calls = %d, want %d", client.callCount(), tc.calls)
+			}
+			if suggests != 0 {
+				t.Fatalf("suggestions = %d, want 0", suggests)
+			}
+			if len(notices) != 1 || !strings.HasPrefix(notices[0], tc.notice) {
+				t.Fatalf("notices = %q, want one starting %q", notices, tc.notice)
+			}
+			recs := diskRecords(t, store)
+			skipped := findProviderRequestRetrySkipped(t, recs)
+			if len(skipped) != 1 || skipped[0].Phase != "empty_response" || skipped[0].SkipReason != tc.skip || skipped[0].PartialCharsDiscarded != 0 {
+				t.Fatalf("provider_request_retry_skipped = %+v, want one empty_response %s", skipped, tc.skip)
+			}
+			if n := kindCount(recs, "provider_request_failed"); n != 1 {
+				t.Fatalf("provider_request_failed = %d, want 1; kinds = %v", n, eventKinds(recs))
+			}
+			if prf := findProviderRequestFailed(t, recs); prf.Phase != "empty_response" || prf.Reason != "zero_delta_stream" {
+				t.Fatalf("provider_request_failed = %+v, want empty_response/zero_delta_stream", prf)
+			}
+			if kindIndex(recs, events.KindProviderRequestRetrySkipped) > kindIndex(recs, "provider_request_failed") {
+				t.Fatal("provider_request_retry_skipped must precede provider_request_failed")
+			}
+			assertBlankAttemptRecords(t, recs, tc.calls, false, events.KindProviderRequestRetrySkipped)
+			if n := kindCount(recs, "model_response"); n != 1 {
+				t.Fatalf("model_response = %d, want 1 accounting record", n)
+			}
+			if mr := decodeModelResponse(t, recs); mr.InputTokens != int64(100*tc.calls) || mr.OutputTokens != int64(10*tc.calls) {
+				t.Fatalf("model_response tokens = (%d, %d), want every attempt's billed usage", mr.InputTokens, mr.OutputTokens)
+			}
+			if final := lastAssistantText(recs); final != "" {
+				t.Fatalf("assistant text = %q, want none", final)
+			}
+		})
+	}
+}
+
+func TestToolLoop_BlankFinalReplyRetriesAndKeepsUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		first     [][]byte
+		rollbacks int
+		retained  int
+	}{
+		{"whitespace", [][]byte{contentChunk("\n"), contentChunk(" \n"), finishChunk("stop"), usageChunk(100, 10)}, 1, 3},
+		{"empty", [][]byte{finishChunk("stop"), usageChunk(100, 10)}, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			noSleep(t)
+			store := storeAt(t.TempDir() + "/session.json")
+			store.Append(textMsg("user", "hi"))
+			client := &scriptedClient{rounds: [][][]byte{tc.first, {contentChunk("Hello"), finishChunk("stop"), usageChunk(200, 20)}}}
+			var progress, rollbacks, retainedAtRollback, callsAtRollback, finalizes int
+			loop := NewToolLoop(Deps{
+				Active:   selectedState("openai", "gpt-x", model.EffortDefault),
+				Store:    store,
+				Client:   client,
+				Retry:    retryOn(),
+				Progress: func(n int) { progress = n },
+				RollbackPartial: func() {
+					rollbacks++
+					retainedAtRollback, callsAtRollback = progress, client.callCount()
+				},
+				Finalize: func() { finalizes++ },
+				Flush:    storeFlush(store),
+			}, &fakeDispatcher{}, 3)
+
+			if err := loop.Run(context.Background()); err != nil {
+				t.Fatalf("ToolLoop.Run() error = %v, want nil", err)
+			}
+			if client.callCount() != 2 {
+				t.Fatalf("provider calls = %d, want 2", client.callCount())
+			}
+			if rollbacks != tc.rollbacks {
+				t.Fatalf("RollbackPartial calls = %d, want %d", rollbacks, tc.rollbacks)
+			}
+			if tc.rollbacks > 0 && (retainedAtRollback != tc.retained || callsAtRollback != 1) {
+				t.Fatalf("rollback saw retained=%d after %d calls, want %d before the re-issue", retainedAtRollback, callsAtRollback, tc.retained)
+			}
+			if finalizes != 1 {
+				t.Fatalf("Finalize calls = %d, want 1 (only the recovered answer)", finalizes)
+			}
+			recs := diskRecords(t, store)
+			retries := findProviderRequestRetry(t, recs)
+			if len(retries) != 1 || retries[0].Phase != "empty_response" || retries[0].PartialCharsDiscarded != 0 {
+				t.Fatalf("provider_request_retry = %+v, want one empty_response with 0 discarded", retries)
+			}
+			if hasKind(recs, "provider_request_failed") {
+				t.Fatalf("provider_request_failed recorded for a recovered turn; kinds = %v", eventKinds(recs))
+			}
+			assertBlankAttemptRecords(t, recs, 2, true, events.KindProviderRequestRetry)
+			var answers []string
+			for _, rec := range recs {
+				if msg, ok := rec.(sessions.Message); ok && msg.Role == "assistant" {
+					answers = append(answers, msg.Content.Text())
+				}
+			}
+			if !slices.Equal(answers, []string{"Hello"}) {
+				t.Fatalf("assistant messages = %q, want only the recovered answer", answers)
+			}
+			if n := kindCount(recs, "model_response"); n != 1 {
+				t.Fatalf("model_response = %d, want 1", n)
+			}
+			if mr := decodeModelResponse(t, recs); mr.InputTokens != 300 || mr.OutputTokens != 30 {
+				t.Fatalf("model_response tokens = (%d, %d), want both attempts' (300, 30)", mr.InputTokens, mr.OutputTokens)
+			}
+		})
 	}
 }

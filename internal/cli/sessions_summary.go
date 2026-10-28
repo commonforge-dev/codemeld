@@ -2,13 +2,18 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/sessions"
+
+	ucli "github.com/urfave/cli/v3"
 )
 
 const (
@@ -18,6 +23,8 @@ const (
 )
 
 const structuredReadSuccess = "success"
+
+const promptWaitCancelled = "cancelled"
 
 type shellExecRow struct {
 	SubjectKind string `json:"subject_kind"`
@@ -59,6 +66,14 @@ type cachedTokenTotal struct {
 	OmittedResponses  int    `json:"omitted_responses"`
 }
 
+type costTotal struct {
+	Availability      string   `json:"availability"`
+	USD               *float64 `json:"usd,omitempty"`
+	ReportedResponses int      `json:"reported_responses"`
+	PartialResponses  int      `json:"partial_responses"`
+	OmittedResponses  int      `json:"omitted_responses"`
+}
+
 type summaryTotals struct {
 	IdentifiedTurns   int                 `json:"identified_turns"`
 	IdentifiedRounds  int                 `json:"identified_rounds"`
@@ -72,6 +87,12 @@ type summaryTotals struct {
 	InputTokens       int64               `json:"input_tokens"`
 	OutputTokens      int64               `json:"output_tokens"`
 	CachedInputTokens cachedTokenTotal    `json:"cached_input_tokens"`
+	CostUSD           costTotal           `json:"cost_usd"`
+
+	ApprovalWaitMs         int64 `json:"approval_wait_ms"`
+	ApprovalRequests       int   `json:"approval_requests"`
+	ApprovalWaitsCancelled int   `json:"approval_waits_cancelled"`
+	approvalWaitEvents     int
 }
 
 type executionRow struct {
@@ -87,6 +108,10 @@ type summaryReport struct {
 	StructuredReads []structuredReadRow `json:"structured_reads"`
 	PathScopes      []pathScopeRow      `json:"path_scopes"`
 	Totals          summaryTotals       `json:"totals"`
+}
+
+type waitInterval struct {
+	start, end int64
 }
 
 type execKey struct {
@@ -152,6 +177,50 @@ func (c *cachedAccumulator) total() cachedTokenTotal {
 	return t
 }
 
+type costAccumulator struct {
+	usd      float64
+	reported int
+	partial  int
+	omitted  int
+}
+
+func (c *costAccumulator) add(p events.ModelResponse) {
+	if p.CostUSD == nil {
+		c.omitted++
+		return
+	}
+	if math.IsInf(c.usd+*p.CostUSD, 0) {
+		c.partial++
+		return
+	}
+	c.usd += *p.CostUSD
+	if p.CostUSDPartial {
+		c.partial++
+		return
+	}
+	c.reported++
+}
+
+func (c *costAccumulator) total() costTotal {
+	t := costTotal{
+		ReportedResponses: c.reported,
+		PartialResponses:  c.partial,
+		OmittedResponses:  c.omitted,
+	}
+	if c.reported == 0 && c.partial == 0 {
+		t.Availability = cachedUnavailable
+		return t
+	}
+	usd := c.usd
+	t.USD = &usd
+	if c.partial == 0 && c.omitted == 0 {
+		t.Availability = cachedExact
+		return t
+	}
+	t.Availability = cachedLowerBound
+	return t
+}
+
 func runSessionsSummary(args []string, asJSON bool, stdout io.Writer) error {
 	target, err := singleTarget(args, "summary")
 	if err != nil {
@@ -161,7 +230,10 @@ func runSessionsSummary(args []string, asJSON bool, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	report := buildSummaryReport(path, sess)
+	report, err := buildSummaryReport(path, sess)
+	if err != nil {
+		return ucli.Exit(fmt.Sprintf("codemeld: sessions summary: %s: %s", path, err), 1)
+	}
 	if asJSON {
 		return renderJSON(stdout, report)
 	}
@@ -169,7 +241,7 @@ func runSessionsSummary(args []string, asJSON bool, stdout io.Writer) error {
 	return nil
 }
 
-func buildSummaryReport(path string, sess *sessions.Session) summaryReport {
+func buildSummaryReport(path string, sess *sessions.Session) (summaryReport, error) {
 	shell := map[execKey]*shellExecAgg{}
 	reads := map[string]*structuredReadAgg{}
 	scopes := map[string]*pathScopeAgg{}
@@ -177,8 +249,10 @@ func buildSummaryReport(path string, sess *sessions.Session) summaryReport {
 	turnIDs := map[string]bool{}
 	roundIDs := map[roundKey]bool{}
 	cached := &cachedAccumulator{}
+	cost := &costAccumulator{}
 	totals := summaryTotals{}
 	var execution *executionRow
+	var waits []waitInterval
 
 	for _, rec := range sess.Records {
 		ev, ok := rec.(sessions.Event)
@@ -262,12 +336,30 @@ func buildSummaryReport(path string, sess *sessions.Session) summaryReport {
 			totals.OutputTokens += p.OutputTokens
 			pairs[providerModelPair{p.Provider, p.ModelID}] = true
 			cached.add(p)
+			cost.add(p)
 		case events.KindExecutionCapability:
 			var p events.ExecutionCapability
 			if json.Unmarshal(ev.Payload, &p) != nil {
 				continue
 			}
 			execution = &executionRow{Capability: p.Capability, Reason: p.Reason}
+		case events.KindPermissionPromptWait:
+			var p events.PermissionPromptWait
+			if json.Unmarshal(ev.Payload, &p) != nil {
+				continue
+			}
+			end := ev.Timestamp.UnixMilli()
+			if end < math.MinInt64+p.WaitedMs {
+				return summaryReport{}, errApprovalWaitRange
+			}
+			waits = append(waits, waitInterval{start: end - p.WaitedMs, end: end})
+			if totals.ApprovalRequests > math.MaxInt-p.Prompts {
+				return summaryReport{}, errApprovalWaitRange
+			}
+			totals.ApprovalRequests += p.Prompts
+			if p.Ended == promptWaitCancelled {
+				totals.ApprovalWaitsCancelled++
+			}
 		}
 	}
 
@@ -282,6 +374,13 @@ func buildSummaryReport(path string, sess *sessions.Session) summaryReport {
 	totals.IncompleteRounds = totals.IdentifiedRounds - totals.TerminatedRounds
 	totals.ProviderModels = sortedProviderModels(pairs)
 	totals.CachedInputTokens = cached.total()
+	totals.CostUSD = cost.total()
+	waitMs, ok := unionMs(waits)
+	if !ok {
+		return summaryReport{}, errApprovalWaitRange
+	}
+	totals.ApprovalWaitMs = waitMs
+	totals.approvalWaitEvents = len(waits)
 
 	return summaryReport{
 		Session:         path,
@@ -291,7 +390,31 @@ func buildSummaryReport(path string, sess *sessions.Session) summaryReport {
 		StructuredReads: structuredReadRows(reads),
 		PathScopes:      pathScopeRows(scopes),
 		Totals:          totals,
+	}, nil
+}
+
+var errApprovalWaitRange = errors.New("permission-prompt wait totals exceed the representable range")
+
+func unionMs(spans []waitInterval) (int64, bool) {
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	var total, covered int64
+	for i, s := range spans {
+		var add int64
+		switch {
+		case i == 0 || s.start > covered:
+			add = s.end - s.start
+		case s.end > covered:
+			add = s.end - covered
+		default:
+			continue
+		}
+		if total > math.MaxInt64-add {
+			return 0, false
+		}
+		total += add
+		covered = s.end
 	}
+	return total, true
 }
 
 func addScopeStart(scopes map[string]*pathScopeAgg, scope, usedBy string) {
@@ -502,6 +625,11 @@ func renderSummaryTotals(w io.Writer, t summaryTotals) {
 	fmt.Fprintf(w, "  input tokens: %d\n", t.InputTokens)
 	fmt.Fprintf(w, "  output tokens: %d\n", t.OutputTokens)
 	fmt.Fprintf(w, "  cached input tokens: %s\n", formatCached(t.CachedInputTokens))
+	fmt.Fprintf(w, "  cost (provider-reported, USD): %s\n", formatCost(t.CostUSD))
+	if t.approvalWaitEvents > 0 {
+		fmt.Fprintf(w, "  permission-prompt wait: %d ms across %d requests (%d waits cancelled)\n",
+			t.ApprovalWaitMs, t.ApprovalRequests, t.ApprovalWaitsCancelled)
+	}
 	fmt.Fprintln(w, "\na terminated round is one a turn_terminal closed, whatever that outcome was — a cancelled or")
 	fmt.Fprintln(w, "provider-failed round is terminated too, so closure is not success. An incomplete round recorded")
 	fmt.Fprintln(w, "its timing and never recorded how it ended; sessions doctor reports the same rounds as")
@@ -529,5 +657,18 @@ func formatCached(c cachedTokenTotal) string {
 	default:
 		return fmt.Sprintf(">= %d (lower bound; reported exact by %d, partial by %d, not reported by %d)",
 			*c.Tokens, c.ReportedResponses, c.PartialResponses, c.OmittedResponses)
+	}
+}
+
+func formatCost(c costTotal) string {
+	switch c.Availability {
+	case cachedUnavailable:
+		return "unavailable (no model_response reported cost)"
+	case cachedExact:
+		return fmt.Sprintf("%s (exact; every one of the %d recorded responses reported a non-partial cost)",
+			strconv.FormatFloat(*c.USD, 'g', -1, 64), c.ReportedResponses)
+	default:
+		return fmt.Sprintf(">= %s (lower bound; of the recorded responses, reported exact by %d, partial by %d, not reported by %d)",
+			strconv.FormatFloat(*c.USD, 'g', -1, 64), c.ReportedResponses, c.PartialResponses, c.OmittedResponses)
 	}
 }

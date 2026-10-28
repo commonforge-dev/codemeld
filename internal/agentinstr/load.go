@@ -125,6 +125,20 @@ type LoadEntry struct {
 	Content       []byte            // file bytes when loaded; nil when skipped
 }
 
+type SelectionMode int
+
+const (
+	DiscoverAll SelectionMode = iota
+	DiscoverNone
+	DiscoverAllButLaunchDir
+	ExplicitFile
+)
+
+type Selection struct {
+	Mode SelectionMode
+	Path string
+}
+
 // LoadAgentInstructions performs the once-per-process discovery walk and returns
 // the ordered load record. It first considers the global file at
 // <home>/.codemeld/global/AGENTS.md (load_order 1 when present or skipped), then
@@ -138,7 +152,23 @@ type LoadEntry struct {
 // halting the walk. The walk is independent of discovery.boundary: it
 // always proceeds to the filesystem root and this function never consults that
 // setting. home is the absolute home directory ("" disables the global file).
-func LoadAgentInstructions(home, launchDir string, maxFileBytes int) ([]LoadEntry, error) {
+func LoadAgentInstructions(home, launchDir string, maxFileBytes int, sel Selection) ([]LoadEntry, error) {
+	switch sel.Mode {
+	case DiscoverAll, DiscoverAllButLaunchDir:
+	case DiscoverNone:
+		return nil, nil
+	case ExplicitFile:
+		if !filepath.IsAbs(sel.Path) {
+			return nil, fmt.Errorf("agentinstr: explicit AGENTS.md path %q is not absolute", sel.Path)
+		}
+		if e, ok := loadCandidate(filepath.Clean(sel.Path), LayerWalked, 2, maxFileBytes); ok {
+			return []LoadEntry{e}, nil
+		}
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("agentinstr: unknown AGENTS.md selection mode %d", sel.Mode)
+	}
+
 	anchor, err := filepath.Abs(launchDir)
 	if err != nil {
 		return nil, fmt.Errorf("agentinstr: resolve launch dir %q: %w", launchDir, err)
@@ -169,6 +199,9 @@ func LoadAgentInstructions(home, launchDir string, maxFileBytes int) ([]LoadEntr
 
 	order := 2
 	for _, dir := range dirs {
+		if sel.Mode == DiscoverAllButLaunchDir && dir == anchor {
+			continue
+		}
 		// an unreadable directory is skipped and the walk continues; no
 		// file skip entry is produced for an AGENTS.md we could never have listed.
 		if _, derr := readDir(dir); derr != nil {

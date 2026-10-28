@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -3431,4 +3432,408 @@ func TestRewriteProviderEntry_OpenRouterMergesConnectionFields(t *testing.T) {
 			t.Fatalf("refused write changed the file:\n%s", got)
 		}
 	})
+}
+
+func TestRewriteProviderEntry_OpenRouterContextWindows(t *testing.T) {
+	session := map[string]int64{"z/m:free": 2048, "a/m": 4096}
+	const (
+		blockHead  = "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-old\n"
+		blockTail  = "    routing:\n      sort: latency\n  # sibling\n  venice:\n    base_url: v\n    api_key: k\n"
+		blockDecl  = "    context_windows:\n      a/m: 4096\n      z/m:free: 2048\n"
+		flowDecl   = `context_windows: {a/m: 4096, "z/m:free": 2048}`
+		venice     = "  venice:\n    base_url: v\n    api_key: k\n"
+		rootVenice = ", venice: {base_url: v, api_key: k}}\n"
+	)
+	cases := []struct {
+		name        string
+		input, want string
+		windows     map[string]int64
+	}{
+		{
+			name:    "block entry replaces block declaration",
+			input:   blockHead + "    context_windows:\n      # inner\n      old/m: 1\n" + blockTail,
+			want:    "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n" + blockDecl + blockTail,
+			windows: session,
+		},
+		{
+			name:    "block entry replaces flow declaration",
+			input:   blockHead + "    context_windows: {old/m: 1} # outer\n" + blockTail,
+			want:    "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n    " + flowDecl + " # outer\n" + blockTail,
+			windows: session,
+		},
+		{
+			name:    "multi-line flow entry under block root replaces declaration on one line",
+			input:   "provider:\n  openrouter: {base_url: u, api_key: sk-old,\n    context_windows: {old/m: 1,\n      x: 2}, routing: {sort: latency}}\n" + venice,
+			want:    "provider:\n  openrouter: {base_url: u, api_key: sk-new,\n    " + flowDecl + ", routing: {sort: latency}}\n" + venice,
+			windows: session,
+		},
+		{
+			name:    "flow root replaces declaration",
+			input:   "provider: {openrouter: {base_url: u, api_key: sk-old, context_windows: {old/m: 1}, routing: {sort: latency}}" + rootVenice,
+			want:    "provider: {openrouter: {base_url: u, api_key: sk-new, " + flowDecl + ", routing: {sort: latency}}" + rootVenice,
+			windows: session,
+		},
+		{
+			name:    "block declaration at end of file keeps the missing final newline",
+			input:   blockHead + "    context_windows:\n      old/m: 1",
+			want:    "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n" + strings.TrimSuffix(blockDecl, "\n"),
+			windows: session,
+		},
+		{
+			name:    "block entry inserts block declaration after existing fields",
+			input:   blockHead + "    routing:\n      sort: latency\n" + venice,
+			want:    "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n    routing:\n      sort: latency\n" + blockDecl + venice,
+			windows: session,
+		},
+		{
+			name:    "flow entry under block root inserts flow declaration",
+			input:   "provider:\n  openrouter: {base_url: u, api_key: sk-old, routing: {sort: latency}}\n" + venice,
+			want:    "provider:\n  openrouter: {base_url: u, api_key: sk-new, routing: {sort: latency}, " + flowDecl + "}\n" + venice,
+			windows: session,
+		},
+		{
+			name:    "flow root inserts flow declaration",
+			input:   "provider: {openrouter: {base_url: u, api_key: sk-old, routing: {sort: latency}}" + rootVenice,
+			want:    "provider: {openrouter: {base_url: u, api_key: sk-new, routing: {sort: latency}, " + flowDecl + "}" + rootVenice,
+			windows: session,
+		},
+		{
+			name:    "empty session map is written",
+			input:   blockHead + venice,
+			want:    "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n    context_windows: {}\n" + venice,
+			windows: map[string]int64{},
+		},
+		{
+			name:    "absent entry is created with the declaration after the connection fields",
+			input:   "provider:\n" + venice,
+			want:    "provider:\n" + venice + "  openrouter:\n    base_url: u\n    api_key: sk-new\n    context_windows:\n      a/m: 4096\n      z/m:free: 2048\n",
+			windows: session,
+		},
+		{
+			name:  "nil session removes block declaration",
+			input: blockHead + "    context_windows:\n      old/m: 1\n" + blockTail,
+			want:  "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n" + blockTail,
+		},
+		{
+			name:  "nil session removes flow declaration in block entry",
+			input: blockHead + "    context_windows: {old/m: 1}\n" + blockTail,
+			want:  "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n" + blockTail,
+		},
+		{
+			name:  "nil session removes declaration in flow entry under block root",
+			input: "provider:\n  openrouter: {base_url: u, api_key: sk-old, context_windows: {old/m: 1}, routing: {sort: latency}}\n" + venice,
+			want:  "provider:\n  openrouter: {base_url: u, api_key: sk-new, routing: {sort: latency}}\n" + venice,
+		},
+		{
+			name:  "nil session removes declaration in flow root",
+			input: "provider: {openrouter: {base_url: u, api_key: sk-old, routing: {sort: latency}, context_windows: {old/m: 1}}" + rootVenice,
+			want:  "provider: {openrouter: {base_url: u, api_key: sk-new, routing: {sort: latency}}" + rootVenice,
+		},
+		{
+			name:  "nil session with no declaration creates none",
+			input: blockHead + blockTail,
+			want:  "# top\nprovider:\n  openrouter:\n    base_url: u\n    api_key: sk-new\n" + blockTail,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value := providerEntryValue("u", "sk-new")
+			if tc.windows != nil {
+				value = append(value, yaml.MapItem{Key: "context_windows", Value: tc.windows})
+			}
+			key := KeyProviderPrefix + "openrouter"
+			rewriteCase{input: tc.input, key: key, value: value, want: tc.want}.run(t)
+			rewriteCase{input: tc.want, key: key, value: value, want: tc.want}.run(t)
+
+			path := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, path, tc.want)
+			want := tc.windows
+			if len(want) == 0 {
+				want = nil
+			}
+			if got := parseProviderEntry(t, path, "openrouter").ContextWindows; !reflect.DeepEqual(got, want) {
+				t.Fatalf("parsed context_windows = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func decodeSettings(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var got map[string]any
+	if err := yaml.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("output is not valid YAML: %v\n%s", err, body)
+	}
+	if got == nil {
+		got = map[string]any{}
+	}
+	return got
+}
+
+func TestRewriteKey_FlowRootMissingKeyInserts(t *testing.T) {
+	const flowPrefix = "# settings\n{discovery: {boundary: launch-dir-only},\n  notes: [\"a, b\", 'c}'], other: 'x: y'"
+	unrelated := map[string]any{
+		"discovery": map[string]any{"boundary": "launch-dir-only"},
+		"notes":     []any{"a, b", "c}"},
+		"other":     "x: y",
+	}
+	model := func(sub string) map[string]any {
+		return map[string]any{sub: map[string]any{"provider": "openai", "id": "gpt: 5, {x}", "effort": "high"}}
+	}
+	cases := []struct {
+		name  string
+		key   string
+		value any
+		entry string
+		top   string
+		want  any
+	}{
+		{
+			name:  "permissions",
+			key:   KeyPermissions,
+			value: permissions.PermissionEntry{Kind: "direct", Subject: "a, b]", PathScope: "*", GrantKind: "global"},
+			entry: `permissions: [{kind: direct, subject: "a, b]", path_scope: "*", grant_kind: global}]`,
+			top:   "permissions",
+			want:  []any{map[string]any{"kind": "direct", "subject": "a, b]", "path_scope": "*", "grant_kind": "global"}},
+		},
+		{
+			name:  "model.active",
+			key:   KeyModelActive,
+			value: modelSelection("openai", "gpt: 5, {x}", "high"),
+			entry: `model: {active: {provider: openai, id: "gpt: 5, {x}", effort: high}}`,
+			top:   "model",
+			want:  model("active"),
+		},
+		{
+			name:  "model.last_used",
+			key:   KeyModelLastUsed,
+			value: modelSelection("openai", "gpt: 5, {x}", "high"),
+			entry: `model: {last_used: {provider: openai, id: "gpt: 5, {x}", effort: high}}`,
+			top:   "model",
+			want:  model("last_used"),
+		},
+		{
+			name:  "auth",
+			key:   KeyAuthOpenAIChatGPT,
+			value: authValue("tok,1", "ref}2", "2026", "acct"),
+			entry: `auth: {openai-chatgpt: {access_token: "tok,1", refresh_token: "ref}2", expires_at: "2026", account_id: acct}}`,
+			top:   "auth",
+			want:  map[string]any{"openai-chatgpt": map[string]any{"access_token": "tok,1", "refresh_token": "ref}2", "expires_at": "2026", "account_id": "acct"}},
+		},
+		{name: "attribution true", key: KeyAttribution, value: true, entry: "attribution: true", top: "attribution", want: true},
+		{name: "attribution false", key: KeyAttribution, value: false, entry: "attribution: false", top: "attribution", want: false},
+		{
+			name:  "favorites",
+			key:   keyModelFavorites,
+			value: preparedToggle(nil, Favorite{Provider: "openai", ID: "gpt, 5"}, true),
+			entry: `model: {favorites: [{provider: openai, id: "gpt, 5"}]}`,
+			top:   "model",
+			want:  map[string]any{"favorites": []any{map[string]any{"provider": "openai", "id": "gpt, 5"}}},
+		},
+		{
+			name:  "provider",
+			key:   KeyProviderPrefix + "local-llm",
+			value: providerEntryValue("http://h/v1", "sk-a,b"),
+			entry: `provider: {local-llm: {base_url: http://h/v1, api_key: "sk-a,b"}}`,
+			top:   "provider",
+			want:  map[string]any{"local-llm": map[string]any{"base_url": "http://h/v1", "api_key": "sk-a,b"}},
+		},
+		{
+			name:  "provider with a quoted name",
+			key:   KeyProviderPrefix + "llm, {2}",
+			value: providerEntryValue("http://h/v1", "sk-x"),
+			entry: `provider: {"llm, {2}": {base_url: http://h/v1, api_key: sk-x}}`,
+			top:   "provider",
+			want:  map[string]any{"llm, {2}": map[string]any{"base_url": "http://h/v1", "api_key": "sk-x"}},
+		},
+	}
+	for _, tc := range cases {
+		for _, seed := range []struct {
+			name, input, want string
+			others            map[string]any
+		}{
+			{"empty", "{}\n", "{" + tc.entry + "}\n", map[string]any{}},
+			{"nonempty", flowPrefix + "}  # keep\n", flowPrefix + ", " + tc.entry + "}  # keep\n", unrelated},
+		} {
+			t.Run(tc.name+"/"+seed.name, func(t *testing.T) {
+				rewriteCase{input: seed.input, key: tc.key, value: tc.value, want: seed.want}.run(t)
+				got := decodeSettings(t, seed.want)
+				if !reflect.DeepEqual(got[tc.top], tc.want) {
+					t.Fatalf("%s = %#v, want %#v", tc.top, got[tc.top], tc.want)
+				}
+				delete(got, tc.top)
+				if !reflect.DeepEqual(got, seed.others) {
+					t.Fatalf("unrelated values = %#v, want %#v", got, seed.others)
+				}
+			})
+		}
+	}
+}
+
+func TestRewriteKey_BlockRootMissingKeyAppendsAtEnd(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		value any
+		block string
+	}{
+		{
+			name:  "permissions",
+			key:   KeyPermissions,
+			value: permissions.PermissionEntry{Kind: "direct", Subject: "ls", PathScope: "*", GrantKind: "global"},
+			block: "permissions:\n  - kind: direct\n    subject: ls\n    path_scope: \"*\"\n    grant_kind: global\n",
+		},
+		{
+			name:  "model.active",
+			key:   KeyModelActive,
+			value: modelSelection("openai", "gpt-5", "high"),
+			block: "model:\n" +
+				"  # This file holds this machine's own settings for this project; it is not shared with the team.\n" +
+				"  # model.active is rewritten whenever you pick a model in this project.\n" +
+				"  # Manual edits to this key will be overwritten the next time you pick a model here.\n" +
+				"  active:\n    provider: openai\n    id: gpt-5\n    effort: high\n",
+		},
+		{
+			name:  "model.last_used",
+			key:   KeyModelLastUsed,
+			value: modelSelection("openai", "gpt-5", "high"),
+			block: "model:\n  last_used:\n    provider: openai\n    id: gpt-5\n    effort: high\n",
+		},
+		{
+			name:  "auth",
+			key:   KeyAuthOpenAIChatGPT,
+			value: authValue("a", "b", "c", "d"),
+			block: "auth:\n  openai-chatgpt:\n    access_token: a\n    refresh_token: b\n    expires_at: c\n    account_id: d\n",
+		},
+		{name: "attribution", key: KeyAttribution, value: false, block: "attribution: false\n"},
+		{
+			name:  "favorites",
+			key:   keyModelFavorites,
+			value: preparedToggle(nil, Favorite{Provider: "openai", ID: "gpt-5"}, true),
+			block: "model:\n  favorites:\n    - provider: openai\n      id: gpt-5\n",
+		},
+		{
+			name:  "provider",
+			key:   KeyProviderPrefix + "local-llm",
+			value: providerEntryValue("http://h/v1", "sk-x"),
+			block: "provider:\n  local-llm:\n    base_url: http://h/v1\n    api_key: sk-x\n",
+		},
+	}
+	for _, tc := range cases {
+		for _, seed := range []struct{ name, input, want string }{
+			{"trailing comment and blank line", "other: keep\n# trailing comment\n\n", "other: keep\n# trailing comment\n\n" + tc.block},
+			{"no final newline", "other: keep # inline", "other: keep # inline\n" + tc.block},
+		} {
+			t.Run(tc.name+"/"+seed.name, func(t *testing.T) {
+				rewriteCase{input: seed.input, key: tc.key, value: tc.value, want: seed.want}.run(t)
+			})
+		}
+	}
+}
+
+func TestRewriteKey_FlowRootTopLevelRemoval(t *testing.T) {
+	const perm = `permissions: [{kind: direct, subject: ls, path_scope: "*", grant_kind: global}]`
+	const auth = `auth: {openai-chatgpt: {access_token: a, refresh_token: b, expires_at: c, account_id: d}}`
+	unrelated := map[string]any{"other": "x: y", "notes": []any{"a, b"}}
+	removals := []struct {
+		name   string
+		key    string
+		value  any
+		entry  string
+		absent string
+	}{
+		{"permission", KeyPermissions, PermissionDelete(directGlobalKey("ls")), perm, "permissions"},
+		{"auth", KeyAuthOpenAIChatGPT, AuthDelete, auth, "auth"},
+	}
+	for _, rm := range removals {
+		cases := []struct {
+			name, input, want string
+			others            map[string]any
+		}{
+			{"first", "{" + rm.entry + ", other: 'x: y', notes: [\"a, b\"]}\n", "{other: 'x: y', notes: [\"a, b\"]}\n", unrelated},
+			{"middle", "# head\n{other: 'x: y', " + rm.entry + ",\n  notes: [\"a, b\"]}  # tail\n", "# head\n{other: 'x: y',\n  notes: [\"a, b\"]}  # tail\n", unrelated},
+			{"last", "{other: 'x: y', notes: [\"a, b\"], " + rm.entry + "}\n", "{other: 'x: y', notes: [\"a, b\"]}\n", unrelated},
+			{"sole", "{" + rm.entry + "}\n", "{}\n", map[string]any{}},
+		}
+		for _, tc := range cases {
+			t.Run(rm.name+"/"+tc.name, func(t *testing.T) {
+				rewriteCase{input: tc.input, key: rm.key, value: rm.value, want: tc.want}.run(t)
+				got := decodeSettings(t, tc.want)
+				if _, ok := got[rm.absent]; ok {
+					t.Fatalf("%s survived removal: %#v", rm.absent, got)
+				}
+				if !reflect.DeepEqual(got, tc.others) {
+					t.Fatalf("unrelated values = %#v, want %#v", got, tc.others)
+				}
+			})
+		}
+	}
+}
+
+func TestRewriteKey_FlowRootPlainScalarQuotes(t *testing.T) {
+	const auth = `auth: {openai-chatgpt: {access_token: a, refresh_token: b, expires_at: c, account_id: d}}`
+	for _, other := range []string{`don't`, `say "hi"`, `'a, b'`, `"a, b"`} {
+		unrelated := map[string]any{"other": decodeSettings(t, "other: "+other+"\n")["other"]}
+		t.Run("insert/"+other, func(t *testing.T) {
+			input := "{other: " + other + ",}\n"
+			want := "{other: " + other + ", attribution: true}\n"
+			rewriteCase{input: input, key: KeyAttribution, value: true, want: want}.run(t)
+			got := decodeSettings(t, want)
+			if got["attribution"] != true {
+				t.Fatalf("attribution = %#v, want true", got["attribution"])
+			}
+			delete(got, "attribution")
+			if !reflect.DeepEqual(got, unrelated) {
+				t.Fatalf("unrelated values = %#v, want %#v", got, unrelated)
+			}
+		})
+		t.Run("remove auth/"+other, func(t *testing.T) {
+			input := "{other: " + other + ", " + auth + "}\n"
+			want := "{other: " + other + "}\n"
+			rewriteCase{input: input, key: KeyAuthOpenAIChatGPT, value: AuthDelete, want: want}.run(t)
+			got := decodeSettings(t, want)
+			if !reflect.DeepEqual(got, unrelated) {
+				t.Fatalf("values = %#v, want %#v", got, unrelated)
+			}
+		})
+	}
+}
+
+func TestSettingsRewritePublish_RefusesUnparseableYAML(t *testing.T) {
+	const seed = "keep: 1\n"
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"parser error", "a: [1, 2\n"},
+		{"duplicate key", "a: 1\na: 2\n"},
+		{"unknown alias", "a: *missing\n"},
+	} {
+		for _, relative := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dir-relative=%v", tc.name, relative), func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "settings.yaml")
+				writeAt(t, path, seed)
+				r := &settingsRewrite{path: path}
+				if relative {
+					d, err := os.Open(dir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = d.Close() })
+					r.dir = d
+				}
+				step, cat, err := r.publish([]byte(tc.body))
+				if err == nil || step != fsutil.LoadStep || cat != fserrors.IOError {
+					t.Fatalf("publish = (%q, %q, %v), want (%q, %q, error)", step, cat, err, fsutil.LoadStep, fserrors.IOError)
+				}
+				if r.published != nil {
+					t.Fatalf("published = %q, want nil", r.published)
+				}
+				if got := readAt(t, path); got != seed {
+					t.Fatalf("file changed:\n%s", got)
+				}
+			})
+		}
+	}
 }

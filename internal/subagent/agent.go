@@ -71,9 +71,7 @@ func (r Request) validate() error {
 
 var errStepCap = errors.New("subagent: step cap reached")
 
-// DefaultStepCap bounds a child that no caller sized itself: enough rounds to read,
-// change, and verify a small piece of work, and few enough that a looping child ends.
-const DefaultStepCap = 12
+const DefaultStepCap = turn.RoundLimit
 
 // Run returns a usable Result and a nil error for a step cap, a cancellation, and a
 // terminal user denial; only an unexpected loop failure returns the partial Result

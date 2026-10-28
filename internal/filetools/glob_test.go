@@ -88,6 +88,7 @@ func TestGlobTool_AdvertiseMetadata(t *testing.T) {
 			t.Fatalf("Parameters.properties missing %q", key)
 		}
 	}
+	assertOutsideScanAdvertise(t, md, "directory outside the project is searched without asking", "such a search asks first")
 }
 
 // TestGlobTool_RecursiveDoublestar pins Done-when 1: `**` matches across directories at any depth, a

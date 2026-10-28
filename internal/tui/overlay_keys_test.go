@@ -35,6 +35,10 @@ func req600Overlays() []req600Overlay {
 			a.SetEffortDeps(EffortDeps{Model: selectedModel(), Applier: &effortApplierFake{}})
 			a.openEffortPicker()
 		}},
+		{name: "systemOnePicker", open: func(_ *testing.T, a *App) {
+			a.SetSystemOneDeps((&fakeSystemOne{current: "off"}).deps())
+			a.OpenSystemOnePicker()
+		}},
 		{name: "modelPicker", open: func(_ *testing.T, a *App) {
 			a.SetModelPickerDeps(ModelPickerDeps{Catalog: selectedModelCatalog(), Applier: &providerModelApplierFake{}})
 			a.openModelPicker()

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 	"strings"
 
@@ -22,6 +23,7 @@ import (
 const (
 	globalLayerRules  = "global layer rules"
 	projectLayerRules = "project layer rules"
+	localLayerRules   = "local layer rules"
 )
 
 const (
@@ -61,19 +63,22 @@ func newConfigCommand(stdout io.Writer) *ucli.Command {
 					"A launch composes three layers, nearest last: the global file\n" +
 					"~/.codemeld/global/settings.yaml, then the project's .codemeld/settings.yaml,\n" +
 					"then the project's .codemeld/settings.local.yaml.\n\n" +
-					"With no argument it currently checks only the global file and the project's\n" +
-					"shared .codemeld/settings.yaml, located the way discovery.boundary says; it\n" +
-					"does not validate .codemeld/settings.local.yaml.\n" +
+					"With no argument it reports three lines, in launch order: the global file,\n" +
+					"the project's shared .codemeld/settings.yaml, and the project's\n" +
+					".codemeld/settings.local.yaml, both in the project root located the way\n" +
+					"discovery.boundary says.\n" +
 					"With a path argument it checks exactly that file and performs no project\n" +
-					"discovery; the global settings path is checked under the global layer's\n" +
-					"rules and any other path under a project layer's rules, and the line names\n" +
-					"which of the two was applied.\n\n" +
+					"discovery. The global settings path is checked under 'global layer rules';\n" +
+					"a file named settings.local.yaml directly inside a .codemeld directory under\n" +
+					"'local layer rules'; any other path under 'project layer rules'. The line\n" +
+					"names the rules applied.\n\n" +
 					"A layer is reported as 'ok', 'not present', 'present, not approved', or\n" +
 					"'failed to load' followed by the same what/consequence/fix message a launch\n" +
-					"prints. An absent file is not a failure: no project settings file is normal,\n" +
-					"and an absent global file is reported rather than generated. A project layer\n" +
-					"in a directory you have not approved yet is named as such and left unparsed;\n" +
-					"pass its path to check the file itself.\n\n" +
+					"prints. An absent file is not a failure: no shared or local project settings\n" +
+					"file is normal, and an absent global file is reported rather than generated.\n" +
+					"A shared or local project layer in a directory you have not approved yet is\n" +
+					"named as such and left unparsed; pass its path to check the file itself,\n" +
+					"which does not approve the project.\n\n" +
 					"It exits non-zero only when a checked layer fails to load. Nothing is\n" +
 					"written, no settings are applied or cached, and checking a directory never\n" +
 					"approves it.",
@@ -147,8 +152,11 @@ func checkNamedFile(path, globalPath string) layerReport {
 		abs = filepath.Clean(path)
 	}
 	rules := projectLayerRules
-	if abs == globalPath {
+	switch {
+	case abs == globalPath:
 		rules = globalLayerRules
+	case filepath.Base(abs) == "settings.local.yaml" && filepath.Base(filepath.Dir(abs)) == ".codemeld":
+		rules = localLayerRules
 	}
 	report, _ := validateLayer(abs, rules)
 	return report
@@ -167,24 +175,50 @@ func checkLaunchLayers(home string) ([]layerReport, error) {
 		return nil, ucli.Exit("codemeld: cannot locate a project settings file: "+err.Error(), 1)
 	}
 
-	if len(layers) == 0 {
-		return append(reports, layerReport{
-			path:   filepath.Join(root, ".codemeld", "settings.yaml"),
-			rules:  projectLayerRules,
-			status: statusAbsent,
-		}), nil
+	approved := trust.Lookup(home, root).Trusted
+	shared := layerReport{path: filepath.Join(root, ".codemeld", "settings.yaml"), rules: projectLayerRules, status: statusAbsent}
+	switch {
+	case len(layers) == 0:
+	case approved:
+		shared, _ = validateLayer(layers[0], projectLayerRules)
+	default:
+		shared = unapprovedLayer(layers[0], projectLayerRules, root)
 	}
-	if !trust.Lookup(home, root).Trusted {
-		return append(reports, layerReport{
-			path:   layers[0],
-			rules:  projectLayerRules,
-			status: statusUnapproved,
-			detail: fmt.Sprintf("  a launch ignores this layer until you start codemeld in %s and approve the project;\n"+
-				"  to validate the file now, run 'codemeld config check %s'", root, layers[0]),
-		}), nil
+
+	localPath := config.LocalSettingsPath(root)
+	var local layerReport
+	if approved {
+		local, _ = validateLayer(localPath, localLayerRules)
+	} else {
+		local = unapprovedLocalLayer(localPath, root)
 	}
-	projectReport, _ := validateLayer(layers[0], projectLayerRules)
-	return append(reports, projectReport), nil
+	return append(reports, shared, local), nil
+}
+
+func unapprovedLayer(path, rules, root string) layerReport {
+	return layerReport{
+		path:   path,
+		rules:  rules,
+		status: statusUnapproved,
+		detail: fmt.Sprintf("  a launch ignores this layer until you start codemeld in %s and approve the project;\n"+
+			"  to validate the file now, run 'codemeld config check %s'", root, path),
+	}
+}
+
+func unapprovedLocalLayer(path, root string) layerReport {
+	_, err := osLstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return layerReport{path: path, rules: localLayerRules, status: statusAbsent}
+	case err != nil:
+		return layerReport{
+			path:   path,
+			rules:  localLayerRules,
+			status: statusFailed,
+			detail: config.FormatLoadError(path, config.UnreadableFile, errUnsafeSettingsRead, checkConsequence),
+		}
+	}
+	return unapprovedLayer(path, localLayerRules, root)
 }
 
 // The decoded map is returned only so the global layer can supply discovery.boundary;
@@ -213,8 +247,11 @@ func validateLayer(path, rules string) (layerReport, map[string]any) {
 }
 
 func validateLayerBytes(data []byte, path, rules string) (map[string]any, config.LoadFailure, error) {
-	if rules == globalLayerRules {
+	switch rules {
+	case globalLayerRules:
 		return config.ValidateGlobalSettingsBytes(data, path)
+	case localLayerRules:
+		return config.ValidateLocalSettingsBytes(data, path)
 	}
 	return config.ValidateProjectSettingsBytes(data, path)
 }

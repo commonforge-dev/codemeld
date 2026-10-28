@@ -3,7 +3,9 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/rivo/tview"
 
@@ -43,14 +45,158 @@ func userRailLines(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-func railWrapText(text string, width int) string {
-	if width <= userRailWidth {
-		return text
+// A reply line's continuation prefix travels as a region tag because tview keeps region
+// tags in GetText(false) yet strips them from GetText(true), and tview.Escape neuters any
+// copy in model text.
+const (
+	hangTagOpen  = `["h:`
+	hangTagClose = `"]`
+)
+
+var styleTagPattern = regexp.MustCompile(`\[[a-zA-Z0-9#:-]+\]`)
+
+func hangTag(prefix string) string {
+	var code strings.Builder
+	for _, r := range prefix {
+		if r == '│' {
+			code.WriteByte('b')
+		} else {
+			code.WriteByte('s')
+		}
 	}
+	return hangTagOpen + code.String() + hangTagClose
+}
+
+func hangLine(raw, plain string) (cont string, prefixBytes int, content string, ok bool) {
+	after, found := strings.CutPrefix(raw, hangTagOpen)
+	if !found {
+		return "", 0, "", false
+	}
+	n := 0
+	for n < len(after) && (after[n] == 'b' || after[n] == 's') {
+		n++
+	}
+	rest, found := strings.CutPrefix(after[n:], hangTagClose)
+	if !found || n == 0 {
+		return "", 0, "", false
+	}
+	for range n {
+		_, size := utf8.DecodeRuneInString(rest[prefixBytes:])
+		if size == 0 {
+			return "", 0, "", false
+		}
+		prefixBytes += size
+	}
+	content = rest[prefixBytes:]
+	if stripStyleTags(content) != plain[min(prefixBytes, len(plain)):] {
+		return "", 0, "", false
+	}
+	return strings.NewReplacer("b", "│", "s", " ").Replace(after[:n]), prefixBytes, content, true
+}
+
+func stripStyleTags(s string) string {
+	var out strings.Builder
+	last := 0
+	for _, loc := range styleTagPattern.FindAllStringIndex(s, -1) {
+		out.WriteString(tview.Unescape(s[last:loc[0]]))
+		last = loc[1]
+	}
+	out.WriteString(tview.Unescape(s[last:]))
+	return out.String()
+}
+
+func lineRows(raw, plain string, width int) []rowSpan {
+	prefixBytes, indent, hang := 0, 0, false
+	if strings.HasPrefix(raw, userRailPrefix) {
+		prefixBytes, indent = len("▌ "), userRailWidth
+	} else if cont, n, _, ok := hangLine(raw, plain); ok && width > utf8.RuneCountInString(cont) {
+		prefixBytes, indent, hang = n, utf8.RuneCountInString(cont), true
+	}
+	if indent == 0 {
+		return wrapRowsAt(plain, width, 0)
+	}
+	rows := wrapRowsAt(plain[prefixBytes:], width, indent)
+	for i := range rows {
+		rows[i].start += prefixBytes
+		rows[i].end += prefixBytes
+		if i > 0 {
+			rows[i].prefixWidth = indent
+		}
+	}
+	rows[0].start = 0
+	for _, row := range rows {
+		if hang && byteOffsetInRow(plain, row, width) < row.end {
+			return wrapRowsAt(plain, width, 0)
+		}
+	}
+	return rows
+}
+
+func hangWrapLine(line string, width int, strip *tview.TextView) string {
+	plain := strip.SetText(line).GetText(true)
+	cont, pos, content, ok := hangLine(line, plain)
+	if !ok {
+		return line
+	}
+	rows := lineRows(line, plain, width)
+	if len(rows) < 2 || rows[1].prefixWidth == 0 {
+		return line
+	}
+	var out strings.Builder
+	out.WriteString(plain[:pos])
+	active := ""
+	k := 0
+	write := func(s string) {
+		for s != "" {
+			switch {
+			case k+1 < len(rows) && pos >= rows[k+1].start:
+				if active != "" {
+					out.WriteString(defaultTag)
+				}
+				out.WriteString("\n" + cont + active)
+				k++
+			case k+1 < len(rows) && pos >= rows[k].end:
+				n := min(len(s), rows[k+1].start-pos)
+				s, pos = s[n:], pos+n
+			default:
+				n := len(s)
+				if k+1 < len(rows) {
+					n = min(n, rows[k].end-pos)
+				}
+				out.WriteString(tview.Escape(s[:n]))
+				s, pos = s[n:], pos+n
+			}
+		}
+	}
+	last := 0
+	for _, loc := range styleTagPattern.FindAllStringIndex(content, -1) {
+		write(tview.Unescape(content[last:loc[0]]))
+		tag := content[loc[0]:loc[1]]
+		out.WriteString(tag)
+		if tag == defaultTag {
+			active = ""
+		} else {
+			active += tag
+		}
+		last = loc[1]
+	}
+	write(tview.Unescape(content[last:]))
+	return out.String()
+}
+
+func railWrapText(text string, width int) string {
 	lines := strings.Split(text, "\n")
+	var strip *tview.TextView
 	for i, line := range lines {
+		if strings.HasPrefix(line, hangTagOpen) {
+			if strip == nil {
+				strip = tview.NewTextView().SetDynamicColors(true)
+			}
+			lines[i] = hangWrapLine(line, width, strip)
+			continue
+		}
 		raw, ok := strings.CutPrefix(line, userRailPrefix)
-		if !ok {
+		if !ok || width <= userRailWidth {
 			continue
 		}
 		plain := tview.NewTextView().SetDynamicColors(true).SetText(raw).GetText(true)

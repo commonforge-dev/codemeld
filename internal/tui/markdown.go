@@ -8,6 +8,8 @@ import (
 	"github.com/rivo/tview"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extast "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/text"
 )
 
@@ -81,7 +83,7 @@ type codeControl struct {
 // unchanged.
 func renderMarkdown(src string) (string, []codeControl, string) {
 	source := []byte(src)
-	doc := goldmark.DefaultParser().Parse(text.NewReader(source))
+	doc := goldmark.New(goldmark.WithExtensions(extension.Table)).Parser().Parse(text.NewReader(source))
 
 	var b strings.Builder
 	// projection mirrors every write to b except the style tags, the escaping, and the
@@ -128,10 +130,25 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 	// then renders onto that line instead of starting another.
 	var suppressNextLineStart bool
 
+	var held string
+	var inHeading, unhung bool
+	commit := func() {
+		if held == "" {
+			return
+		}
+		if !unhung {
+			b.WriteString(hangTag(held))
+		}
+		b.WriteString(held)
+		projection.WriteString(held)
+		held = ""
+	}
+
 	flush := func() {
 		if pending.Len() == 0 {
 			return
 		}
+		commit()
 		eff := effectiveStyleTag(bold, italic, code)
 		if eff != prevTag {
 			// The partial tags ([::b], [#4e9a06]) leave the unspecified attribute
@@ -175,6 +192,7 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 		}
 		flush()
 		resetStyle()
+		commit()
 		if b.Len() > 0 {
 			b.WriteString("\n")
 			projection.WriteString("\n")
@@ -183,8 +201,7 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 				projection.WriteString("\n")
 			}
 		}
-		b.WriteString(curPrefix())
-		projection.WriteString(curPrefix())
+		held, unhung = curPrefix(), inHeading
 	}
 
 	// newlineWithPrefix ends the current line inside a block and starts the next
@@ -193,14 +210,122 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 	newlineWithPrefix := func() {
 		flush()
 		resetStyle()
+		commit()
 		b.WriteString("\n")
-		b.WriteString(curPrefix())
 		projection.WriteString("\n")
-		projection.WriteString(curPrefix())
+		held, unhung = curPrefix(), inHeading
 	}
 
-	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+	plainText := func(n ast.Node) string {
+		var s strings.Builder
+		_ = ast.Walk(n, func(c ast.Node, entering bool) (ast.WalkStatus, error) {
+			if entering {
+				switch t := c.(type) {
+				case *ast.Text:
+					s.Write(t.Value(source))
+				case *ast.String:
+					s.Write(t.Value)
+				}
+			}
+			return ast.WalkContinue, nil
+		})
+		return s.String()
+	}
+
+	var visit ast.Walker
+
+	renderInline := func(cell ast.Node) {
+		for c := cell.FirstChild(); c != nil; c = c.NextSibling() {
+			_ = ast.Walk(c, visit)
+		}
+	}
+
+	renderTable := func(table *extast.Table) {
+		reuseMarker := table.PreviousSibling() == nil && table.Parent().Kind() == ast.KindListItem
+		opened := false
+		openItem := func() {
+			if opened {
+				newlineWithPrefix()
+			} else {
+				opened = true
+				startBlockLine(isTopLevel(table))
+				if reuseMarker {
+					return
+				}
+			}
+			held += "• "
+		}
+		var headers []ast.Node
+		for c := table.FirstChild().FirstChild(); c != nil; c = c.NextSibling() {
+			headers = append(headers, c)
+		}
+		for row := table.FirstChild().NextSibling(); row != nil; row = row.NextSibling() {
+			var cells []ast.Node
+			for c := row.FirstChild(); c != nil; c = c.NextSibling() {
+				cells = append(cells, c)
+			}
+			openItem()
+			lead := plainText(cells[0])
+			if lead != "" {
+				bold++
+				renderInline(cells[0])
+				flush()
+				bold--
+			}
+			if len(cells) == 2 {
+				if plainText(cells[1]) != "" {
+					if lead != "" {
+						if strings.ContainsAny(lead[len(lead)-1:], ".:?!") {
+							pending.WriteString(" ")
+						} else {
+							pending.WriteString(". ")
+						}
+					}
+					renderInline(cells[1])
+				}
+				continue
+			}
+			for i := 1; i < len(cells); i++ {
+				if plainText(cells[i]) == "" {
+					continue
+				}
+				newlineWithPrefix()
+				held += "  "
+				if label := plainText(headers[i]); label != "" {
+					pending.WriteString(label + ": ")
+				}
+				renderInline(cells[i])
+			}
+		}
+		if opened {
+			return
+		}
+		var named []ast.Node
+		for _, h := range headers {
+			if plainText(h) != "" {
+				named = append(named, h)
+			}
+		}
+		if len(named) == 0 {
+			suppressNextLineStart = false
+			return
+		}
+		openItem()
+		for i, h := range named {
+			if i > 0 {
+				pending.WriteString(" — ")
+			}
+			renderInline(h)
+		}
+	}
+
+	visit = func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		switch node := n.(type) {
+		case *extast.Table:
+			if entering {
+				renderTable(node)
+				return ast.WalkSkipChildren, nil
+			}
 		case *ast.Document:
 			// The root carries no text and needs no separator.
 		case *ast.Emphasis:
@@ -247,10 +372,12 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 			// way out so the buffered text is emitted while bold is still active.
 			if entering {
 				startBlockLine(isTopLevel(n))
+				inHeading, unhung = true, true
 				bold++
 			} else {
 				flush()
 				bold--
+				inHeading = false
 			}
 		case *ast.Blockquote:
 			// Push the quote bar before opening the line so the first content line —
@@ -275,9 +402,10 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 				// A top-level list opens with a blank-line gap from the prior block; the
 				// first item supplies the line break itself, so only the extra blank line
 				// is added here. Nested lists flow directly under their parent item.
-				if isTopLevel(n) && !suppressNextLineStart && b.Len() > 0 {
+				if isTopLevel(n) && !suppressNextLineStart && (b.Len() > 0 || held != "") {
 					flush()
 					resetStyle()
+					commit()
 					b.WriteString("\n")
 					projection.WriteString("\n")
 				}
@@ -301,13 +429,14 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 					ls.next++
 				}
 				startBlockLine(false)
-				b.WriteString(marker)
-				projection.WriteString(marker)
+				held += marker
 				suppressNextLineStart = true
 			}
 		case *ast.FencedCodeBlock:
 			if entering {
 				startBlockLine(isTopLevel(n))
+				unhung = true
+				commit()
 				// The payload keeps the body exactly as written; only the drawn lines drop
 				// the newline that belongs to the last one, which has no cell of its own.
 				body := string(node.Lines().Value(source))
@@ -352,6 +481,8 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 			// injection-safety guarantee as the inline pending buffer.
 			if entering {
 				startBlockLine(isTopLevel(n))
+				unhung = true
+				commit()
 				b.WriteString(tview.Escape(string(node.Lines().Value(source))))
 				projection.WriteString(string(node.Lines().Value(source)))
 				return ast.WalkSkipChildren, nil
@@ -371,9 +502,11 @@ func renderMarkdown(src string) (string, []codeControl, string) {
 			}
 		}
 		return ast.WalkContinue, nil
-	})
+	}
+	_ = ast.Walk(doc, visit)
 
 	flush()
+	commit()
 	// Close any open styling so the accent cannot bleed into the block separator
 	// renderLocked adds after this block, or into the next (escaped, untagged) block.
 	if prevTag != defaultTag {

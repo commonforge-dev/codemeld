@@ -41,6 +41,11 @@ func (a *App) overlays() []overlay {
 			dismiss: func() { a.dismissEffortPicker() },
 		},
 		{
+			name:    "systemOnePicker",
+			isOpen:  func() bool { return a.systemOnePickerOpen },
+			dismiss: func() { a.dismissSystemOnePicker() },
+		},
+		{
 			name:    "modelPicker",
 			isOpen:  func() bool { return a.modelPickerOpen },
 			dismiss: func() { a.dismissModelPicker() },

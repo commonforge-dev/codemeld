@@ -29,6 +29,7 @@ import (
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessionfailures"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/skills"
 	"codemeld.dev/codemeld/internal/subagent"
 	"codemeld.dev/codemeld/internal/trust"
 	"codemeld.dev/codemeld/internal/tui"
@@ -77,6 +78,7 @@ type BootstrapResult struct {
 
 	Session           *sessions.Store        // step 7b (active session)
 	AgentInstructions []agentinstr.LoadEntry // step 7c (in-memory AGENTS.md load record, for /status + /clear replay)
+	Skills            skills.Set
 
 	// TrustDecision is the step-2b gate's run-fixed outcome, consumed by the interactive
 	// project-grant prompt. A headless run retains it from its own non-prompting evaluator.
@@ -155,8 +157,9 @@ type FreshSteps struct {
 	// RecoverJournals puts back the writes of a child agent whose codemeld process was killed
 	// before it could unwind them, for the project folder being opened (step 2.6). It returns
 	// nothing because recovery must never block a launch: what it could not do is reported and the
-	// launch continues.
-	RecoverJournals func(home, projectRoot string)
+	// launch continues. global and decision are steps 1 and 2b's results, from which it reads the
+	// admitted blocked paths before step 3 composes config.
+	RecoverJournals func(home, projectRoot string, global map[string]any, decision trust.Decision)
 	// ComposeConfig composes the config layers (step 3).
 	ComposeConfig func(global map[string]any, projectRoot string) (composition ConfigComposition, err error)
 	// LoadVCSTemplates loads built-in and project VCS templates (step 4). projectLayer is
@@ -210,7 +213,8 @@ type FreshSteps struct {
 	// composed/projectRoot/layerPaths feed the config.Cache the per-file size cap is
 	// read from. The returned record is surfaced on BootstrapResult so the /status
 	// overlay and /clear replay reuse it without re-walking the disk.
-	LoadAgentInstructions func(ctx context.Context, session *sessions.Store, home, launchDir string, composed map[string]any, projectRoot string, layerPaths []string) ([]agentinstr.LoadEntry, error)
+	LoadAgentInstructions      func(ctx context.Context, session *sessions.Store, home, launchDir string, composed map[string]any, projectRoot string, layerPaths []string, selection agentinstr.Selection) ([]agentinstr.LoadEntry, error)
+	AgentInstructionsSelection agentinstr.Selection
 	// StartTUI starts the TUI (step 8).
 	StartTUI func(ctx context.Context, result *BootstrapResult) error
 }
@@ -315,7 +319,7 @@ func runFreshCore(ctx context.Context, cwd string, steps FreshSteps) (res *Boots
 	// 2.6 — put back the child agent writes a killed launch left behind, before any later step
 	// reads the project tree.
 	if steps.RecoverJournals != nil {
-		steps.RecoverJournals(home, root)
+		steps.RecoverJournals(home, root, global, res.TrustDecision)
 	}
 
 	// 3 — compose config layers.
@@ -411,7 +415,7 @@ func runFreshCore(ctx context.Context, cwd string, steps FreshSteps) (res *Boots
 	// in-memory load record for the /status overlay and /clear replay. The walk
 	// anchor is the launch CWD (cwd), not the resolved project root (root): the
 	// loader walks from the launch directory independent of discovery.boundary.
-	entries, err := steps.LoadAgentInstructions(ctx, session, home, cwd, composed, root, res.ConfigLayerPaths)
+	entries, err := steps.LoadAgentInstructions(ctx, session, home, cwd, composed, root, res.ConfigLayerPaths, steps.AgentInstructionsSelection)
 	if err != nil {
 		return nil, false, err
 	}
@@ -446,8 +450,8 @@ func DefaultFreshSteps(stdout, stderr io.Writer) FreshSteps {
 		ScaffoldProjectIgnore: func(projectRoot string) error {
 			return ScaffoldProjectCodemeldignore(projectRoot, stderr)
 		},
-		RecoverJournals: func(home, projectRoot string) {
-			recoverChildJournals(home, projectRoot, os.Stdin, stderr, stdinIsTerminal(os.Stdin))
+		RecoverJournals: func(home, projectRoot string, global map[string]any, decision trust.Decision) {
+			recoverChildJournals(home, projectRoot, global, decision, os.Stdin, stderr, stdinIsTerminal(os.Stdin))
 		},
 		ComposeConfig:        defaultComposeConfig,
 		LoadVCSTemplates:     loadVCSTemplates,
@@ -494,7 +498,7 @@ func DefaultFreshSteps(stdout, stderr io.Writer) FreshSteps {
 // A flush failure is fatal here. Step 7c runs before the TUI, so it uses the
 // clean-shutdown write-failure protocol: retry once, write the OP_FAIL line on the
 // second failure, then abort the launch with a quiet status-1 sentinel.
-func loadAgentInstructions(ctx context.Context, session *sessions.Store, home, launchDir string, composed map[string]any, projectRoot string, layerPaths []string) ([]agentinstr.LoadEntry, error) {
+func loadAgentInstructions(ctx context.Context, session *sessions.Store, home, launchDir string, composed map[string]any, projectRoot string, layerPaths []string, selection agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 	if composed == nil {
 		composed = map[string]any{}
 	}
@@ -502,7 +506,7 @@ func loadAgentInstructions(ctx context.Context, session *sessions.Store, home, l
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: agent-instructions config cache: %w", err)
 	}
-	entries, err := agentinstr.LoadAgentInstructions(home, launchDir, cache.AgentInstructionsMaxFileBytes())
+	entries, err := agentinstr.LoadAgentInstructions(home, launchDir, cache.AgentInstructionsMaxFileBytes(), selection)
 	if err != nil {
 		return nil, err
 	}
@@ -513,6 +517,98 @@ func loadAgentInstructions(ctx context.Context, session *sessions.Store, home, l
 		return nil, ErrSessionWriteOnExit
 	}
 	return entries, nil
+}
+
+func loadSkills(result *BootstrapResult, maxFileBytes int) []string {
+	result.Skills = skills.Load(result.Home, result.ProjectRoot, builtinCommandNames(), maxFileBytes)
+	if f, ok := result.ToolRegistry.(*toolRegistryFactory); ok && f != nil {
+		f.skills = result.Skills
+	}
+	global, project := skillRoots(result)
+	return skillWarnings(result.Skills.Skipped, global, project)
+}
+
+func skillRoots(result *BootstrapResult) (string, string) {
+	return filepath.Join(result.Home, ".codemeld", "skills"), filepath.Join(result.ProjectRoot, ".codemeld", "skills")
+}
+
+func builtinCommandNames() map[string]bool {
+	names := map[string]bool{}
+	for _, c := range tui.BuildRegistry(nil).Commands() {
+		names[c.Name] = true
+		for _, alias := range c.Aliases {
+			names[alias] = true
+		}
+	}
+	return names
+}
+
+var skillSkipExplanations = map[skills.Reason]string{
+	skills.BadName:            "name is not a valid skill name",
+	skills.MissingDescription: "description is missing or blank",
+	skills.TooLarge:           "SKILL.md exceeds the configured byte limit",
+	skills.Unreadable:         "SKILL.md could not be read",
+	skills.BadFrontMatter:     "SKILL.md front matter is invalid",
+	skills.OutsideFolder:      "skill folder or SKILL.md resolves outside its skills folder",
+	skills.NameMismatch:       "declared name differs from folder name; rename the folder or the name so they match",
+}
+
+func skillSkipReason(s skills.Skipped, globalRoot, projectRoot string) string {
+	if s.Path == globalRoot || s.Path == projectRoot {
+		switch s.Reason {
+		case skills.Unreadable:
+			return "the skills folder could not be read"
+		case skills.OutsideFolder:
+			return "the skills folder was rejected because it resolves to a place skills cannot be loaded from"
+		}
+	}
+	name := singleLine(filepath.Base(s.Path))
+	switch s.Reason {
+	case skills.BuiltinClash:
+		return fmt.Sprintf("/%s is a built-in command; rename the skill folder and its name", name)
+	case skills.OverriddenByProject:
+		return fmt.Sprintf("the project has its own skill with that name. To use both, rename the folder ~/.codemeld/skills/%s and its name line.", name)
+	}
+	return skillSkipExplanations[s.Reason]
+}
+
+func skillWarnings(skipped []skills.Skipped, globalRoot, projectRoot string) []string {
+	warnings := make([]string, 0, len(skipped))
+	for _, s := range skipped {
+		reason := skillSkipReason(s, globalRoot, projectRoot)
+		name := singleLine(filepath.Base(s.Path))
+		switch s.Reason {
+		case skills.BuiltinClash:
+			warnings = append(warnings, fmt.Sprintf("skill \"%s\" not loaded: %s", name, reason))
+		case skills.OverriddenByProject:
+			warnings = append(warnings, fmt.Sprintf("your global skill \"%s\" is not loaded in this project: %s", name, reason))
+		default:
+			warnings = append(warnings, fmt.Sprintf("skill folder \"%s\" not loaded: %s", singleLine(s.Path), reason))
+		}
+	}
+	return warnings
+}
+
+func skillsView(result *BootstrapResult) tui.SkillsView {
+	global, project := skillRoots(result)
+	view := tui.SkillsView{GlobalRoot: singleLine(global), ProjectRoot: singleLine(project)}
+	for _, s := range result.Skills.Loaded {
+		s.Name, s.Description, s.Folder = singleLine(s.Name), singleLine(s.Description), singleLine(s.Folder)
+		view.Loaded = append(view.Loaded, s)
+	}
+	for _, s := range result.Skills.Skipped {
+		view.Skipped = append(view.Skipped, tui.SkippedSkill{Path: singleLine(s.Path), Reason: skillSkipReason(s, global, project)})
+	}
+	return view
+}
+
+func singleLine(s string) string {
+	return fserrors.CollapseControls(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s))
 }
 
 // initLaunchMode is the production step-7b2 adapter shared by the fresh and resume
@@ -559,7 +655,7 @@ var stdinIsTerminal = func(stdin io.Reader) bool { return term.IsTerminal(stream
 // recoverChildJournals runs the step-2.6 recovery pass and reports it on stderr, where the other
 // pre-TUI launch notices go. A launch with no one to answer defers every changed path to a launch
 // that can ask rather than deciding for the user.
-func recoverChildJournals(home, projectRoot string, stdin io.Reader, stderr io.Writer, interactive bool) {
+func recoverChildJournals(home, projectRoot string, global map[string]any, decision trust.Decision, stdin io.Reader, stderr io.Writer, interactive bool) {
 	if projectRoot == "" {
 		return
 	}
@@ -570,13 +666,17 @@ func recoverChildJournals(home, projectRoot string, stdin io.Reader, stderr io.W
 		reader := bufio.NewReader(stdin)
 		ask = func(u subagent.Unresolved) subagent.Choice { return askJournalChoice(reader, stderr, u) }
 	}
-	reportJournalRecovery(stderr, subagent.Recover(home, projectRoot, ask))
+	policy := recoveryPolicy(home, projectRoot, global, decision.Trusted)
+	reportJournalRecovery(stderr, subagent.Recover(home, projectRoot, policy, ask), interactive)
 }
 
 func askJournalChoice(reader *bufio.Reader, stderr io.Writer, u subagent.Unresolved) subagent.Choice {
-	if len(u.Moves) > 0 {
+	switch {
+	case len(u.Moves) > 0:
 		writeMoveGroupPrompt(stderr, u)
-	} else {
+	case u.Completed:
+		writeCompletedPathPrompt(stderr, u)
+	default:
 		_, _ = fmt.Fprintf(stderr, journalRecoveryPrompt, shown(u.Path))
 	}
 	line, err := reader.ReadString('\n')
@@ -594,8 +694,17 @@ func askJournalChoice(reader *bufio.Reader, stderr io.Writer, u subagent.Unresol
 	}
 }
 
+const completedJournalIntro = "codemeld: a child agent completed, but codemeld could not confirm all of its changes at the end of the run, so it kept its undo record."
+
+const committedJournalIntro = "codemeld: a child agent completed and codemeld confirmed its changes, but it kept its undo record."
+
 func writeMoveGroupPrompt(stderr io.Writer, u subagent.Unresolved) {
-	_, _ = fmt.Fprintln(stderr, "codemeld: these moves by an interrupted child agent run changed afterwards, so codemeld will not undo them on its own:")
+	if u.Completed {
+		_, _ = fmt.Fprintln(stderr, completedJournalIntro)
+		_, _ = fmt.Fprintln(stderr, "  It made these moves:")
+	} else {
+		_, _ = fmt.Fprintln(stderr, "codemeld: these moves by an interrupted child agent run changed afterwards, so codemeld will not undo them on its own:")
+	}
 	for _, move := range u.Moves {
 		label := "move"
 		if move.Pending {
@@ -603,9 +712,27 @@ func writeMoveGroupPrompt(stderr io.Writer, u subagent.Unresolved) {
 		}
 		_, _ = fmt.Fprintf(stderr, "  %s: %s -> %s\n", label, shown(move.Source), shown(move.Destination))
 	}
+	if u.Completed && u.Reason != "" {
+		_, _ = fmt.Fprintf(stderr, "  codemeld could not confirm these moves: %s\n", shown(u.Reason))
+	}
 	_, _ = fmt.Fprintln(stderr, "  [k] keep every path named above as it is now")
+	writeRestoreChoices(stderr, u, "  [r] put every path named above back to how it was before the child agent ran")
+}
+
+func writeCompletedPathPrompt(stderr io.Writer, u subagent.Unresolved) {
+	_, _ = fmt.Fprintln(stderr, completedJournalIntro)
+	if u.Reason != "" {
+		_, _ = fmt.Fprintf(stderr, "  %s: codemeld could not confirm this change: %s\n", shown(u.Path), shown(u.Reason))
+	} else {
+		_, _ = fmt.Fprintf(stderr, "  %s holds the child agent's change; codemeld found no problem with this file itself\n", shown(u.Path))
+	}
+	_, _ = fmt.Fprintln(stderr, "  [k] keep the file as it is now")
+	writeRestoreChoices(stderr, u, "  [r] put back the version from before the child agent ran")
+}
+
+func writeRestoreChoices(stderr io.Writer, u subagent.Unresolved, restore string) {
 	if slices.Contains(u.Choices, subagent.ChoiceRestore) {
-		_, _ = fmt.Fprintln(stderr, "  [r] put every path named above back to how it was before the child agent ran")
+		_, _ = fmt.Fprintln(stderr, restore)
 		_, _ = fmt.Fprintln(stderr, "  [d] decide later (default)")
 		_, _ = fmt.Fprint(stderr, "Keep, put back, or decide later? [k/r/d] ")
 		return
@@ -615,7 +742,7 @@ func writeMoveGroupPrompt(stderr io.Writer, u subagent.Unresolved) {
 	_, _ = fmt.Fprint(stderr, "Keep or decide later? [k/d] ")
 }
 
-func reportJournalRecovery(stderr io.Writer, report subagent.Report) {
+func reportJournalRecovery(stderr io.Writer, report subagent.Report, interactive bool) {
 	if report.Empty() {
 		return
 	}
@@ -625,7 +752,15 @@ func reportJournalRecovery(stderr io.Writer, report subagent.Report) {
 			_, _ = fmt.Fprintf(stderr, "  left alone: %s (%s)\n", shown(left.Path), shown(left.Reason))
 		}
 	}
-	if len(report.Restored) > 0 || len(report.Kept) > 0 || len(report.Retained) > 0 {
+	var interrupted, completed []subagent.RetainedJournal
+	for _, retained := range report.Retained {
+		if retained.Completed {
+			completed = append(completed, retained)
+		} else {
+			interrupted = append(interrupted, retained)
+		}
+	}
+	if len(report.Restored) > 0 || len(report.Kept) > 0 || len(interrupted) > 0 {
 		_, _ = fmt.Fprintln(stderr, "codemeld: a previous session ended while a child agent was still writing files.")
 		for _, path := range report.Restored {
 			_, _ = fmt.Fprintf(stderr, "  put back: %s\n", shown(path))
@@ -633,24 +768,82 @@ func reportJournalRecovery(stderr io.Writer, report subagent.Report) {
 		for _, path := range report.Kept {
 			_, _ = fmt.Fprintf(stderr, "  kept as it is now, as you asked: %s\n", shown(path))
 		}
-		for _, retained := range report.Retained {
+		for _, retained := range interrupted {
 			for _, note := range retained.Notes {
 				_, _ = fmt.Fprintf(stderr, "  not put back: %s\n", shown(note))
 			}
 			for _, dir := range retained.Dirs {
 				_, _ = fmt.Fprintf(stderr, "  left in place: %s (codemeld does not delete a directory a child agent created once it holds other entries or was replaced)\n", shown(dir))
 			}
+			asks := len(retained.Notes) > retained.PolicyNotes
+			if retained.PolicyNotes > 0 {
+				_, _ = fmt.Fprintln(stderr, "  codemeld tries these again the next time you start it here, once its settings can be read and no blocked path is involved")
+			}
 			if len(retained.Moves) == 0 && len(retained.Dirs) == 0 {
+				if !asks && retained.PolicyNotes > 0 {
+					_, _ = fmt.Fprintf(stderr, "  its record of the run is %s\n", shown(retained.Path))
+					continue
+				}
 				_, _ = fmt.Fprintf(stderr, "  codemeld asks what to do with these files the next time you start it here; its record of the run is %s\n", shown(retained.Path))
 				continue
 			}
-			if len(retained.Notes) > 0 {
+			if asks {
 				_, _ = fmt.Fprintln(stderr, "  codemeld asks what to do with these files the next time you start it here")
 			}
 			reportHeldMoves(stderr, retained.Moves, false, "  codemeld asks what to do with these moves the next time you start it here interactively")
 			reportHeldMoves(stderr, retained.Moves, true, "  codemeld tries again to finish undoing these interrupted moves the next time you start it here; it does not ask about them")
 			_, _ = fmt.Fprintf(stderr, "  its record of the run is %s\n", shown(retained.Path))
 		}
+	}
+	if len(report.CompletedRestored) > 0 || len(report.CompletedKept) > 0 || len(completed) > 0 {
+		reportCompletedJournals(stderr, report, completed, interactive)
+	}
+}
+
+func reportCompletedJournals(stderr io.Writer, report subagent.Report, completed []subagent.RetainedJournal, interactive bool) {
+	var unconfirmed, committed []subagent.RetainedJournal
+	for _, retained := range completed {
+		if retained.Committed {
+			committed = append(committed, retained)
+		} else {
+			unconfirmed = append(unconfirmed, retained)
+		}
+	}
+	if len(report.CompletedRestored) > 0 || len(report.CompletedKept) > 0 || len(unconfirmed) > 0 {
+		_, _ = fmt.Fprintln(stderr, completedJournalIntro)
+		for _, path := range report.CompletedRestored {
+			_, _ = fmt.Fprintf(stderr, "  put back, as you asked: %s\n", shown(path))
+		}
+		for _, path := range report.CompletedKept {
+			_, _ = fmt.Fprintf(stderr, "  kept as it is now, as you asked: %s\n", shown(path))
+		}
+		reportRetainedCompleted(stderr, unconfirmed, interactive)
+	}
+	if len(committed) > 0 {
+		_, _ = fmt.Fprintln(stderr, committedJournalIntro)
+		reportRetainedCompleted(stderr, committed, interactive)
+	}
+}
+
+func reportRetainedCompleted(stderr io.Writer, completed []subagent.RetainedJournal, interactive bool) {
+	for _, retained := range completed {
+		for _, note := range retained.Notes {
+			_, _ = fmt.Fprintf(stderr, "  not settled: %s\n", shown(note))
+		}
+		for _, dir := range retained.Dirs {
+			_, _ = fmt.Fprintf(stderr, "  directory not settled: %s (codemeld removes a directory a child agent created only after what it holds is put back, and only while it is empty, confirmed, and not replaced)\n", shown(dir))
+		}
+		if retained.PolicyNotes > 0 {
+			_, _ = fmt.Fprintln(stderr, "  codemeld tries these again the next time you start it here, once its settings can be read and no blocked path is involved")
+		}
+		switch {
+		case retained.Unanswered == 0:
+		case interactive:
+			_, _ = fmt.Fprintln(stderr, "  codemeld asks what to do with these again the next time you start it here")
+		default:
+			_, _ = fmt.Fprintln(stderr, "  codemeld asks what to do with these the next time you start it here interactively")
+		}
+		_, _ = fmt.Fprintf(stderr, "  its record of the run is %s\n", shown(retained.Path))
 	}
 }
 

@@ -118,6 +118,9 @@ func exceptionalAuthority(req permissions.MatchRequest, mc permissions.ModeConte
 	if !mc.ExecutionConstrained || mc.Mode != string(mode.AutoEdits) || (req.Kind != matchKindDirect && req.Kind != matchKindLiteral) {
 		return ""
 	}
+	if !mc.SettingsBroken {
+		return permissions.SandboxedAutoEditsAuthority(req, mc)
+	}
 	authority, _ := permissions.ClassifyExceptional(req, mc)
 	return authority
 }
@@ -311,6 +314,7 @@ func buildPromptRequest(req permissions.MatchRequest, display PromptDisplay, esc
 		Boundary:                display.Boundary,
 		WouldCreateSettingsFile: display.WouldCreateSettingsFile,
 		ScopeEscalationNarrower: esc.NarrowerScope,
+		Note:                    esc.Note,
 		ProjectUntrusted:        display.ProjectUntrusted,
 		Summary:                 promptSummaryFor(req, display, nil),
 		ExceptionalAuthority:    display.ExceptionalAuthority,

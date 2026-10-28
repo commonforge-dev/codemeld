@@ -213,25 +213,25 @@ func TestReadToolsIntegration_AutoAllowedInAllModesNoGrant(t *testing.T) {
 }
 
 // TestReadToolsIntegration_PlanAdvertisesReadOnlyToolsUnderFilter pins Done-when 3: in Plan the
-// advertised set is filtered to the read-only registry tools (the navigation tools plus file_count) plus bash, with
-// the mutating edit/create dropped, while Build advertises every tool. The filter keys
-// on the same Advertise().ReadOnly classification dispatch authorizes by, so advertising and posture
-// cannot disagree.
+// advertised set is filtered to the read-only registry tools (the navigation tools plus file_count),
+// general_agent and bash, with the mutating edit/create dropped, while Build advertises every tool.
 func TestReadToolsIntegration_PlanAdvertisesReadOnlyToolsUnderFilter(t *testing.T) {
 	project := readToolsProject(t)
 	home := t.TempDir()
 	cache := emptyCache(t, project)
 	store := mkStore(t)
 
-	reg, err := (&toolRegistryFactory{active: nil}).realize(cache, func() *sessions.Store { return store }, home, project, securitystate.Policy{})
+	active := model.NewActiveState(&model.Selection{Provider: "openai", ID: "gpt-5.5"}, model.SourceProject)
+	reg, err := (&toolRegistryFactory{active: nil}).realize(cache, func() *sessions.Store { return store }, home, project, securitystate.Policy{},
+		generalAgentTestBinding(active, mode.NewActiveState(mode.Build, mode.SourceDefault)))
 	if err != nil {
 		t.Fatalf("realize production registry: %v", err)
 	}
 
 	plan := toolNames(advertisedTools(reg, mode.Plan))
-	wantPlan := []string{"bash", "file_count", "glob", "grep", "list", "read", "read_image", "suggest_followup", "tree"}
+	wantPlan := []string{"bash", "file_count", "general_agent", "glob", "grep", "list", "read", "read_image", "suggest_followup", "tree"}
 	if !slices.Equal(plan, wantPlan) {
-		t.Fatalf("Plan advertised %v, want %v (read-only filter keeps the read-only tools + bash + suggest_followup)", plan, wantPlan)
+		t.Fatalf("Plan advertised %v, want %v (read-only filter keeps the read-only tools + general_agent + bash + suggest_followup)", plan, wantPlan)
 	}
 	for _, mutating := range []string{filetools.EditToolName, filetools.CreateToolName, filetools.DeleteToolName, filetools.MkdirToolName, filetools.MoveToolName} {
 		if slices.Contains(plan, mutating) {
@@ -240,7 +240,7 @@ func TestReadToolsIntegration_PlanAdvertisesReadOnlyToolsUnderFilter(t *testing.
 	}
 
 	build := toolNames(advertisedTools(reg, mode.Build))
-	wantBuild := []string{"bash", "create", "delete", "edit", "file_count", "glob", "grep", "list", "mkdir", "move", "read", "read_image", "suggest_followup", "tree", "web_fetch", "web_search"}
+	wantBuild := []string{"bash", "create", "delete", "edit", "file_count", "general_agent", "glob", "grep", "list", "mkdir", "move", "read", "read_image", "suggest_followup", "tree", "web_fetch", "web_search"}
 	if !slices.Equal(build, wantBuild) {
 		t.Fatalf("Build advertised %v, want %v (every tool + bash + suggest_followup + the default-on web tools, no read-only filter)", build, wantBuild)
 	}

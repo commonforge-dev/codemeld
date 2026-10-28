@@ -54,6 +54,8 @@ const journalDirSchemaVersion = 4
 
 const journalAnswerSchemaVersion = 5
 
+const journalCompletedSchemaVersion = 6
+
 const (
 	journalRecordName = "journal.json"
 	journalLockName   = "journal.lock"
@@ -193,6 +195,7 @@ type journalRecord struct {
 	Invocation    string         `json:"invocation"`
 	Depth         int            `json:"depth"`
 	Lifecycle     lifecycleState `json:"lifecycle"`
+	Completed     bool           `json:"completed,omitempty"`
 	DirDev        uint64         `json:"dir_dev"`
 	DirIno        uint64         `json:"dir_ino"`
 	Paths         []pathRecord   `json:"paths"`
@@ -232,6 +235,9 @@ type Journal struct {
 	recoveryLock heldLock
 	// recordUnlinked stops every later flush from republishing a record whose lock may already be gone.
 	recordUnlinked bool
+	gate           *recoveryGate
+	policyRoots    map[string]string
+	policyNotes    []string
 }
 
 // heldLock keeps a flock descriptor as a raw number, never an *os.File, whose finalizer would close it
@@ -725,6 +731,9 @@ func (j *Journal) flush() error {
 	if j.gone || j.recordUnlinked {
 		return errors.New("subagent: the child agent journal has already been removed")
 	}
+	if j.gate != nil && !j.gate.allows() {
+		return errRecoveryStopped
+	}
 	j.promote()
 	data, err := j.marshal()
 	if err != nil {
@@ -748,6 +757,9 @@ func (j *Journal) flush() error {
 func (j *Journal) promote() {
 	if j.rec.SchemaVersion < journalAnswerSchemaVersion && carriesAnswerState(&j.rec) {
 		j.rec.SchemaVersion = journalAnswerSchemaVersion
+	}
+	if j.rec.Completed && j.rec.SchemaVersion < journalCompletedSchemaVersion {
+		j.rec.SchemaVersion = journalCompletedSchemaVersion
 	}
 }
 
@@ -1212,15 +1224,19 @@ func (j *Journal) ReconcilePending() {
 	defer j.mu.Unlock()
 	for i := len(j.rec.Moves) - 1; i >= 0; i-- {
 		if j.rec.Moves[i].State == movePending && j.answerOf(j.rec.Moves[i]) == "" {
-			j.reconcilePendingMove(i)
+			if group := j.groupOf(i); j.beginOp(j.groupLabel(group), endpointsOf(j.rec.Moves, group)) {
+				j.reconcilePendingMove(i)
+				j.endOp()
+			}
 		}
 	}
 	for i := range j.rec.Paths {
 		pr := &j.rec.Paths[i]
-		if j.endpointOf(pr.Path, func(s moveState) bool { return s == movePending }) {
+		if pr.Pending == nil || j.endpointOf(pr.Path, func(s moveState) bool { return s == movePending }) || !j.beginOp(pr.Path, []string{pr.Path}) {
 			continue
 		}
 		j.reconcileRecord(pr)
+		j.endOp()
 	}
 }
 
@@ -1492,6 +1508,11 @@ func (j *Journal) Finish(reason Reason) JournalOutcome {
 	if committed {
 		return j.cleanUpCommitted()
 	}
+	if reason == ReasonCompleted && j.parent == nil {
+		if outcome, ok := j.markCompleted(); !ok {
+			return outcome
+		}
+	}
 	j.absorbTransferReady()
 	j.ReconcilePending()
 	if reason != ReasonCompleted {
@@ -1513,6 +1534,26 @@ func (j *Journal) Finish(reason Reason) JournalOutcome {
 	return JournalOutcome{}
 }
 
+func (j *Journal) markCompleted() (JournalOutcome, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.rec.Completed {
+		return JournalOutcome{}, true
+	}
+	j.rec.Completed = true
+	err := j.step("completed")
+	if err == nil {
+		return JournalOutcome{}, true
+	}
+	reason := "the child agent completed, but that could not be recorded: " + err.Error()
+	j.retainDurable(reason)
+	j.note(reason)
+	if rErr := j.step("completion_retained"); rErr != nil {
+		j.note("the record of the run could not be saved either (" + rErr.Error() + "), so the next codemeld launch may treat this run as interrupted and put its changes back")
+	}
+	return JournalOutcome{Unrecovered: append([]string(nil), j.rec.Unrecovered...), JournalPath: j.path}, false
+}
+
 // resetNotes clears what a terminal pass re-derives from the current state, so notes left by an
 // attempt that was interrupted cannot outlive the condition that produced them. A retained durability
 // failure is re-noted: it cannot be re-derived, and a later successful sync would otherwise turn the
@@ -1522,7 +1563,7 @@ func (j *Journal) resetNotes() {
 	defer j.mu.Unlock()
 	j.rec.Unrecovered = nil
 	j.retainedDirs = nil
-	for _, msg := range j.rec.Retained {
+	for _, msg := range slices.Concat(j.rec.Retained, j.policyNotes) {
 		j.note(msg)
 	}
 }
@@ -1573,32 +1614,9 @@ func (j *Journal) commit() JournalOutcome {
 		if pr.KeptByUser {
 			continue
 		}
-		for _, dir := range pr.Dirs {
-			if !dir.Confirmed {
-				j.note(pr.Path + ": a parent directory the child agent started to create was never confirmed")
-			}
-		}
-		if pr.Pending != nil {
-			j.note(pr.Path + ": a write the child agent started was never resolved")
-			continue
-		}
-		var current fileState
-		var cerr error
-		dir, err := j.openTargetParent(pr)
-		switch {
-		case errors.Is(err, errSuffixAbsent):
-		case err != nil:
-			j.note(pr.Path + ": the target's parent directory could not be safely reopened: " + err.Error())
-			continue
-		default:
-			current, cerr = j.currentState(pr, dir)
-			_ = dir.Close() //nolint:errcheck // read-only directory descriptor
-		}
-		switch {
-		case cerr != nil:
-			j.note(pr.Path + ": the current state could not be read: " + cerr.Error())
-		case !sameState(current, pr.LastKnown) && !j.ownsCreatedDir(pr, current):
-			j.note(pr.Path + ": it was changed outside the child agent's journalled writes")
+		reasons, _, _ := j.completionFailures(pr)
+		for _, reason := range reasons {
+			j.note(pr.Path + ": " + reason)
 		}
 	}
 	if len(j.rec.Unrecovered) > 0 {
@@ -1611,6 +1629,36 @@ func (j *Journal) commit() JournalOutcome {
 		return JournalOutcome{Unrecovered: append([]string(nil), j.rec.Unrecovered...), JournalPath: j.path}
 	}
 	return j.removeCommitted()
+}
+
+const dirNeverConfirmed = "a parent directory the child agent started to create was never confirmed"
+
+func (j *Journal) completionFailures(pr *pathRecord) (reasons []string, current fileState, read bool) {
+	for _, dir := range pr.Dirs {
+		if !dir.Confirmed && !slices.Contains(reasons, dirNeverConfirmed) {
+			reasons = append(reasons, dirNeverConfirmed)
+		}
+	}
+	if pr.Pending != nil {
+		return append(reasons, "a write the child agent started was never resolved"), fileState{}, false
+	}
+	dir, err := j.openTargetParent(pr)
+	switch {
+	case errors.Is(err, errSuffixAbsent):
+	case err != nil:
+		return append(reasons, "the target's parent directory could not be safely reopened: "+err.Error()), fileState{}, false
+	default:
+		var cerr error
+		current, cerr = j.currentState(pr, dir)
+		_ = dir.Close() //nolint:errcheck // read-only directory descriptor
+		if cerr != nil {
+			return append(reasons, "the current state could not be read: "+cerr.Error()), fileState{}, false
+		}
+	}
+	if !sameState(current, pr.LastKnown) && !j.ownsCreatedDir(pr, current) {
+		reasons = append(reasons, "it was changed outside the child agent's journalled writes")
+	}
+	return reasons, current, true
 }
 
 func (j *Journal) cleanUpCommitted() JournalOutcome {
@@ -1679,7 +1727,11 @@ func (j *Journal) undoMoves(unrestoredBeneath func(destination string) bool, fro
 	held = make(map[string]bool)
 	heldAt = make(map[int]HeldMove)
 	for _, group := range j.newestGroupsFirst() {
+		if !slices.ContainsFunc(group, func(i int) bool { return j.rec.Moves[i].State != moveUndone }) || !j.beginOp(j.groupLabel(group), endpointsOf(j.rec.Moves, group)) {
+			continue
+		}
 		changed, groupHeld := j.undoGroup(group, unrestoredBeneath, frozen)
+		j.endOp()
 		for _, path := range changed {
 			if !slices.Contains(restored, path) {
 				restored = append(restored, path)
@@ -1788,13 +1840,16 @@ func (j *Journal) answerMembers(ans groupAnswer) []int {
 
 // restoreRefusal changes nothing; the states it returns are the ones a Restore answer adopts.
 func (j *Journal) restoreRefusal(group []int) (observed map[string]fileState, refusal string) {
+	_, early := j.changedInsideMovedEntries()
+	return j.restoreRefusalWith(group, j.unrestoredBeneath(early))
+}
+
+func (j *Journal) restoreRefusalWith(group []int, beneath func(destination string) bool) (observed map[string]fileState, refusal string) {
 	for _, i := range group {
 		if _, _, err := j.moveEndpoints(&j.rec.Moves[i]); err != nil {
 			return nil, err.Error()
 		}
 	}
-	_, early := j.changedInsideMovedEntries()
-	beneath := j.unrestoredBeneath(early)
 	if slices.ContainsFunc(group, func(i int) bool { return beneath(j.rec.Moves[i].Destination) }) {
 		return nil, "a path the child agent changed inside the moved entry could not be put back first"
 	}
@@ -1857,26 +1912,33 @@ func (j *Journal) publishAnswer(group []int, choice Choice, adopted map[string]f
 // settleKept derives a Keep answer's settled records and changes nothing once they are settled, so it
 // can run again after a crash at any point.
 func (j *Journal) settleKept(ans groupAnswer) error {
-	changed := false
+	if !j.markKept(ans, true) {
+		return nil
+	}
+	return j.step("group_kept")
+}
+
+func (j *Journal) markKept(ans groupAnswer, apply bool) (changed bool) {
 	for _, path := range ans.Endpoints {
 		if pr := j.record(path); pr != nil && (!pr.KeptByUser || pr.Pending != nil) {
-			pr.KeptByUser, pr.Pending = true, nil
+			if apply {
+				pr.KeptByUser, pr.Pending = true, nil
+			}
 			changed = true
 		}
 		for i := range j.rec.Paths {
 			q := &j.rec.Paths[i]
 			for k := range q.Dirs {
 				if d := &q.Dirs[k]; !d.KeptByUser && filepath.Join(q.Ancestor, filepath.FromSlash(d.Rel)) == path {
-					d.KeptByUser = true
+					if apply {
+						d.KeptByUser = true
+					}
 					changed = true
 				}
 			}
 		}
 	}
-	if !changed {
-		return nil
-	}
-	return j.step("group_kept")
+	return changed
 }
 
 func (j *Journal) groupNote(group []int, endpoints []string) func(string) bool {
@@ -1890,7 +1952,7 @@ func (j *Journal) groupNote(group []int, endpoints []string) func(string) bool {
 func (j *Journal) clearGroupNotes(group []int, endpoints []string) {
 	ofGroup := j.groupNote(group, endpoints)
 	j.rec.Unrecovered = slices.DeleteFunc(j.rec.Unrecovered, func(note string) bool {
-		return ofGroup(note) && !slices.Contains(j.rec.Retained, note)
+		return ofGroup(note) && !slices.Contains(j.rec.Retained, note) && !slices.Contains(j.policyNotes, note)
 	})
 	j.retainedDirs = slices.DeleteFunc(j.retainedDirs, func(dir string) bool { return slices.Contains(endpoints, dir) })
 }
@@ -1925,19 +1987,28 @@ func (j *Journal) replayAnswers() []string {
 	notes, dirs := slices.Clone(j.rec.Unrecovered), slices.Clone(j.retainedDirs)
 	defer func() {
 		j.rec.Unrecovered, j.retainedDirs = notes, dirs
-		for _, msg := range j.rec.Retained {
+		for _, msg := range slices.Concat(j.rec.Retained, j.policyNotes) {
 			j.note(msg)
 		}
 	}()
 	var restored []string
 	for _, ans := range j.rec.Answers {
+		members := j.answerMembers(ans)
 		switch ans.Choice {
 		case ChoiceKeep:
+			if !j.markKept(ans, false) || !j.beginOp(j.groupLabel(members), ans.Endpoints) {
+				continue
+			}
 			if err := j.settleKept(ans); err != nil {
 				j.note("the kept moves could not be recorded as settled: " + err.Error())
 			}
+			j.endOp()
 		case ChoiceRestore:
-			changed, _ := j.restoreGroup(j.answerMembers(ans), ans.Endpoints)
+			if !j.beginOp(j.groupLabel(members), ans.Endpoints) {
+				continue
+			}
+			changed, _ := j.restoreGroup(members, ans.Endpoints)
+			j.endOp()
 			for _, path := range changed {
 				if !slices.Contains(restored, path) {
 					restored = append(restored, path)
@@ -2613,10 +2684,11 @@ func (j *Journal) confirmedDir(dev, ino uint64) bool {
 func (j *Journal) restorePaths(restored []string, include func(path string) bool) []string {
 	for i := range j.rec.Paths {
 		pr := &j.rec.Paths[i]
-		if pr.Progress == rollbackRestored || pr.KeptByUser || !include(pr.Path) || j.awaitsCreatedDir(pr) {
+		if pr.Progress == rollbackRestored || pr.KeptByUser || !include(pr.Path) || j.awaitsCreatedDir(pr) || !j.beginOp(pr.Path, []string{pr.Path}) {
 			continue
 		}
 		changed, err := j.restorePath(pr)
+		j.endOp()
 		if err != nil {
 			j.note(pr.Path + ": " + err.Error())
 			continue
@@ -2688,33 +2760,42 @@ func (j *Journal) removeCreatedDirs(include func(owner, dir string) bool) {
 	depth := func(c candidate) int { return strings.Count(filepath.Join(c.pr.Ancestor, c.dir.Rel), "/") }
 	sort.SliceStable(all, func(a, b int) bool { return depth(all[a]) > depth(all[b]) })
 	for _, c := range all {
-		if c.dir.Progress == rollbackRestored || c.dir.KeptByUser {
+		path := filepath.Join(c.pr.Ancestor, filepath.FromSlash(c.dir.Rel))
+		if c.dir.Progress == rollbackRestored || c.dir.KeptByUser || !j.beginOp(path, []string{path}) {
 			continue
 		}
-		if !c.dir.Confirmed {
-			j.note(c.pr.Path + ": a parent directory the child agent started to create was never confirmed, so it was left in place")
-			continue
-		}
-		if !c.dir.Created {
-			c.dir.Progress = rollbackRestored
-			continue
-		}
-		err := j.removeCreatedDir(c.pr, c.dir)
-		switch {
-		case errors.Is(err, errDirHoldsEntries) || errors.Is(err, errDirReplaced):
-			path := filepath.Join(c.pr.Ancestor, filepath.FromSlash(c.dir.Rel))
-			j.note(path + ": " + err.Error())
-			if !slices.Contains(j.retainedDirs, path) {
-				j.retainedDirs = append(j.retainedDirs, path)
-			}
-		case err != nil:
-			j.note(c.pr.Path + ": " + err.Error())
-		}
+		j.removeCandidate(c.pr, c.dir, path)
+		j.endOp()
 	}
 	_ = j.flush() //nolint:errcheck // every step above already flushed its own transition
 }
 
+func (j *Journal) removeCandidate(pr *pathRecord, dr *dirRecord, path string) {
+	if dr.Confirmed && !dr.Created {
+		dr.Progress = rollbackRestored
+		return
+	}
+	held := j.rec.Completed
+	err := errDirUnconfirmed
+	if dr.Confirmed {
+		err = j.removeCreatedDir(pr, dr)
+	}
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, errDirHoldsEntries) || errors.Is(err, errDirReplaced):
+		j.note(path + ": " + err.Error())
+		held = true
+	default:
+		j.note(pr.Path + ": " + err.Error())
+	}
+	if held && !slices.Contains(j.retainedDirs, path) {
+		j.retainedDirs = append(j.retainedDirs, path)
+	}
+}
+
 var (
+	errDirUnconfirmed  = errors.New("a parent directory the child agent started to create was never confirmed, so it was left in place")
 	errDirHoldsEntries = errors.New("the directory the child agent created holds entries it did not create, so it was left in place")
 	errDirReplaced     = errors.New("another writer replaced the directory the child agent created, so it was left in place")
 )
@@ -2768,7 +2849,7 @@ func (j *Journal) removeCreatedDir(pr *pathRecord, dr *dirRecord) error {
 		return errors.New("the created directory could not be read: " + eErr.Error())
 	}
 	if !empty {
-		if dr.Mkdir {
+		if dr.Mkdir || j.rec.Completed {
 			return errDirHoldsEntries
 		}
 		return j.settleCreatedDir(path, dr, false)
@@ -2957,6 +3038,9 @@ func statEntry(parent *os.File, name string) (os.FileInfo, error) {
 func (j *Journal) remove() error {
 	if j.gone {
 		return nil
+	}
+	if j.gate != nil && !j.gate.allows() {
+		return errRecoveryStopped
 	}
 	dev, ino, iErr := entryIdentity(j.holder, j.dirName)
 	if iErr != nil && !errors.Is(iErr, fs.ErrNotExist) {

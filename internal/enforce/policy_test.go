@@ -42,7 +42,13 @@ func TestPolicyFrameRoundTrips(t *testing.T) {
 	plan := Policy{Mode: ModePlan, BlockedPaths: []string{"/home/u/.codemeld"}}
 	network := validAutoEdits()
 	network.ExceptionalAuthority = NetworkAccessAuthority
-	for name, p := range map[string]Policy{"auto_edits": validAutoEdits(), "plan": plan, "network": network} {
+	planSkills := plan
+	planSkills.ReadRoots = []string{"/home/u/.codemeld/skills"}
+	autoSkills := validAutoEdits()
+	autoSkills.ReadRoots = []string{"/home/u/.codemeld/skills"}
+	cases := map[string]Policy{"auto_edits": validAutoEdits(), "plan": plan, "network": network,
+		"plan read roots": planSkills, "auto_edits read roots": autoSkills}
+	for name, p := range cases {
 		if got := roundTrip(t, p); !reflect.DeepEqual(got, p) {
 			t.Errorf("%s: round trip = %+v, want %+v", name, got, p)
 		}
@@ -91,7 +97,6 @@ func TestReadPolicyFrameRejectsBadFrames(t *testing.T) {
 		"truncated":             frameBytes(good)[:20],
 		"short header":          {0, 0},
 		"unknown field extra":   frameBytes(`{"mode":"plan","blocked_paths":["/b"],"extra":1}`),
-		"unknown read_roots":    frameBytes(`{"mode":"plan","blocked_paths":["/b"],"read_roots":["/"]}`),
 		"second value":          frameBytes(good + ` {}`),
 		"trailing garbage":      frameBytes(good + ` x`),
 	}
@@ -112,6 +117,8 @@ func TestPolicyValidationRejects(t *testing.T) {
 		"relative write root":          func(p *Policy) { p.WriteRoots = []string{"docs"} },
 		"relative no-write":            func(p *Policy) { p.NoWritePaths = []string{"docs"} },
 		"relative tmp_dir":             func(p *Policy) { p.TmpDir = "docs" },
+		"relative read root":           func(p *Policy) { p.ReadRoots = []string{"docs"} },
+		"unclean read root":            func(p *Policy) { p.ReadRoots = []string{"/a/../b"} },
 		"unclean blocked":              func(p *Policy) { p.BlockedPaths = []string{"/a/../b"} },
 		"unclean write root":           func(p *Policy) { p.WriteRoots = []string{"/a/../b"} },
 		"unclean no-write":             func(p *Policy) { p.NoWritePaths = []string{"/a/../b"} },
@@ -126,6 +133,9 @@ func TestPolicyValidationRejects(t *testing.T) {
 		},
 		"plan with exceptional_authority": func(p *Policy) {
 			*p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, ExceptionalAuthority: NetworkAccessAuthority}
+		},
+		"plan relative read root": func(p *Policy) {
+			*p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, ReadRoots: []string{"docs"}}
 		},
 	}
 	for name, mutate := range cases {
@@ -151,6 +161,7 @@ func TestWritePolicyFrameRejectsInvalidUTF8Paths(t *testing.T) {
 		"write root": func(p *Policy) { p.WriteRoots = []string{bad} },
 		"no-write":   func(p *Policy) { p.NoWritePaths = []string{bad} },
 		"tmp_dir":    func(p *Policy) { p.TmpDir = bad },
+		"read root":  func(p *Policy) { p.ReadRoots = []string{bad} },
 	}
 	for name, mutate := range cases {
 		p := validAutoEdits()

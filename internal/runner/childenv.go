@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -33,7 +34,47 @@ var (
 		"NODE_OPTIONS", "BASH_ENV", "ENV", "IFS", "SHELLOPTS", "RIPGREP_CONFIG_PATH", "DOCKER_HOST",
 	}
 	withheldEnvPrefixes = []string{"LD_", "DYLD_", "PYTHON", "PERL5", "GIT_", "HG", "SSH_", "DBUS_", "XDG_"}
+
+	secretNameParts = []string{
+		"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "APIKEY", "ACCESS_KEY", "PRIVATE_KEY", "COOKIE",
+	}
+	secretNameSuffixes = []string{"_KEY", "_PASS", "_PW", "_AUTH"}
+	secretNamePrefixes = []string{"AUTH_", "AWS_", "AZURE_", "GOOGLE_", "GH_", "GITHUB_", "GITLAB_", "NPM_TOKEN", "CODEMELD_"}
+	credentialURL      = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s/?#@:]+:[^\s/?#@]+@`)
 )
+
+func InheritedEnvironment(environ []string) (inherited, withheld []string) {
+	at := map[string]int{}
+	for _, e := range environ {
+		name, _, ok := strings.Cut(e, "=")
+		if !ok || name == "" {
+			continue
+		}
+		if i, seen := at[name]; seen {
+			inherited[i] = e
+			continue
+		}
+		at[name] = len(inherited)
+		inherited = append(inherited, e)
+	}
+	inherited = slices.DeleteFunc(inherited, func(e string) bool {
+		name, value, _ := strings.Cut(e, "=")
+		if envNameWithheld(name) || secretLookingName(name) || credentialURL.MatchString(value) {
+			withheld = append(withheld, name)
+			return true
+		}
+		return false
+	})
+	slices.Sort(withheld)
+	return inherited, withheld
+}
+
+func secretLookingName(name string) bool {
+	upper := strings.ToUpper(name)
+	return slices.ContainsFunc(secretNameParts, func(p string) bool { return strings.Contains(upper, p) }) ||
+		slices.ContainsFunc(secretNameSuffixes, func(s string) bool { return strings.HasSuffix(upper, s) }) ||
+		slices.ContainsFunc(secretNamePrefixes, func(p string) bool { return strings.HasPrefix(upper, p) })
+}
 
 func FixedEnvironment(home, cwd, tmpDir, lookupPath string, assignments []string) ([]string, error) {
 	env := []string{"PATH=" + lookupPath, "HOME=" + home, "PWD=" + cwd}

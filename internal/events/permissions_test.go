@@ -5,9 +5,15 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"codemeld.dev/codemeld/internal/ids"
@@ -1621,5 +1627,320 @@ func TestPermissionEvents_RejectAMalformedChildAttribution(t *testing.T) {
 	_, store := emitFixture()
 	if err := EmitPromptShownAttributed(store, "tool", "edit", "/home/u/proj/a.txt", nil, "", "", "not-a-v7"); err == nil {
 		t.Fatal("EmitPromptShownAttributed() = nil error, want a non-UUIDv7 child_invocation_id rejected")
+	}
+}
+
+func systemOneScored(outcome, effect string) PermissionSystemOneCheck {
+	return PermissionSystemOneCheck{
+		SubjectKind: "direct", Subject: "git status", PathScope: "/home/u/proj",
+		Provider: "openrouter", ModelID: "jev/jev-1-20261001", Outcome: outcome, Effect: effect,
+		PReadOnly: f64(0.97), PSecrets: f64(0), PCode: f64(0.02),
+		TReadOnly: f64(0.9), TSecrets: f64(0.3), TCode: f64(0),
+		DurationMs: 420,
+	}
+}
+
+func systemOneUnscored(outcome, reason string) PermissionSystemOneCheck {
+	return PermissionSystemOneCheck{
+		SubjectKind: "literal", Subject: "ls | wc -l", Provider: "venice", ModelID: "venice/configured-model",
+		Outcome: outcome, Reason: reason,
+	}
+}
+
+func systemOneScores(p *PermissionSystemOneCheck) map[string]**float64 {
+	return map[string]**float64{
+		"p_read_only": &p.PReadOnly, "p_secrets": &p.PSecrets, "p_code": &p.PCode,
+		"t_read_only": &p.TReadOnly, "t_secrets": &p.TSecrets, "t_code": &p.TCode,
+	}
+}
+
+func TestPermissionSystemOneCheck_AcceptsEachOutcomeAndRoundTrips(t *testing.T) {
+	declinedReadOnly := systemOneScored("declined", "read_only")
+	declinedReadOnly.PCode = f64(0.8)
+	accepted := []struct {
+		name    string
+		payload PermissionSystemOneCheck
+		scored  bool
+	}{
+		{"allowed", systemOneScored("allowed", "read_only"), true},
+		{"declined with a read_only top label", declinedReadOnly, true},
+		{"declined", systemOneScored("declined", "writes_files"), true},
+		{"failed without a reply", systemOneUnscored("failed", "timeout"), false},
+		{"failed with no key", systemOneUnscored("failed", "no_key"), false},
+		{"skipped while paused", systemOneUnscored("skipped", "paused"), false},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidatePayload(KindPermissionSystemOneCheck, raw); err != nil {
+				t.Fatalf("ValidatePayload() rejected a valid record: %v\n%s", err, raw)
+			}
+
+			sess, store := emitFixture()
+			child := ids.NewV7()
+			if err := EmitSystemOneCheckAttributed(store, tc.payload, child); err != nil {
+				t.Fatalf("EmitSystemOneCheckAttributed() error = %v", err)
+			}
+			ev := reloadOnly(t, sess)
+			if ev.Kind != "permission_system_one_check" {
+				t.Fatalf("kind = %q, want permission_system_one_check", ev.Kind)
+			}
+			var got PermissionSystemOneCheck
+			mustUnmarshal(t, ev.Payload, &got)
+			want := tc.payload
+			want.ChildInvocationID = child
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("round trip = %+v, want %+v", got, want)
+			}
+
+			var fields map[string]json.RawMessage
+			mustUnmarshal(t, ev.Payload, &fields)
+			for _, name := range []string{"p_read_only", "p_secrets", "p_code", "t_read_only", "t_secrets", "t_code"} {
+				_, present := fields[name]
+				if present != tc.scored {
+					t.Errorf("%s present = %v, want %v: %s", name, present, tc.scored, ev.Payload)
+				}
+			}
+			if tc.scored {
+				if string(fields["p_secrets"]) != "0" || string(fields["t_code"]) != "0" {
+					t.Errorf("explicit zeros not persisted: %s", ev.Payload)
+				}
+				return
+			}
+			if string(fields["provider"]) != `"venice"` || string(fields["model_id"]) != `"venice/configured-model"` {
+				t.Errorf("an unscored record lost its configured provider or model id: %s", ev.Payload)
+			}
+		})
+	}
+}
+
+func TestPermissionSystemOneCheck_RecordsTheSuppliedModelSnapshot(t *testing.T) {
+	sess, store := emitFixture()
+	p := systemOneScored("allowed", "read_only")
+	p.ModelID = "jev/jev-1-snapshot-20261020"
+	if err := EmitSystemOneCheckAttributed(store, p, ""); err != nil {
+		t.Fatalf("EmitSystemOneCheckAttributed() error = %v", err)
+	}
+	var got PermissionSystemOneCheck
+	mustUnmarshal(t, reloadOnly(t, sess).Payload, &got)
+	if got.ModelID != "jev/jev-1-snapshot-20261020" {
+		t.Fatalf("model_id = %q, want the supplied snapshot", got.ModelID)
+	}
+}
+
+func TestPermissionSystemOneCheck_Rejects(t *testing.T) {
+	type mutate func(p *PermissionSystemOneCheck)
+	cases := []struct {
+		name string
+		base PermissionSystemOneCheck
+		edit mutate
+	}{
+		{"allowed without probabilities or thresholds", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) {
+			p.PReadOnly, p.PSecrets, p.PCode, p.TReadOnly, p.TSecrets, p.TCode = nil, nil, nil, nil, nil, nil
+		}},
+		{"failed without a reason", systemOneUnscored("failed", ""), nil},
+		{"failed with a paused reason", systemOneUnscored("failed", "paused"), nil},
+		{"failed with an unknown reason", systemOneUnscored("failed", "teapot"), nil},
+		{"skipped with a timeout reason", systemOneUnscored("skipped", "timeout"), nil},
+		{"skipped without a reason", systemOneUnscored("skipped", ""), nil},
+		{"probability 1.2", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.PReadOnly = f64(1.2) }},
+		{"negative threshold", systemOneScored("declined", "network"), func(p *PermissionSystemOneCheck) { p.TSecrets = f64(-0.1) }},
+		{"NaN probability", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.PCode = f64(math.NaN()) }},
+		{"infinite threshold", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.TCode = f64(math.Inf(1)) }},
+		{"unknown effect label", systemOneScored("allowed", "reads"), nil},
+		{"allowed without an effect", systemOneScored("allowed", ""), nil},
+		{"declined without an effect", systemOneScored("declined", ""), nil},
+		{"allowed with a reason", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.Reason = "timeout" }},
+		{"declined with a reason", systemOneScored("declined", "deletes"), func(p *PermissionSystemOneCheck) { p.Reason = "paused" }},
+		{"failed with an effect", systemOneUnscored("failed", "server"), func(p *PermissionSystemOneCheck) { p.Effect = "read_only" }},
+		{"skipped with an effect", systemOneUnscored("skipped", "paused"), func(p *PermissionSystemOneCheck) { p.Effect = "read_only" }},
+		{"tool subject kind", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.SubjectKind = "tool" }},
+		{"unknown provider", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.Provider = "openai" }},
+		{"empty provider", systemOneUnscored("failed", "auth"), func(p *PermissionSystemOneCheck) { p.Provider = "" }},
+		{"unknown outcome", systemOneScored("maybe", "read_only"), nil},
+		{"negative duration", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.DurationMs = -1 }},
+		{"empty subject", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.Subject = "" }},
+		{"empty model id", systemOneUnscored("skipped", "paused"), func(p *PermissionSystemOneCheck) { p.ModelID = "" }},
+		{"relative path scope", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.PathScope = "home/u/proj" }},
+		{"unclean path scope", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.PathScope = "/home/u/proj/../x" }},
+		{"invalid child invocation id", systemOneScored("allowed", "read_only"), func(p *PermissionSystemOneCheck) { p.ChildInvocationID = "not-a-v7" }},
+	}
+	for _, outcome := range []string{"allowed", "declined"} {
+		for name := range systemOneScores(&PermissionSystemOneCheck{}) {
+			cases = append(cases, struct {
+				name string
+				base PermissionSystemOneCheck
+				edit mutate
+			}{outcome + " without " + name, systemOneScored(outcome, "read_only"), func(p *PermissionSystemOneCheck) { *systemOneScores(p)[name] = nil }})
+		}
+	}
+	for _, unscored := range []PermissionSystemOneCheck{systemOneUnscored("failed", "credits"), systemOneUnscored("skipped", "paused")} {
+		for name := range systemOneScores(&PermissionSystemOneCheck{}) {
+			cases = append(cases, struct {
+				name string
+				base PermissionSystemOneCheck
+				edit mutate
+			}{unscored.Outcome + " with " + name, unscored, func(p *PermissionSystemOneCheck) { *systemOneScores(p)[name] = f64(0) }})
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := tc.base
+			if tc.edit != nil {
+				tc.edit(&p)
+			}
+			if _, err := Append(newStore(), p); err == nil {
+				t.Fatalf("Append() accepted %s", tc.name)
+			}
+			raw, err := json.Marshal(p)
+			if err != nil {
+				return
+			}
+			if err := ValidatePayload(KindPermissionSystemOneCheck, raw); err == nil {
+				t.Fatalf("ValidatePayload() accepted %s: %s", tc.name, raw)
+			}
+		})
+	}
+}
+
+func TestPermissionSystemOneCheck_ConcurrentEmittersKeepBothRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	store := sessions.New(path, newSession())
+	subjects := []string{"git status", "git log"}
+	var wg sync.WaitGroup
+	errs := make([]error, len(subjects))
+	for i, subject := range subjects {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p := systemOneScored("allowed", "read_only")
+			p.Subject = subject
+			errs[i] = EmitSystemOneCheckAttributed(store, p, "")
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("EmitSystemOneCheckAttributed() error = %v", err)
+		}
+	}
+	if _, _, err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := sessions.Unmarshal(data)
+	if err != nil {
+		t.Fatalf("sessions.Unmarshal() error = %v", err)
+	}
+	var got []string
+	for _, rec := range loaded.Records {
+		ev, ok := rec.(sessions.Event)
+		if !ok || ev.Kind != KindPermissionSystemOneCheck {
+			continue
+		}
+		if err := ValidatePayload(ev.Kind, ev.Payload); err != nil {
+			t.Fatalf("ValidatePayload() rejected a flushed record: %v", err)
+		}
+		var p PermissionSystemOneCheck
+		mustUnmarshal(t, ev.Payload, &p)
+		got = append(got, p.Subject)
+	}
+	slices.Sort(got)
+	if want := []string{"git log", "git status"}; !slices.Equal(got, want) {
+		t.Fatalf("flushed subjects = %v, want %v", got, want)
+	}
+}
+
+func TestPermissionMatched_SystemOneCheckSource(t *testing.T) {
+	accepted := []PermissionMatched{
+		{SubjectKind: "direct", Subject: "git status", PathScope: "/home/u/proj", Outcome: "once", OutcomeSource: "system_one_check"},
+		{SubjectKind: "literal", Subject: "ls | wc -l", PathScope: "/home/u/proj", Outcome: "once", OutcomeSource: "system_one_check", ArgumentHash: literalArgumentHash("ls | wc -l")},
+	}
+	for _, payload := range accepted {
+		t.Run("accepted "+payload.SubjectKind, func(t *testing.T) {
+			if _, err := Append(newStore(), payload); err != nil {
+				t.Fatalf("Append() rejected a valid system_one_check record: %v", err)
+			}
+		})
+	}
+	rejected := []struct {
+		name    string
+		payload PermissionMatched
+	}{
+		{"deny", PermissionMatched{SubjectKind: "direct", Subject: "git status", PathScope: "/home/u/proj", Outcome: "deny", OutcomeSource: "system_one_check"}},
+		{"tool subject", PermissionMatched{SubjectKind: "tool", Subject: "edit", PathScope: "/home/u/proj", Outcome: "once", OutcomeSource: "system_one_check"}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Append(newStore(), tc.payload); err == nil {
+				t.Fatalf("Append() accepted %s", tc.name)
+			}
+			raw, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidatePayload(KindPermissionMatched, raw); err == nil {
+				t.Fatalf("ValidatePayload() accepted %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestPermissionSystemOneCheck_SkippedAcceptsEveryEligibilityReason(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	blocked := permissions.NewBlockedPaths(home, []permissions.BlockedEntry{{Path: filepath.Join(home, "secret"), Source: "s"}})
+	mc := permissions.ModeContext{Mode: "auto_edits", ProjectRoot: root}
+	cases := []struct {
+		command string
+		blocked *permissions.BlockedPaths
+	}{
+		{"ls\nls", blocked},
+		{"ls", nil},
+		{"echo $(id)", blocked},
+		{"cat " + filepath.Join(home, "secret", "a"), blocked},
+		{"bash --version | head -1", blocked},
+		{"nosuchprogram x", blocked},
+		{"ls > out", blocked},
+	}
+	produced := map[string]bool{}
+	for _, tc := range cases {
+		req := permissions.MatchRequest{Kind: "literal", Subject: tc.command, PathScope: root}
+		reason := permissions.SystemOneEligible(req, mc, tc.blocked, tc.command)
+		if reason == "" {
+			t.Fatalf("SystemOneEligible(%q) = \"\", want a reason", tc.command)
+		}
+		produced[reason] = true
+	}
+	if len(produced) != len(cases) {
+		t.Fatalf("produced reasons = %v, want %d distinct", produced, len(cases))
+	}
+	produced["paused"] = true
+	for reason := range produced {
+		p := systemOneUnscored("skipped", reason)
+		if _, err := Build(p); err != nil {
+			t.Errorf("Build(skipped/%s) error = %v", reason, err)
+		}
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidatePayload(KindPermissionSystemOneCheck, raw); err != nil {
+			t.Errorf("ValidatePayload(skipped/%s) error = %v", reason, err)
+		}
+	}
+	unknown := systemOneUnscored("skipped", "teapot")
+	if _, err := Build(unknown); err == nil {
+		t.Error("Build accepted an unknown skipped reason")
+	}
+	raw, _ := json.Marshal(unknown)
+	if err := ValidatePayload(KindPermissionSystemOneCheck, raw); err == nil {
+		t.Error("ValidatePayload accepted an unknown skipped reason")
 	}
 }

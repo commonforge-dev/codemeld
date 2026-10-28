@@ -151,3 +151,9 @@ func EmitPersistFailed(store *sessions.Store, targetPath, grantKind, subjectKind
 	_, err := Append(store, p)
 	return err
 }
+
+func EmitSystemOneCheckAttributed(store *sessions.Store, p PermissionSystemOneCheck, childInvocationID string) error {
+	p.ChildInvocationID = childInvocationID
+	_, err := Append(store, p)
+	return err
+}

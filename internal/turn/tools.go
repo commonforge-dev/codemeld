@@ -202,7 +202,6 @@ type ToolLoop struct {
 	lastCalls   []AssembledToolCall
 	lastAttempt int
 	repeats     int
-	halted      bool
 
 	deadline time.Time
 	work     context.Context
@@ -216,10 +215,10 @@ type PendingUserMessage struct {
 	Parts []sessions.ContentPart
 }
 
-const wrapUpInstruction = "For this assistant turn only, tools are no longer available. Write your final answer now, using only the information you already have. This restriction ends when the next user message starts a new turn; follow the tools and instructions supplied for that new turn."
+const wrapUpInstruction = "For this assistant turn only, tools are no longer available. Write your final answer now, using only the information you already have. If your final answer reports why work stopped, state this cause. This restriction ends when the next user message starts a new turn; follow the tools and instructions supplied for that new turn."
 
 const (
-	roundLimit  = 200
+	RoundLimit  = 200
 	repeatLimit = 3
 )
 
@@ -276,7 +275,7 @@ func NewToolLoop(deps Deps, dispatcher ToolDispatcher, maxConcurrency int) *Tool
 func (l *ToolLoop) Run(ctx context.Context) error {
 	defer l.close()
 	err := l.run(ctx)
-	if l.acct.recorded || (err == nil && l.halted) {
+	if l.acct.recorded {
 		return err
 	}
 	return l.recordUnfinishedUsage(ctx, err)
@@ -295,7 +294,7 @@ func (l *ToolLoop) run(ctx context.Context) error {
 	for pass := 0; ; pass++ {
 		if !l.wrapUp && l.timeUp() {
 			l.timeLimited = true
-			l.beginWrapUp()
+			l.beginWrapUp("The run's time limit was reached, ending tool use in this turn.")
 		}
 		if pass > 0 && !l.wrapUp {
 			if batch := l.takePending(false); len(batch) > 0 {
@@ -320,7 +319,7 @@ func (l *ToolLoop) run(ctx context.Context) error {
 		}
 		recordsBefore := len(l.deps.Store.Records())
 		deps := l.deps
-		deps.Retry.MaxAttempts = min(deps.Retry.MaxAttempts, roundLimit-1-l.acct.attempts)
+		deps.Retry.MaxAttempts = min(deps.Retry.MaxAttempts, RoundLimit-1-l.acct.attempts)
 		if wrapUpRound {
 			deps.Retry.MaxAttempts = 1
 		}
@@ -341,15 +340,9 @@ func (l *ToolLoop) run(ctx context.Context) error {
 			}
 			return err
 		}
-		// Runner.Run commits a whitespace-only final reply as an answer, and reports an empty
-		// stream itself but returns nil.
-		if wrapUpRound {
-			switch found, blank := finalReply(l.deps.Store.Records()[recordsBefore:]); {
-			case !found:
-				return errors.New("turn: wrap-up round produced no visible assistant response")
-			case blank:
-				return l.rejectEmptyRound(ctx, "wrap-up round")
-			}
+		// Runner.Run reports a blank stream itself but returns nil.
+		if wrapUpRound && !finalReply(l.deps.Store.Records()[recordsBefore:]) {
+			return errors.New("turn: wrap-up round produced no visible assistant response")
 		}
 		// This round completed successfully and (on every tool-call, text-tool-call,
 		// and final-answer branch) folded its exact usage into UsageAcc. Push the cumulative
@@ -364,7 +357,7 @@ func (l *ToolLoop) run(ctx context.Context) error {
 		// the continued check so it fires for both a continuing tool-call round and the
 		// final/suggest-only terminal round.
 		if l.userUsage != nil && l.usage.UsageRounds() > usageRoundsBefore {
-			inputTokens, outputTokens, _, _, _, _ := l.usage.Totals()
+			inputTokens, outputTokens, _, _, _, _, _, _ := l.usage.Totals()
 			l.userUsage(inputTokens, outputTokens)
 		}
 		if l.continued && !l.wrapUp && !l.timeUp() {
@@ -459,7 +452,7 @@ func (l *ToolLoop) commitUserMessages(ctx context.Context, lead []sessions.Recor
 	return nil
 }
 
-func (l *ToolLoop) interceptFinalAnswer(ctx context.Context, text string) (bool, error) {
+func (l *ToolLoop) interceptFinalAnswer(ctx context.Context, text string, reasoning *sessions.Reasoning) (bool, error) {
 	if l.wrapUp {
 		return false, nil
 	}
@@ -472,6 +465,7 @@ func (l *ToolLoop) interceptFinalAnswer(ctx context.Context, text string) (bool,
 		Role:      "assistant",
 		Content:   sessions.TextContent(text),
 		Timestamp: time.Now().UTC(),
+		Reasoning: reasoning,
 	}
 	if err := l.commitUserMessages(ctx, []sessions.Record{answer}, batch); err != nil {
 		return false, err
@@ -488,14 +482,14 @@ func (l *ToolLoop) timeUp() bool {
 	return !l.deadline.IsZero() && l.work != nil && errors.Is(context.Cause(l.work), errTimeLimit)
 }
 
-func (l *ToolLoop) beginWrapUp() {
+func (l *ToolLoop) beginWrapUp(cause string) {
 	if l.wrapUp {
 		return
 	}
 	l.deps.Store.Append(sessions.Message{
 		ID:        ids.NewV7(),
 		Role:      "system",
-		Content:   sessions.TextContent(wrapUpInstruction),
+		Content:   sessions.TextContent(cause + " " + wrapUpInstruction),
 		Timestamp: time.Now().UTC(),
 	})
 	l.deps.Tools = nil
@@ -503,16 +497,18 @@ func (l *ToolLoop) beginWrapUp() {
 }
 
 func (l *ToolLoop) limitWrapUp(repeated []AssembledToolCall) {
-	var notice string
+	var cause, notice string
 	switch {
-	case l.acct.attempts >= roundLimit-1:
-		notice = fmt.Sprintf("codemeld: this turn reached its %d-round limit; tools were removed and the model is writing its final answer. Send a new message to continue.", roundLimit)
+	case l.acct.attempts >= RoundLimit-1:
+		cause = fmt.Sprintf("This turn reached its %d-round limit.", RoundLimit)
+		notice = fmt.Sprintf("codemeld: this turn reached its %d-round limit; tools were removed and the model is writing its final answer. Send a new message to continue.", RoundLimit)
 	case repeated != nil:
+		cause = fmt.Sprintf("The same tool call (%s) was repeated %d rounds in a row.", toolNames(repeated), repeatLimit)
 		notice = fmt.Sprintf("codemeld: this turn repeated the same tool call (%s) %d rounds in a row; tools were removed and the model is writing its final answer. Send a new message to continue.", toolNames(repeated), repeatLimit)
 	default:
 		return
 	}
-	l.beginWrapUp()
+	l.beginWrapUp(cause)
 	if l.deps.ToolNotice != nil {
 		l.deps.ToolNotice(notice)
 	}
@@ -536,12 +532,12 @@ func toolNames(calls []AssembledToolCall) string {
 }
 
 func (l *ToolLoop) recordUnfinishedUsage(ctx context.Context, err error) error {
-	inputTokens, outputTokens, cachedInput, cachedPartial, anomalies, hadUsage := l.usage.Totals()
+	inputTokens, outputTokens, cachedInput, cachedPartial, cost, costPartial, anomalies, hadUsage := l.usage.Totals()
 	sel, _, ok := l.deps.Active.Current()
 	if !hadUsage || !ok {
 		return err
 	}
-	if appendErr := model.EmitModelResponse(l.deps.Store, sel.Provider, sel.ID, inputTokens, outputTokens, cachedInput, cachedPartial, anomalies, l.acct.upstream); appendErr != nil {
+	if appendErr := model.EmitModelResponse(l.deps.Store, sel.Provider, sel.ID, inputTokens, outputTokens, cachedInput, cachedPartial, cost, costPartial, anomalies, l.acct.upstream); appendErr != nil {
 		return errors.Join(err, appendErr)
 	}
 	l.acct.recorded = true
@@ -601,7 +597,7 @@ func (l *ToolLoop) onToolCalls(ctx context.Context, h ToolCallHandoff) error {
 			round.FailurePhase = provider.EmptyStreamClassification().Phase
 			return l.rejectEmptyRound(ctx, "wrap-up round")
 		}
-		if err := l.finalizeInterceptedRound(h.AssistantText, h.UpstreamProvider); err != nil {
+		if err := l.finalizeInterceptedRound(h.AssistantText, h.Reasoning, h.UpstreamProvider); err != nil {
 			round.Outcome = events.TurnOutcomeContinuationFailed
 			return err
 		}
@@ -667,9 +663,10 @@ func (l *ToolLoop) onToolCalls(ctx context.Context, h ToolCallHandoff) error {
 		if strings.TrimSpace(h.AssistantText) == "" {
 			round.Outcome = events.TurnOutcomeProviderFailed
 			round.FailurePhase = provider.EmptyStreamClassification().Phase
-			return l.rejectEmptyRound(ctx, "suggest_followup-only round")
+			round.BlankSuggestOnly = true
+			return errors.New("turn: suggest_followup-only round produced no visible assistant response")
 		}
-		intercepted, err := l.interceptFinalAnswer(ctx, h.AssistantText)
+		intercepted, err := l.interceptFinalAnswer(ctx, h.AssistantText, h.Reasoning)
 		if err != nil {
 			round.Outcome = events.TurnOutcomeContinuationFailed
 			return err
@@ -678,7 +675,7 @@ func (l *ToolLoop) onToolCalls(ctx context.Context, h ToolCallHandoff) error {
 			return nil
 		}
 		l.routeSuggestFollowups(suggestions)
-		if err := l.finalizeInterceptedRound(h.AssistantText, h.UpstreamProvider); err != nil {
+		if err := l.finalizeInterceptedRound(h.AssistantText, h.Reasoning, h.UpstreamProvider); err != nil {
 			round.Outcome = events.TurnOutcomeContinuationFailed
 			return err
 		}
@@ -757,7 +754,7 @@ func (l *ToolLoop) onToolCalls(ctx context.Context, h ToolCallHandoff) error {
 	// well-formed and the model reads the deny envelope exactly as it would a tool output.
 	// DeliverDeny is called only here, after the assistant tool-call
 	// record is appended, so it never races ahead of that record or duplicates a result.
-	l.deps.Store.Append(assistantToolCallRecord(h.AssistantText, realCalls))
+	l.deps.Store.Append(assistantToolCallRecord(h.AssistantText, h.Reasoning, realCalls))
 	terminalDenial := false
 	terminalResult := false
 	wrapUp := false
@@ -813,7 +810,7 @@ func (l *ToolLoop) onToolCalls(ctx context.Context, h ToolCallHandoff) error {
 	l.continued = timeLimited || (!terminalDenial && !terminalResult)
 	l.denied = terminalDenial
 	if l.continued && wrapUp {
-		l.beginWrapUp()
+		l.beginWrapUp("Repeated refusals of a tool call ended tool use in this turn.")
 	}
 	if l.continued && !timeLimited && !l.wrapUp {
 		var repeated []AssembledToolCall
@@ -823,7 +820,6 @@ func (l *ToolLoop) onToolCalls(ctx context.Context, h ToolCallHandoff) error {
 		l.limitWrapUp(repeated)
 	}
 	if !l.continued {
-		l.halted = true
 		// Flush terminal rounds immediately so their records are durable.
 		if l.deps.Flush != nil {
 			if err := l.deps.Flush(); err != nil {
@@ -1035,10 +1031,9 @@ func (l *ToolLoop) routeSuggestFollowups(suggestions []suggestFollowup) {
 	}
 }
 
-// rejectEmptyRound handles a suggest_followup-only round or a wrap-up round whose
-// assistant prose is empty or whitespace: the provider produced no visible answer, so
-// recording a model_response/turn_latency or finalizing it would persist an invisible
-// "successful" reply. It instead surfaces the same empty-response failure feedback as
+// rejectEmptyRound handles a wrap-up tool-call round whose assistant prose is empty or
+// whitespace: the provider produced no visible answer, so recording a
+// model_response/turn_latency or finalizing it would persist an invisible "successful" reply. It instead surfaces the same empty-response failure feedback as
 // Runner.runAttempt — a durable provider_request_failed event plus the one-line notice —
 // appends no assistant message, and returns a non-nil error so ToolLoop.Run skips the
 // success-path Usage callback and ends the turn without continuation. The provider_round_trip
@@ -1057,14 +1052,14 @@ func (l *ToolLoop) rejectEmptyRound(ctx context.Context, round string) error {
 	return fmt.Errorf("turn: %s produced no visible assistant response", round)
 }
 
-func finalReply(records []sessions.Record) (found, blank bool) {
+func finalReply(records []sessions.Record) bool {
 	for _, rec := range records {
 		msg, ok := rec.(sessions.Message)
 		if ok && msg.Role == "assistant" && len(msg.ToolCalls) == 0 {
-			return true, !msg.Content.IsList() && strings.TrimSpace(msg.Content.Text()) == ""
+			return true
 		}
 	}
-	return false, false
+	return false
 }
 
 // finalizeInterceptedRound closes a round whose only tool calls were intercepted
@@ -1077,18 +1072,19 @@ func finalReply(records []sessions.Record) (found, blank bool) {
 // terminal round fires Usage once rather than twice. The provider_round_trip for
 // this round was already recorded and flushed by
 // Runner.Run before the tool-call handoff, so it is deliberately not recorded again.
-func (l *ToolLoop) finalizeInterceptedRound(assistantText, upstream string) error {
+func (l *ToolLoop) finalizeInterceptedRound(assistantText string, reasoning *sessions.Reasoning, upstream string) error {
 	if assistantText != "" {
 		l.deps.Store.Append(sessions.Message{
 			ID:        ids.NewV7(),
 			Role:      "assistant",
 			Content:   sessions.TextContent(assistantText),
 			Timestamp: time.Now().UTC(),
+			Reasoning: reasoning,
 		})
 	}
 	if sel, _, ok := l.deps.Active.Current(); ok {
-		inputTokens, outputTokens, cachedInput, cachedPartial, anomalies, _ := l.usage.Totals()
-		if err := model.EmitModelResponse(l.deps.Store, sel.Provider, sel.ID, inputTokens, outputTokens, cachedInput, cachedPartial, anomalies, upstream); err != nil {
+		inputTokens, outputTokens, cachedInput, cachedPartial, cost, costPartial, anomalies, _ := l.usage.Totals()
+		if err := model.EmitModelResponse(l.deps.Store, sel.Provider, sel.ID, inputTokens, outputTokens, cachedInput, cachedPartial, cost, costPartial, anomalies, upstream); err != nil {
 			return err
 		}
 		l.acct.recorded = true
@@ -1223,7 +1219,7 @@ func assembleToolCalls(deltas [][]openai.ChatCompletionChunkChoiceDeltaToolCall)
 // {id,type:"function",function:{name,arguments}} shape so the record persists and
 // re-feeds the follow-up provider request unchanged (the request builder
 // reads it back via providerToolCalls).
-func assistantToolCallRecord(text string, calls []AssembledToolCall) sessions.Message {
+func assistantToolCallRecord(text string, reasoning *sessions.Reasoning, calls []AssembledToolCall) sessions.Message {
 	tcs := make([]sessions.ToolCall, len(calls))
 	for i, c := range calls {
 		tcs[i] = sessions.ToolCall{ID: c.ID, Type: "function", Raw: marshalToolCallRaw(c)}
@@ -1234,6 +1230,7 @@ func assistantToolCallRecord(text string, calls []AssembledToolCall) sessions.Me
 		Content:   sessions.TextContent(text),
 		Timestamp: time.Now().UTC(),
 		ToolCalls: tcs,
+		Reasoning: reasoning,
 	}
 }
 

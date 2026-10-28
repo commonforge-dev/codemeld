@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"unicode/utf8"
 
 	"codemeld.dev/codemeld/internal/enforce"
@@ -26,11 +28,12 @@ type confinement struct {
 	mode        func() string
 	home        string
 	projectRoot string
-	writeRoots  []string
+	writable    *writableFoldersReader
 	blocked     *permissions.BlockedPaths
 	lookupPath  string
 	lookupSet   bool
 	tmpDir      string
+	inherited   []string
 	retryPaths  []string
 	warning     string
 }
@@ -101,7 +104,11 @@ func (c *confinement) resolve(ctx context.Context) (current, tmpDir string, conf
 	return current, "", true, fmt.Errorf("bootstrap: confined run refused for unrecognized mode %q", current)
 }
 
-func (c *confinement) prepare(spec runner.RunSpec, tmpDir string) (runner.RunSpec, error) {
+func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permissions.BlockedPaths) (runner.RunSpec, error) {
+	home := c.home
+	if home == "" {
+		home = blocked.Home()
+	}
 	lookup := c.lookupPath
 	if lookup == "" && !c.lookupSet {
 		lookup = runner.FixedPATH
@@ -112,9 +119,24 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string) (runner.RunSpe
 			assignments = append(assignments, pin)
 		}
 	}
-	env, err := runner.FixedEnvironment(c.home, spec.Cwd, tmpDir, lookup, assignments)
+	env, err := runner.FixedEnvironment(home, spec.Cwd, tmpDir, lookup, assignments)
 	if err != nil {
 		return runner.RunSpec{}, err
+	}
+	set := make(map[string]bool, len(env))
+	for _, e := range env {
+		name, _, _ := strings.Cut(e, "=")
+		set[name] = true
+	}
+	merged := make([]string, 0, len(c.inherited)+len(env)+1)
+	for _, e := range c.inherited {
+		if name, _, _ := strings.Cut(e, "="); !set[name] {
+			merged = append(merged, e)
+		}
+	}
+	env = append(merged, env...)
+	if gitGlobalConfigBlocked(home, blocked) {
+		env = append(env, "GIT_CONFIG_GLOBAL=/dev/null")
 	}
 	prepared := cloneSpec(spec)
 	prepared.Env = env
@@ -126,12 +148,22 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string) (runner.RunSpe
 	return prepared, nil
 }
 
+func gitGlobalConfigBlocked(home string, blocked *permissions.BlockedPaths) bool {
+	if home == "" {
+		return false
+	}
+	_, global := blocked.Blocking(filepath.Join(home, ".gitconfig"))
+	_, xdg := blocked.Blocking(filepath.Join(home, ".config", "git", "config"))
+	return global || xdg
+}
+
 func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string) (runner.RunSpec, error) {
-	prepared, err := c.prepare(spec, tmpDir)
+	blocked := c.blocked.Current()
+	prepared, err := c.prepare(spec, tmpDir, blocked)
 	if err != nil {
 		return runner.RunSpec{}, err
 	}
-	policy, err := c.policy(current, tmpDir, spec.ExceptionalAuthority)
+	policy, err := c.policy(current, tmpDir, spec.ExceptionalAuthority, blocked)
 	if err != nil {
 		return runner.RunSpec{}, err
 	}
@@ -144,8 +176,13 @@ func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string) (runn
 	return prepared, nil
 }
 
-func (c *confinement) policy(current, tmpDir, authority string) (enforce.Policy, error) {
-	p := enforce.Policy{Mode: current, BlockedPaths: c.blocked.Current().Forms()}
+func (c *confinement) policy(current, tmpDir, authority string, blocked *permissions.BlockedPaths) (enforce.Policy, error) {
+	p := enforce.Policy{Mode: current, BlockedPaths: blocked.Forms()}
+	skills, err := c.skillsReadRoots(blocked)
+	if err != nil {
+		return enforce.Policy{}, err
+	}
+	p.ReadRoots = skills
 	if mode.Mode(current) != mode.AutoEdits {
 		return p, nil
 	}
@@ -160,7 +197,7 @@ func (c *confinement) policy(current, tmpDir, authority string) (enforce.Policy,
 	if err != nil {
 		return enforce.Policy{}, err
 	}
-	p.NoWritePaths = []string{filepath.Join(root, ".codemeld")}
+	p.NoWritePaths = append([]string{filepath.Join(root, ".codemeld")}, skills...)
 	for _, e := range entries {
 		if e.Name() == ".codemeld" {
 			continue
@@ -176,9 +213,11 @@ func (c *confinement) policy(current, tmpDir, authority string) (enforce.Policy,
 		}
 		p.WriteRoots = append(p.WriteRoots, target)
 	}
-	for _, folder := range c.writeRoots {
-		if !slices.Contains(p.WriteRoots, folder) {
-			p.WriteRoots = append(p.WriteRoots, folder)
+	if c.writable != nil && !blocked.Degraded() {
+		for _, folder := range c.writable.current() {
+			if !slices.Contains(p.WriteRoots, folder) {
+				p.WriteRoots = append(p.WriteRoots, folder)
+			}
 		}
 	}
 	p.TmpDir = tmpDir
@@ -186,6 +225,65 @@ func (c *confinement) policy(current, tmpDir, authority string) (enforce.Policy,
 		p.ExceptionalAuthority = authority
 	}
 	return p, nil
+}
+
+func (c *confinement) skillsReadRoots(blocked *permissions.BlockedPaths) ([]string, error) {
+	if blocked.Degraded() {
+		return nil, nil
+	}
+	home := c.home
+	if home == "" {
+		home = blocked.Home()
+	}
+	if !filepath.IsAbs(home) {
+		return nil, nil
+	}
+	candidate := filepath.Join(home, ".codemeld", "skills")
+	fold := blocked.FoldCase()
+	var floor string
+	for _, entry := range blocked.Entries() {
+		if entry.Floor() {
+			floor = entry.Path
+			continue
+		}
+		if _, ok := permissions.RelWithin(entry.Path, candidate, fold); ok {
+			return nil, nil
+		}
+		if _, ok := permissions.RelWithin(candidate, entry.Path, fold); ok {
+			return nil, nil
+		}
+	}
+	resolved, ok, err := resolvedDir(candidate)
+	if !ok || err != nil {
+		return nil, err
+	}
+	floorReal, ok, err := resolvedDir(floor)
+	if !ok || err != nil {
+		return nil, err
+	}
+	if !resolvedWithin(resolved, filepath.Join(floorReal, "skills")) && (resolvedWithin(resolved, floorReal) || resolvedWithin(floorReal, resolved)) {
+		return nil, nil
+	}
+	return []string{resolved}, nil
+}
+
+func resolvedWithin(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+func resolvedDir(path string) (string, bool, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		var info os.FileInfo
+		if info, err = os.Stat(resolved); err == nil {
+			return resolved, info.IsDir(), nil
+		}
+	}
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return "", false, nil
+	}
+	return "", false, err
 }
 
 func cloneSpecs(specs []runner.RunSpec) []runner.RunSpec {

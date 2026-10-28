@@ -50,7 +50,7 @@ func TestTRTUI8_StatusOverlay_OpensFastWithAllItemsThroughProductionPath(t *test
 	if err := model.EmitModelTurn(store, "openai", "gpt-5.5", "medium", model.SourceResume); err != nil {
 		t.Fatalf("seed model_turn: %v", err)
 	}
-	if err := model.EmitModelResponse(store, "openai", "gpt-5.5", 120, 340, nil, false, nil, ""); err != nil {
+	if err := model.EmitModelResponse(store, "openai", "gpt-5.5", 120, 340, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("seed model_response: %v", err)
 	}
 
@@ -208,7 +208,7 @@ func TestTRTUI8_StatusStateSourcesSessionFromMemoryNotDisk(t *testing.T) {
 		UpdatedAt:     time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
 		SchemaVersion: sessions.CurrentSchemaVersion,
 	}})
-	if err := model.EmitModelResponse(diskStore, "openai", "gpt-5.5", 999, 888, nil, false, nil, ""); err != nil {
+	if err := model.EmitModelResponse(diskStore, "openai", "gpt-5.5", 999, 888, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("seed disk model_response: %v", err)
 	}
 	if _, _, err := diskStore.Flush(ctx); err != nil {
@@ -224,7 +224,7 @@ func TestTRTUI8_StatusStateSourcesSessionFromMemoryNotDisk(t *testing.T) {
 		UpdatedAt:     testStart,
 		SchemaVersion: sessions.CurrentSchemaVersion,
 	}})
-	if err := model.EmitModelResponse(inMem, "openai", "gpt-5.5", 120, 340, nil, false, nil, ""); err != nil {
+	if err := model.EmitModelResponse(inMem, "openai", "gpt-5.5", 120, 340, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("seed in-memory model_response: %v", err)
 	}
 

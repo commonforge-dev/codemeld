@@ -134,6 +134,16 @@ func TestEnforceGlobalOnly_Rejects(t *testing.T) {
 			"confinement",
 		},
 		{
+			"system_one off",
+			map[string]any{"system_one": "off"},
+			"system_one",
+		},
+		{
+			"system_one model",
+			map[string]any{"system_one": "venice:jev-latest"},
+			"system_one",
+		},
+		{
 			"attribution outranks confinement",
 			map[string]any{"attribution": true, "confinement": map[string]any{"program_lookup": "strict"}},
 			"attribution",

@@ -5,6 +5,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -79,7 +80,9 @@ type Message struct {
 	ToolCalls []ToolCall
 	// ToolCallID correlates a Role=="tool" result message to the assistant
 	// tool-call entry it answers. It is empty for every other role.
-	ToolCallID string
+	ToolCallID       string
+	Reasoning        string
+	ReasoningDetails json.RawMessage
 }
 
 // ContentPart is one part of a multi-part user message in the provider contract.
@@ -140,21 +143,21 @@ type Client interface {
 // HTTPClient is optional and lets tests point the client at a stub
 // server.
 type ClientConfig struct {
-	Name          string
-	BaseURL       string
-	AuthHeader    string
-	AuthValue     string
-	Attribution   bool
-	Routing       Routing
-	HTTPClient    *http.Client
-	MinThroughput func(ctx context.Context, model string) (float64, bool)
+	Name         string
+	BaseURL      string
+	AuthHeader   string
+	AuthValue    string
+	Attribution  bool
+	Routing      Routing
+	HTTPClient   *http.Client
+	BestValueTag func(ctx context.Context, model string, ignored []string) string
 }
 
 type openAIClient struct {
-	name          string
-	routing       Routing
-	minThroughput func(ctx context.Context, model string) (float64, bool)
-	svc           openai.ChatCompletionService
+	name         string
+	routing      Routing
+	bestValueTag func(ctx context.Context, model string, ignored []string) string
+	svc          openai.ChatCompletionService
 }
 
 // OpenRouter groups dashboard activity by HTTP-Referer and fetches that URL for the
@@ -194,7 +197,7 @@ func NewClient(cfg ClientConfig) Client {
 		hc = http.DefaultClient
 	}
 	opts = append(opts, option.WithHTTPClient(pinRedirects(hc)), option.WithMiddleware(refuseRedirect(cfg.Name)))
-	return &openAIClient{name: cfg.Name, routing: cfg.Routing, minThroughput: cfg.MinThroughput, svc: openai.NewChatCompletionService(opts...)}
+	return &openAIClient{name: cfg.Name, routing: cfg.Routing, bestValueTag: cfg.BestValueTag, svc: openai.NewChatCompletionService(opts...)}
 }
 
 func (c *openAIClient) ChatCompletion(ctx context.Context, req Request) (Response, error) {
@@ -203,7 +206,7 @@ func (c *openAIClient) ChatCompletion(ctx context.Context, req Request) (Respons
 	}
 	params := openai.ChatCompletionNewParams{
 		Model:    req.Model,
-		Messages: toSDKMessages(req.Messages),
+		Messages: toSDKMessages(req.Messages, c.name == openRouterProviderID),
 	}
 	if req.PromptCacheKey != "" {
 		params.PromptCacheKey = openai.String(req.PromptCacheKey)
@@ -222,11 +225,14 @@ func (c *openAIClient) ChatCompletion(ctx context.Context, req Request) (Respons
 		}
 		switch {
 		case c.routing.Sort == openRouterSortBestValue:
-			extraOpts = append(extraOpts, option.WithJSONSet("provider.sort", "price"))
-			if c.minThroughput != nil {
-				if bar, ok := c.minThroughput(ctx, req.Model); ok {
-					extraOpts = append(extraOpts, option.WithJSONSet("provider.preferred_min_throughput", bar))
-				}
+			tag := ""
+			if c.bestValueTag != nil {
+				tag = c.bestValueTag(ctx, req.Model, req.IgnoredProviders)
+			}
+			if tag != "" {
+				extraOpts = append(extraOpts, option.WithJSONSet("provider.order", []string{tag}))
+			} else {
+				extraOpts = append(extraOpts, option.WithJSONSet("provider.sort", "price"))
 			}
 		case c.routing.Sort != "":
 			extraOpts = append(extraOpts, option.WithJSONSet("provider.sort", c.routing.Sort))
@@ -444,18 +450,26 @@ func toSDKTools(defs []ToolDefinition) []openai.ChatCompletionToolUnionParam {
 	return out
 }
 
-func toSDKMessages(msgs []Message) []openai.ChatCompletionMessageParamUnion {
+func toSDKMessages(msgs []Message, replayReasoning bool) []openai.ChatCompletionMessageParamUnion {
 	out := make([]openai.ChatCompletionMessageParamUnion, 0, len(msgs))
 	for _, m := range msgs {
 		switch m.Role {
 		case "system":
 			out = append(out, openai.SystemMessage(m.Content))
 		case "assistant":
+			msg := openai.AssistantMessage(m.Content)
 			if len(m.ToolCalls) > 0 {
-				out = append(out, assistantToolCallMessage(m))
-			} else {
-				out = append(out, openai.AssistantMessage(m.Content))
+				msg = assistantToolCallMessage(m)
 			}
+			if replayReasoning {
+				switch {
+				case len(m.ReasoningDetails) > 0:
+					msg.OfAssistant.SetExtraFields(map[string]any{"reasoning_details": m.ReasoningDetails})
+				case m.Reasoning != "":
+					msg.OfAssistant.SetExtraFields(map[string]any{"reasoning": m.Reasoning})
+				}
+			}
+			out = append(out, msg)
 		case "tool":
 			out = append(out, openai.ToolMessage(m.Content, m.ToolCallID))
 		default:

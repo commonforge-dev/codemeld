@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/skills"
 )
 
 // snapshotDir holds the committed golden fixtures, one per case below.
@@ -94,12 +95,21 @@ func snapshotCases() []struct {
 		file string
 		got  string
 	}{
-		{"plan mode", "plan.txt", AssembleSystemMessage(mode.Plan, "", "", snapshotEnv(), nil)},
-		{"build mode", "build.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnv(), nil)},
-		{"auto_edits mode", "auto_edits.txt", AssembleSystemMessage(mode.AutoEdits, "", "", snapshotEnv(), nil)},
-		{"base + env only (empty AGENTS.md)", "base_env_only.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnvWithRepoRoot(), emptyAgents())},
-		{"base + env + AGENTS.md", "with_agents.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnv(), sampleAgents())},
-		{"flagged model special instructions (Granite)", "special_latex.txt", AssembleSystemMessage(mode.Build, graniteProvider, graniteID, snapshotEnv(), nil)},
+		{"plan mode", "plan.txt", AssembleSystemMessage(mode.Plan, "", "", snapshotEnv(), nil, nil)},
+		{"build mode", "build.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnv(), nil, nil)},
+		{"auto_edits mode", "auto_edits.txt", AssembleSystemMessage(mode.AutoEdits, "", "", snapshotEnv(), nil, nil)},
+		{"base + env only (empty AGENTS.md)", "base_env_only.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnvWithRepoRoot(), nil, emptyAgents())},
+		{"base + env + AGENTS.md", "with_agents.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnv(), nil, sampleAgents())},
+		{"flagged model special instructions (Granite)", "special_latex.txt", AssembleSystemMessage(mode.Build, graniteProvider, graniteID, snapshotEnv(), nil, nil)},
+		{"base + env + skills + AGENTS.md", "with_skills.txt", AssembleSystemMessage(mode.Build, "", "", snapshotEnv(), sampleSkills(), sampleAgents())},
+	}
+}
+
+func sampleSkills() []skills.Skill {
+	return []skills.Skill{
+		{Name: "deploy", Description: "Deploy the service\n  to staging.", Body: "DEPLOY-BODY", ModelInvocable: true},
+		{Name: "manual-only", Description: "Only run by hand.", ModelInvocable: false},
+		{Name: "release-notes", Description: "Draft release notes.", ModelInvocable: true},
 	}
 }
 

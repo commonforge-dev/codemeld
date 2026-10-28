@@ -343,37 +343,37 @@ func TestRenderMarkdown_BlockElements(t *testing.T) {
 		{
 			name: "bullet list",
 			src:  "- one\n- two",
-			want: "• one\n• two",
+			want: `["h:ss"]• one` + "\n" + `["h:ss"]• two`,
 		},
 		{
 			name: "ordered list numbers from one",
 			src:  "1. a\n2. b",
-			want: "1. a\n2. b",
+			want: `["h:sss"]1. a` + "\n" + `["h:sss"]2. b`,
 		},
 		{
 			name: "ordered list honors start offset",
 			src:  "3. a\n4. b",
-			want: "3. a\n4. b",
+			want: `["h:sss"]3. a` + "\n" + `["h:sss"]4. b`,
 		},
 		{
 			name: "nested list is indented",
 			src:  "- a\n  - b",
-			want: "• a\n  • b",
+			want: `["h:ss"]• a` + "\n" + `["h:ssss"]  • b`,
 		},
 		{
 			name: "inline bold inside bullet item",
 			src:  "- **x** y",
-			want: "• [::b]x[-:-:-] y",
+			want: `["h:ss"]• [::b]x[-:-:-] y`,
 		},
 		{
 			name: "blockquote prefixes every line",
 			src:  "> alpha\n> beta",
-			want: "│ alpha\n│ beta",
+			want: `["h:bs"]│ alpha` + "\n" + `["h:bs"]│ beta`,
 		},
 		{
 			name: "inline bold inside blockquote",
 			src:  "> **q**",
-			want: "│ [::b]q[-:-:-]",
+			want: `["h:bs"]│ [::b]q[-:-:-]`,
 		},
 	}
 	for _, tc := range tests {
@@ -1335,5 +1335,561 @@ func BenchmarkRenderStreamMarkdown(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = renderStreamMarkdown(src)
+	}
+}
+
+func TestRenderMarkdown_Tables(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		want     string
+		wantProj string
+	}{
+		{
+			name:     "one column",
+			src:      "| Name |\n|---|\n| alpha |\n| beta |",
+			want:     `["h:ss"]• [::b]alpha[-:-:-]` + "\n" + `["h:ss"]• [::b]beta[-:-:-]`,
+			wantProj: "• alpha\n• beta",
+		},
+		{
+			name:     "two columns",
+			src:      "| Term | Meaning |\n|---|---|\n| foo | a thing |\n| bar | `x` |",
+			want:     `["h:ss"]• [::b]foo[-:-:-]. a thing` + "\n" + `["h:ss"]• [::b]bar[-:-:-]. [#4e9a06]x[-:-:-]`,
+			wantProj: "• foo. a thing\n• bar. x",
+		},
+		{
+			name: "two columns with trailing punctuation on the visible lead",
+			src:  "| A | B |\n|---|---|\n| end. | v |\n| key: | v |\n| why? | v |\n| wow! | v |\n| **bold.** | v |",
+			want: `["h:ss"]• [::b]end.[-:-:-] v` + "\n" + `["h:ss"]• [::b]key:[-:-:-] v` + "\n" +
+				`["h:ss"]• [::b]why?[-:-:-] v` + "\n" + `["h:ss"]• [::b]wow![-:-:-] v` + "\n" + `["h:ss"]• [::b]bold.[-:-:-] v`,
+			wantProj: "• end. v\n• key: v\n• why? v\n• wow! v\n• bold. v",
+		},
+		{
+			name:     "two columns with an empty first or second cell",
+			src:      "| A | B |\n|---|---|\n|  | second |\n| first |  |",
+			want:     `["h:ss"]• second` + "\n" + `["h:ss"]• [::b]first[-:-:-]`,
+			wantProj: "• second\n• first",
+		},
+		{
+			name: "three columns with alignment markers and empty cells",
+			src:  "| Name | Type | Notes |\n|:---|:---:|---:|\n| id | int | primary |\n| x |  | n |\n|  | t |  |",
+			want: `["h:ss"]• [::b]id[-:-:-]` + "\n" + `["h:ss"]  Type: int` + "\n" + `["h:ss"]  Notes: primary` + "\n" +
+				`["h:ss"]• [::b]x[-:-:-]` + "\n" + `["h:ss"]  Notes: n` + "\n" + `["h:ss"]• ` + "\n" + `["h:ss"]  Type: t`,
+			wantProj: "• id\n  Type: int\n  Notes: primary\n• x\n  Notes: n\n• \n  Type: t",
+		},
+		{
+			name:     "three columns with an empty header",
+			src:      "| Name |  | Notes |\n|---|---|---|\n| id | int | primary |",
+			want:     `["h:ss"]• [::b]id[-:-:-]` + "\n" + `["h:ss"]  int` + "\n" + `["h:ss"]  Notes: primary`,
+			wantProj: "• id\n  int\n  Notes: primary",
+		},
+		{
+			name:     "short body rows",
+			src:      "| A | B | C |\n|---|---|---|\n| a | b |\n\n| D | E |\n|---|---|\n| d |",
+			want:     `["h:ss"]• [::b]a[-:-:-]` + "\n" + `["h:ss"]  B: b` + "\n\n" + `["h:ss"]• [::b]d[-:-:-]`,
+			wantProj: "• a\n  B: b\n\n• d",
+		},
+		{
+			name:     "excess body cells are ignored",
+			src:      "| A | B |\n|---|---|\n| a | b | c | d |",
+			want:     `["h:ss"]• [::b]a[-:-:-]. b`,
+			wantProj: "• a. b",
+		},
+		{
+			name:     "header-only table keeps its styled header cells",
+			src:      "| Alpha | **Beta** |\n|---|---|",
+			want:     `["h:ss"]• Alpha — [::b]Beta[-:-:-]`,
+			wantProj: "• Alpha — Beta",
+		},
+		{
+			name:     "header-only table skips empty header cells",
+			src:      "| A |  | C |\n|---|---|---|",
+			want:     `["h:ss"]• A — C`,
+			wantProj: "• A — C",
+		},
+		{
+			name:     "header-only table with all headers empty writes no bullet",
+			src:      "| |\n|---|\n\nnext",
+			want:     "next",
+			wantProj: "next",
+		},
+		{
+			name:     "table directly under prose",
+			src:      "Intro:\n| A | B |\n|---|---|\n| a | b |",
+			want:     "Intro:\n\n" + `["h:ss"]• [::b]a[-:-:-]. b`,
+			wantProj: "Intro:\n\n• a. b",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, proj := renderMarkdown(tc.src)
+			if got != tc.want {
+				t.Errorf("renderMarkdown(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			if proj != tc.wantProj {
+				t.Errorf("renderMarkdown(%q) projection = %q, want %q", tc.src, proj, tc.wantProj)
+			}
+		})
+	}
+}
+
+func TestRenderMarkdown_TablesInContainers(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		want     string
+		wantProj string
+	}{
+		{
+			name:     "blockquote two columns",
+			src:      "> | A | B |\n> |---|---|\n> | 1 | 2 |\n> | 3 | 4 |",
+			want:     `["h:bsss"]│ • [::b]1[-:-:-]. 2` + "\n" + `["h:bsss"]│ • [::b]3[-:-:-]. 4`,
+			wantProj: "│ • 1. 2\n│ • 3. 4",
+		},
+		{
+			name:     "blockquote three columns",
+			src:      "> | A | B | C |\n> |---|---|---|\n> | 1 | 2 | 3 |",
+			want:     `["h:bsss"]│ • [::b]1[-:-:-]` + "\n" + `["h:bsss"]│   B: 2` + "\n" + `["h:bsss"]│   C: 3`,
+			wantProj: "│ • 1\n│   B: 2\n│   C: 3",
+		},
+		{
+			name:     "blockquote header-only",
+			src:      "> | A | B |\n> |---|---|",
+			want:     `["h:bsss"]│ • A — B`,
+			wantProj: "│ • A — B",
+		},
+		{
+			name:     "unordered list item reuses its marker",
+			src:      "- | A | B |\n  |---|---|\n  | 1 | 2 |\n  | 3 | 4 |",
+			want:     `["h:ss"]• [::b]1[-:-:-]. 2` + "\n" + `["h:ss"]• [::b]3[-:-:-]. 4`,
+			wantProj: "• 1. 2\n• 3. 4",
+		},
+		{
+			name:     "ordered list item reuses its marker for the first row only",
+			src:      "1. | A | B |\n   |---|---|\n   | 1 | 2 |\n   | 3 | 4 |",
+			want:     `["h:sss"]1. [::b]1[-:-:-]. 2` + "\n" + `["h:ss"]• [::b]3[-:-:-]. 4`,
+			wantProj: "1. 1. 2\n• 3. 4",
+		},
+		{
+			name:     "ordered list item three columns",
+			src:      "1. | A | B | C |\n   |---|---|---|\n   | 1 | 2 | 3 |",
+			want:     `["h:sss"]1. [::b]1[-:-:-]` + "\n" + `["h:ss"]  B: 2` + "\n" + `["h:ss"]  C: 3`,
+			wantProj: "1. 1\n  B: 2\n  C: 3",
+		},
+		{
+			name:     "list item inside blockquote",
+			src:      "> - | A | B |\n>   |---|---|\n>   | 1 | 2 |\n>   | 3 | 4 |",
+			want:     `["h:bsss"]│ • [::b]1[-:-:-]. 2` + "\n" + `["h:bsss"]│ • [::b]3[-:-:-]. 4`,
+			wantProj: "│ • 1. 2\n│ • 3. 4",
+		},
+		{
+			name:     "list item header-only",
+			src:      "- | A | B |\n  |---|---|",
+			want:     `["h:ss"]• A — B`,
+			wantProj: "• A — B",
+		},
+		{
+			name:     "list item with an all-empty header-only table",
+			src:      "- | |\n  |---|\n- next",
+			want:     `["h:ss"]• ` + "\n" + `["h:ss"]• next`,
+			wantProj: "• \n• next",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, proj := renderMarkdown(tc.src)
+			if got != tc.want {
+				t.Errorf("renderMarkdown(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			if proj != tc.wantProj {
+				t.Errorf("renderMarkdown(%q) projection = %q, want %q", tc.src, proj, tc.wantProj)
+			}
+		})
+	}
+}
+
+func TestTranscript_HeaderOnlyTableSurvivesSealing(t *testing.T) {
+	const src = "| Alpha | **Beta** |\n|---|---|"
+	const visible = "• Alpha — Beta"
+	for name, seal := range map[string]func(*transcript){
+		"finalize":        (*transcript).finalize,
+		"markInterrupted": (*transcript).markInterrupted,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr := newTranscript()
+			tr.appendDelta(src)
+			seal(tr)
+
+			if got := tr.view.GetText(true); !strings.HasPrefix(got, visible) {
+				t.Fatalf("GetText(true) = %q, want it to start with %q", got, visible)
+			}
+			if got := responseRegions(tr.controls.all); len(got) != 1 || got[0].payload != visible {
+				t.Fatalf("response regions = %+v, want one carrying %q", got, visible)
+			}
+		})
+	}
+}
+
+func TestTranscript_TableRendersWithoutSyntaxDelimiters(t *testing.T) {
+	const src = "| Cmd | Effect |\n|:---|---:|\n| `a \\| b` | x-y |\n| c | --- |"
+	const visible = "• a | b. x-y\n• c. ---"
+
+	if got, _, proj := renderMarkdown(src); got != `["h:ss"]• [#4e9a06::b]a | b[-:-:-]. x-y`+"\n"+`["h:ss"]• [::b]c[-:-:-]. ---` || proj != visible {
+		t.Fatalf("renderMarkdown(%q) = %q, projection %q", src, got, proj)
+	}
+
+	t.Run("sealed", func(t *testing.T) {
+		tr := newTranscript()
+		tr.appendDelta(src)
+		tr.finalize()
+		if got, want := tr.view.GetText(true), visible+visibleResponseLine; got != want {
+			t.Fatalf("GetText(true) = %q, want %q", got, want)
+		}
+		if got := responseRegions(tr.controls.all); len(got) != 1 || got[0].payload != visible {
+			t.Fatalf("response regions = %+v, want one carrying %q", got, visible)
+		}
+	})
+	t.Run("completed streaming block", func(t *testing.T) {
+		tr := newTranscript()
+		tr.appendDelta(src + "\n\nmore")
+		if got, want := tr.view.GetText(true), visible+"\n\nmore"; got != want {
+			t.Fatalf("GetText(true) = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestTranscript_TableCellsAndLabelsRenderLiterally(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		want    string
+		visible string
+	}{
+		{
+			name:    "cells carrying a tview tag and a split link",
+			src:     "| Name | Value |\n|---|---|\n| [red] | see [blue](x and [red] |",
+			want:    `["h:ss"]• [::b]` + tview.Escape("[red]") + "[-:-:-]. " + tview.Escape("see [blue](x and [red]"),
+			visible: "• [red]. see [blue](x and [red]",
+		},
+		{
+			name: "header labels with a tview tag, inline code and bold",
+			src:  "| Name | [red] | `code` | **bold** |\n|---|---|---|---|\n| n | v1 | v2 | v3 |",
+			want: `["h:ss"]• [::b]n[-:-:-]` + "\n" + `["h:ss"]  ` + tview.Escape("[red]: v1") + "\n" +
+				`["h:ss"]  code: v2` + "\n" + `["h:ss"]  bold: v3`,
+			visible: "• n\n  [red]: v1\n  code: v2\n  bold: v3",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, _, proj := renderMarkdown(tc.src); got != tc.want || proj != tc.visible {
+				t.Fatalf("renderMarkdown(%q) = %q, projection %q; want %q, %q", tc.src, got, proj, tc.want, tc.visible)
+			}
+			tr := newTranscript()
+			tr.appendDelta(tc.src)
+			tr.finalize()
+			if got, want := tr.view.GetText(true), tc.visible+visibleResponseLine; got != want {
+				t.Fatalf("GetText(true) = %q, want %q", got, want)
+			}
+			if got := responseRegions(tr.controls.all); len(got) != 1 || got[0].payload != tc.visible {
+				t.Fatalf("response regions = %+v, want one carrying %q", got, tc.visible)
+			}
+		})
+	}
+}
+
+func TestTranscript_StreamedTable(t *testing.T) {
+	deltas := []string{"Intro\n\n", "| Name | Value |\n", "|---|---|\n", "| [re", "d] | [x](", "y |\n", "| b | c |"}
+	full := strings.Join(deltas, "")
+	stream := func(t *testing.T) *transcript {
+		t.Helper()
+		tr := newTranscript()
+		for i, d := range deltas {
+			tr.appendDelta(d)
+			if i < 2 {
+				continue
+			}
+			if got, want := tr.view.GetText(true), strings.Join(deltas[:i+1], ""); got != want {
+				t.Fatalf("after delta %d GetText(true) = %q, want the raw tail literal %q", i, got, want)
+			}
+		}
+		return tr
+	}
+
+	t.Run("finalize without a trailing blank line", func(t *testing.T) {
+		tr := stream(t)
+		tr.finalize()
+		rendered, _, _ := renderMarkdown(full)
+		if got, want := tr.view.GetText(false), rendered+rawResponseLine; got != want {
+			t.Fatalf("GetText(false) = %q, want %q", got, want)
+		}
+		if got, want := tr.view.GetText(true), "Intro\n\n• [red]. [x](y\n• b. c"+visibleResponseLine; got != want {
+			t.Fatalf("GetText(true) = %q, want %q", got, want)
+		}
+	})
+	t.Run("block boundary then markInterrupted", func(t *testing.T) {
+		tr := stream(t)
+		tr.appendDelta("\n\nmore")
+		if got, want := tr.view.GetText(true), "Intro\n\n• [red]. [x](y\n• b. c\n\nmore"; got != want {
+			t.Fatalf("GetText(true) = %q, want %q", got, want)
+		}
+		tr.markInterrupted()
+		rendered, _, _ := renderMarkdown(full + "\n\nmore")
+		if got, want := tr.view.GetText(false), rendered+tview.Escape(streamInterruptedMarker)+rawResponseLine; got != want {
+			t.Fatalf("GetText(false) = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestRenderMarkdown_PipeProseIsNotATable(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		want     string
+		wantProj string
+	}{
+		{name: "inline pipe", src: "a | b", want: "a | b", wantProj: "a | b"},
+		{name: "pipe lines without a delimiter row", src: "a | b\nc | d", want: "a | b\nc | d", wantProj: "a | b\nc | d"},
+		{name: "pipe line above a setext underline", src: "x | y\n---", want: "[::b]x | y[-:-:-]", wantProj: "x | y"},
+		{name: "inline code holding a pipe", src: "use `a | b` here", want: "use [#4e9a06]a | b[-:-:-] here", wantProj: "use a | b here"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, proj := renderMarkdown(tc.src)
+			if got != tc.want || proj != tc.wantProj {
+				t.Fatalf("renderMarkdown(%q) = %q, projection %q; want %q, %q", tc.src, got, proj, tc.want, tc.wantProj)
+			}
+		})
+	}
+}
+
+const hangWords = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau"
+
+func TestRenderMarkdown_HangTagFollowsTheEmittedPrefix(t *testing.T) {
+	tests := []struct {
+		name, src, want, wantProj string
+	}{
+		{"ordered marker width", "10. x", `["h:ssss"]10. x`, "10. x"},
+		{"nested quotes", "> > a\n> > b", `["h:bs"]│ a` + "\n" + `["h:bsbs"]│ │ b`, "│ a\n│ │ b"},
+		{"list inside a quote", "> - a\n>   b", `["h:bsss"]│ • a` + "\n" + `["h:bs"]│ b`, "│ • a\n│ b"},
+		{"quote inside a list keeps the first row barless", "- > q\n  > r", `["h:ss"]• q` + "\n" + `["h:bs"]│ r`, "• q\n│ r"},
+		{"unprefixed soft break gets no tag", "- a\n  b", `["h:ss"]• a` + "\nb", "• a\nb"},
+		{"hard break in a nested item", "- x\n  - a\\\n    b", `["h:ss"]• x` + "\n" + `["h:ssss"]  • a` + "\n" + `["h:ss"]  b`, "• x\n  • a\n  b"},
+		{"table inside a quoted list", "> - | A | B | C |\n>   |---|---|---|\n>   | 1 | 2 | 3 |",
+			`["h:bsss"]│ • [::b]1[-:-:-]` + "\n" + `["h:bsss"]│   B: 2` + "\n" + `["h:bsss"]│   C: 3`, "│ • 1\n│   B: 2\n│   C: 3"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, _, proj := renderMarkdown(tc.src); got != tc.want || proj != tc.wantProj {
+				t.Fatalf("renderMarkdown(%q) = %q, projection %q; want %q, %q", tc.src, got, proj, tc.want, tc.wantProj)
+			}
+		})
+	}
+}
+
+func TestRenderMarkdown_HangTagSkipsHeadingsCodeAndControls(t *testing.T) {
+	for _, src := range []string{
+		"- # Title " + hangWords,
+		"> # Title " + hangWords,
+		"- ```sh\n  " + hangWords + "\n  ```",
+		"> ```\n> " + hangWords + "\n> ```",
+		">     " + hangWords,
+		"plain " + hangWords + "\nsoft " + hangWords,
+	} {
+		if got, _, _ := renderMarkdown(src); strings.Contains(got, `["h:`) {
+			t.Errorf("renderMarkdown(%q) = %q, want no hanging-indent tag", src, got)
+		}
+	}
+}
+
+func TestTranscript_WrappedReplyLinesHangUnderTheirText(t *testing.T) {
+	tests := []struct {
+		name  string
+		src   string
+		width int
+		want  []string
+	}{
+		{"bullet at 40", "- " + hangWords, 40, []string{
+			"• alpha beta gamma delta epsilon zeta",
+			"  eta theta iota kappa lambda mu nu xi",
+			"  omicron pi rho sigma tau",
+		}},
+		{"bullet at 80", "- " + hangWords + " " + hangWords, 80, []string{
+			"• alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi",
+			"  omicron pi rho sigma tau alpha beta gamma delta epsilon zeta eta theta iota",
+			"  kappa lambda mu nu xi omicron pi rho sigma tau",
+		}},
+		{"ordered at 40", "10. " + hangWords, 40, []string{
+			"10. alpha beta gamma delta epsilon zeta",
+			"    eta theta iota kappa lambda mu nu",
+			"    xi omicron pi rho sigma tau",
+		}},
+		{"ordered at 80", "10. " + hangWords + " " + hangWords, 80, []string{
+			"10. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi",
+			"    omicron pi rho sigma tau alpha beta gamma delta epsilon zeta eta theta iota",
+			"    kappa lambda mu nu xi omicron pi rho sigma tau",
+		}},
+		{"nested at 40", "- top\n  - " + hangWords, 40, []string{
+			"• top",
+			"  • alpha beta gamma delta epsilon zeta",
+			"    eta theta iota kappa lambda mu nu",
+			"    xi omicron pi rho sigma tau",
+		}},
+		{"nested at 80", "- top\n  - " + hangWords + " " + hangWords, 80, []string{
+			"• top",
+			"  • alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi",
+			"    omicron pi rho sigma tau alpha beta gamma delta epsilon zeta eta theta iota",
+			"    kappa lambda mu nu xi omicron pi rho sigma tau",
+		}},
+		{"nested quotes", "> " + hangWords + "\n> > " + hangWords, 40, []string{
+			"│ alpha beta gamma delta epsilon zeta",
+			"│ eta theta iota kappa lambda mu nu xi",
+			"│ omicron pi rho sigma tau",
+			"│ │ alpha beta gamma delta epsilon zeta",
+			"│ │ eta theta iota kappa lambda mu nu",
+			"│ │ xi omicron pi rho sigma tau",
+		}},
+		{"list inside a quote", "> - " + hangWords, 40, []string{
+			"│ • alpha beta gamma delta epsilon zeta",
+			"│   eta theta iota kappa lambda mu nu",
+			"│   xi omicron pi rho sigma tau",
+		}},
+		{"quote inside a list", "- > " + hangWords + "\n  > " + hangWords, 40, []string{
+			"• alpha beta gamma delta epsilon zeta",
+			"  eta theta iota kappa lambda mu nu xi",
+			"  omicron pi rho sigma tau",
+			"│ alpha beta gamma delta epsilon zeta",
+			"│ eta theta iota kappa lambda mu nu xi",
+			"│ omicron pi rho sigma tau",
+		}},
+		{"table bullets and header lines", "| Name | Notes | More |\n|---|---|---|\n| " + hangWords + " | " + hangWords + " | x |", 40, []string{
+			"• alpha beta gamma delta epsilon zeta",
+			"  eta theta iota kappa lambda mu nu xi",
+			"  omicron pi rho sigma tau",
+			"  Notes: alpha beta gamma delta epsilon",
+			"  zeta eta theta iota kappa lambda mu",
+			"  nu xi omicron pi rho sigma tau",
+			"  More: x",
+		}},
+		{"two-column table inside a list", "- | A | B |\n  |---|---|\n  | a | " + hangWords + " |", 40, []string{
+			"• a. alpha beta gamma delta epsilon",
+			"  zeta eta theta iota kappa lambda mu",
+			"  nu xi omicron pi rho sigma tau",
+		}},
+		{"header line inside a quote", "> | A | B | C |\n> |---|---|---|\n> | a | " + hangWords + " | c |", 40, []string{
+			"│ • a",
+			"│   B: alpha beta gamma delta epsilon",
+			"│   zeta eta theta iota kappa lambda mu",
+			"│   nu xi omicron pi rho sigma tau",
+			"│   C: c",
+		}},
+		{"soft and hard breaks", "- top\n  - one\n    " + hangWords + "\\\n    " + hangWords, 40, []string{
+			"• top",
+			"  • one",
+			"  alpha beta gamma delta epsilon zeta",
+			"  eta theta iota kappa lambda mu nu xi",
+			"  omicron pi rho sigma tau",
+			"  alpha beta gamma delta epsilon zeta",
+			"  eta theta iota kappa lambda mu nu xi",
+			"  omicron pi rho sigma tau",
+		}},
+		{"unprefixed soft break wraps flush left", "- one\n  " + hangWords, 40, []string{
+			"• one",
+			"alpha beta gamma delta epsilon zeta eta",
+			"theta iota kappa lambda mu nu xi",
+			"omicron pi rho sigma tau",
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := paneRows(t, finalizedReply(tc.src), tc.width, 30)
+			want := append(tc.want, "  [Copy response]")
+			if strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("rows at width %d:\n%s\nwant:\n%s", tc.width, strings.Join(got, "\n"), strings.Join(want, "\n"))
+			}
+		})
+	}
+}
+
+func TestTranscript_HangMetadataStaysOutOfVisibleText(t *testing.T) {
+	const src = "- " + hangWords + "\n  - nested " + hangWords + "\n\n> quoted " + hangWords + "\n\n| A | B |\n|---|---|\n| a | " + hangWords + " |"
+	const visible = "• " + hangWords + "\n  • nested " + hangWords + "\n\n│ quoted " + hangWords + "\n\n• a. " + hangWords
+	a := finalizedReply(src)
+	for _, width := range []int{20, 40, 80} {
+		drawTranscriptPane(t, a, width, 30)
+		if got := a.transcript.view.GetText(true); got != visible+visibleResponseLine {
+			t.Fatalf("GetText(true) at width %d = %q, want %q", width, got, visible+visibleResponseLine)
+		}
+	}
+	if _, _, proj := renderMarkdown(src); proj != visible {
+		t.Fatalf("projection = %q, want %q", proj, visible)
+	}
+	if got := responseRegions(a.transcript.controls.all); len(got) != 1 || got[0].payload != visible {
+		t.Fatalf("response regions = %+v, want one carrying %q", got, visible)
+	}
+}
+
+func TestTranscript_ForgedHangMetadataStaysLiteral(t *testing.T) {
+	const forged = `["h:ssssssss"]`
+	tests := []struct {
+		name, src, visible string
+		want               []string
+	}{
+		{"paragraph", forged + hangWords, forged + hangWords, []string{
+			`["h:ssssssss"]alpha beta gamma delta`,
+			"epsilon zeta eta theta iota kappa",
+			"lambda mu nu xi omicron pi rho sigma tau",
+		}},
+		{"list item", "- " + forged + hangWords, "• " + forged + hangWords, []string{
+			`• ["h:ssssssss"]alpha beta gamma delta`,
+			"  epsilon zeta eta theta iota kappa",
+			"  lambda mu nu xi omicron pi rho sigma",
+			"  tau",
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := finalizedReply(tc.src)
+			got := paneRows(t, a, 40, 20)
+			want := append(tc.want, "  [Copy response]")
+			if strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+			}
+			if got := a.transcript.view.GetText(true); got != tc.visible+visibleResponseLine {
+				t.Fatalf("GetText(true) = %q, want %q", got, tc.visible+visibleResponseLine)
+			}
+		})
+	}
+}
+
+func TestTranscript_HangingWrapLeavesOtherBlocksUnchanged(t *testing.T) {
+	const code = "go test -run TestSomethingLong ./internal/..."
+	tests := []struct {
+		name, src string
+		bodies    []string
+	}{
+		{"paragraph and heading", "# Heading " + hangWords + "\n\n" + hangWords + "\nsoft " + hangWords, nil},
+		{"heading in a list and a quote", "- # " + hangWords + "\n\n> ## " + hangWords, nil},
+		{"fence sharing the list-marker row", "- ```sh\n  " + code + "\n  ```", []string{code + "\n"}},
+		{"fence inside a quote", "> ```\n> " + code + "\n> " + code + "\n> ```", []string{code + "\n" + code + "\n"}},
+		{"fence inside a quoted list", "> - x\n>\n>   ```\n>   " + code + "\n>   ```", []string{code + "\n"}},
+		{"indented code inside a quote", ">     " + code, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := finalizedReply(tc.src)
+			for _, width := range []int{12, 40} {
+				drawTranscriptPane(t, a, width, 30)
+				if raw := a.transcript.view.GetText(false); a.transcript.view.paintText != raw {
+					t.Fatalf("paint text at width %d = %q, want the unwrapped text %q", width, a.transcript.view.paintText, raw)
+				}
+			}
+			var bodies []string
+			for _, r := range codeRegions(a.transcript.controls.all) {
+				bodies = append(bodies, r.payload)
+			}
+			if fmt.Sprint(bodies) != fmt.Sprint(tc.bodies) {
+				t.Fatalf("copy payloads = %q, want %q", bodies, tc.bodies)
+			}
+		})
 	}
 }

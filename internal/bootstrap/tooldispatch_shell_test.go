@@ -3,12 +3,18 @@ package bootstrap
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,7 +22,9 @@ import (
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/permissions"
+	"codemeld.dev/codemeld/internal/provider"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
@@ -838,16 +846,16 @@ func TestProductionDispatcher_SwitchWhileThePromptIsOpenKeepsTheCapturedMode(t *
 			h := newPinShellHarness(t, active, func(tui.PromptRequest) tui.PromptDecision {
 				active.ApplyUserCommand(mode.Build)
 				return tui.PromptDecision{Option: tui.OptionAllowOnce}
-			}, "rm")
+			}, "git")
 			h.inner.exitCode = exitCode
-			h.inner.stderr = []byte("rm: denied\n")
+			h.inner.stderr = []byte("git: denied\n")
 
-			res, err := h.d.Dispatch(context.Background(), bashCall("c1", "rm -f out.txt"))
+			res, err := h.d.Dispatch(context.Background(), bashCall("c1", "git rebase main"))
 			if err != nil {
 				t.Fatalf("Dispatch: %v", err)
 			}
-			if len(*h.shown) != 1 || (*h.shown)[0].ExceptionalAuthority != "file deletion" {
-				t.Fatalf("prompts = %+v, want the one exceptional Auto deletion prompt and no reauthorization", *h.shown)
+			if len(*h.shown) != 1 || (*h.shown)[0].ExceptionalAuthority != "VCS history rewrite" {
+				t.Fatalf("prompts = %+v, want the one exceptional Auto history-rewrite prompt and no reauthorization", *h.shown)
 			}
 			if live, _ := active.Current(); live != mode.Build {
 				t.Fatalf("live mode = %q, want the switch made while the prompt was open", live)
@@ -866,4 +874,397 @@ func TestProductionDispatcher_SwitchWhileThePromptIsOpenKeepsTheCapturedMode(t *
 			}
 		})
 	}
+}
+
+func bashCallWithTimeout(id, command string, timeout any) turn.AssembledToolCall {
+	raw, _ := json.Marshal(map[string]any{"command": command, "timeout": timeout})
+	return turn.AssembledToolCall{ID: id, Name: "bash", Arguments: string(raw)}
+}
+
+func TestDecodeBashCommand_Timeout(t *testing.T) {
+	for _, tc := range []struct {
+		args string
+		want time.Duration
+	}{
+		{`{"command":"ls"}`, 10 * time.Minute},
+		{`{"command":"ls","timeout":1}`, time.Millisecond},
+		{`{"command":"ls","timeout":250}`, 250 * time.Millisecond},
+		{`{"command":"ls","timeout":1800000}`, 30 * time.Minute},
+	} {
+		command, got, err := decodeBashCommand(tc.args)
+		if err != nil || command != "ls" || got != tc.want {
+			t.Errorf("decodeBashCommand(%s) = %q, %v, %v; want ls, %v", tc.args, command, got, err, tc.want)
+		}
+	}
+	for _, timeout := range []string{"0", "-1", "1.5", `"1000"`, "null", "1800001"} {
+		t.Run(timeout, func(t *testing.T) {
+			run := &fakeDispatchRunner{}
+			auth := &recordingAuthorizer{decision: allow()}
+			d := dispatcherFor(t, tools.NewRegistry(), run, auth)
+			res, err := d.Dispatch(context.Background(), turn.AssembledToolCall{ID: "c1", Name: "bash", Arguments: `{"command":"ls","timeout":` + timeout + `}`})
+			if err != nil || !strings.Contains(res.Content, `"timeout"`) {
+				t.Fatalf("Dispatch = %q, %v; want an in-band timeout argument error", res.Content, err)
+			}
+			if auth.callCount() != 0 || run.callCount() != 0 {
+				t.Fatalf("authorizer/runner calls = %d/%d, want 0/0", auth.callCount(), run.callCount())
+			}
+		})
+	}
+}
+
+func timeoutScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "script.sh")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func scriptPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+				t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+				return pid
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no pid written to %s", path)
+	return 0
+}
+
+func waitProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d is still alive after the timed-out call returned", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func realRunnerDispatcher(t *testing.T) (*productionToolDispatcher, *sessions.Store) {
+	t.Helper()
+	store := mkStore(t)
+	return newProductionToolDispatcher(tools.NewRegistry(), cmdrunner.DirectExecRunner{}, &recordingAuthorizer{decision: allow()}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, 65536, securitystate.Policy{}), store
+}
+
+func wantOneTimeoutNote(t *testing.T, content string, limit time.Duration) {
+	t.Helper()
+	note := bashTimeoutNote(limit)
+	if strings.Count(content, "timed out after") != 1 || !strings.Contains(content, note+"\nexit status -1") {
+		t.Fatalf("content = %q, want one %q note followed by exit status -1", content, note)
+	}
+}
+
+func TestProductionDispatcher_BashTimeoutReturnsPartialOutputAndKillsTheChild(t *testing.T) {
+	d, store := realRunnerDispatcher(t)
+	pidFile := filepath.Join(t.TempDir(), "child")
+	script := timeoutScript(t, "printf 'printed\\n'\nsleep 30 &\necho $! > \"$1\"\nsleep 30\n")
+	began := time.Now()
+	res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "sh "+script+" "+pidFile, 500))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want a timed-out tool result", err)
+	}
+	if elapsed := time.Since(began); elapsed > 5*time.Second {
+		t.Fatalf("Dispatch took %v, want a return within a few seconds of the 500ms limit", elapsed)
+	}
+	if !strings.HasPrefix(res.Content, "printed\n") {
+		t.Fatalf("content = %q, want the line printed before the timeout", res.Content)
+	}
+	wantOneTimeoutNote(t, res.Content, 500*time.Millisecond)
+	waitProcessGone(t, scriptPID(t, pidFile))
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+	if len(ends) != 1 || ends[0].ExitCode != -1 {
+		t.Fatalf("tool_exec_end = %+v, want one end with exit -1", ends)
+	}
+}
+
+func TestProductionDispatcher_BashTimeoutSkipsLaterGroups(t *testing.T) {
+	d, store := realRunnerDispatcher(t)
+	res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "sleep 5 ; echo after", 300))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want a timed-out tool result", err)
+	}
+	if slices.Contains(strings.Split(res.Content, "\n"), "after") {
+		t.Fatalf("content = %q, want the group after the timeout skipped", res.Content)
+	}
+	wantOneTimeoutNote(t, res.Content, 300*time.Millisecond)
+	reloaded := reloadStore(t, store)
+	starts := decodeStoreEvents[events.ToolExecStart](t, reloaded, events.KindToolExecStart)
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloaded, events.KindToolExecEnd)
+	if len(starts) != 1 || len(ends) != 1 || starts[0].Subject != "sleep 5" {
+		t.Fatalf("tool_exec events = %+v / %+v, want one pair for sleep and none for the skipped echo", starts, ends)
+	}
+}
+
+func TestProductionDispatcher_BashTimeoutKeepsPartialPipelineOutput(t *testing.T) {
+	d, store := realRunnerDispatcher(t)
+	script := timeoutScript(t, "#!/bin/sh\nprintf 'partial\\n'\nsleep 30\n")
+	if err := os.Chmod(script, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", script+" | cat", 500))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want a timed-out tool result", err)
+	}
+	if !strings.HasPrefix(res.Content, "partial\n") {
+		t.Fatalf("content = %q, want the partial pipeline output", res.Content)
+	}
+	wantOneTimeoutNote(t, res.Content, 500*time.Millisecond)
+	reloaded := reloadStore(t, store)
+	starts := decodeStoreEvents[events.ToolExecStart](t, reloaded, events.KindToolExecStart)
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloaded, events.KindToolExecEnd)
+	if len(starts) != 2 || len(ends) != 2 {
+		t.Fatalf("tool_exec events = %d start/%d end, want one pair per stage", len(starts), len(ends))
+	}
+}
+
+type deadlinePipelineRunner struct {
+	fakeDispatchRunner
+	copyErr error
+}
+
+func (f *deadlinePipelineRunner) PreflightPipeline(context.Context, []cmdrunner.RunSpec) error {
+	return nil
+}
+
+func (f *deadlinePipelineRunner) Pipeline(ctx context.Context, specs []cmdrunner.RunSpec, _ int) ([]cmdrunner.PipelineResult, error) {
+	<-ctx.Done()
+	results := make([]cmdrunner.PipelineResult, len(specs))
+	for i, spec := range specs {
+		results[i] = cmdrunner.PipelineResult{InvocationID: spec.InvocationID, ExitCode: -1, PipelineErrCategory: cmdrunner.PipelineFailureCanceled}
+	}
+	err := fmt.Errorf("runner: pipeline canceled: %w", ctx.Err())
+	if f.copyErr != nil {
+		results[0].PipelineErrCategory = cmdrunner.PipelineFailureCopy
+		err = errors.Join(err, f.copyErr)
+	}
+	return results, err
+}
+
+func TestProductionDispatcher_BashTimeoutNeverHidesAPipelineFailure(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta")
+	copyErr := errors.New("stage 0 stdout capture: broken")
+	for _, tc := range []struct {
+		name    string
+		copyErr error
+	}{{"cancellation only", nil}, {"copier failure", copyErr}} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := mkStore(t)
+			inner := &deadlinePipelineRunner{copyErr: tc.copyErr}
+			d := newProductionToolDispatcher(tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, 65536, securitystate.Policy{})
+			res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "alpha | beta", 100))
+			if tc.copyErr != nil {
+				if !errors.Is(err, copyErr) {
+					t.Fatalf("Dispatch error = %v, want the copier failure", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Dispatch error = %v, want the deadline converted to a tool result", err)
+			}
+			wantOneTimeoutNote(t, res.Content, 100*time.Millisecond)
+			if ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd); len(ends) != 2 {
+				t.Fatalf("tool_exec_end events = %d, want one per stage", len(ends))
+			}
+		})
+	}
+}
+
+func TestProductionDispatcher_ConfinedTimeoutKeepsBothNotesWithinTheCap(t *testing.T) {
+	const cap = 512
+	limit := 100 * time.Millisecond
+	for _, size := range []int{cap, 4 * cap} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			inner := &confineInner{exitCode: -1, stderr: bytes.Repeat([]byte("e"), size), onBounded: func(cmdrunner.RunSpec) { time.Sleep(limit + 100*time.Millisecond) }}
+			d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()})
+			d.outputCap = cap
+			d.confinement = &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: programDir(t, "ls"), blocked: testBlocked(t)}
+
+			res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "ls", int(limit.Milliseconds())))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			stderr, ok := strings.CutSuffix(res.Content, "\nexit status -1")
+			if !ok || len(stderr) > cap {
+				t.Fatalf("content = %q (%d stderr bytes), want stderr within the %d-byte cap then exit status -1", res.Content, len(stderr), cap)
+			}
+			if !strings.HasSuffix(stderr, confinedFailureNote+"\n"+bashTimeoutNote(limit)) ||
+				strings.Count(stderr, confinedFailureNote) != 1 || strings.Count(stderr, "timed out after") != 1 {
+				t.Fatalf("stderr = %q, want the confinement note once, then the timeout note once", stderr)
+			}
+		})
+	}
+}
+
+func TestProductionDispatcher_IncomingCancellationIsNotATimeout(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skipf("setsid not available: %v", err)
+	}
+	script := timeoutScript(t, "printf 'started\\n'\nsetsid sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" &\nsleep 30\n")
+	for _, tc := range []struct {
+		name        string
+		ctx         func(t *testing.T) context.Context
+		stop        func(ctl *turnController)
+		wantSurface string
+	}{
+		{"user cancel", func(*testing.T) context.Context { return context.Background() }, func(ctl *turnController) { ctl.Cancel() }, "interrupted"},
+		{"turn deadline", func(t *testing.T) context.Context {
+			ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+			t.Cleanup(cancel)
+			return ctx
+		}, func(*turnController) {}, "turn_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var turns sync.WaitGroup
+			defer swapGoTurn(waitableGoTurn(&turns))()
+			pidFile := filepath.Join(t.TempDir(), "escaped")
+			args, _ := json.Marshal(map[string]string{"command": "sh " + script + " " + pidFile})
+			var round int32
+			client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+				if atomic.AddInt32(&round, 1) == 1 {
+					return provider.Response{Stream: newStream(toolCallsChunk(toolFrag(0, "call_1", "bash", string(args))))}, nil
+				}
+				return provider.Response{Stream: newStream(contentChunk("done"), finishChunk("stop"))}, nil
+			}}
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+			d, store := realRunnerDispatcher(t)
+			rec := &resultRecordingDispatcher{ToolDispatcher: d}
+			surface := &recordingSurface{}
+			ctl := newTurnController(tc.ctx(t), surface, providerCache(t, t.TempDir()),
+				turnSelection("openai", "gpt-5.5", model.EffortDefault), nil, nil)
+			ctl.setToolDispatcher(rec)
+			if err := ctl.dispatch(store, time.Time{}); err != nil {
+				t.Fatalf("dispatch error = %v", err)
+			}
+			scriptPID(t, pidFile)
+			tc.stop(ctl)
+			drained := make(chan struct{})
+			go func() { turns.Wait(); close(drained) }()
+			select {
+			case <-drained:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the turn did not end after the incoming context ended")
+			}
+
+			if len(rec.results) != 1 || rec.errs[0] != nil || rec.results[0].Content != "started\nexit status -1" {
+				t.Fatalf("bash call returned %+v / %v, want only the killed command's own output and exit status -1", rec.results, rec.errs)
+			}
+			if got := surface.outcomeList(); !slices.Equal(got, []string{tc.wantSurface}) {
+				t.Fatalf("TurnEnded outcomes = %v, want [%s]", got, tc.wantSurface)
+			}
+			reloaded := reloadStore(t, store)
+			terminals := decodeStoreEvents[events.TurnTerminal](t, reloaded, events.KindTurnTerminal)
+			if len(terminals) != 1 || terminals[0].Outcome != events.TurnOutcomeCancelled || !terminals[0].DispatchStarted {
+				t.Fatalf("turn_terminal events = %+v, want one cancelled outcome after dispatch started", terminals)
+			}
+			if msgs := messagesByRole(reloaded, "tool"); len(msgs) != 0 {
+				t.Fatalf("tool result messages = %+v, want none: the cancellation must not become a tool result", msgs)
+			}
+			if client.callCount() != 1 {
+				t.Fatalf("provider calls = %d, want 1 (no round after the cancellation)", client.callCount())
+			}
+		})
+	}
+}
+
+type resultRecordingDispatcher struct {
+	turn.ToolDispatcher
+	results []turn.ToolResult
+	errs    []error
+}
+
+func (d *resultRecordingDispatcher) Plan(calls []turn.AssembledToolCall, n int) turn.ToolPlan {
+	plan := d.ToolDispatcher.Plan(calls, n)
+	for i := range plan.Units {
+		run := plan.Units[i].Run
+		plan.Units[i].Run = func(ctx context.Context) (turn.ToolResult, error) {
+			res, err := run(ctx)
+			d.results, d.errs = append(d.results, res), append(d.errs, err)
+			return res, err
+		}
+	}
+	return plan
+}
+
+type slowAuthorizer struct{ delay time.Duration }
+
+func (a slowAuthorizer) Authorize(context.Context, permissions.MatchRequest, dispatch.PromptDisplay, permissions.ModeContext) (permissions.Decision, error) {
+	time.Sleep(a.delay)
+	return allow(), nil
+}
+
+type ctxPipelineRunner struct {
+	fakePipelineDispatchRunner
+	ctxErrs []error
+}
+
+func (f *ctxPipelineRunner) PreflightPipeline(ctx context.Context, specs []cmdrunner.RunSpec) error {
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	return f.fakePipelineDispatchRunner.PreflightPipeline(ctx, specs)
+}
+
+func (f *ctxPipelineRunner) Pipeline(ctx context.Context, specs []cmdrunner.RunSpec, maxCapture int) ([]cmdrunner.PipelineResult, error) {
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	return f.fakePipelineDispatchRunner.Pipeline(ctx, specs, maxCapture)
+}
+
+type sleepyRunner struct {
+	fakeDispatchRunner
+	delay time.Duration
+}
+
+func (r *sleepyRunner) Exec(ctx context.Context, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
+	atomic.AddInt32(&r.calls, 1)
+	select {
+	case <-time.After(r.delay):
+		return cmdrunner.RunResult{InvocationID: spec.InvocationID, Stdout: []byte("ran\n")}, nil
+	case <-ctx.Done():
+		return cmdrunner.RunResult{InvocationID: spec.InvocationID, ExitCode: -1}, nil
+	}
+}
+
+func TestProductionDispatcher_BashTimeoutStartsAfterAuthorizationAndIsShared(t *testing.T) {
+	t.Run("builtin only", func(t *testing.T) {
+		store := mkStore(t)
+		d := newProductionToolDispatcher(tools.NewRegistry(), &fakeDispatchRunner{}, slowAuthorizer{300 * time.Millisecond}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, 65536, securitystate.Policy{})
+		res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "command -v sh", 50))
+		if err != nil || strings.Contains(res.Content, "timed out") || !strings.HasSuffix(res.Content, "/sh") {
+			t.Fatalf("Dispatch = %q, %v; want the lookup answered with the limit unspent by authorization", res.Content, err)
+		}
+	})
+	t.Run("first pipeline preflight", func(t *testing.T) {
+		prependFixturePrograms(t, "alpha", "beta")
+		store := mkStore(t)
+		inner := &ctxPipelineRunner{fakePipelineDispatchRunner: fakePipelineDispatchRunner{results: []cmdrunner.PipelineResult{{}, {Stdout: []byte("piped")}}}}
+		d := newProductionToolDispatcher(tools.NewRegistry(), inner, slowAuthorizer{300 * time.Millisecond}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, 65536, securitystate.Policy{})
+		res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "alpha | beta", 100))
+		if err != nil || res.Content != "piped" {
+			t.Fatalf("Dispatch = %q, %v; want the pipeline result with no timeout", res.Content, err)
+		}
+		if !slices.Equal(inner.ctxErrs, []error{nil, nil}) {
+			t.Fatalf("preflight/pipeline context errors = %v, want a live budget at both", inner.ctxErrs)
+		}
+	})
+	t.Run("shared across stages", func(t *testing.T) {
+		prependFixturePrograms(t, "alpha", "beta")
+		store := mkStore(t)
+		run := &sleepyRunner{delay: 300 * time.Millisecond}
+		d := newProductionToolDispatcher(tools.NewRegistry(), run, &recordingAuthorizer{decision: allow()}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, 65536, securitystate.Policy{})
+		res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "alpha ; beta", 450))
+		if err != nil {
+			t.Fatalf("Dispatch: %v", err)
+		}
+		if strings.Count(res.Content, "ran") != 1 {
+			t.Fatalf("content = %q, want only the first stage finished within the shared limit", res.Content)
+		}
+		wantOneTimeoutNote(t, res.Content, 450*time.Millisecond)
+	})
 }

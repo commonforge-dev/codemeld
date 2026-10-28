@@ -42,6 +42,7 @@ import (
 	"codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/skills"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/trust"
 	"codemeld.dev/codemeld/internal/tui"
@@ -464,6 +465,32 @@ func TestStartTUI_BareEffortAndModelOpenPickerThroughInstalledSubmit(t *testing.
 	// Neither bare invocation recorded a slash_command (parity with CTRL-E/CTRL-M).
 	if cmds := slashCmds(t, store); len(cmds) != 0 {
 		t.Fatalf("bare /effort and /model recorded %+v slash_command events, want none", cmds)
+	}
+}
+
+func TestStartTUI_BareSystemOneOpensPickerWithoutRecords(t *testing.T) {
+	app, global, store := startSystemOneTUI(t, systemOneKeysSeed)
+
+	if !app.SubmitInput("/systemone") {
+		t.Fatal("installed submit rejected bare /systemone")
+	}
+	if !app.SystemOnePickerOpen() {
+		t.Fatal("bare /systemone did not open the picker; OpenPicker is not wired")
+	}
+	app.HandleEsc()
+	if app.SystemOnePickerOpen() {
+		t.Fatal("Esc did not dismiss the System One picker")
+	}
+
+	app.SubmitInput("/systemone")
+	if !app.SelectSystemOneRowForTest("venice:jev-latest") {
+		t.Fatal("picker has no venice:jev-latest row")
+	}
+	if got := systemOneOnDisk(t, global); got != "venice:jev-latest" {
+		t.Fatalf("system_one on disk = %#v, want the picker choice", got)
+	}
+	if cmds := slashCmds(t, store); len(cmds) != 0 {
+		t.Fatalf("picker open and confirm recorded %+v, want no slash_command", cmds)
 	}
 }
 
@@ -1317,9 +1344,17 @@ func runLiveApp(t *testing.T, screen tcell.Screen, drive func(app *tui.App)) fun
 		app.SetScreenFactoryForTest(func() (tcell.Screen, error) { return screen, nil })
 		errc := make(chan error, 1)
 		go func() { errc <- app.Run() }()
+		stopped := false
+		defer func() {
+			if !stopped {
+				app.Stop()
+				<-errc
+			}
+		}()
 		onEventLoop(t, app, func() {})
 		drive(app)
 		app.Stop()
+		stopped = true
 		return <-errc
 	})
 }
@@ -3088,14 +3123,18 @@ func TestAdvertisedTools_AutoEditsAdvertisesAll(t *testing.T) {
 	}
 }
 
-// Plan advertises only read-only registry tools but still
+// Plan advertises only read-only registry tools and general_agent but still
 // advertises bash and suggest_followup: bash's read/write intent is per-invocation and
 // suggest_followup is never destructive, so neither is filtered at advertise time.
 func TestAdvertisedTools_PlanFiltersToReadOnlyButKeepsBash(t *testing.T) {
-	got := toolNames(advertisedTools(advRegistry(t), mode.Plan))
-	want := []string{"bash", "suggest_followup", "vcs_status"} // vcs_commit (mutating) filtered out
+	reg := advRegistry(t)
+	if err := reg.Register(tools.BuiltinSource, advTestTool{name: "general_agent", desc: "delegate", params: map[string]any{"type": "object"}}); err != nil {
+		t.Fatalf("register general_agent: %v", err)
+	}
+	got := toolNames(advertisedTools(reg, mode.Plan))
+	want := []string{"bash", "general_agent", "suggest_followup", "vcs_status"} // vcs_commit (mutating) filtered out
 	if !slices.Equal(got, want) {
-		t.Fatalf("Plan advertised %v, want %v (read-only registry tools + bash + suggest_followup)", got, want)
+		t.Fatalf("Plan advertised %v, want %v (read-only registry tools + general_agent + bash + suggest_followup)", got, want)
 	}
 }
 
@@ -3119,31 +3158,37 @@ func TestBashToolDefinition_MatchesDispatchName(t *testing.T) {
 // TestContextState_UsesActiveSelectionAndRecords pins the /context production adapter
 // to the live run state: it reads the active provider/model from model.ActiveState and
 // the session token records from the app's active store (live, not a startup copy), so
-// BuildContextSnapshot sums the current totals and flags an anomalous turn. No provider
-// or catalog exposes a context-window size yet, so ContextWindow stays 0 (unknown).
+// BuildContextSnapshot sums the current totals and flags an anomalous turn.
 func TestContextState_UsesActiveSelectionAndRecords(t *testing.T) {
 	app := tui.New(nil)
-	cs := newContextState(app, selectedState())
+	cache, err := config.NewCache(map[string]any{"provider": map[string]any{
+		"openai": map[string]any{"base_url": "u", "api_key": "k", "context_windows": map[string]any{"gpt-5.5": uint64(128000)}},
+	}}, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	cs := newContextState(app, cache, selectedState())
 
-	// Before any store is active: selection is still readable, records are empty, and
-	// the window is unknown.
 	if p, m := cs.Selection(); p != "openai" || m != "gpt-5.5" {
 		t.Fatalf("Selection = %q/%q, want openai/gpt-5.5", p, m)
 	}
 	if recs := cs.Records(); recs != nil {
 		t.Errorf("Records with no active store = %v, want nil", recs)
 	}
-	if w := cs.ContextWindow(); w != 0 {
-		t.Errorf("ContextWindow = %d, want 0 (no window source landed)", w)
+	if w := cs.ContextWindow(); w != 128000 {
+		t.Errorf("ContextWindow = %d, want the declared 128000", w)
+	}
+	if w := newContextState(app, cache, model.NewActiveState(nil, "")).ContextWindow(); w != 0 {
+		t.Errorf("ContextWindow with no active selection = %d, want 0", w)
 	}
 
 	// Attach a live store with two completed turns, the second reporting missing usage;
 	// /context reads it live through the active store.
 	store := mkStore(t)
-	if err := model.EmitModelResponse(store, "openai", "gpt-5.5", 100, 40, nil, false, nil, ""); err != nil {
+	if err := model.EmitModelResponse(store, "openai", "gpt-5.5", 100, 40, nil, false, nil, false, nil, ""); err != nil {
 		t.Fatalf("seed model_response: %v", err)
 	}
-	if err := model.EmitModelResponse(store, "openai", "gpt-5.5", 30, 10, nil, false, []string{"usage_missing"}, ""); err != nil {
+	if err := model.EmitModelResponse(store, "openai", "gpt-5.5", 30, 10, nil, false, nil, false, []string{"usage_missing"}, ""); err != nil {
 		t.Fatalf("seed anomalous model_response: %v", err)
 	}
 	app.SetActiveStore(store)
@@ -3158,8 +3203,81 @@ func TestContextState_UsesActiveSelectionAndRecords(t *testing.T) {
 	if !snap.Incomplete {
 		t.Errorf("snapshot Incomplete = false, want true (a turn reported usage_missing)")
 	}
-	if snap.Window != 0 {
-		t.Errorf("snapshot Window = %d, want 0 (unknown)", snap.Window)
+	if snap.Window != 128000 {
+		t.Errorf("snapshot Window = %d, want 128000", snap.Window)
+	}
+}
+
+func TestContextState_WindowFromSettingsFollowsSelection(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	settingsPath := SettingsPath(home)
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settings := `provider:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    context_windows:
+      gpt-5.5: 128000
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: or-test
+    context_windows:
+      anthropic/claude-x: 200000
+`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storePath := config.DiscoveredModelsPath(settingsPath)
+	if err := config.UpdateDiscoveredModelsProvider(storePath, "openai-chatgpt", config.DiscoveredProvider{
+		Models: []config.DiscoveredModel{{ID: "gpt-chat", ContextWindow: 400000}},
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	global, err := defaultLoadGlobalSettings(home)
+	if err != nil {
+		t.Fatalf("load global settings: %v", err)
+	}
+	composition, err := defaultComposeConfig(global, project)
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	cache, err := config.NewCache(composition.Config, project, []string{settingsPath})
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	if err := os.Remove(storePath); err != nil {
+		t.Fatal(err)
+	}
+
+	active := selectedState()
+	cs := newContextState(tui.New(nil), cache, active)
+	steps := []struct {
+		provider, model string
+		want            int64
+	}{
+		{"openai", "gpt-5.5", 128000},
+		{"openrouter", "anthropic/claude-x", 200000},
+		{"openai-chatgpt", "gpt-chat", 400000},
+		{"openai", "gpt-unknown", 0},
+	}
+	for _, st := range steps {
+		active.ApplyUserSelection(model.Selection{Provider: st.provider, ID: st.model}, false)
+		if got := tui.BuildContextSnapshot(cs).Window; got != st.want {
+			t.Errorf("/context window for %s/%s = %d, want %d", st.provider, st.model, got, st.want)
+		}
+	}
+
+	active.ApplyResumeSwitch(nil, "")
+	if got := tui.BuildContextSnapshot(cs).Window; got != 0 {
+		t.Errorf("/context window with no active selection = %d, want 0", got)
+	}
+
+	active.ApplyUserSelection(model.Selection{Provider: "openai-chatgpt", ID: "gpt-chat"}, false)
+	cache.ReloadDiscoveredCatalog()
+	if got := cs.ContextWindow(); got != 0 {
+		t.Errorf("after explicit reload of the removed store ContextWindow = %d, want 0", got)
 	}
 }
 
@@ -4646,6 +4764,67 @@ func TestStartTUI_BigBlockedPathsEntryWarnsAfterTheBanner(t *testing.T) {
 	}
 }
 
+func TestStartTUI_SkippedSkillsWarnAfterTheBannerOnEveryStart(t *testing.T) {
+	for _, resumed := range []bool{false, true} {
+		for start := range 2 {
+			t.Run(fmt.Sprintf("resumed=%v/start=%d", resumed, start), func(t *testing.T) {
+				var ran *tui.App
+				defer swapRunApp(func(a *tui.App) error { ran = a; return nil })()
+				var turns sync.WaitGroup
+				defer swapGoTurn(waitableGoTurn(&turns))()
+				var system string
+				client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+					if !isTitleRequest(req) && len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+						system = req.Messages[0].Content
+					}
+					return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+				}}
+				defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+				home, project := t.TempDir(), t.TempDir()
+				warnings := seedStartupSkills(t, home, project)
+				seedOpenAIDiscovered(t, SettingsPath(home), "gpt-5.5")
+				store := mkStore(t)
+				if resumed {
+					store = resumeStoreWithHistory(t)
+				}
+				result := &BootstrapResult{
+					Home:             home,
+					LaunchDir:        "/launch",
+					ProjectRoot:      project,
+					Session:          store,
+					ResumeReplay:     resumed,
+					Model:            model.NewActiveState(&model.Selection{Provider: "openai", ID: "gpt-5.5", Effort: model.EffortDefault}, model.SourceProject),
+					Mode:             mode.NewActiveState(mode.Build, mode.SourceDefault),
+					Config:           headlessProviderConfig(),
+					ConfigLayerPaths: []string{SettingsPath(home)},
+				}
+				if err := StartTUI(context.Background(), result, io.Discard); err != nil || ran == nil {
+					t.Fatalf("StartTUI error = %v, event loop ran = %v; want a launch", err, ran != nil)
+				}
+				if got := ran.TranscriptText(); !bannerHasHead(got, "openai · gpt-5.5", "/launch", codemeldVersion) {
+					t.Fatalf("transcript does not start with the launch banner\n--- got ---\n%s", got)
+				}
+				if !ran.SubmitInput("hello") {
+					t.Fatal("wired submit rejected a plain prompt")
+				}
+				turns.Wait()
+
+				lines := strings.Split(ran.TranscriptText(), "\n")
+				for _, w := range warnings {
+					if n := slices.Index(lines, w); n <= 0 || slices.Index(lines[n+1:], w) >= 0 {
+						t.Fatalf("transcript has warning line %q at %d (want once, after the banner)\n--- got ---\n%s", w, n, strings.Join(lines, "\n"))
+					}
+				}
+				if got := len(result.Skills.Skipped); got != len(warnings) {
+					t.Fatalf("run record holds %d skipped skills, want %d", got, len(warnings))
+				}
+				assertStartupSkillsPrompt(t, system)
+			})
+		}
+	}
+}
+
 const (
 	toolLessModelID = "tencent/hy-mt2-30b-a3b"
 	toolfulModelID  = "openai/gpt-5.5"
@@ -5651,6 +5830,8 @@ func TestStartTUI_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 	t.Cleanup(func() { newVCSActionRunner = prev })
 	launchPath := t.TempDir()
 	t.Setenv("PATH", launchPath)
+	t.Setenv("MISE_DATA_DIR", "/launch/mise")
+	t.Setenv("GITHUB_TOKEN", "launch-secret")
 
 	var turns sync.WaitGroup
 	defer swapGoTurn(waitableGoTurn(&turns))()
@@ -5689,6 +5870,11 @@ func TestStartTUI_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 	if conf.blocked == nil || conf.blocked != d.guard.Blocked {
 		t.Fatalf("blocked = %p, want the launch guard's %p", conf.blocked, d.guard.Blocked)
 	}
+	if !slices.Contains(conf.inherited, "MISE_DATA_DIR=/launch/mise") || slices.ContainsFunc(conf.inherited, func(e string) bool {
+		return strings.HasPrefix(e, "GITHUB_TOKEN=")
+	}) {
+		t.Fatalf("inherited = %q, want the launch MISE_DATA_DIR and no GITHUB_TOKEN", conf.inherited)
+	}
 
 	conf.lookupPath = programDir(t, "git")
 	if _, err := d.Dispatch(context.Background(), structuredCall("c1", "vcs_status", map[string]any{})); err != nil {
@@ -5698,6 +5884,9 @@ func TestStartTUI_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 		t.Fatalf("vcs runs = %+v, want one confined run", inner.bounded)
 	}
 	got := inner.bounded[0]
+	if !slices.Contains(got.Env, "MISE_DATA_DIR=/launch/mise") {
+		t.Fatalf("vcs env = %q, want the launch snapshot's MISE_DATA_DIR", got.Env)
+	}
 	if len(got.Argv) < 3 || got.Argv[0] != "/proc/self/exe" || got.Argv[1] != enforce.HelperCommand || got.Argv[2] != filepath.Join(conf.lookupPath, "git") {
 		t.Fatalf("vcs argv = %q, want the helper prefix and git from the shared confinement's lookup path", got.Argv)
 	}
@@ -6148,32 +6337,27 @@ func TestStartTUI_BrokenSettingsFileRefusesAndRecordsUntilFixed(t *testing.T) {
 func TestStartTUI_RefusedLaunchKeepsItsReasonWhileTheSettingsFileIsBroken(t *testing.T) {
 	swapResolveExecutionCapability(t, injectedResolution)
 	result, f := settingsFileLaunch(t)
-	var stepErr error
-	defer swapRunApp(func(app *tui.App) error {
+	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
 		for _, edit := range []func(){
 			func() { rewriteSettings(t, f.global, "blocked_paths: [\n") },
 			func() { f.editGlobal(t, "a") },
 		} {
 			edit()
-			app.SubmitInput("/blocked")
-			app.SubmitInput("/status")
-			if got := app.StatusLineText(); !strings.HasSuffix(strings.TrimSpace(got), "sandbox: unavailable") {
-				stepErr = fmt.Errorf("status line = %q, want the sandbox: unavailable pill", got)
-				return nil
-			}
-			if overlay := app.StatusText(); !strings.Contains(overlay, "\n"+injectedSandboxLine+"\n") {
-				stepErr = fmt.Errorf("/status lost the launch reason\n--- overlay ---\n%s", overlay)
-				return nil
+			submitOnEventLoop(t, app, "/blocked")
+			waitForStatusLine(t, app, "sandbox: unavailable")
+			var overlay string
+			onEventLoop(t, app, func() {
+				app.SubmitInput("/status")
+				overlay = app.StatusText()
+			})
+			if !strings.Contains(overlay, "\n"+injectedSandboxLine+"\n") {
+				t.Fatalf("/status lost the launch reason\n--- overlay ---\n%s", overlay)
 			}
 		}
-		return nil
 	})()
 
 	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
 		t.Fatalf("StartTUI error: %v", err)
-	}
-	if stepErr != nil {
-		t.Fatal(stepErr)
 	}
 	requireDiskCapabilities(t, result.Session, injectedCapability)
 }
@@ -6183,17 +6367,20 @@ func TestStartTUI_SettingsFileBrokenBeforeTheFirstRecordStartsRefused(t *testing
 	result, f := settingsFileLaunch(t)
 	rewriteSettings(t, f.global, "blocked_paths: [\n")
 
-	app, restore := startCaptured(t, context.Background(), result, io.Discard)
-	defer restore()
+	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
+		waitForStatusLine(t, app, "sandbox: unavailable")
+		submitOnEventLoop(t, app, "/status")
+		var overlay string
+		onEventLoop(t, app, func() { overlay = app.StatusText() })
+		if !strings.Contains(overlay, "\n"+brokenSandboxLine+"\n") {
+			t.Fatalf("/status is missing the refusal\n--- overlay ---\n%s", overlay)
+		}
+	})()
 
+	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
 	requireDiskCapabilities(t, result.Session, brokenCapability)
-	if got := app.StatusLineText(); !strings.HasSuffix(strings.TrimSpace(got), "sandbox: unavailable") {
-		t.Fatalf("status line = %q, want the sandbox: unavailable pill", got)
-	}
-	app.SubmitInput("/status")
-	if overlay := app.StatusText(); !strings.Contains(overlay, "\n"+brokenSandboxLine+"\n") {
-		t.Fatalf("/status is missing the refusal\n--- overlay ---\n%s", overlay)
-	}
 }
 
 func TestStartTUI_SessionStaysOwnedUntilTheDeliveryWorkerRecords(t *testing.T) {
@@ -6775,5 +6962,474 @@ func TestStartTUI_ConstrainedLaunchAsksNoTempQuestionAndGrantsOnlyThePrivateFold
 				t.Fatalf("global settings = %q, want %q unchanged", got, tc.saved)
 			}
 		})
+	}
+}
+
+func windowResult(t *testing.T, store *sessions.Store) *BootstrapResult {
+	t.Helper()
+	result := titleResult(t, store, t.TempDir())
+	result.Config["provider"].(map[string]any)["openai"].(map[string]any)["context_windows"] = map[string]any{"gpt-5.5": 1000}
+	return result
+}
+
+func noticeOnEventLoop(t *testing.T, app *tui.App) string {
+	t.Helper()
+	var notice string
+	onEventLoop(t, app, func() { notice = app.NoticeText() })
+	return notice
+}
+
+func TestContextWindowNotice_OncePerSessionID(t *testing.T) {
+	cache := windowCache(t, map[string]any{"gpt-5.5": 1000, "gpt-small": 1000})
+	app := tui.New(nil)
+	observe := newContextWindowNotice(app, cache)
+	near := func(modelID string) events.ModelResponse {
+		return events.ModelResponse{Provider: "openai", ModelID: modelID, InputTokens: 950}
+	}
+	want := func(modelID string) string {
+		return "openai/" + modelID + ": 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900. This is not one request's size. If individual requests approach the limit, check the server/model limit and match `context_windows`; the declaration does not raise capacity. For Ollama, check `OLLAMA_CONTEXT_LENGTH` or model `num_ctx`."
+	}
+	session := func(id string) *sessions.Store {
+		store := storeAt(t, filepath.Join(t.TempDir(), "session.json"), id, "/proj")
+		app.SetActiveStore(store)
+		app.ClearNotice()
+		return store
+	}
+	steps := []struct {
+		name    string
+		id      string
+		modelID string
+		want    string
+	}{
+		{"first warning", "01890000-0000-7000-8000-00000000a001", "gpt-5.5", want("gpt-5.5")},
+		{"repeat turn", "01890000-0000-7000-8000-00000000a001", "gpt-5.5", ""},
+		{"model switch", "01890000-0000-7000-8000-00000000a001", "gpt-small", ""},
+		{"fork ID", "01890000-0000-7000-8000-00000000a002", "gpt-5.5", want("gpt-5.5")},
+		{"another session", "01890000-0000-7000-8000-00000000a003", "gpt-small", want("gpt-small")},
+		{"return to a warned session", "01890000-0000-7000-8000-00000000a001", "gpt-5.5", ""},
+	}
+	for _, st := range steps {
+		store := session(st.id)
+		observe(store.SessionID(), near(st.modelID))
+		if got := app.NoticeText(); got != st.want {
+			t.Fatalf("%s: notice = %q, want %q", st.name, got, st.want)
+		}
+	}
+}
+
+func TestStartTUI_ContextWindowNoticeIsTransientAndOncePerSession(t *testing.T) {
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return usageReply(950, 1) })()
+
+	store := titledStore(t)
+	want := "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900. This is not one request's size. If individual requests approach the limit, check the server/model limit and match `context_windows`; the declaration does not raise capacity. For Ollama, check `OLLAMA_CONTEXT_LENGTH` or model `num_ctx`."
+	var first, afterSubmit, repeat, afterClear string
+	var cleared *sessions.Store
+	var transcript string
+	turn := func(app *tui.App, prompt string) string {
+		if !submitOnEventLoop(t, app, prompt) {
+			t.Fatalf("prompt %q rejected", prompt)
+		}
+		turns.Wait()
+		waitTitleBackgroundDone(t)
+		return noticeOnEventLoop(t, app)
+	}
+	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
+		first = turn(app, "first")
+		onEventLoop(t, app, func() {
+			app.SubmitInput("second")
+			afterSubmit = app.NoticeText()
+			transcript = app.TranscriptText()
+		})
+		turns.Wait()
+		waitTitleBackgroundDone(t)
+		repeat = noticeOnEventLoop(t, app)
+		if !submitOnEventLoop(t, app, "/clear") {
+			t.Fatal("/clear rejected")
+		}
+		cleared = app.ActiveStore()
+		afterClear = turn(app, "after clear")
+	})()
+	if err := StartTUI(context.Background(), windowResult(t, store), io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+
+	if first != want {
+		t.Fatalf("first-turn notice = %q, want %q", first, want)
+	}
+	if afterSubmit != "" {
+		t.Fatalf("notice after the next submission = %q, want it cleared", afterSubmit)
+	}
+	if strings.Contains(transcript, "recorded input tokens") {
+		t.Fatalf("transcript = %q, want the warning kept out of committed history", transcript)
+	}
+	if repeat != "" {
+		t.Fatalf("repeat-turn notice = %q, want none for an already-warned session", repeat)
+	}
+	if cleared == store || cleared.SessionID() == store.SessionID() {
+		t.Fatal("/clear did not switch to a new session ID")
+	}
+	if afterClear != want {
+		t.Fatalf("notice after /clear = %q, want %q", afterClear, want)
+	}
+}
+
+func TestStartTUI_ContextWindowNoticeDroppedWhenClearSwapsBeforeDelivery(t *testing.T) {
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	ready := make(chan struct{})
+	var calls atomic.Int32
+	client := &stubTurnClient{fn: func(ctx context.Context, _ provider.Request) (provider.Response, error) {
+		if calls.Add(1) == 1 {
+			return provider.Response{Stream: blockingStream(ctx, usageChunk(950, 1), ready)}, nil
+		}
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"), usageChunk(950, 1))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	store := titledStore(t)
+	want := "openai/gpt-5.5: 950 recorded input tokens across rounds/retries; window 1000, 90% threshold 900. This is not one request's size. If individual requests approach the limit, check the server/model limit and match `context_windows`; the declaration does not raise capacity. For Ollama, check `OLLAMA_CONTEXT_LENGTH` or model `num_ctx`."
+	var afterClear, returned string
+	var departedResponses int
+	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
+		if !submitOnEventLoop(t, app, "first") {
+			t.Fatal("prompt rejected")
+		}
+		<-ready
+		if !submitOnEventLoop(t, app, "/clear") {
+			t.Fatal("/clear rejected")
+		}
+		turns.Wait()
+		waitTitleBackgroundDone(t)
+		afterClear = noticeOnEventLoop(t, app)
+		departedResponses = len(kindEvents(t, store, events.KindModelResponse))
+
+		back := storeAt(t, filepath.Join(t.TempDir(), "session.json"), store.SessionID(), "/proj")
+		onEventLoop(t, app, func() { app.SetActiveStore(back) })
+		if !submitOnEventLoop(t, app, "back again") {
+			t.Fatal("prompt on the returned session rejected")
+		}
+		turns.Wait()
+		waitTitleBackgroundDone(t)
+		returned = noticeOnEventLoop(t, app)
+	})()
+	if err := StartTUI(context.Background(), windowResult(t, store), io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+
+	if departedResponses != 1 {
+		t.Fatalf("departed session model_response records = %d, want the interrupted turn's one", departedResponses)
+	}
+	if afterClear != "" {
+		t.Fatalf("notice after /clear = %q, want the departed session's warning dropped", afterClear)
+	}
+	if returned != want {
+		t.Fatalf("notice on returning to the unwarned session = %q, want %q", returned, want)
+	}
+}
+
+func writeSkillBody(t *testing.T, skillsDir, name, body string) {
+	t.Helper()
+	dir := filepath.Join(skillsDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create skill folder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Skill "+name+"\n---\n"+body), 0o644); err != nil {
+		t.Fatalf("write SKILL.md: %v", err)
+	}
+}
+
+func seedSlashSkills(t *testing.T, home, project string) {
+	t.Helper()
+	projectSkills := filepath.Join(project, ".codemeld", "skills")
+	writeSkillBody(t, projectSkills, "my-skill", "Fix: $ARGUMENTS\n")
+	writeSkillBody(t, projectSkills, "slashy", "/help $ARGUMENTS")
+	writeSkillBody(t, filepath.Join(home, ".codemeld", "skills"), "7zip", "Zip things")
+}
+
+func skillTurnResult(t *testing.T, store *sessions.Store) *BootstrapResult {
+	t.Helper()
+	home, project := t.TempDir(), t.TempDir()
+	seedSlashSkills(t, home, project)
+	seedOpenAIDiscovered(t, SettingsPath(home), "gpt-5.5")
+	return &BootstrapResult{
+		Home:             home,
+		LaunchDir:        "/launch",
+		ProjectRoot:      project,
+		Session:          store,
+		Model:            model.NewActiveState(&model.Selection{Provider: "openai", ID: "gpt-5.5", Effort: model.EffortDefault}, model.SourceProject),
+		Mode:             mode.NewActiveState(mode.Build, mode.SourceDefault),
+		Config:           headlessProviderConfig(),
+		ConfigLayerPaths: []string{SettingsPath(home)},
+	}
+}
+
+func lastUserContent(req provider.Request) string {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			return req.Messages[i].Content
+		}
+	}
+	return ""
+}
+
+func TestStartTUI_SkillSlashCommandSendsExpandedBodyAsUserTurn(t *testing.T) {
+	var ran *tui.App
+	defer swapRunApp(func(a *tui.App) error { ran = a; return nil })()
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	var mu sync.Mutex
+	var sentUser []string
+	client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+		if !isTitleRequest(req) {
+			mu.Lock()
+			sentUser = append(sentUser, lastUserContent(req))
+			mu.Unlock()
+		}
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	store := mkStore(t)
+	result := skillTurnResult(t, store)
+	if err := StartTUI(context.Background(), result, io.Discard); err != nil || ran == nil {
+		t.Fatalf("StartTUI error = %v, event loop ran = %v; want a launch", err, ran != nil)
+	}
+
+	warning := `skill "7zip" has no slash command: slash-command names must start with a lowercase letter`
+	lines := strings.Split(ran.TranscriptText(), "\n")
+	if n := slices.Index(lines, warning); n <= 0 || slices.Index(lines[n+1:], warning) >= 0 {
+		t.Fatalf("transcript has the slash warning at %d, want once after the banner\n%s", n, strings.Join(lines, "\n"))
+	}
+	if !slices.ContainsFunc(result.Skills.Loaded, func(s skills.Skill) bool { return s.Name == "7zip" && s.ModelInvocable }) {
+		t.Fatalf("loaded skills = %+v, want 7zip still loaded and model-invocable", result.Skills.Loaded)
+	}
+
+	if !ran.SubmitInput("/my-skill fix   the tests") {
+		t.Fatal("installed submit rejected /my-skill")
+	}
+	turns.Wait()
+	if !ran.SubmitInput("/slashy now") {
+		t.Fatal("installed submit rejected /slashy")
+	}
+	turns.Wait()
+	if !ran.SubmitInput("/help") {
+		t.Fatal("built-in /help stopped working")
+	}
+
+	disk := readSessionFile(t, store.Path())
+	if !diskHasUserMessage(disk, "Fix: fix the tests\n") || !diskHasUserMessage(disk, "/help now") || userMessageCount(store) != 2 {
+		t.Fatalf("persisted user messages = %d, want the two expanded bodies", userMessageCount(store))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"Fix: fix the tests\n", "/help now"}; !slices.Equal(sentUser, want) {
+		t.Fatalf("provider turns carried %q, want %q", sentUser, want)
+	}
+	var got []string
+	for _, c := range slashCmds(t, store) {
+		got = append(got, c.Name+"|"+strings.Join(c.Args, ",")+"|"+c.Outcome)
+	}
+	if want := []string{"my-skill|fix the tests|success", "slashy|now|success", "help||success"}; !slices.Equal(got, want) {
+		t.Fatalf("slash_command events = %q, want %q", got, want)
+	}
+}
+
+func TestStartTUI_SkillsPanelShowsTheRunsSkillsWithoutRescanning(t *testing.T) {
+	store := mkStore(t)
+	result := skillTurnResult(t, store)
+	globalSkills := filepath.Join(result.Home, ".codemeld", "skills")
+	projectSkills := filepath.Join(result.ProjectRoot, ".codemeld", "skills")
+	writeSkillBody(t, globalSkills, "my-skill", "Global copy")
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	var rendered string
+	defer runLiveApp(t, screen, func(app *tui.App) {
+		onEventLoop(t, app, func() { screen.SetSize(300, 60) })
+		for _, dir := range []string{globalSkills, projectSkills} {
+			if err := os.RemoveAll(dir); err != nil {
+				t.Fatalf("remove %s: %v", dir, err)
+			}
+		}
+		if !submitOnEventLoop(t, app, "/skills") {
+			t.Fatal("installed submit rejected /skills")
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			onEventLoop(t, app, func() { rendered = simScreenText(screen) })
+			if strings.Contains(rendered, "Not loaded") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the skills panel never rendered\n%s", rendered)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})()
+
+	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+	for _, want := range []string{
+		"my-skill (project)",
+		filepath.Join(projectSkills, "my-skill", "SKILL.md"),
+		"slashy (project)",
+		"7zip (global)",
+		filepath.Join(globalSkills, "my-skill"),
+		"the project has its own skill with that name",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("skills panel lacks %q\n%s", want, rendered)
+		}
+	}
+	if cmds := slashCmds(t, store); len(cmds) != 1 || cmds[0].Name != "skills" || cmds[0].Outcome != "success" {
+		t.Fatalf("slash_command events = %+v, want one {skills, success}", cmds)
+	}
+}
+
+func TestStartTUI_SkillBodyHeldDuringBusyTurnDrainsLiterally(t *testing.T) {
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var streamed atomic.Int32
+	client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+		if isTitleRequest(req) {
+			return titleCompletion("Skill session"), nil
+		}
+		if streamed.Add(1) == 1 {
+			close(entered)
+			<-release
+			return provider.Response{Stream: newStream(toolCallsChunk(toolFrag(0, "call_1", "bash", `{"command":"go test ./..."}`)))}, nil
+		}
+		return provider.Response{Stream: newStream(contentChunk("second"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	terminal := &fakeTurnDispatcher{results: map[string]turn.ToolResult{"call_1": {Content: "done", Terminal: true}}}
+	defer swapToolLoop(func(d turn.Deps, _ turn.ToolDispatcher, n int) *turn.ToolLoop {
+		return turn.NewToolLoop(d, terminal, n)
+	})()
+
+	store := mkStore(t)
+	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
+		if !submitOnEventLoop(t, app, "first prompt") {
+			t.Fatal("wired submit rejected a plain prompt")
+		}
+		<-entered
+		if !submitOnEventLoop(t, app, "/slashy queued") {
+			t.Fatal("busy skill invocation was rejected")
+		}
+		close(release)
+		turns.Wait()
+	})()
+
+	if err := StartTUI(context.Background(), skillTurnResult(t, store), io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+
+	if got := streamed.Load(); got != 2 {
+		t.Fatalf("streamed provider requests = %d, want 2 (the held body dispatches as the next turn)", got)
+	}
+	disk := readSessionFile(t, store.Path())
+	if !diskHasUserMessage(disk, "/help queued") || userMessageCount(store) != 2 {
+		t.Fatalf("persisted user messages = %d, want the held body persisted literally", userMessageCount(store))
+	}
+	for _, c := range slashCmds(t, store) {
+		if c.Name == "help" {
+			t.Fatalf("slash_command events %+v include /help; the drained body ran as a command", slashCmds(t, store))
+		}
+	}
+}
+
+func TestStartTUI_SkillPreTurnPersistenceFailureRetainsInput(t *testing.T) {
+	var ran *tui.App
+	defer swapRunApp(func(a *tui.App) error { ran = a; return nil })()
+	client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	dir := filepath.Join(t.TempDir(), "sessions")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("create session folder: %v", err)
+	}
+	store := storeAt(t, filepath.Join(dir, "session.json"), "01890000-0000-7000-8000-0000000d0001", "/proj")
+	if err := StartTUI(context.Background(), skillTurnResult(t, store), io.Discard); err != nil || ran == nil {
+		t.Fatalf("StartTUI error = %v, event loop ran = %v; want a launch", err, ran != nil)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove session folder: %v", err)
+	}
+	if err := os.WriteFile(dir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("replace session folder with a file: %v", err)
+	}
+
+	if ran.SubmitInput("/my-skill x") {
+		t.Fatal("a skill whose pre-turn persistence failed was accepted")
+	}
+	if got := ran.InputText(); got != "/my-skill x" {
+		t.Fatalf("input = %q, want the invocation retained", got)
+	}
+	if got := client.callCount(); got != 0 {
+		t.Fatalf("provider calls = %d, want no turn started", got)
+	}
+	for _, c := range slashCmds(t, store) {
+		if c.Outcome == "success" {
+			t.Fatalf("slash_command events %+v record a success for a refused body", slashCmds(t, store))
+		}
+	}
+}
+
+func TestStartTUI_LiteralPromptRefusedWhileCompactionHeld(t *testing.T) {
+	parent := mkStore(t)
+	parent.Append(sessions.Message{ID: "01890000-0000-7000-8000-0000000d0002", Role: "user", Content: sessions.TextContent("plan the work"), Timestamp: testStart})
+	parent.Append(sessions.Message{ID: "01890000-0000-7000-8000-0000000d0003", Role: "assistant", Content: sessions.TextContent("here is the plan"), Timestamp: testStart})
+
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+			return provider.Response{Completion: &openai.ChatCompletion{
+				Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Content: "summary"}}},
+			}}, nil
+		}
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	var refused bool
+	var notice string
+	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
+		if !submitOnEventLoop(t, app, "/compact") {
+			t.Fatal("/compact was rejected")
+		}
+		<-entered
+		onEventLoop(t, app, func() {
+			refused = !app.SubmitLiteral("/help from a held skill")
+			notice = app.NoticeText()
+		})
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("provider calls during compaction = %d, want 1", got)
+		}
+		close(release)
+		waitForStoreSwitch(t, app, parent)
+		turns.Wait()
+	})()
+
+	if err := StartTUI(context.Background(), skillTurnResult(t, parent), io.Discard); err != nil {
+		t.Fatalf("StartTUI: %v", err)
+	}
+	if !refused || !strings.Contains(notice, "compaction is running; your input was kept") {
+		t.Fatalf("literal prompt refused = %v, notice = %q; want the compaction refusal", refused, notice)
+	}
+	if diskHasUserMessage(readSessionFile(t, parent.Path()), "/help from a held skill") {
+		t.Fatal("the refused literal prompt was persisted")
 	}
 }

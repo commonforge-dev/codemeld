@@ -14,10 +14,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/goccy/go-yaml"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/events"
@@ -619,11 +622,29 @@ func TestProviderModelApplier_CleanProviderSwitch_WritesActiveAndMirrors(t *test
 	settings := config.LocalSettingsPath(projectRoot)
 	assertFileContains(t, settings, "anthropic")
 	assertFileContains(t, settings, "claude-x")
+	selection := func(path, key string) yaml.MapSlice {
+		t.Helper()
+		var doc map[string]map[string]yaml.MapSlice
+		if err := yaml.Unmarshal([]byte(readFileString(t, path)), &doc); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		return doc["model"][key]
+	}
+	want := yaml.MapSlice{{Key: "provider", Value: "anthropic"}, {Key: "id", Value: "claude-x"}, {Key: "effort", Value: "default"}}
+	if got := selection(settings, "active"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("local model.active = %#v, want provider/id/effort in that order %#v", got, want)
+	}
+	if got := selection(settings, "last_used"); got != nil {
+		t.Fatalf("local model.last_used = %#v, want it only in the global file", got)
+	}
 	if _, err := os.Stat(filepath.Join(projectRoot, ".codemeld", "settings.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("shared settings.yaml must stay absent; stat err = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".codemeld", "global", "settings.yaml")); err != nil {
 		t.Fatalf("model.last_used mirror not written: %v", err)
+	}
+	if got := selection(SettingsPath(home), "last_used"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("global model.last_used = %#v, want %#v", got, want)
 	}
 	if n := len(slashCmds(t, store)); n != 0 {
 		t.Fatalf("slash_command events = %d, want 0 (the picker apply must not emit a slash_command)", n)

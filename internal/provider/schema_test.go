@@ -2,6 +2,7 @@
 package provider
 
 import (
+	"math"
 	"reflect"
 	"testing"
 
@@ -372,4 +373,115 @@ func keysOf(m map[string]ProviderEntry) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestParseProviders_ContextWindowsFromDecodedYAML(t *testing.T) {
+	src := `provider:
+  ollama:
+    base_url: http://localhost:11434/v1
+    api_key: ""
+    context_windows:
+      qwen3:8b: 32768
+      llama3.2: 4096.0
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: or-test
+    context_windows:
+      vendor/huge: 10000000
+  plain:
+    base_url: http://localhost:8080/v1
+    api_key: ""
+  empty:
+    base_url: http://localhost:8081/v1
+    api_key: ""
+    context_windows: {}
+`
+	var composed map[string]any
+	if err := yaml.Unmarshal([]byte(src), &composed); err != nil {
+		t.Fatalf("yaml.Unmarshal() error = %v", err)
+	}
+	got, err := ParseProviders(composed)
+	if err != nil {
+		t.Fatalf("ParseProviders() error = %v, want nil", err)
+	}
+	if want := map[string]int64{"qwen3:8b": 32768, "llama3.2": 4096}; !reflect.DeepEqual(got["ollama"].ContextWindows, want) {
+		t.Errorf("ollama ContextWindows = %v, want %v", got["ollama"].ContextWindows, want)
+	}
+	if want := map[string]int64{"vendor/huge": 10000000}; !reflect.DeepEqual(got["openrouter"].ContextWindows, want) {
+		t.Errorf("openrouter ContextWindows = %v, want %v", got["openrouter"].ContextWindows, want)
+	}
+	if got["plain"].ContextWindows != nil {
+		t.Errorf("absent context_windows = %v, want nil", got["plain"].ContextWindows)
+	}
+	if got["empty"].ContextWindows != nil {
+		t.Errorf("empty context_windows = %v, want nil", got["empty"].ContextWindows)
+	}
+
+	delete(composed["provider"].(map[string]any)["openrouter"].(map[string]any), "context_windows")
+	again, err := ParseProviders(composed)
+	if err != nil {
+		t.Fatalf("ParseProviders() error = %v, want nil", err)
+	}
+	if again["openrouter"].ContextWindows != nil {
+		t.Errorf("openrouter without context_windows = %v, want nil", again["openrouter"].ContextWindows)
+	}
+}
+
+func TestParseProviders_ContextWindowsDecodedNumberForms(t *testing.T) {
+	accepted := map[string]struct {
+		v    any
+		want int64
+	}{
+		"int maximum":    {int(10000000), 10000000},
+		"int64":          {int64(8192), 8192},
+		"uint64 maximum": {uint64(10000000), 10000000},
+		"whole float64":  {float64(131072), 131072},
+		"float maximum":  {float64(10000000), 10000000},
+	}
+	for name, tc := range accepted {
+		t.Run("accept/"+name, func(t *testing.T) {
+			got, err := ParseProviders(map[string]any{"provider": map[string]any{
+				"p": map[string]any{"base_url": "u", "api_key": "k", "context_windows": map[string]any{"m": tc.v}},
+			}})
+			if err != nil {
+				t.Fatalf("ParseProviders() error = %v, want nil", err)
+			}
+			if w := got["p"].ContextWindows["m"]; w != tc.want {
+				t.Fatalf("ContextWindows[m] = %d, want %d", w, tc.want)
+			}
+		})
+	}
+
+	rejected := map[string]any{
+		"windows not object":   4096,
+		"zero int":             int(0),
+		"int above maximum":    int(10000001),
+		"negative int64":       int64(-1),
+		"int64 above maximum":  int64(10000001),
+		"uint64 above maximum": uint64(10000001),
+		"uint64 maximum":       uint64(math.MaxUint64),
+		"fractional float":     4096.5,
+		"zero float":           float64(0),
+		"float above maximum":  float64(10000001),
+		"huge float":           1e30,
+		"negative float":       float64(-4096),
+		"NaN":                  math.NaN(),
+		"infinity":             math.Inf(1),
+		"string":               "4096",
+		"null":                 nil,
+	}
+	for name, v := range rejected {
+		t.Run("reject/"+name, func(t *testing.T) {
+			var windows any = map[string]any{"m": v}
+			if name == "windows not object" {
+				windows = v
+			}
+			_, err := ParseProviders(map[string]any{"provider": map[string]any{
+				"p": map[string]any{"base_url": "u", "api_key": "k", "context_windows": windows},
+			}})
+			if err == nil {
+				t.Fatalf("ParseProviders(%v) error = nil, want a rejection", v)
+			}
+		})
+	}
 }

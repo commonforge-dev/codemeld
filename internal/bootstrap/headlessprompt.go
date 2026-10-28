@@ -193,6 +193,9 @@ func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.Pr
 	} else if req.Kind == matchKindDirect || req.Kind == matchKindLiteral {
 		_, _ = fmt.Fprintf(p.out, "  %s\n", tui.ShellBlockedPathsNotice)
 	}
+	if esc.Note != "" {
+		_, _ = fmt.Fprintf(p.out, "  %s\n", fact(esc.Note))
+	}
 	if esc.NarrowerScope != "" {
 		_, _ = fmt.Fprintf(p.out, "  ⚠ broader than a folder you already allowed: this asks for the PARENT of %s\n", fact(esc.NarrowerScope))
 	}

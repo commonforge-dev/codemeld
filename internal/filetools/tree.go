@@ -1,11 +1,4 @@
-// Built-in structured tree tool: project-confined, recursive listing of the directory structure under an
-// optional `path` (default project root) to an optional maximum descendant `depth`, in deterministic
-// ascending project-relative (pre-order) path order, bounded by a total-entry `limit` with the
-// truncation signal, over the shared walker (directory symlinks not followed, hidden/ignore
-// filtering). Display is selected by `format`: `ai` (the default) emits one project-relative,
-// slash-normalized path per line; `human` emits the indented basename tree. The two layouts differ only in
-// the per-line body — resolution, walk order, depth, limit, filtering, symlink handling, and truncation are
-// shared.
+// Built-in tree tool: recursively lists the directory structure under a path.
 package filetools
 
 import (
@@ -66,12 +59,6 @@ var _ tools.Tool = (*TreeTool)(nil)
 
 func (t *TreeTool) SetBlockedPaths(blocked *permissions.BlockedPaths) { t.blocked = blocked }
 
-// NewTreeTool builds the tree tool bound to the run's ~ anchor (home), the process cwd accepted for
-// signature symmetry with the other file tools, the project root the listing is confined to (via
-// ResolveReadTarget), and the tool-output byte cap (cache.MaxToolOutputBytes()) BoundedResult uses to
-// predict byte-cap truncation. The project root is symlink-resolved once here — mirroring
-// NewListTool/NewGrepTool — so a launch through a symlinked project directory does not reject valid
-// in-project paths; ResolveReadTarget normalizes again, so the double normalization is idempotent.
 func NewTreeTool(home, processCWD, projectRoot string, outputCap int) *TreeTool {
 	return &TreeTool{home: home, processCWD: processCWD, projectRoot: normalizeRoot(projectRoot), outputCap: outputCap}
 }
@@ -88,7 +75,7 @@ func (t *TreeTool) SubjectKind() string { return "tool" }
 // every mode.
 func (t *TreeTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description: "List the directory structure under a path within the project. path is the directory to " +
+		Description: "List the directory structure under a path inside or outside the project. path is the directory to " +
 			"walk (default project root); depth caps how many levels below path are shown (omit for the whole " +
 			"subtree, 1 for immediate children only, 0 for nothing); limit caps the total number of entries " +
 			"(default " + fmt.Sprintf("%d, max %d", TreeDefaultLimit, TreeMaxLimit) + "). format selects the " +
@@ -103,7 +90,7 @@ func (t *TreeTool) Advertise() tools.Metadata {
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Directory to walk. Relative paths resolve against the project root and walk normally; an explicitly named directory whose real location is outside the project is walked only after you approve it at the permission prompt. Defaults to the project root when omitted.",
+					"description": "Directory to walk. Defaults to the project root when omitted. Relative paths resolve against the project root. An explicitly named absolute or ~ directory outside the project is walked without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a walk asks first. A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms and malformed paths.",
 				},
 				"depth": map[string]any{
 					"type":        "integer",
@@ -154,10 +141,6 @@ func (t *TreeTool) ResolveTarget(args map[string]any) (target string, scope stri
 	})
 }
 
-// ExternalReadScope reports whether scope (the directory ResolveTarget returned) is an explicit
-// out-of-project read target — the promptable case DispatchTool routes to a permission prompt while
-// bypassing the read-only mode auto-allow. False for an in-project directory, keeping in-project trees on
-// their existing no-prompt auto-allow.
 func (t *TreeTool) ExternalReadScope(scope string) bool {
 	return isExternalReadScope(scope, t.projectRoot)
 }
@@ -174,8 +157,6 @@ func (t *TreeTool) InvokeWithResolvedTarget(_ context.Context, args map[string]a
 // dispatch instead calls ResolveTarget then InvokeWithResolvedTarget; this keeps the tool a complete unit
 // for direct callers and tests. A target-resolution failure surfaces as the same in-band error result the
 // dispatcher would render, so the observable outcome matches either entry.
-// Standalone Invoke has no authorizer, so it refuses an explicit out-of-project directory in-band:
-// only the dispatch path can obtain the required approval. The in-project path is unchanged.
 func (t *TreeTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
@@ -249,10 +230,6 @@ func (t *TreeTool) tree(dir string, args map[string]any) tools.Result {
 		maxDepth = *depthPtr
 	}
 
-	// Anchor emitted paths and the ignore matchers at the project root for an in-project walk, or at the
-	// approved external directory for an out-of-project read, so external "ai"-format paths stay
-	// clean (project-root-relative paths would otherwise carry a ".." prefix) and the matchers see the
-	// same base.
 	anchor := readAnchor(dir, t.projectRoot)
 
 	// Load the default codemeldignore filter set unless include_ignored disables it. A

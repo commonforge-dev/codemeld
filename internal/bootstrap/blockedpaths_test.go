@@ -28,6 +28,7 @@ import (
 	"codemeld.dev/codemeld/internal/provider"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/trust"
 	"codemeld.dev/codemeld/internal/turn"
 )
 
@@ -151,13 +152,13 @@ func blockedPathDenial(tool, folder, source string) events.PermissionMatched {
 	return events.PermissionMatched{SubjectKind: "tool", Subject: tool, PathScope: folder, Outcome: "deny", OutcomeSource: "blocked_path", BlockedEntry: folder, BlockedEntrySource: source}
 }
 
-func TestDelegateBinding_ChildReadOfAGloballyBlockedFileCarriesItsInvocationID(t *testing.T) {
-	cache, home, project, active, modeActive := delegateFixture(t)
+func TestGeneralAgentBinding_ChildReadOfAGloballyBlockedFileCarriesItsInvocationID(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
 	store := mkStore(t)
 	file := seedBlockedSecret(t, project)
-	reg := delegateRegistry(t, cache, home, project, active, modeActive)
+	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
 	guard := mustProtectedStatePolicy(t, home, cache.ProjectRoot(), blockedGlobalLayers(t, home, project, filepath.Dir(file)))
-	deps := delegateTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, guard)
+	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, guard)
 
 	child := ids.NewV7()
 	calls := []turn.AssembledToolCall{structuredCall("c1", filetools.ReadToolName, map[string]any{"path": file})}
@@ -1374,5 +1375,564 @@ func TestReadSettingsAt(t *testing.T) {
 	})
 	if data, _, err := read("replaced"); !errors.Is(err, errSettingsChanged) || data != nil {
 		t.Fatalf("atomically replaced file = %q, %v; want %v", data, err, errSettingsChanged)
+	}
+}
+
+func TestRecoveryBlockedPaths_ReadsEveryAdmittedLayerAndIgnoresAnUnapprovedProject(t *testing.T) {
+	f := newRereadFixture(t)
+	f.writeGlobal(t, "g")
+	f.writeProject(t, "p")
+	f.writeLocal(t, "l")
+
+	trusted, err := recoveryBlockedPaths(f.home, f.project, true)
+	if err != nil {
+		t.Fatalf("recoveryBlockedPaths(trusted): %v", err)
+	}
+	requireBlockedEntries(t, trusted, f.fromGlobal("g"), f.fromProject("p"), f.fromLocal("l"))
+
+	untrusted, err := recoveryBlockedPaths(f.home, f.project, false)
+	if err != nil {
+		t.Fatalf("recoveryBlockedPaths(untrusted): %v", err)
+	}
+	requireBlockedEntries(t, untrusted, f.fromGlobal("g"))
+}
+
+func TestRecoveryBlockedPaths_PicksUpAnAdmittedLayerCreatedAfterLaunch(t *testing.T) {
+	f := newRereadFixture(t)
+	f.writeGlobal(t, "g")
+
+	before, err := recoveryBlockedPaths(f.home, f.project, true)
+	if err != nil {
+		t.Fatalf("recoveryBlockedPaths with no project layers: %v, want a confirmed absence to be no error", err)
+	}
+	requireBlockedEntries(t, before, f.fromGlobal("g"))
+
+	f.writeLocal(t, "l")
+	after, err := recoveryBlockedPaths(f.home, f.project, true)
+	if err != nil {
+		t.Fatalf("recoveryBlockedPaths after the local layer appeared: %v", err)
+	}
+	requireBlockedEntries(t, after, f.fromGlobal("g"), f.fromLocal("l"))
+}
+
+func TestRecoveryBlockedPaths_FailsOnAnUnsettledSettingsRead(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deferred bool
+		stage    func(t *testing.T, f rereadFixture)
+	}{
+		{"a busy settings lock", true, func(t *testing.T, f rereadFixture) {
+			parent, err := os.Open(filepath.Dir(f.localFile))
+			if err != nil {
+				t.Fatalf("open the settings folder: %v", err)
+			}
+			t.Cleanup(func() { _ = parent.Close() })
+			release, _, err := locks.AcquireAt(parent, filepath.Base(f.localFile)+".lock", 0)
+			if err != nil {
+				t.Fatalf("take the settings lock: %v", err)
+			}
+			t.Cleanup(release)
+		}},
+		{"an unsafe settings lock", false, func(t *testing.T, f rereadFixture) {
+			if err := os.Symlink(filepath.Join(f.outside, "elsewhere"), f.localFile+".lock"); err != nil {
+				t.Fatalf("plant the lock symlink: %v", err)
+			}
+		}},
+		{"a read that raced a replacement", true, func(t *testing.T, _ rereadFixture) {
+			real := readHeldSettings
+			readHeldSettings = func(*os.File, string) ([]byte, fs.FileInfo, error) { return nil, nil, errSettingsChanged }
+			t.Cleanup(func() { readHeldSettings = real })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRereadFixture(t)
+			f.writeGlobal(t, "g")
+			f.writeLocal(t, "l")
+			watcher := f.blocked(t, true)
+			tc.stage(t, f)
+
+			if _, err := recoveryBlockedPaths(f.home, f.project, true); err == nil {
+				t.Fatalf("recoveryBlockedPaths = nil error, want the refresh to fail")
+			}
+			if current := watcher.Current(); current.Degraded() == tc.deferred {
+				t.Fatalf("watcher degraded = %v, want %v", current.Degraded(), !tc.deferred)
+			}
+		})
+	}
+}
+
+func TestRecoveryBlockedPaths_RequiresTheGlobalLayer(t *testing.T) {
+	f := newRereadFixture(t)
+	if _, err := recoveryBlockedPaths(f.home, f.project, false); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("recoveryBlockedPaths with no global settings = %v, want a missing-file failure", err)
+	}
+	writeGlobalSettings(t, f.home, "blocked_paths: [", 0o600)
+	if _, err := recoveryBlockedPaths(f.home, f.project, false); err == nil {
+		t.Fatalf("recoveryBlockedPaths with broken global settings = nil error, want a failure")
+	}
+}
+
+func TestRecoveryPolicy_AnInvalidAdmittedLayerMakesTheListUnavailable(t *testing.T) {
+	f := newRereadFixture(t)
+	f.writeGlobal(t, "g")
+	writeLocalProjectSettings(t, f.project, "blocked_paths: [")
+	global, err := defaultLoadGlobalSettings(f.home)
+	if err != nil {
+		t.Fatalf("defaultLoadGlobalSettings: %v", err)
+	}
+
+	if policy := recoveryPolicy(f.home, f.project, global, true); policy.Blocked != nil || policy.Unavailable == "" {
+		t.Fatalf("trusted policy = %+v, want the invalid local layer to make the list unavailable", policy)
+	}
+	policy := recoveryPolicy(f.home, f.project, global, false)
+	if policy.Blocked == nil || policy.Unavailable != "" {
+		t.Fatalf("untrusted policy = %+v, want the unapproved layer never read", policy)
+	}
+	requireBlockedEntries(t, policy.Blocked, f.fromGlobal("g"))
+}
+
+func TestRecoverChildJournals_ASymlinkedSettingsFolderHoldsRecoveryUntilItCanBeLocked(t *testing.T) {
+	home, project, real := realPath(t, t.TempDir()), realPath(t, t.TempDir()), realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
+	target := filepath.Join(project, "a.txt")
+	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	journal := killedChildJournal(t, home, project, target)
+	record := filepath.Join(journal, "journal.json")
+	settingsDir := filepath.Dir(config.LocalSettingsPath(project))
+	name := filepath.Base(config.LocalSettingsPath(project))
+	if err := os.WriteFile(filepath.Join(real, name), []byte(blockedYAML()), 0o600); err != nil {
+		t.Fatalf("write the settings file: %v", err)
+	}
+	if err := os.Symlink(real, settingsDir); err != nil {
+		t.Fatalf("link the settings folder: %v", err)
+	}
+	parent, err := os.Open(real)
+	if err != nil {
+		t.Fatalf("open the real settings folder: %v", err)
+	}
+	t.Cleanup(func() { _ = parent.Close() })
+	release, _, err := locks.AcquireAt(parent, name+".lock", 0)
+	if err != nil {
+		t.Fatalf("take the settings lock: %v", err)
+	}
+	before, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("read the journal record: %v", err)
+	}
+
+	if _, err := recoveryBlockedPaths(home, project, true); err == nil {
+		t.Fatalf("recoveryBlockedPaths = nil error, want a settings folder that can't be locked to be unavailable")
+	}
+	var stderr strings.Builder
+	recoverChildJournals(home, project, map[string]any{}, trust.Decision{Trusted: true}, strings.NewReader("r\n"), &stderr, true)
+
+	if strings.Contains(stderr.String(), "Keep, put back, or decide later?") {
+		t.Fatalf("stderr = %q, want no question while the list is unavailable", stderr.String())
+	}
+	if after, err := os.ReadFile(record); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("journal record = %q (err=%v), want it unchanged", after, err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "CHILD\n" {
+		t.Fatalf("%s = %q (err=%v), want it untouched", target, got, err)
+	}
+
+	release()
+	if err := os.Remove(settingsDir); err != nil {
+		t.Fatalf("remove the settings folder link: %v", err)
+	}
+	writeLocalProjectSettings(t, project, blockedYAML())
+	stderr.Reset()
+	recoverChildJournals(home, project, map[string]any{}, trust.Decision{Trusted: true}, strings.NewReader(""), &stderr, true)
+
+	if got, err := os.ReadFile(target); err != nil || string(got) != "ORIGINAL\n" {
+		t.Fatalf("%s = %q (err=%v), want a healthy launch to put it back; stderr = %q", target, got, err, stderr.String())
+	}
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Fatalf("stat the journal record: %v, want it removed after the retry", err)
+	}
+}
+
+func liveFoldersReader(t *testing.T, f rereadFixture, layerPaths []string, home ...string) *writableFoldersReader {
+	t.Helper()
+	cache, err := config.NewCache(map[string]any{}, f.project, layerPaths, home...)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	return newWritableFoldersReader(cache)
+}
+
+func admittedFoldersReader(t *testing.T, folder string) (rereadFixture, *writableFoldersReader) {
+	t.Helper()
+	f := newRereadFixture(t)
+	f.writeGlobal(t)
+	writeProjectSettings(t, f.project, writableFoldersYAML(folder))
+	return f, liveFoldersReader(t, f, []string{f.global, f.projectFile}, f.home)
+}
+
+func requireLiveFolders(t *testing.T, r *writableFoldersReader, want ...string) {
+	t.Helper()
+	if got := r.current(); !slices.Equal(got, want) {
+		t.Fatalf("live writable folders = %v, want %v", got, want)
+	}
+}
+
+func countSettingsReads(t *testing.T) (reads *atomic.Int32, fail *atomic.Bool) {
+	t.Helper()
+	reads, fail = &atomic.Int32{}, &atomic.Bool{}
+	real := readHeldSettings
+	readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+		reads.Add(1)
+		if fail.Load() {
+			return nil, nil, errSettingsChanged
+		}
+		return real(parent, name)
+	}
+	t.Cleanup(func() { readHeldSettings = real })
+	return reads, fail
+}
+
+func TestWritableFoldersReader_FailuresGrantNothingUntilValidSettingsReturn(t *testing.T) {
+	rewrite := func(t *testing.T, f rereadFixture, next string) func() {
+		return func() { writeProjectSettings(t, f.project, writableFoldersYAML(next)) }
+	}
+	cases := map[string]func(t *testing.T, f rereadFixture, next string) (restore func()){
+		"malformed YAML": func(t *testing.T, f rereadFixture, next string) func() {
+			rewriteSettings(t, f.projectFile, "writable_folders: [\n")
+			return rewrite(t, f, next)
+		},
+		"schema rejection": func(t *testing.T, f rereadFixture, next string) func() {
+			rewriteSettings(t, f.projectFile, "attribution: false\n"+writableFoldersYAML(next))
+			return rewrite(t, f, next)
+		},
+		"deleted": func(t *testing.T, f rereadFixture, next string) func() {
+			if err := os.Remove(f.projectFile); err != nil {
+				t.Fatalf("remove: %v", err)
+			}
+			return rewrite(t, f, next)
+		},
+		"stat failure": func(t *testing.T, f rereadFixture, next string) func() {
+			if os.Geteuid() == 0 {
+				t.Skip("root ignores folder permissions")
+			}
+			dir := filepath.Dir(f.projectFile)
+			if err := os.Chmod(dir, 0); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			return func() {
+				if err := os.Chmod(dir, 0o755); err != nil {
+					t.Fatalf("chmod: %v", err)
+				}
+				rewrite(t, f, next)()
+			}
+		},
+		"held lock": func(t *testing.T, f rereadFixture, next string) func() {
+			release, reason, err := locks.TryAcquire(f.projectFile + ".lock")
+			if release == nil {
+				t.Fatalf("TryAcquire = %q, %v; want the lock", reason, err)
+			}
+			t.Cleanup(release)
+			rewriteSettings(t, f.projectFile, writableFoldersYAML(next))
+			return release
+		},
+		"unsettled read": func(t *testing.T, f rereadFixture, next string) func() {
+			_, fail := countSettingsReads(t)
+			fail.Store(true)
+			rewriteSettings(t, f.projectFile, writableFoldersYAML(next))
+			return func() { fail.Store(false) }
+		},
+	}
+	for name, breakSettings := range cases {
+		t.Run(name, func(t *testing.T) {
+			first, next := declaredScopeDir(t), declaredScopeDir(t)
+			f, r := admittedFoldersReader(t, first)
+			requireLiveFolders(t, r, first)
+
+			restore := breakSettings(t, f, next)
+			requireLiveFolders(t, r)
+			requireLiveFolders(t, r)
+
+			restore()
+			requireLiveFolders(t, r, next)
+		})
+	}
+}
+
+func TestWritableFoldersReader_StatGatesTheReread(t *testing.T) {
+	folder := declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, folder)
+	reads, _ := countSettingsReads(t)
+	step := func(state string, wantReads int32) {
+		t.Helper()
+		requireLiveFolders(t, r, folder)
+		if got := reads.Load(); got != wantReads {
+			t.Fatalf("%s: settings reads = %d, want %d", state, got, wantReads)
+		}
+	}
+	step("first", 1)
+	step("unchanged", 1)
+
+	info, err := os.Lstat(f.projectFile)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	later := info.ModTime().Add(time.Second)
+	if err := os.Chtimes(f.projectFile, later, later); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	step("mtime", 2)
+
+	writeAt := func(path string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(writableFoldersYAML(folder)+"\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := os.Chtimes(path, later, later); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+	}
+	writeAt(f.projectFile)
+	step("size", 3)
+
+	writeAt(f.projectFile + ".new")
+	if err := os.Rename(f.projectFile+".new", f.projectFile); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	step("identity", 4)
+}
+
+func TestWritableFoldersReader_AFailureForcesARereadWhenThePriorMetadataReturns(t *testing.T) {
+	folder := declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, folder)
+	reads, fail := countSettingsReads(t)
+	requireLiveFolders(t, r, folder)
+	original, err := os.Lstat(f.projectFile)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	content := writableFoldersYAML(folder)
+
+	fail.Store(true)
+	rewriteSettings(t, f.projectFile, strings.Repeat("#", len(content)-1)+"\n")
+	requireLiveFolders(t, r)
+	fail.Store(false)
+
+	if err := os.WriteFile(f.projectFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chtimes(f.projectFile, original.ModTime(), original.ModTime()); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if again, err := os.Lstat(f.projectFile); err != nil || !sameSettingsStat(original, nil, again, nil) {
+		t.Fatalf("restored metadata = %v, %v; want the original metadata back", again, err)
+	}
+	before := reads.Load()
+	requireLiveFolders(t, r, folder)
+	if got := reads.Load(); got != before+1 {
+		t.Fatalf("settings reads = %d, want %d: a failure must not leave a reusable success", got, before+1)
+	}
+}
+
+func TestWritableFoldersReader_HoldsNoLockAfterTheObservation(t *testing.T) {
+	folder := declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, folder)
+	requireLiveFolders(t, r, folder)
+	release, reason, err := locks.TryAcquire(f.projectFile + ".lock")
+	if release == nil {
+		t.Fatalf("TryAcquire after the read = %q, %v; want the sidecar free", reason, err)
+	}
+	release()
+
+	next := declaredScopeDir(t)
+	rewriteSettings(t, f.projectFile, writableFoldersYAML(next))
+	requireLiveFolders(t, r, next)
+}
+
+func TestWritableFoldersReader_AFileChangedDuringTheReadGrantsNothing(t *testing.T) {
+	first, next := declaredScopeDir(t), declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, first)
+	requireLiveFolders(t, r, first)
+
+	real := readSettingsBytes
+	readSettingsBytes = func(file *os.File, limit int64) ([]byte, error) {
+		readSettingsBytes = real
+		if err := bumpSettings(f.projectFile, writableFoldersYAML(next, first)); err != nil {
+			t.Errorf("rewrite during the read: %v", err)
+		}
+		return real(file, limit)
+	}
+	t.Cleanup(func() { readSettingsBytes = real })
+	rewriteSettings(t, f.projectFile, writableFoldersYAML(next))
+	requireLiveFolders(t, r)
+
+	requireLiveFolders(t, r, next, first)
+}
+
+func TestWritableFoldersReader_AReplacedSettingsFolderDuringTheReadGrantsNothing(t *testing.T) {
+	first, next := declaredScopeDir(t), declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, first)
+	requireLiveFolders(t, r, first)
+
+	dir := filepath.Dir(f.projectFile)
+	real := readHeldSettings
+	readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+		readHeldSettings = real
+		if err := os.Rename(dir, dir+".old"); err != nil {
+			t.Errorf("move the settings folder: %v", err)
+		}
+		writeProjectSettings(t, f.project, writableFoldersYAML(next))
+		return real(parent, name)
+	}
+	t.Cleanup(func() { readHeldSettings = real })
+	rewriteSettings(t, f.projectFile, writableFoldersYAML(first, next))
+	requireLiveFolders(t, r)
+
+	requireLiveFolders(t, r, next)
+}
+
+func TestWritableFoldersReader_PublishesTheMetadataOfTheFileItRead(t *testing.T) {
+	first, next := declaredScopeDir(t), declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, first)
+
+	real := readHeldSettings
+	readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+		readHeldSettings = real
+		data, info, err := real(parent, name)
+		if err := bumpSettings(f.projectFile, writableFoldersYAML(next)); err != nil {
+			t.Errorf("rewrite after the read: %v", err)
+		}
+		return data, info, err
+	}
+	t.Cleanup(func() { readHeldSettings = real })
+	requireLiveFolders(t, r, first)
+
+	requireLiveFolders(t, r, next)
+}
+
+func TestWritableFoldersReader_AConcurrentCallWaitsForAFailedRefreshThenRecovers(t *testing.T) {
+	first, next := declaredScopeDir(t), declaredScopeDir(t)
+	f, r := admittedFoldersReader(t, first)
+	requireLiveFolders(t, r, first)
+
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	var reads atomic.Int32
+	real := readHeldSettings
+	readHeldSettings = func(parent *os.File, name string) ([]byte, fs.FileInfo, error) {
+		if reads.Add(1) == 1 {
+			close(entered)
+			<-proceed
+			return nil, nil, errSettingsChanged
+		}
+		return real(parent, name)
+	}
+	t.Cleanup(func() { readHeldSettings = real })
+	rewriteSettings(t, f.projectFile, writableFoldersYAML(next))
+
+	failed, recovered := make(chan []string, 1), make(chan []string, 1)
+	go func() { failed <- r.current() }()
+	<-entered
+	go func() { recovered <- r.current() }()
+	select {
+	case got := <-recovered:
+		t.Fatalf("the second call returned %v while the first refresh was still reading", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(proceed)
+
+	if got := <-failed; len(got) != 0 {
+		t.Fatalf("failed refresh = %v, want no folders", got)
+	}
+	if got := <-recovered; !slices.Equal(got, []string{next}) {
+		t.Fatalf("recovered refresh = %v, want [%s] and never the stale [%s]", got, next, first)
+	}
+	if reads.Load() != 2 {
+		t.Fatalf("settings reads = %d, want 2", reads.Load())
+	}
+}
+
+func TestWritableFoldersReader_OnlyTheAdmittedProjectLayerContributes(t *testing.T) {
+	cases := map[string]func(t *testing.T, f rereadFixture, folder string) *writableFoldersReader{
+		"unapproved project approved later": func(t *testing.T, f rereadFixture, folder string) *writableFoldersReader {
+			writeProjectSettings(t, f.project, writableFoldersYAML(folder))
+			r := liveFoldersReader(t, f, []string{f.global}, f.home)
+			f.trust(t)
+			rewriteSettings(t, f.projectFile, writableFoldersYAML(folder, f.outside))
+			return r
+		},
+		"settings created after a nothing-covered launch": func(t *testing.T, f rereadFixture, folder string) *writableFoldersReader {
+			r := liveFoldersReader(t, f, []string{f.global}, f.home)
+			writeProjectSettings(t, f.project, writableFoldersYAML(folder))
+			f.trust(t)
+			return r
+		},
+		"local layer": func(t *testing.T, f rereadFixture, folder string) *writableFoldersReader {
+			writeLocalProjectSettings(t, f.project, writableFoldersYAML(folder))
+			return liveFoldersReader(t, f, []string{f.global, f.localFile}, f.home)
+		},
+		"global layer": func(t *testing.T, f rereadFixture, folder string) *writableFoldersReader {
+			writeProjectSettings(t, f.project, writableFoldersYAML())
+			r := liveFoldersReader(t, f, []string{f.global, f.projectFile}, f.home)
+			writeGlobalSettings(t, f.home, writableFoldersYAML(folder), 0o600)
+			writeLocalProjectSettings(t, f.project, writableFoldersYAML(folder))
+			return r
+		},
+		"absent list": func(t *testing.T, f rereadFixture, _ string) *writableFoldersReader {
+			writeProjectSettings(t, f.project, blockedYAML())
+			return liveFoldersReader(t, f, []string{f.global, f.projectFile}, f.home)
+		},
+		"empty list": func(t *testing.T, f rereadFixture, _ string) *writableFoldersReader {
+			writeProjectSettings(t, f.project, writableFoldersYAML())
+			return liveFoldersReader(t, f, []string{f.global, f.projectFile}, f.home)
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRereadFixture(t)
+			f.writeGlobal(t)
+			r := setup(t, f, declaredScopeDir(t))
+			requireLiveFolders(t, r)
+			requireLiveFolders(t, r)
+		})
+	}
+}
+
+func TestWritableFoldersReader_ParsesSilentlyWithTheLaunchHome(t *testing.T) {
+	f := newRereadFixture(t)
+	f.writeGlobal(t)
+	inHome := filepath.Join(f.home, "work")
+	if err := os.Mkdir(inHome, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sibling := declaredScopeDir(t)
+	writeProjectSettings(t, f.project, writableFoldersYAML("~/work", filepath.Join(f.project, ".codemeld", "inside"), "relative", sibling))
+	t.Setenv("HOME", declaredScopeDir(t))
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	stderr := os.Stderr
+	os.Stderr = write
+	t.Cleanup(func() { os.Stderr = stderr })
+	r := liveFoldersReader(t, f, []string{f.global, f.projectFile}, f.home)
+	requireLiveFolders(t, r, inHome, sibling)
+	rewriteSettings(t, f.projectFile, writableFoldersYAML("~/work", "relative", sibling))
+	requireLiveFolders(t, r, inHome, sibling)
+	os.Stderr = stderr
+	_ = write.Close()
+	var printed bytes.Buffer
+	if _, err := printed.ReadFrom(read); err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	if printed.Len() != 0 {
+		t.Fatalf("stderr = %q, want no notices from the live reads", printed.String())
+	}
+
+	for name, home := range map[string][]string{"omitted": nil, "empty": {""}} {
+		if got := liveFoldersReader(t, f, []string{f.global, f.projectFile}, home...).current(); len(got) != 0 {
+			t.Fatalf("%s launch home: live writable folders = %v, want none", name, got)
+		}
 	}
 }

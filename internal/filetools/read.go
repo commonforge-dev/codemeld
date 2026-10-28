@@ -1,5 +1,4 @@
-// Built-in structured read tool: verbatim, line-paginated read of a regular in-project file with no
-// injected line numbers, hidden-path exempt, returning truncation/continuation metadata out-of-band
+// Built-in read tool: returns a regular file's contents verbatim, paginated by line.
 package filetools
 
 import (
@@ -21,15 +20,6 @@ const ReadToolName = "read"
 // read-specific (not one of the shared limit constants), so it lives here.
 const readDefaultOffset = 1
 
-// ReadTool is the built-in read-only read tool. It returns the verbatim contents of a
-// regular in-project file, paginated by line with no injected line numbers (the exact-text contract
-// shared with edit/create); pagination/truncation metadata is carried in the prefixed-stderr
-// channel, never appended to the content. It is read-only (Advertise().ReadOnly == true), so it
-// auto-allows without prompting in every mode. Unlike the recursive navigation tools it is
-// exempt from hidden filtering — an explicit path is honored even if hidden — because it never
-// routes through the hidden-filtering walker. The run-scoped home, process cwd, project root, and the
-// configured tool-output byte cap are bound at construction so target resolution matches the permission
-// path-scope rules and the truncation indicator survives the same byte cap as every other tool output.
 type ReadTool struct {
 	home        string
 	processCWD  string
@@ -39,12 +29,6 @@ type ReadTool struct {
 
 var _ tools.Tool = (*ReadTool)(nil)
 
-// NewReadTool builds the read tool bound to the run's ~ anchor (home), the process cwd accepted for
-// signature symmetry with the other file tools, the project root the target must stay within
-// (via ResolveReadTarget), and the tool-output byte cap (cache.MaxToolOutputBytes()) BoundedResult uses to
-// predict byte-cap truncation. The project root is symlink-resolved once here — mirroring
-// NewEditTool/NewCreateTool — so a launch through a symlinked project directory does not reject valid
-// in-project reads; ResolveReadTarget normalizes again, so the double normalization is idempotent.
 func NewReadTool(home, processCWD, projectRoot string, outputCap int) *ReadTool {
 	return &ReadTool{home: home, processCWD: processCWD, projectRoot: normalizeRoot(projectRoot), outputCap: outputCap}
 }
@@ -53,14 +37,9 @@ func (t *ReadTool) Name() string { return ReadToolName }
 
 func (t *ReadTool) SubjectKind() string { return "tool" }
 
-// Advertise returns the read tool's advertising metadata and read-only classification.
-// The parameter JSON-Schema is the OpenAI function-tool shape with additionalProperties:false so
-// the advertised contract matches the decoder exactly: `path` is the only required argument; `offset`
-// and `limit` are optional integers. ReadOnly is true: read never mutates, so it is advertised in Plan
-// and auto-allowed in every mode.
 func (t *ReadTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description: "Read the contents of a project file, returned verbatim with no line numbers. " +
+		Description: "Read the contents of a file inside or outside the project, returned verbatim with no line numbers. " +
 			"offset is the 1-based line to start at (default 1); limit caps the lines returned (default " +
 			fmt.Sprintf("%d, max %d", ReadDefaultLimit, ReadMaxLimit) + "). When more lines remain, the " +
 			"result reports the next offset to request. A binary file returns a short notice instead of " +
@@ -70,7 +49,7 @@ func (t *ReadTool) Advertise() tools.Metadata {
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Path of the file to read. Relative paths resolve against the project root and read normally; an explicitly named path whose real location is outside the project is read only after you approve it at the permission prompt. An explicit hidden (dot-prefixed) path is honored.",
+					"description": "Path of the file to read. Relative paths resolve against the project root. An explicitly named absolute or ~ path outside the project is read without asking unless it is blocked, in which case it is refused; while a settings file is broken, so that the blocked-path list is unknown, such a read asks first. A relative path that leaves the project through `..` or through a symlink inside the project is refused, as are ~user forms and malformed paths. An explicit hidden (dot-prefixed) path is honored.",
 				},
 				"offset": map[string]any{
 					"type":        "integer",
@@ -108,11 +87,6 @@ func (t *ReadTool) ResolveTarget(args map[string]any) (target string, scope stri
 	})
 }
 
-// ExternalReadScope reports whether scope (the path scope ResolveTarget returned) is an explicit
-// out-of-project read target — the promptable case DispatchTool routes to a permission prompt while
-// bypassing the read-only mode auto-allow. It mirrors the mutating tools' OutOfRootScope but drives the
-// read-only external posture, never a write grant. An in-project scope returns false, keeping in-project
-// reads on their existing no-prompt auto-allow.
 func (t *ReadTool) ExternalReadScope(scope string) bool {
 	return isExternalReadScope(scope, t.projectRoot)
 }
@@ -129,10 +103,6 @@ func (t *ReadTool) InvokeWithResolvedTarget(_ context.Context, args map[string]a
 // dispatch instead calls ResolveTarget then InvokeWithResolvedTarget; this keeps the tool a complete unit
 // for direct callers and tests. A target-resolution failure surfaces as the same in-band error result the
 // dispatcher would render, so the observable outcome matches either entry.
-// Standalone Invoke has no authorizer, so it must enforce the out-of-project boundary itself: an explicit
-// out-of-project read target (ExternalReadScope) is reachable only by per-read approval, which only the
-// dispatch path can obtain. This method refuses it in-band rather than reading; the in-project path is
-// unchanged. InvokeWithResolvedTarget carries no such guard because dispatch already authorized the read.
 func (t *ReadTool) Invoke(_ context.Context, args map[string]any) (tools.Result, error) {
 	target, scope, err := t.ResolveTarget(args)
 	if err != nil {
@@ -160,12 +130,6 @@ func (t *ReadTool) read(resolvedTarget string, args map[string]any) tools.Result
 		limit = *limitPtr
 	}
 
-	// Apply read's follow-to-regular-file symlink policy and reject a missing path, a directory
-	// or a non-regular file in-band — all surfaced as ResolveReadFile reasons. The containment
-	// boundary is the project root for an in-project read, or the approved external file's own enclosing
-	// directory for an authorized out-of-project read — so a post-authorization symlink swap that
-	// redirected the file elsewhere is still caught against the scope the prompt approved, without the
-	// project-root check rejecting the legitimately external file.
 	boundary := t.projectRoot
 	if t.ExternalReadScope(resolvedTarget) {
 		boundary = filepath.Dir(resolvedTarget)

@@ -226,24 +226,24 @@ func (t *transcript) commitError(text string) {
 }
 
 // appendToolActivity commits one tool-call round's activity lines as a single
-// permanent transcript block. Each line is escaped on the way in — they carry
-// file paths and shell commands whose "[...]" must render literally under the
-// transcript's dynamic colors, never as a style tag — and the escaped lines are
-// joined with newlines so the whole round renders as one block, not one
-// blank-gapped entry per call (the block separator only goes between entries).
+// permanent transcript block, so the round is not split into blank-gapped entries.
 // Tool activity is display-only and never recorded.
 func (t *transcript) appendToolActivity(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	escaped := make([]string, len(lines))
-	for i, line := range lines {
-		escaped[i] = tview.Escape(line)
-	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.commitLocked(strings.Join(escaped, "\n"), nil)
+	t.commitLocked(toolActivityBlockText(lines), nil)
 	t.renderLocked()
+}
+
+func toolActivityBlockText(lines []string) string {
+	rendered := make([]string, len(lines))
+	for i, line := range lines {
+		rendered[i] = "[" + toolActivityColor + "]▸ " + tview.Escape(line) + defaultTag
+	}
+	return strings.Join(rendered, "\n")
 }
 
 func (t *transcript) appendEditPatch(patch string) {

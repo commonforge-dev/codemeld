@@ -1,4 +1,4 @@
-// Package subagenttool registers the delegate tool, the production caller that hands one bounded
+// Package subagenttool registers the general_agent tool, the production caller that hands one bounded
 // piece of work to a child agent confined to caller-declared write, delete, move, and directory scopes.
 package subagenttool
 
@@ -27,7 +27,7 @@ import (
 	"codemeld.dev/codemeld/internal/turn"
 )
 
-const ToolName = "delegate"
+const ToolName = "general_agent"
 
 const (
 	instructionsArg = "instructions"
@@ -39,7 +39,7 @@ const (
 	destinationKey  = "destination"
 )
 
-// Snapshot is the parent state one delegate call inherits, read when that call starts
+// Snapshot is the parent state one general_agent call inherits, read when that call starts
 // rather than when the tool was registered.
 type Snapshot struct {
 	Mode            string
@@ -99,7 +99,8 @@ func (t *Tool) Advertise() tools.Metadata {
 			"destination pairs listed in files_move, and create only the exact directories listed in files_mkdir, " +
 			"which grant nothing inside them. It reports back a single summary of what it did, followed by a list of the operations the child was refused. " +
 			"codemeld appends one fixed sentence to the instructions asking the child to name each refused operation and its impact in its reply. " +
-			"At least one of files, files_delete, files_move, or files_mkdir must name a path.",
+			"Omit files, files_delete, files_move and files_mkdir, or pass them empty, to start a read-only child: it is offered only read tools, " +
+			"cannot create, edit, delete, move or make anything, and is the only form usable in Plan mode.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -110,12 +111,12 @@ func (t *Tool) Advertise() tools.Metadata {
 				filesArg: map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Paths, relative to the launch directory and inside the project, that the child may create or edit. Absolute and ~-prefixed paths are refused. Optional when files_delete, files_move, or files_mkdir names a path.",
+					"description": "Paths, relative to the launch directory and inside the project, that the child may create or edit. Absolute and ~-prefixed paths are refused. Optional; omit every path list for a read-only child.",
 				},
 				filesDeleteArg: map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Paths inside the project that the child may delete: a file, a symlink (removed as the link itself), or an empty directory. Relative, absolute, ~ and ~/ paths are accepted. A path listed only here may not be created or edited; list it in files as well for that. Optional when files, files_move, or files_mkdir names a path.",
+					"description": "Paths inside the project that the child may delete: a file, a symlink (removed as the link itself), or an empty directory. Relative, absolute, ~ and ~/ paths are accepted. A path listed only here may not be created or edited; list it in files as well for that. Optional; omit every path list for a read-only child.",
 				},
 				filesMoveArg: map[string]any{
 					"type": "array",
@@ -128,12 +129,12 @@ func (t *Tool) Advertise() tools.Metadata {
 						"required":             []string{sourceKey, destinationKey},
 						"additionalProperties": false,
 					},
-					"description": "Moves inside the project that the child may make. Each pair names an existing source (a file or directory, not a symlink) and a destination that does not exist yet under an existing parent directory. A pair authorizes exactly that one move: not a move of its source anywhere else, not a write to its destination, and not a delete of its source. No path may be the source of one pair and the destination of another. Relative, absolute, ~ and ~/ paths are accepted. Optional when files, files_delete, or files_mkdir names a path.",
+					"description": "Moves inside the project that the child may make. Each pair names an existing source (a file or directory, not a symlink) and a destination that does not exist yet under an existing parent directory. A pair authorizes exactly that one move: not a move of its source anywhere else, not a write to its destination, and not a delete of its source. No path may be the source of one pair and the destination of another. Relative, absolute, ~ and ~/ paths are accepted. Optional; omit every path list for a read-only child.",
 				},
 				filesMkdirArg: map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Directories inside the project, below its root, that the child may create with mkdir, along with any missing parent directories that mkdir makes on the way. A listed directory authorizes nothing inside it: a file beneath it still has to be listed in files. Relative, absolute, ~ and ~/ paths are accepted. Optional when files, files_delete, or files_move names a path.",
+					"description": "Directories inside the project, below its root, that the child may create with mkdir, along with any missing parent directories that mkdir makes on the way. A listed directory authorizes nothing inside it: a file beneath it still has to be listed in files. Relative, absolute, ~ and ~/ paths are accepted. Optional; omit every path list for a read-only child.",
 				},
 			},
 			"required":             []string{instructionsArg},
@@ -143,7 +144,7 @@ func (t *Tool) Advertise() tools.Metadata {
 	}
 }
 
-// A caller that prepares separately from invocation must return Result in band; a delegate call
+// A caller that prepares separately from invocation must return Result in band; a general_agent call
 // rejected on its arguments was never a permission question and must not abort the turn.
 type PreparationError struct {
 	Reason string
@@ -158,10 +159,10 @@ func (t *Tool) Invoke(ctx context.Context, args map[string]any) (tools.Result, e
 	if refusal != nil {
 		return refusal.Result(), nil
 	}
-	return t.InvokeWithPreparedDelegate(ctx, instruction, write, remove, moves, dirs)
+	return t.InvokeWithPreparedGeneralAgent(ctx, instruction, write, remove, moves, dirs)
 }
 
-func (t *Tool) PrepareDelegate(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, []string, error) {
+func (t *Tool) PrepareGeneralAgent(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, []string, error) {
 	instruction, write, remove, moves, dirs, refusal := t.prepare(args)
 	if refusal != nil {
 		return "", nil, nil, nil, nil, nil, refusal
@@ -209,7 +210,7 @@ func (t *Tool) prepare(args map[string]any) (string, map[string]bool, map[string
 	return instruction, write, remove, moves, dirs, nil
 }
 
-func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error) {
+func (t *Tool) InvokeWithPreparedGeneralAgent(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error) {
 	snap, ok := t.deps.Snapshot()
 	if !ok {
 		return failResult("no model is resolvable, so no child agent can start"), nil
@@ -236,24 +237,31 @@ func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction strin
 		return failResult("the child agent could not be recorded in the session, so no child agent started: " + serr.Error()), nil
 	}
 
-	journal, jerr := t.openJournal(ctx, write, remove, moves, dirs)
-	if jerr != nil {
-		return failResult("the child agent's changes could not be made undoable, so no child agent started: " + jerr.Error()), nil
+	readOnly := len(write)+len(remove)+len(moves)+len(dirs) == 0
+	var journal *subagent.Journal
+	if !readOnly {
+		var jerr error
+		journal, jerr = t.openJournal(ctx, write, remove, moves, dirs)
+		if jerr != nil {
+			return failResult("the child agent's changes could not be made undoable, so no child agent started: " + jerr.Error()), nil
+		}
 	}
 
 	// A failed start record stops the child, so the journal opened above has to be resolved by
 	// hand here: subagent.Run, which normally does it, is never reached.
 	start := childStartPayload(invocation, instruction, write, remove, moves, dirs, snap)
 	if err := events.EmitChildAgentStart(store, t.deps.ProjectRoot, start); err != nil {
-		journal.Finish(subagent.ReasonFailed)
-		journal.Close()
+		if journal != nil {
+			journal.Finish(subagent.ReasonFailed)
+			journal.Close()
+		}
 		return failResult("the child agent could not be recorded in the session, so no child agent started: " + err.Error()), nil
 	}
 	if t.deps.Activity != nil {
 		t.deps.Activity.ChildAgentStarted(start)
 	}
 
-	permitted := childPermittedTools(snap.Registered)
+	permitted := childPermittedTools(snap.Registered, readOnly)
 	started := time.Now()
 	res, runErr := subagent.Run(ctx, subagent.Request{
 		Instruction:     instruction,
@@ -266,7 +274,7 @@ func (t *Tool) InvokeWithPreparedDelegate(ctx context.Context, instruction strin
 		Dispatcher: &confinedDispatcher{
 			inner:     dispatcher,
 			permitted: permitted,
-			nested:    t.nestedDelegate(snap.Mode, write, remove, moves, dirs, invocation),
+			nested:    t.nestedGeneralAgent(snap.Mode, write, remove, moves, dirs, invocation),
 		},
 		StepCap:      subagent.DefaultStepCap,
 		Journal:      journal,
@@ -410,7 +418,7 @@ func sortedPaths(declared map[string]bool) []string {
 	return paths
 }
 
-// openJournal snapshots the declared scope before the child is dispatched, linking a nested delegate's
+// openJournal snapshots the declared scope before the child is dispatched, linking a nested general_agent call's
 // journal to the one bound to ctx so the parent can absorb it deepest-first.
 func (t *Tool) openJournal(ctx context.Context, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (*subagent.Journal, error) {
 	parent, _ := filetools.WriteJournalFromContext(ctx).(*subagent.Journal)
@@ -434,8 +442,6 @@ func sortedPairs(declared map[permissions.MovePair]bool) []permissions.MovePair 
 	return pairs
 }
 
-// At least one path is required across the forms: the nested containment check reads a
-// candidate with no path in any form as a declaration that did not resolve.
 func (t *Tool) validate(args map[string]any) (string, map[string]bool, map[string]bool, map[permissions.MovePair]bool, map[string]bool, error) {
 	if err := rejectUnknownArgs(args); err != nil {
 		return "", nil, nil, nil, nil, err
@@ -462,9 +468,6 @@ func (t *Tool) validate(args map[string]any) (string, map[string]bool, map[strin
 	mkdirs, mkdirsGiven, err := optionalStringSlice(args, filesMkdirArg)
 	if err != nil {
 		return "", nil, nil, nil, nil, err
-	}
-	if len(files)+len(deletes)+len(pairs)+len(mkdirs) == 0 {
-		return "", nil, nil, nil, nil, fmt.Errorf("arguments %q, %q, %q and %q must name at least one path between them", filesArg, filesDeleteArg, filesMoveArg, filesMkdirArg)
 	}
 	for i, raw := range files {
 		switch {
@@ -568,10 +571,8 @@ func suppliedSet(declared map[string]bool, supplied bool) map[string]bool {
 	return declared
 }
 
-// delete, mkdir, move and delegate are pinned in so each reaches authorization and is refused
-// there for the child declaration form it lacks. Withholding them instead would make a missing
-// declaration look like a missing capability, and a later declaration form would have to unpick
-// a prohibition rather than fill a set.
+// A child that declared any path keeps delete, mkdir and move so each reaches authorization and is
+// refused there for the declaration form it lacks.
 var childToolNames = map[string]bool{
 	filetools.ReadToolName:      true,
 	filetools.ReadImageToolName: true,
@@ -588,15 +589,26 @@ var childToolNames = map[string]bool{
 	ToolName:                    true,
 }
 
+var childWriteToolNames = map[string]bool{
+	filetools.EditToolName:   true,
+	filetools.CreateToolName: true,
+	filetools.DeleteToolName: true,
+	filetools.MkdirToolName:  true,
+	filetools.MoveToolName:   true,
+}
+
 const vcsToolNamePrefix = "vcs_"
 
 // A vcs_<action> tool joins the set on what its registered instance advertises, never on its
 // name or the source of the template that defined it — only the VCS layer classifies which argv
 // an action runs. That classification covers the argv alone: hooks, extensions and repository
 // configuration reached through it stay unsandboxed.
-func childPermittedTools(registered []tools.Tool) map[string]bool {
+func childPermittedTools(registered []tools.Tool, readOnly bool) map[string]bool {
 	permitted := make(map[string]bool, len(childToolNames)+len(registered))
 	for name := range childToolNames {
+		if readOnly && childWriteToolNames[name] {
+			continue
+		}
 		permitted[name] = true
 	}
 	for _, tool := range registered {
@@ -630,7 +642,7 @@ func childTools(parent []provider.ToolDefinition, permitted map[string]bool) []p
 type confinedDispatcher struct {
 	inner     turn.ToolDispatcher
 	permitted map[string]bool
-	// nested handles a delegate call the child itself makes. That one call is withheld from the
+	// nested handles a general_agent call the child itself makes. That one call is withheld from the
 	// inner dispatcher so no grant, turn-cache entry, mode auto-allow, or prompt reachable there
 	// can authorize it; the child's own declaration is the only route.
 	nested func(context.Context, turn.AssembledToolCall) (turn.ToolResult, error)
@@ -641,7 +653,7 @@ var _ turn.ToolDispatcher = (*confinedDispatcher)(nil)
 // Plan is where the confinement has to bite: turn's loop calls Plan once and then runs the
 // units it returns, reaching Dispatch only through their Run closures, so a check in Dispatch
 // alone would never see a call. A call this dispatcher answers itself — a refusal, or a nested
-// delegate — is withheld from the inner Plan entirely rather than filtered afterward: the
+// general_agent call — is withheld from the inner Plan entirely rather than filtered afterward: the
 // production planner prepares structured reads and assembles authorization groups there, and a
 // confined-away call must take part in neither. Forwarded calls
 // keep their relative order and the planner's own unit metadata, and a child loop runs at
@@ -704,21 +716,22 @@ func (d *confinedDispatcher) Dispatch(ctx context.Context, call turn.AssembledTo
 	return d.inner.Dispatch(ctx, call)
 }
 
-func (t *Tool) nestedDelegate(mode string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, invocation string) func(context.Context, turn.AssembledToolCall) (turn.ToolResult, error) {
+func (t *Tool) nestedGeneralAgent(mode string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, invocation string) func(context.Context, turn.AssembledToolCall) (turn.ToolResult, error) {
 	return func(ctx context.Context, call turn.AssembledToolCall) (turn.ToolResult, error) {
-		nestedWrite, nestedDelete, nestedMoves, nestedDirs := t.nestedDeclaration(call.Arguments)
+		nestedWrite, nestedDelete, nestedMoves, nestedDirs, resolved := t.nestedDeclaration(call.Arguments)
 		dispatcher := t.deps.NewDispatcher(permissions.ModeContext{
-			Mode:              mode,
-			ChildAgent:        true,
-			ChildInvocationID: invocation,
-			DeclaredWrite:     write,
-			DeclaredDelete:    remove,
-			DeclaredMoves:     moves,
-			DeclaredDirs:      dirs,
-			DelegateWrite:     nestedWrite,
-			DelegateDelete:    nestedDelete,
-			DelegateMoves:     nestedMoves,
-			DelegateDirs:      nestedDirs,
+			Mode:                 mode,
+			ChildAgent:           true,
+			ChildInvocationID:    invocation,
+			DeclaredWrite:        write,
+			DeclaredDelete:       remove,
+			DeclaredMoves:        moves,
+			DeclaredDirs:         dirs,
+			GeneralAgentWrite:    nestedWrite,
+			GeneralAgentDelete:   nestedDelete,
+			GeneralAgentMoves:    nestedMoves,
+			GeneralAgentDirs:     nestedDirs,
+			GeneralAgentResolved: resolved,
 		})
 		if dispatcher == nil {
 			return turn.ToolResult{Content: ToolName + ": child agent dispatch is unavailable"}, nil
@@ -727,18 +740,16 @@ func (t *Tool) nestedDelegate(mode string, write, remove map[string]bool, moves 
 	}
 }
 
-// A nested declaration that does not parse or does not validate resolves to the empty set, which
-// the containment check refuses.
-func (t *Tool) nestedDeclaration(arguments string) (write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) {
+func (t *Tool) nestedDeclaration(arguments string) (write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, resolved bool) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, false
 	}
 	_, write, remove, moves, dirs, err := t.validate(args)
 	if err != nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, false
 	}
-	return write, remove, moves, dirs
+	return write, remove, moves, dirs, true
 }
 
 // A refusal is an in-band tool error, not a deny envelope: the call was never a permission
@@ -746,6 +757,9 @@ func (t *Tool) nestedDeclaration(arguments string) (write, remove map[string]boo
 // refusal and pick a permitted alternative rather than have the turn halt on it. Minting a
 // deny envelope is the authorizer's business, not this package's.
 func refuseChildTool(name string) turn.ToolResult {
+	if childWriteToolNames[name] {
+		return turn.ToolResult{Content: fmt.Sprintf("tool %q is not available to a read-only child agent: its general_agent call declared no path in files, files_delete, files_move or files_mkdir", name)}
+	}
 	return turn.ToolResult{Content: fmt.Sprintf("tool %q is not available to a child agent", name)}
 }
 

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -19,6 +20,8 @@ import (
 func i64(n int64) *int64 { return &n }
 
 func bptr(b bool) *bool { return &b }
+
+func f64(v float64) *float64 { return &v }
 
 // litHash returns the lowercase hex SHA-256 of a literal subject, the value
 // permission_matched.argument_hash must mirror.
@@ -60,6 +63,9 @@ var validPayloads = []struct {
 	{"permission_prompt_shown/host-search", PermissionPromptShown{SubjectKind: "host", Subject: "web_search", HostScope: "mcp.exa.ai"}},
 	{"permission_prompt_shown/host-ip-literal", PermissionPromptShown{SubjectKind: "host", Subject: "web_fetch", HostScope: "2001:db8::1"}},
 	{"permission_prompt_shown/host-punycode", PermissionPromptShown{SubjectKind: "host", Subject: "web_fetch", HostScope: "xn--bcher-kva.example"}},
+	{"permission_prompt_wait/answered", PermissionPromptWait{WaitedMs: 1500, Prompts: 3, Ended: "answered"}},
+	{"permission_prompt_wait/zero-duration", PermissionPromptWait{WaitedMs: 0, Prompts: 1, Ended: "cancelled"}},
+	{"permission_prompt_wait/failed", PermissionPromptWait{WaitedMs: 7, Prompts: 1, Ended: "failed"}},
 	{"permission_decision/granted", PermissionDecision{SubjectKind: "direct", Subject: "git status", PathScope: "/home/u/proj", Outcome: "granted", GrantKind: "folder", GrantPathScope: "/home/u/proj"}},
 	{"permission_decision/granted-global", PermissionDecision{SubjectKind: "tool", Subject: "Read", PathScope: "/home/u/proj", Outcome: "granted", GrantKind: "global", GrantPathScope: "*"}},
 	{"permission_decision/granted-once", PermissionDecision{SubjectKind: "tool", Subject: "vcs_commit", PathScope: "/home/u/proj", Outcome: "granted"}},
@@ -119,6 +125,9 @@ var validPayloads = []struct {
 	{"model_response/cached-reported", ModelResponse{Provider: "openai", ModelID: "gpt-5", InputTokens: 100, OutputTokens: 50, CachedInputTokens: i64(80)}},
 	{"model_response/cached-reported-zero", ModelResponse{Provider: "openai", ModelID: "gpt-5", InputTokens: 100, OutputTokens: 50, CachedInputTokens: i64(0)}},
 	{"model_response/cached-partial", ModelResponse{Provider: "openai", ModelID: "gpt-5", InputTokens: 100, OutputTokens: 50, CachedInputTokens: i64(80), CachedInputTokensPartial: true}},
+	{"model_response/cost-reported", ModelResponse{Provider: "openrouter", ModelID: "m", InputTokens: 100, OutputTokens: 50, CostUSD: f64(0.00123)}},
+	{"model_response/cost-reported-zero", ModelResponse{Provider: "openrouter", ModelID: "m", InputTokens: 100, OutputTokens: 50, CostUSD: f64(0)}},
+	{"model_response/cost-partial", ModelResponse{Provider: "openrouter", ModelID: "m", InputTokens: 100, OutputTokens: 50, CostUSD: f64(0.5), CostUSDPartial: true}},
 	{"model_changed/with-prior", ModelChanged{NewProvider: "openai", NewModelID: "gpt-5", NewEffort: "high", PriorProvider: "openrouter", PriorModelID: "z-ai/glm-5.1", PriorEffort: "low"}},
 	{"model_changed/no-prior", ModelChanged{NewProvider: "openai", NewModelID: "gpt-5", NewEffort: "medium"}},
 	{"model_changed/advertised-tokens", ModelChanged{NewProvider: "venice", NewModelID: "custom-1", NewEffort: "ultra", PriorProvider: "venice", PriorModelID: "custom-0", PriorEffort: "max"}},
@@ -461,6 +470,22 @@ func TestModelResponse_LegacyRecordOmittingCachedFields(t *testing.T) {
 	if p.CachedInputTokensPartial {
 		t.Error("CachedInputTokensPartial = true, want false for a record carrying no cached total")
 	}
+	if p.CostUSD != nil || p.CostUSDPartial {
+		t.Errorf("cost = (%v, %v), want (nil, false) for a record carrying no cost", p.CostUSD, p.CostUSDPartial)
+	}
+}
+
+func TestModelResponse_RejectsNonFiniteCostBeforeMarshalling(t *testing.T) {
+	for _, v := range []float64{math.Inf(1), math.Inf(-1), math.NaN()} {
+		store := newStore()
+		_, err := Append(store, ModelResponse{Provider: "o", ModelID: "m", CostUSD: f64(v)})
+		if err == nil || !strings.Contains(err.Error(), "model_response.cost_usd") {
+			t.Errorf("Append(cost_usd=%v) error = %v, want a model_response.cost_usd validation error", v, err)
+		}
+		if got := len(store.Records()); got != 0 {
+			t.Errorf("rejected payload still appended %d record(s)", got)
+		}
+	}
 }
 
 func TestModelResponse_CachedZeroSurvivesTheWire(t *testing.T) {
@@ -505,6 +530,27 @@ func TestProviderRoundTrip_UpstreamProviderSerialization(t *testing.T) {
 	const legacy = `{"provider":"openrouter","model_id":"m","duration_ms":5}`
 	if err := ValidatePayload(KindProviderRoundTrip, json.RawMessage(legacy)); err != nil {
 		t.Fatalf("ValidatePayload() rejected a pre-change provider_round_trip: %v", err)
+	}
+}
+
+func TestProviderRoundTrip_StreamCountersSerialization(t *testing.T) {
+	rec, err := Append(newStore(), ProviderRoundTrip{Provider: "openrouter", ModelID: "m", DurationMs: 1, Chunks: 7, ReasoningChars: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw := string(rec.(sessions.Event).Payload); !strings.Contains(raw, `"chunks":7`) || !strings.Contains(raw, `"reasoning_chars":12`) {
+		t.Errorf("counters not written: %s", raw)
+	}
+	zero, err := Append(newStore(), ProviderRoundTrip{Provider: "openai", ModelID: "gpt-5", DurationMs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw := string(zero.(sessions.Event).Payload); strings.Contains(raw, "chunks") || strings.Contains(raw, "reasoning_chars") {
+		t.Errorf("zero counters wrote a key: %s", raw)
+	}
+	const old = `{"provider":"openrouter","model_id":"m","duration_ms":5,"turn_id":"` + goodV7 + `","round_id":"` + goodV7 + `"}`
+	if err := ValidatePayload(KindProviderRoundTrip, json.RawMessage(old)); err != nil {
+		t.Fatalf("ValidatePayload() rejected a provider_round_trip without counters: %v", err)
 	}
 }
 
@@ -584,6 +630,11 @@ var invalidPayloads = []struct {
 	{"child_agent_end/negative-steps", ChildAgentEnd{InvocationID: goodV7, Reason: "completed", Steps: -1, RollbackOutcome: "not_needed"}},
 	{"tool_exec_end/bad-uuid", ToolExecEnd{SubjectKind: "tool", Subject: "Read", ExitCode: 0, DurationMs: 5, Truncated: false, InvocationID: "not-a-v7"}},
 	{"prompt_shown/star-scope", PermissionPromptShown{SubjectKind: "direct", Subject: "x", PathScope: "*"}},
+	{"permission_prompt_wait/negative-waited", PermissionPromptWait{WaitedMs: -1, Prompts: 1, Ended: "answered"}},
+	{"permission_prompt_wait/zero-prompts", PermissionPromptWait{WaitedMs: 1, Prompts: 0, Ended: "answered"}},
+	{"permission_prompt_wait/negative-prompts", PermissionPromptWait{WaitedMs: 1, Prompts: -2, Ended: "answered"}},
+	{"permission_prompt_wait/unknown-ended", PermissionPromptWait{WaitedMs: 1, Prompts: 1, Ended: "timed_out"}},
+	{"permission_prompt_wait/empty-ended", PermissionPromptWait{WaitedMs: 1, Prompts: 1}},
 	{"prompt_shown/host-missing-scope", PermissionPromptShown{SubjectKind: "host", Subject: "web_fetch"}},
 	{"prompt_shown/host-wildcard", PermissionPromptShown{SubjectKind: "host", Subject: "web_fetch", HostScope: "*"}},
 	{"prompt_shown/host-uppercase", PermissionPromptShown{SubjectKind: "host", Subject: "web_fetch", HostScope: "Docs.Example.com"}},
@@ -692,6 +743,8 @@ var invalidPayloads = []struct {
 	{"model_response/bad-anomaly", ModelResponse{Provider: "o", ModelID: "m", Anomaly: []string{"weird"}}},
 	{"model_response/negative-cached", ModelResponse{Provider: "o", ModelID: "m", CachedInputTokens: i64(-1)}},
 	{"model_response/partial-without-cached", ModelResponse{Provider: "o", ModelID: "m", CachedInputTokensPartial: true}},
+	{"model_response/negative-cost", ModelResponse{Provider: "o", ModelID: "m", CostUSD: f64(-0.01)}},
+	{"model_response/cost-partial-without-cost", ModelResponse{Provider: "o", ModelID: "m", CostUSDPartial: true}},
 	{"model_changed/partial-prior", ModelChanged{NewProvider: "o", NewModelID: "m", NewEffort: "high", PriorProvider: "o"}},
 	{"model_changed/empty-new-effort", ModelChanged{NewProvider: "o", NewModelID: "m", NewEffort: ""}},
 	{"model_effort_unsupported/empty-configured-effort", ModelEffortUnsupported{Provider: "o", ModelID: "m", ConfiguredEffort: ""}},
@@ -738,6 +791,10 @@ var invalidPayloads = []struct {
 	{"provider_round_trip/missing-provider", ProviderRoundTrip{ModelID: "gpt-5", DurationMs: 1}},
 	{"provider_round_trip/missing-model", ProviderRoundTrip{Provider: "openai", DurationMs: 1}},
 	{"provider_round_trip/negative-duration", ProviderRoundTrip{Provider: "openai", ModelID: "gpt-5", DurationMs: -1}},
+	{"provider_round_trip/negative-chunks", ProviderRoundTrip{Provider: "openai", ModelID: "gpt-5", DurationMs: 1, Chunks: -1}},
+	{"provider_round_trip/negative-reasoning-chars", ProviderRoundTrip{Provider: "openai", ModelID: "gpt-5", DurationMs: 1, ReasoningChars: -1}},
+	{"provider_round_trip/ids-negative-chunks", ProviderRoundTrip{Provider: "openai", ModelID: "gpt-5", DurationMs: 1, TurnID: goodV7, RoundID: goodV7, Chunks: -1}},
+	{"provider_round_trip/ids-negative-reasoning-chars", ProviderRoundTrip{Provider: "openai", ModelID: "gpt-5", DurationMs: 1, TurnID: goodV7, RoundID: goodV7, ReasoningChars: -1}},
 	{"suggest_followup_debug/bad-stage", SuggestFollowupDebug{Stage: "wat", Provider: "o", ModelID: "m", Mode: "build", Advertised: bptr(true)}},
 	{"suggest_followup_debug/missing-provider", SuggestFollowupDebug{Stage: "provider_round_no_call", ModelID: "m", Mode: "build"}},
 	{"suggest_followup_debug/missing-model", SuggestFollowupDebug{Stage: "provider_round_no_call", Provider: "o", Mode: "build"}},

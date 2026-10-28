@@ -115,7 +115,9 @@ func TestFixedEnvironment_RejectsAssignments(t *testing.T) {
 }
 
 func TestFixedEnvironment_AcceptsAssignments(t *testing.T) {
-	for _, a := range []string{"GOFLAGS=-mod=mod", "PATHX=1", "MY_PATH=1", "GOPATH=/x", "LANGUAGE=en"} {
+	for _, a := range []string{
+		"GOFLAGS=-mod=mod", "PATHX=1", "MY_PATH=1", "GOPATH=/x", "LANGUAGE=en", "MYAPP_TOKEN=x", "DATABASE_URL=postgres://u:p@h/db",
+	} {
 		got, err := FixedEnvironment("/h", "/p", "/t", FixedPATH, []string{a})
 		if err != nil {
 			t.Errorf("assignment %q: %v", a, err)
@@ -124,6 +126,44 @@ func TestFixedEnvironment_AcceptsAssignments(t *testing.T) {
 		if got[len(got)-1] != a {
 			t.Errorf("assignment %q: last entry = %q", a, got[len(got)-1])
 		}
+	}
+}
+
+func TestInheritedEnvironment_WithholdsNamesAndCredentialURLs(t *testing.T) {
+	for _, entry := range []string{
+		"LD_PRELOAD=x", "GIT_DIR=x", "HGRCPATH=x", "SSH_AUTH_SOCK=x", "HTTPS_PROXY=x", "https_proxy=x",
+		"XDG_CONFIG_HOME=x", "BASH_ENV=x", "DOCKER_HOST=x", "GITHUB_TOKEN=x", "OPENROUTER_API_KEY=x",
+		"AWS_SECRET_ACCESS_KEY=x", "my_secret=x", "DB_PASSWORD=x", "SERVICE_PW=x", "SESSION_COOKIE=x",
+		"PASSWD_FILE=x", "MY_CREDENTIALS=x", "STRIPE_APIKEY=x", "S3_ACCESS_KEY_ID=x", "SSL_PRIVATE_KEY_PATH=x",
+		"SIGNING_KEY=x", "SMTP_PASS=x", "PROXY_AUTH=x", "AUTH_HEADER=x", "AZURE_TENANT=x", "GOOGLE_PROJECT=x",
+		"GH_HOST=x", "GITLAB_HOST=x", "NPM_TOKEN_FILE=x", "CODEMELD_RUN_ID=x", "PATH=/x", "HOME=/x", "TMPDIR=/x",
+		"DATABASE_URL=postgres://u:p@h/db", "PGURL=postgresql://u:p@/db", "MIRROR=see git+ssh://me:pw@host:22/x for it",
+	} {
+		name, _, _ := strings.Cut(entry, "=")
+		inherited, withheld := InheritedEnvironment([]string{"KEEP=1", entry})
+		if !slices.Equal(inherited, []string{"KEEP=1"}) || !slices.Equal(withheld, []string{name}) {
+			t.Errorf("%q: inherited = %q, withheld = %q; want only KEEP=1 inherited and %q withheld", entry, inherited, withheld, name)
+		}
+	}
+}
+
+func TestInheritedEnvironment_KeepsOrdinaryEntries(t *testing.T) {
+	environ := []string{
+		"MISE_DATA_DIR=/data/coding/mise", "GOPATH=/go", "REPO_URL=https://example.com/x", "NOTE=user:password@",
+		"PORTED=http://host:8080/a@b", "EMPTY=", "KEYBOARD=us", "OAUTHOR=x", "AUTHOR=x",
+	}
+	inherited, withheld := InheritedEnvironment(environ)
+	if !slices.Equal(inherited, environ) || withheld != nil {
+		t.Fatalf("inherited = %q, withheld = %q; want every entry inherited and none withheld", inherited, withheld)
+	}
+}
+
+func TestInheritedEnvironment_SortsWithheldAndDedupesLastWins(t *testing.T) {
+	inherited, withheld := InheritedEnvironment([]string{
+		"ZED_TOKEN=x", "A=1", "noequals", "=empty", "LD_PRELOAD=x", "A=2", "B=1", "B=postgres://u:p@h/db", "C=postgres://u:p@h/db", "C=3",
+	})
+	if !slices.Equal(inherited, []string{"A=2", "C=3"}) || !slices.Equal(withheld, []string{"B", "LD_PRELOAD", "ZED_TOKEN"}) {
+		t.Fatalf("inherited = %q, withheld = %q", inherited, withheld)
 	}
 }
 

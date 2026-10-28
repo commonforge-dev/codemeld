@@ -97,6 +97,16 @@ func landlockRules(p Policy, view fsView) ([]pathRule, error) {
 	} else if ok && !coveredBy(t, b.blocked) {
 		b.add(t, accessDevNull, isDir)
 	}
+	for _, root := range p.ReadRoots {
+		t, isDir, ok, err := b.resolve(root)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || !isDir || slices.Contains(b.blocked, t) || containsAny(t, b.blocked) {
+			continue
+		}
+		b.add(t, accessRead, true)
+	}
 	if p.Mode != ModeAutoEdits {
 		return b.rules, nil
 	}

@@ -510,6 +510,82 @@ func TestToolLoop_UserDeniedResultAppendedAndStops(t *testing.T) {
 	}
 }
 
+func costToolRound(n int, in, out int64, cost string) accountingRound {
+	return func(context.Context, *accountingEnv) (provider.Response, error) {
+		return streamResponse(toolCallsChunk(toolFrag(0, fmt.Sprintf("call_%d", n), "do", "{}")), costUsageChunk(in, out, cost))
+	}
+}
+
+func TestToolLoop_HaltedTurnRecordsOneModelResponseWithEveryRoundsUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		halt       ToolResult
+		wantDenied bool
+	}{
+		{"user denial", ToolResult{Content: `{"denied_by":"user","reason":"no"}`, Denied: true}, true},
+		{"terminal result", ToolResult{Content: "stopped", Terminal: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			afterHalt := func(context.Context, *accountingEnv) (provider.Response, error) {
+				t.Error("provider called after the halt")
+				return provider.Response{}, errBadRequest
+			}
+			e := newAccountingEnv(t, "openrouter", costToolRound(1, 100, 10, "0.25"), costToolRound(2, 50, 5, "0.5"), afterHalt)
+			e.loop.dispatcher = &fakeDispatcher{resultFn: func(call AssembledToolCall) (ToolResult, error) {
+				if call.ID == "call_2" {
+					return tc.halt, nil
+				}
+				return ToolResult{Content: "out:" + call.ID}, nil
+			}}
+
+			if err := e.loop.Run(e.ctx); err != nil {
+				t.Fatalf("loop.Run() error = %v, want nil", err)
+			}
+			if e.loop.Denied() != tc.wantDenied {
+				t.Fatalf("loop.Denied() = %v, want %v", e.loop.Denied(), tc.wantDenied)
+			}
+			recs := diskRecords(t, e.store)
+			mr := decodeModelResponse(t, recs)
+			if mr.InputTokens != 150 || mr.OutputTokens != 15 {
+				t.Fatalf("model_response tokens = (%d, %d), want (150, 15)", mr.InputTokens, mr.OutputTokens)
+			}
+			if mr.CostUSD == nil || *mr.CostUSD != 0.75 || mr.CostUSDPartial {
+				t.Fatalf("model_response cost = %v partial %v, want 0.75 complete", mr.CostUSD, mr.CostUSDPartial)
+			}
+			if final := lastAssistantText(recs); final != "" {
+				t.Fatalf("final assistant answer = %q, want none after a halt", final)
+			}
+		})
+	}
+}
+
+func TestToolLoop_DeniedTurnFallbackFlushFailureIsReported(t *testing.T) {
+	e := newAccountingEnv(t, "openai", usageToolRound(1, 100, 10, ""))
+	e.loop.dispatcher = &fakeDispatcher{resultFn: func(AssembledToolCall) (ToolResult, error) {
+		return ToolResult{Content: `{"denied_by":"user","reason":"no"}`, Denied: true}, nil
+	}}
+	// Runs after the denial round's own records are flushed and before the fallback writes.
+	e.loop.userUsage = func(int64, int64) {
+		if err := os.RemoveAll(e.dir); err != nil {
+			t.Fatalf("remove session directory: %v", err)
+		}
+		if err := os.WriteFile(e.dir, []byte("not a directory"), 0o600); err != nil {
+			t.Fatalf("replace session directory: %v", err)
+		}
+	}
+
+	err := e.loop.Run(e.ctx)
+	if err == nil {
+		t.Fatal("loop.Run() error = nil, want the fallback's write failure")
+	}
+	if !e.loop.Denied() {
+		t.Fatal("loop.Denied() = false, want the denial halt")
+	}
+	if len(e.writeFailures) != 1 || !errors.Is(err, e.writeFailures[0]) {
+		t.Fatalf("write failures = %v, want one, returned as %v", e.writeFailures, err)
+	}
+}
+
 // A mode-policy denial (denied_by:"mode") is recoverable. The deny envelope is
 // appended keyed to the call and a friendly refusal line is surfaced, but — unlike a user denial —
 // the loop re-issues the model so it sees the refused tool result and can pick a permitted
@@ -717,11 +793,14 @@ func TestToolLoop_WrapUpRefusalGetsOneToolLessRoundForTheFinalAnswer(t *testing.
 		t.Fatalf("wrap-up request advertised %d tools, want none", len(wrap.Tools))
 	}
 	last := wrap.Messages[len(wrap.Messages)-1]
-	if last.Role != "system" || last.Content != wrapUpInstruction {
+	if last.Role != "system" || last.Content != wrapUpText(refusalCause) {
 		t.Fatalf("wrap-up request ends with %+v, want the wrap-up system instruction", last)
 	}
 	assertContinuation(t, wrap, "call_1", permissions.BuildUnattendedDenyEnvelope("no approval available in non-interactive run mode"))
 	recs := store.Records()
+	if got := systemMessages(recs); !slices.Equal(got, []string{wrapUpText(refusalCause)}) {
+		t.Fatalf("stored system messages = %q, want the refusal cause before the instruction", got)
+	}
 	if got := messageRoleSeq(recs); !slices.Equal(got, []string{"user", "assistant_tc", "tool", "system", "assistant"}) {
 		t.Fatalf("message roles = %v, want the refused group, the instruction, then the answer", got)
 	}
@@ -732,19 +811,23 @@ func TestToolLoop_WrapUpRefusalGetsOneToolLessRoundForTheFinalAnswer(t *testing.
 
 func TestToolLoop_WrapUpReplyNeverDispatchesAToolCall(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		round     [][]byte
-		wantFinal string
-		wantErr   bool
+		name        string
+		round       [][]byte
+		wantFinal   string
+		wantErr     bool
+		wantSkipped bool
 	}{
 		{name: "structured call with text", round: [][]byte{contentChunk("Final words."), toolCallsChunk(toolFrag(0, "call_2", "do", "{}"))}, wantFinal: "Final words."},
 		{name: "structured call only", round: [][]byte{toolCallsChunk(toolFrag(0, "call_2", "do", "{}"))}, wantErr: true},
+		{name: "structured call with whitespace", round: [][]byte{contentChunk(" \n"), toolCallsChunk(toolFrag(0, "call_2", "do", "{}"))}, wantErr: true},
+		{name: "suggest-only with whitespace", round: [][]byte{contentChunk(" \n"), toolCallsChunk(toolFrag(0, "call_s", "suggest_followup", suggestArgs))}, wantErr: true},
 		{name: "whole-message text call", round: finalAnswer(`{"name":"do","arguments":{}}`), wantErr: true},
-		{name: "whitespace-only answer", round: finalAnswer("  \n\t "), wantErr: true},
-		{name: "empty answer", round: [][]byte{finishChunk("stop")}, wantErr: true},
+		{name: "whitespace-only answer", round: finalAnswer("  \n\t "), wantErr: true, wantSkipped: true},
+		{name: "empty answer", round: [][]byte{finishChunk("stop")}, wantErr: true, wantSkipped: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			loop, client, store, notices := wrapUpLoop(t, tc.round)
+			loop.deps.Retry = retryOn()
 
 			err := loop.Run(context.Background())
 			if (err != nil) != tc.wantErr {
@@ -775,8 +858,27 @@ func TestToolLoop_WrapUpReplyNeverDispatchesAToolCall(t *testing.T) {
 					failures++
 				}
 			}
-			if failures != 1 || len(*notices) == 0 {
+			emptyNotices := 0
+			for _, n := range *notices {
+				if strings.Contains(n, "empty_response") {
+					emptyNotices++
+				}
+			}
+			if failures != 1 || emptyNotices != 1 {
 				t.Fatalf("kinds = %v, notices = %v, want exactly one empty-response failure and its notice", eventKinds(recs), *notices)
+			}
+			if !strings.Contains(err.Error(), "no visible assistant response") {
+				t.Fatalf("loop.Run() error = %v, want the no-visible-response error", err)
+			}
+			if rs := findProviderRequestRetry(t, recs); len(rs) != 0 {
+				t.Fatalf("provider_request_retry = %+v, want none: wrap-up runs one attempt", rs)
+			}
+			skipped := findProviderRequestRetrySkipped(t, recs)
+			if tc.wantSkipped != (len(skipped) == 1) || len(skipped) > 1 {
+				t.Fatalf("provider_request_retry_skipped = %+v, want one only for a plain blank reply (%t)", skipped, tc.wantSkipped)
+			}
+			if tc.wantSkipped && (skipped[0].Phase != "empty_response" || skipped[0].SkipReason != "max_attempts_reached") {
+				t.Fatalf("provider_request_retry_skipped = %+v, want empty_response max_attempts_reached", skipped[0])
 			}
 		})
 	}
@@ -1766,6 +1868,47 @@ func TestToolLoop_AccumulatesCachedTokensAcrossRounds(t *testing.T) {
 			}
 			if mr.CachedInputTokensPartial != tt.wantPartial {
 				t.Fatalf("cached_input_tokens_partial = %v, want %v", mr.CachedInputTokensPartial, tt.wantPartial)
+			}
+		})
+	}
+}
+
+func TestToolLoop_AccumulatesCostAcrossRounds(t *testing.T) {
+	tests := []struct {
+		name        string
+		firstRound  [][]byte
+		wantCost    float64
+		wantPartial bool
+	}{
+		{"every-round-reports", [][]byte{toolCallChunk(), costUsageChunk(100, 20, "0.25")}, 0.75, false},
+		{"one-round-omits", [][]byte{toolCallChunk(), usageChunk(100, 20)}, 0.5, true},
+		{"one-round-has-no-usage-chunk", [][]byte{toolCallChunk()}, 0.5, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			store.Append(textMsg("user", "do the thing"))
+
+			client := &scriptedClient{rounds: [][][]byte{
+				tt.firstRound,
+				{contentChunk("all done"), finishChunk("stop"), costUsageChunk(120, 40, "0.5")},
+			}}
+			loop := NewToolLoop(Deps{
+				Active: selectedState("openrouter", "m", model.EffortDefault),
+				Store:  store,
+				Client: client,
+			}, &fakeDispatcher{}, 3)
+
+			if err := loop.Run(context.Background()); err != nil {
+				t.Fatalf("loop.Run() error = %v, want nil", err)
+			}
+
+			mr := decodeModelResponse(t, store.Records())
+			if mr.CostUSD == nil || *mr.CostUSD != tt.wantCost {
+				t.Fatalf("cost_usd = %v, want %v", mr.CostUSD, tt.wantCost)
+			}
+			if mr.CostUSDPartial != tt.wantPartial {
+				t.Fatalf("cost_usd_partial = %v, want %v", mr.CostUSDPartial, tt.wantPartial)
 			}
 		})
 	}
@@ -3437,8 +3580,11 @@ func assertTimeLimitWrapUp(t *testing.T, client *timeLimitClient, loop *ToolLoop
 	if len(final.Tools) != 0 {
 		t.Fatalf("final request advertised %d tools, want none", len(final.Tools))
 	}
-	if last := final.Messages[len(final.Messages)-1]; last.Role != "system" || last.Content != wrapUpInstruction {
+	if last := final.Messages[len(final.Messages)-1]; last.Role != "system" || last.Content != wrapUpText(timeLimitCause) {
 		t.Fatalf("final request's last message = %+v, want the wrap-up instruction", last)
+	}
+	if got := systemMessages(diskRecords(t, store)); !slices.Equal(got, []string{wrapUpText(timeLimitCause)}) {
+		t.Fatalf("durable system messages = %q, want the time-limit cause before the instruction", got)
 	}
 	if err := client.ctxErrs[wantRequests-1]; err != nil {
 		t.Fatalf("final request context error = %v, want the live parent context", err)
@@ -4292,6 +4438,16 @@ func limitNotices(notices []string) []string {
 	return out
 }
 
+const (
+	timeLimitCause  = "The run's time limit was reached, ending tool use in this turn."
+	roundLimitCause = "This turn reached its 200-round limit."
+	refusalCause    = "Repeated refusals of a tool call ended tool use in this turn."
+)
+
+func wrapUpText(cause string) string {
+	return cause + " For this assistant turn only, tools are no longer available. Write your final answer now, using only the information you already have. If your final answer reports why work stopped, state this cause. This restriction ends when the next user message starts a new turn; follow the tools and instructions supplied for that new turn."
+}
+
 func systemMessages(recs []sessions.Record) []string {
 	var out []string
 	for _, r := range recs {
@@ -4326,7 +4482,7 @@ func TestToolLoop_RoundLimitMakesTheTwoHundredthRoundTheWrapUp(t *testing.T) {
 	if !slices.Equal(h.notices, []string{roundLimitNoticeText}) || h.noticeAt[0] != 199 {
 		t.Fatalf("notices = %q at requests %v, want the round-limit notice once before request 200", h.notices, h.noticeAt)
 	}
-	if got := systemMessages(diskRecords(t, store)); !slices.Equal(got, []string{wrapUpInstruction}) {
+	if got := systemMessages(diskRecords(t, store)); !slices.Equal(got, []string{wrapUpText(roundLimitCause)}) {
 		t.Fatalf("durable system messages = %q, want the wrap-up instruction", got)
 	}
 }
@@ -4393,6 +4549,9 @@ func TestToolLoop_ThirdIdenticalToolCallRoundWrapsUp(t *testing.T) {
 			}
 			if seq := messageRoleSeq(recs); !slices.Equal(seq[len(seq)-3:], []string{"tool", "system", "assistant"}) {
 				t.Fatalf("message roles = %v, want the third round's result, the instruction, then the answer", seq)
+			}
+			if got, want := systemMessages(recs), wrapUpText("The same tool call (do) was repeated 3 rounds in a row."); !slices.Equal(got, []string{want}) {
+				t.Fatalf("stored system messages = %q, want %q", got, want)
 			}
 			if final := lastAssistantText(recs); final != "final answer" {
 				t.Fatalf("final assistant text = %q, want the wrap-up answer", final)
@@ -4497,8 +4656,8 @@ func TestToolLoop_RepeatAtTheRoundLimitWrapsUpOnceWithTheRoundLimitNotice(t *tes
 		t.Fatalf("notices = %q at requests %v, want only the round-limit notice before request 200", h.notices, h.noticeAt)
 	}
 	recs := store.Records()
-	if got := len(systemMessages(recs)); got != 1 {
-		t.Fatalf("system messages = %d, want one wrap-up instruction", got)
+	if got := systemMessages(recs); !slices.Equal(got, []string{wrapUpText(roundLimitCause)}) {
+		t.Fatalf("system messages = %q, want one wrap-up instruction with the round-limit cause", got)
 	}
 	if got := len(toolMessages(recs)); got != 199 {
 		t.Fatalf("tool results = %d, want 199", got)
@@ -4643,6 +4802,134 @@ func TestToolLoop_NextTurnAfterARoundLimitGetsToolsAndFreshCounts(t *testing.T) 
 	}
 	if !slices.ContainsFunc(second.requests[0].Messages, func(m provider.Message) bool { return m.Role == "user" && m.Content == "go" }) {
 		t.Fatal("second turn request omits the earlier turn's messages")
+	}
+}
+
+func TestToolLoop_NextTurnAfterATimeLimitGetsTools(t *testing.T) {
+	store := limitStore(t)
+	first := newLimitHarness(t, store, distinctCall)
+	first.loop.SetDeadline(time.Now().Add(-time.Second))
+	if err := first.loop.Run(context.Background()); err != nil {
+		t.Fatalf("first turn error = %v, want nil", err)
+	}
+	want := wrapUpText(timeLimitCause)
+	if got := systemMessages(store.Records()); !slices.Equal(got, []string{want}) {
+		t.Fatalf("persisted wrap-up instruction = %q, want %q", got, want)
+	}
+
+	store.Append(textMsg("user", "continue"))
+	second := newLimitHarness(t, store, func(int) (provider.Response, error) {
+		return streamResponse(contentChunk("second answer"), finishChunk("stop"))
+	})
+	if err := second.loop.Run(context.Background()); err != nil {
+		t.Fatalf("second turn error = %v, want nil", err)
+	}
+	req := second.requests[0]
+	if len(req.Tools) == 0 {
+		t.Fatal("second turn request offered no tools after the earlier time limit")
+	}
+	if !slices.ContainsFunc(req.Messages, func(m provider.Message) bool { return m.Role == "system" && m.Content == want }) {
+		t.Fatal("second turn request does not replay the earlier wrap-up instruction")
+	}
+}
+
+func TestToolLoop_RefusalWrapUpKeepsItsCauseWhenTheDeadlineExpires(t *testing.T) {
+	refusal := ToolResult{Content: permissions.BuildUnattendedDenyEnvelope("no approval"), Denied: true, WrapUp: true}
+	t.Run("deadline expires after the wrap-up began", func(t *testing.T) {
+		client := &timeLimitClient{rounds: []func(context.Context) (provider.Response, error){
+			func(context.Context) (provider.Response, error) {
+				return streamResponse(toolCallsChunk(toolFrag(0, "call_1", "do", "{}")), usageChunk(10, 1))
+			},
+			answer("final answer"),
+		}}
+		disp := &fakeDispatcher{resultFn: func(AssembledToolCall) (ToolResult, error) { return refusal, nil }}
+		loop, store, _, _ := timeLimitLoop(t, client, disp)
+		loop.userUsage = func(int64, int64) { loop.Expire() }
+		loop.SetDeadline(time.Now().Add(time.Hour))
+
+		if err := loop.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !loop.timeUp() {
+			t.Fatal("the deadline never expired; the fixture must expire it after the refusal wrap-up")
+		}
+		if len(client.requests) != 2 || len(client.requests[1].Tools) != 0 {
+			t.Fatalf("provider requests = %d, want one tool-less wrap-up after the refusal", len(client.requests))
+		}
+		if got := systemMessages(diskRecords(t, store)); !slices.Equal(got, []string{wrapUpText(refusalCause)}) {
+			t.Fatalf("durable system messages = %q, want only the refusal wrap-up", got)
+		}
+	})
+	t.Run("deadline expires during the refusing dispatch", func(t *testing.T) {
+		calls := toolCallsChunk(toolFrag(0, "done", "do", "{}"), toolFrag(1, "slow", "do", "{}"))
+		client := &timeLimitClient{rounds: []func(context.Context) (provider.Response, error){
+			func(context.Context) (provider.Response, error) {
+				return provider.Response{Stream: newStream(calls)}, nil
+			},
+			answer("final answer"),
+		}}
+		disp := &timeLimitDispatcher{doneRan: make(chan struct{}), done: &refusal}
+		loop, store, _, _ := timeLimitLoop(t, client, disp)
+		disp.expire = func() { loop.Expire() }
+		loop.SetDeadline(time.Now().Add(time.Hour))
+
+		if err := loop.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if len(client.requests) != 2 || len(client.requests[1].Tools) != 0 {
+			t.Fatalf("provider requests = %d, want one tool-less wrap-up", len(client.requests))
+		}
+		if got := systemMessages(diskRecords(t, store)); !slices.Equal(got, []string{wrapUpText(refusalCause)}) {
+			t.Fatalf("durable system messages = %q, want only the refusal wrap-up", got)
+		}
+	})
+}
+
+func TestToolLoop_DeadlineAtALimitBoundaryWrapsUpForTheTimeLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		at      int
+		respond func(int) (provider.Response, error)
+	}{
+		{"repeat limit", 3, func(n int) (provider.Response, error) {
+			return callRound(fmt.Sprintf("call_%d", n), "do", `{"path":"a.txt"}`)
+		}},
+		{"round limit", 199, distinctCall},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := limitStore(t)
+			h := newLimitHarness(t, store, tc.respond)
+			h.disp.resultFn = func(call AssembledToolCall) (ToolResult, error) {
+				if len(h.requests) == tc.at {
+					h.loop.Expire()
+				}
+				return ToolResult{Content: "out:" + call.ID}, nil
+			}
+			h.loop.SetDeadline(time.Now().Add(time.Hour))
+
+			if err := h.loop.Run(context.Background()); err != nil {
+				t.Fatalf("loop.Run() error = %v, want nil", err)
+			}
+			if len(h.requests) != tc.at+1 || len(h.requests[tc.at].Tools) != 0 {
+				t.Fatalf("provider requests = %d, want %d ending in one tool-less wrap-up", len(h.requests), tc.at+1)
+			}
+			if got := limitNotices(h.notices); len(got) != 0 {
+				t.Fatalf("limit notices = %q, want none when the deadline expired first", got)
+			}
+			if got := systemMessages(diskRecords(t, store)); !slices.Equal(got, []string{wrapUpText(timeLimitCause)}) {
+				t.Fatalf("durable system messages = %q, want only the time-limit wrap-up", got)
+			}
+		})
+	}
+}
+
+func TestToolLoop_LaterWrapUpKeepsTheFirstCause(t *testing.T) {
+	store := limitStore(t)
+	loop := newLimitHarness(t, store, distinctCall).loop
+	loop.beginWrapUp("First cause.")
+	loop.beginWrapUp("Second cause.")
+	if got := systemMessages(store.Records()); !slices.Equal(got, []string{wrapUpText("First cause.")}) {
+		t.Fatalf("system messages = %q, want one instruction with the first cause", got)
 	}
 }
 

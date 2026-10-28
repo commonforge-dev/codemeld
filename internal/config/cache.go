@@ -73,12 +73,13 @@ const composedSource = "composed config"
 // methods are visible to subsequent reads immediately but are not persisted to
 // disk by those methods, and there is no general reload API.
 //
-// ToggleFavorite and SetAttribution are the exceptions: they durably write the
+// ToggleFavorite, SetAttribution and SetSystemOne are the exceptions: they durably write the
 // global settings layer through the locked writer and replace the cached value
 // only from that write's confirmed result.
 type Cache struct {
 	projectRoot string
 	layerPaths  []string
+	launchHome  string
 
 	discoveryBoundary      string
 	agentMaxConcurrency    int
@@ -97,16 +98,18 @@ type Cache struct {
 	webResearch       WebResearchSettings
 	webResearchAPIKey string
 
-	// mu guards the live-mutable provider set and selectable catalog only
-	// (providers, catalog) against concurrent SetProvider writes and the
-	// background reads that resolve models mid-turn. The rest of the struct is
-	// built once in NewCache; the permission and model fields keep their existing
-	// external-serialization contract (bootstrap's syncGrants / the picker apply)
-	// and are deliberately not covered here.
-	mu          sync.RWMutex
-	providers   map[string]provider.ProviderEntry
-	catalog     provider.Catalog
-	permissions []permissions.PermissionEntry
+	// mu guards the live-mutable provider set, selectable catalog and discovered
+	// context windows only (providers, catalog, discoveredWindows) against
+	// concurrent SetProvider writes and the background reads that resolve models
+	// mid-turn. The rest of the struct is built once in NewCache; the permission
+	// and model fields keep their existing external-serialization contract
+	// (bootstrap's syncGrants / the picker apply) and are deliberately not covered
+	// here.
+	mu                sync.RWMutex
+	providers         map[string]provider.ProviderEntry
+	catalog           provider.Catalog
+	discoveredWindows map[string]map[string]int64
+	permissions       []permissions.PermissionEntry
 
 	layeredPermissions []permissions.PermissionEntry
 
@@ -120,6 +123,9 @@ type Cache struct {
 	hasModelLastUsed bool
 
 	favorites []Favorite
+
+	systemOneMu sync.RWMutex
+	systemOne   string
 }
 
 func NewCache(composed map[string]any, projectRoot string, layerPaths []string, home ...string) (*Cache, error) {
@@ -159,7 +165,6 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		vcsPriority:            vcsPriorityOr(composed),
 		vcsPreferred:           nestedStringOr(composed, "vcs", "preferred", ""),
 		providers:              providers,
-		catalog:                provider.BuildCatalog(providers, discoveredChatGPTStoreModels(layerPaths), discoveredConfiguredModels(layerPaths)),
 		permissions:            perms,
 		favorites:              favorites,
 		webResearch:            resolveWebResearch(composed),
@@ -168,11 +173,19 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		declaredCommands:       declaredCommands,
 		writableFolders:        parseWritableFolders(composed, projectRoot, home),
 	}
+	if len(home) > 0 {
+		c.launchHome = home[0]
+	}
+	c.rebuildCatalogLocked()
 	c.modeDefault, c.modeConfigured = resolveModeDefault(composed)
 	c.retry = resolveRetry(composed)
 	c.attribution = defaultAttribution
 	if b, ok := composed["attribution"].(bool); ok {
 		c.attribution = b
+	}
+	c.systemOne = "off"
+	if s, ok := composed[KeySystemOne].(string); ok {
+		c.systemOne = s
 	}
 
 	rawActive, hasActive := nestedRaw(composed, "model", "active")
@@ -212,8 +225,7 @@ func discoveredModelsPath(layerPaths []string) string {
 	return DiscoveredModelsPath(layerPaths[0])
 }
 
-func discoveredConfiguredModels(layerPaths []string) map[string][]provider.DiscoveredConfiguredModel {
-	store, _ := ReadDiscoveredModels(discoveredModelsPath(layerPaths))
+func discoveredConfiguredModels(store DiscoveredModelsStore) map[string][]provider.DiscoveredConfiguredModel {
 	if len(store.Providers) == 0 {
 		return nil
 	}
@@ -232,15 +244,12 @@ func discoveredConfiguredModels(layerPaths []string) map[string][]provider.Disco
 	return out
 }
 
-// discoveredChatGPTStoreModels reads the openai-chatgpt entry of the shared, system-owned
-// discovered-model store (models.yaml) for the composed layer set and adapts it into the
-// provider package's neutral discovered-model records, so [provider.BuildCatalog] can
-// extend the built-in ChatGPT row with locally discovered ids and their cached effort
-// metadata. A missing, empty, or malformed store — or no openai-chatgpt entry — yields nil,
-// leaving only the compiled ChatGPT seed selectable. The read is local-only —
-// no network.
-func discoveredChatGPTStoreModels(layerPaths []string) []provider.ChatGPTStoreModel {
-	store, _ := ReadDiscoveredModels(discoveredModelsPath(layerPaths))
+// discoveredChatGPTStoreModels adapts the openai-chatgpt entry of the shared, system-owned
+// discovered-model store (models.yaml) into the provider package's neutral discovered-model
+// records, so [provider.BuildCatalog] can extend the built-in ChatGPT row with locally
+// discovered ids and their cached effort metadata. A missing, empty, or malformed store — or
+// no openai-chatgpt entry — yields nil, leaving only the compiled ChatGPT seed selectable.
+func discoveredChatGPTStoreModels(store DiscoveredModelsStore) []provider.ChatGPTStoreModel {
 	prov, ok := store.Providers[provider.ChatGPTProviderID]
 	if !ok || len(prov.Models) == 0 {
 		return nil
@@ -264,7 +273,7 @@ func discoveredChatGPTStoreModels(layerPaths []string) []provider.ChatGPTStoreMo
 // ProjectRoot returns the resolved project root used for this session.
 func (c *Cache) ProjectRoot() string { return c.projectRoot }
 
-func (c *Cache) WritableFolders() []string { return slices.Clone(c.writableFolders) }
+func (c *Cache) LaunchHome() string { return c.launchHome }
 
 // LayerPaths returns a copy of the ordered settings-layer paths that composed
 // the session config; mutating it does not change the cache.
@@ -331,6 +340,29 @@ func (c *Cache) SetAttribution(on bool) (PersistReason, fserrors.Category, error
 		return reason, cat, err
 	}
 	c.attribution = on
+	return ReasonNone, "", nil
+}
+
+func (c *Cache) SystemOne() string {
+	c.systemOneMu.RLock()
+	defer c.systemOneMu.RUnlock()
+	return c.systemOne
+}
+
+var beforeSystemOnePublish = func(string) {}
+
+func (c *Cache) SetSystemOne(name string) (PersistReason, fserrors.Category, error) {
+	if len(c.layerPaths) == 0 || c.layerPaths[0] == "" {
+		return ReasonRereadParseError, "", fmt.Errorf("config.SetSystemOne: no global settings layer path configured")
+	}
+	c.systemOneMu.Lock()
+	defer c.systemOneMu.Unlock()
+	reason, cat, err := Persist(c.layerPaths[0], KeySystemOne, name)
+	if reason != ReasonNone || err != nil {
+		return reason, cat, err
+	}
+	beforeSystemOnePublish(name)
+	c.systemOne = name
 	return ReasonNone, "", nil
 }
 
@@ -507,13 +539,44 @@ func (c *Cache) storeProviderLocked(id string, entry provider.ProviderEntry) {
 	// providers is always non-nil for a NewCache-built cache (ParseProviders returns
 	// an initialized map, or NewCache fails), so this first entry never hits a nil map.
 	c.providers[id] = entry
-	c.catalog = provider.BuildCatalog(c.providers, discoveredChatGPTStoreModels(c.layerPaths), discoveredConfiguredModels(c.layerPaths))
+	c.rebuildCatalogLocked()
 }
 
 func (c *Cache) ReloadDiscoveredCatalog() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.catalog = provider.BuildCatalog(c.providers, discoveredChatGPTStoreModels(c.layerPaths), discoveredConfiguredModels(c.layerPaths))
+	c.rebuildCatalogLocked()
+}
+
+func (c *Cache) rebuildCatalogLocked() {
+	store, _ := ReadDiscoveredModels(discoveredModelsPath(c.layerPaths))
+	c.catalog = provider.BuildCatalog(c.providers, discoveredChatGPTStoreModels(store), discoveredConfiguredModels(store))
+	c.discoveredWindows = discoveredContextWindows(store)
+}
+
+func discoveredContextWindows(store DiscoveredModelsStore) map[string]map[string]int64 {
+	out := map[string]map[string]int64{}
+	for id, prov := range store.Providers {
+		for _, m := range prov.Models {
+			if m.ContextWindow <= 0 {
+				continue
+			}
+			if out[id] == nil {
+				out[id] = map[string]int64{}
+			}
+			out[id][m.ID] = m.ContextWindow
+		}
+	}
+	return out
+}
+
+func (c *Cache) ContextWindow(providerID, modelID string) int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if w := c.providers[providerID].ContextWindows[modelID]; w > 0 {
+		return w
+	}
+	return c.discoveredWindows[providerID][modelID]
 }
 
 // Permissions returns a copy of the in-memory permission list (composed on-disk
@@ -690,6 +753,7 @@ func copyProviderEntry(e provider.ProviderEntry) provider.ProviderEntry {
 		cp.AuthHeader = &h
 	}
 	cp.Routing.MaxPrice = maps.Clone(e.Routing.MaxPrice)
+	cp.ContextWindows = maps.Clone(e.ContextWindows)
 	return cp
 }
 

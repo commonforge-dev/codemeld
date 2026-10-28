@@ -79,6 +79,7 @@ func IsDescendantOrEqual(path, scope string) bool {
 // request is not a scope escalation.
 type ScopeEscalation struct {
 	NarrowerScope string
+	Note          string
 }
 
 // FindScopeEscalation reports whether req's path scope is a strict ancestor of an

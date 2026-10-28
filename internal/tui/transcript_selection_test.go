@@ -40,7 +40,7 @@ func reverseText(t *testing.T, view tview.Primitive, w, h int) string {
 func TestWrapRows_TracksByteSpans(t *testing.T) {
 	t.Run("block separator becomes an empty row", func(t *testing.T) {
 		rows := wrapRows("hello\n\nworld", 40)
-		want := []rowSpan{{0, 5}, {6, 6}, {7, 12}}
+		want := []rowSpan{{start: 0, end: 5}, {start: 6, end: 6}, {start: 7, end: 12}}
 		if len(rows) != len(want) {
 			t.Fatalf("rows = %v, want %v", rows, want)
 		}
@@ -292,6 +292,7 @@ func drawTranscriptPane(t *testing.T, a *App, width, height int) tcell.Simulatio
 // block and would otherwise shift every following row.
 func transcriptCopyHits(t *testing.T, a *App, width, height int, want map[string]string) map[string]string {
 	t.Helper()
+	a.afterFunc = func(time.Duration, func()) {}
 	var captured []string
 	a.input.osc52 = func(seq string) error { captured = append(captured, seq); return nil }
 	screen := drawTranscriptPane(t, a, width, height)
@@ -564,6 +565,7 @@ func TestTranscriptResponseCopy_ReportsOutcomeWithoutChangingTheResponse(t *test
 	open := func(t *testing.T, sink func(string) error) *App {
 		t.Helper()
 		a := New(nil)
+		a.afterFunc = func(time.Duration, func()) {}
 		a.input.osc52 = sink
 		a.transcript.appendDelta("the answer")
 		a.transcript.finalize()
@@ -1446,5 +1448,549 @@ func TestInputSelection_PlainClickLeavesNoSelection(t *testing.T) {
 	}
 	if a.input.HasSelection() {
 		t.Fatal("a plain input click left a selection, want the cursor placed with no selection")
+	}
+}
+
+func paneRows(t *testing.T, a *App, width, height int) []string {
+	t.Helper()
+	cells, w, h := drawTranscriptPane(t, a, width, height).GetContents()
+	var rows []string
+	for y := 0; y < h; y++ {
+		var row strings.Builder
+		for x := 0; x < w; x++ {
+			if r := cells[y*w+x].Runes; len(r) > 0 {
+				row.WriteString(string(r))
+			} else {
+				row.WriteByte(' ')
+			}
+		}
+		rows = append(rows, strings.TrimRight(row.String(), " "))
+	}
+	for len(rows) > 0 && rows[len(rows)-1] == "" {
+		rows = rows[:len(rows)-1]
+	}
+	return rows
+}
+
+func finalizedReply(src string) *App {
+	a := New(nil)
+	a.transcript.appendDelta(src)
+	a.transcript.finalize()
+	return a
+}
+
+func TestTranscriptSelection_HangingRowsMapClicksToSourceGlyphs(t *testing.T) {
+	const words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau"
+	tests := []struct {
+		name, src, visible string
+		widths             []int
+	}{
+		{"bullet", "- " + words, "• " + words, []int{40, 80}},
+		{"ordered", "10. " + words + " " + words, "10. " + words + " " + words, []int{40, 80}},
+		{"nested list", "- top\n  - " + words, "• top\n  • " + words, []int{40, 80}},
+		{"nested quotes", "> " + words + "\n> > " + words, "│ " + words + "\n│ │ " + words, []int{40}},
+		{"list inside a quote", "> - " + words, "│ • " + words, []int{40}},
+		{"quote inside a list", "- > " + words + "\n  > " + words, "• " + words + "\n│ " + words, []int{40}},
+		{"table bullets and header lines", "| Name | Notes | More |\n|---|---|---|\n| " + words + " | " + words + " | x |", "• " + words + "\n  Notes: " + words + "\n  More: x", []int{40}},
+		{"table inside a quote", "> | A | B | C |\n> |---|---|---|\n> | a | " + words + " | c |", "│ • a\n│   B: " + words + "\n│   C: c", []int{40}},
+		{"soft and hard breaks", "- top\n  - one\n    " + words + "\\\n    " + words, "• top\n  • one\n  " + words + "\n  " + words, []int{40}},
+		{"forged metadata", "- " + `["h:ssssssss"]` + words, "• " + `["h:ssssssss"]` + words, []int{40}},
+		{"line separator", "> - alpha " + words, "│ • alpha " + words, []int{40}},
+	}
+	for _, tc := range tests {
+		for _, width := range tc.widths {
+			t.Run(fmt.Sprintf("%s at %d", tc.name, width), func(t *testing.T) {
+				const height = 12
+				a := finalizedReply(tc.src)
+				screen := drawTranscriptPane(t, a, width, height)
+				cells, _, _ := screen.GetContents()
+				text := a.transcript.view.GetText(true)
+				if want := tc.visible + "\n  [Copy response]"; text != want {
+					t.Fatalf("GetText(true) = %q, want %q", text, want)
+				}
+				hit := map[int]int{}
+				prefixed := 0
+				for y := 0; y < height; y++ {
+					rowStart := -1
+					var synthetic []int
+					for x := 0; x < width; x++ {
+						a.transcript.mu.Lock()
+						off, onText := a.transcript.offsetRowAt(x, y)
+						a.transcript.mu.Unlock()
+						if !onText {
+							if rowStart < 0 {
+								synthetic = append(synthetic, off)
+							}
+							continue
+						}
+						if rowStart < 0 {
+							rowStart = off
+						}
+						if r := string(cells[y*width+x].Runes); !strings.HasPrefix(text[off:], r) {
+							t.Fatalf("cell (%d,%d) draws %q but maps to offset %d (%q)", x, y, r, off, text[off:])
+						}
+						hit[off]++
+					}
+					for _, off := range synthetic {
+						if rowStart >= 0 && off != rowStart {
+							t.Fatalf("row %d: a synthetic-prefix cell maps to %d, want the row's source start %d", y, off, rowStart)
+						}
+					}
+					if rowStart >= 0 && len(synthetic) > 0 {
+						prefixed++
+					}
+				}
+				if prefixed == 0 {
+					t.Fatal("no drawn row carries a synthetic continuation prefix")
+				}
+				for off, r := range text {
+					if r != '\n' && r != ' ' && hit[off] != 1 {
+						t.Fatalf("offset %d (%q) is drawn in %d cells, want exactly one", off, r, hit[off])
+					}
+				}
+
+				a.input.osc52 = func(string) error { return nil }
+				a.transcript.beginSelect(0, 0)
+				a.transcript.updateSelect(width, height-1)
+				if got := a.transcript.endSelect(); got != text {
+					t.Fatalf("drag copy = %q, want the logical text %q", got, text)
+				}
+			})
+		}
+	}
+}
+
+func TestTranscriptSelection_HangingHighlightSkipsSyntheticPrefix(t *testing.T) {
+	tests := []struct {
+		name         string
+		src          string
+		press, move  [2]int
+		copied       string
+		reversedCols map[int][2]int
+	}{
+		{
+			name:   "two-cell bullet indent",
+			src:    "- alpha beta gamma delta epsilon zeta eta theta iota",
+			press:  [2]int{13, 0},
+			move:   [2]int{6, 1},
+			copied: "gamma delta epsilon zeta eta ",
+			reversedCols: map[int][2]int{
+				0: {13, 37},
+				1: {2, 5},
+			},
+		},
+		{
+			name:   "four-cell quoted bullet indent",
+			src:    "> - alpha beta gamma delta epsilon zeta eta theta iota",
+			press:  [2]int{15, 0},
+			move:   [2]int{8, 1},
+			copied: "gamma delta epsilon zeta eta ",
+			reversedCols: map[int][2]int{
+				0: {15, 39},
+				1: {4, 7},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const width, height = 40, 6
+			a := finalizedReply(tc.src)
+			var captured []string
+			a.input.osc52 = func(seq string) error { captured = append(captured, seq); return nil }
+			drawTranscriptPane(t, a, width, height)
+			a.handleAppMouse(tcell.NewEventMouse(tc.press[0], tc.press[1], tcell.Button1, tcell.ModNone), tview.MouseLeftDown)
+			a.handleAppMouse(tcell.NewEventMouse(tc.move[0], tc.move[1], tcell.Button1, tcell.ModNone), tview.MouseMove)
+
+			cells, _, _ := drawTranscriptPane(t, a, width, height).GetContents()
+			for y := 0; y < height; y++ {
+				span, selected := tc.reversedCols[y]
+				for x := 0; x < width; x++ {
+					_, _, attr := cells[y*width+x].Style.Decompose()
+					want := selected && x >= span[0] && x <= span[1]
+					if got := attr&tcell.AttrReverse != 0; got != want {
+						t.Fatalf("cell (%d,%d) %q reverse = %v, want %v", x, y, string(cells[y*width+x].Runes), got, want)
+					}
+				}
+			}
+
+			a.handleAppMouse(tcell.NewEventMouse(tc.move[0], tc.move[1], tcell.Button1, tcell.ModNone), tview.MouseLeftUp)
+			if want := osc52Sequence(tc.copied); len(captured) != 1 || captured[0] != want {
+				t.Fatalf("osc52 sink = %q, want exactly one %q", captured, want)
+			}
+		})
+	}
+}
+
+func TestTranscriptSelection_HangingTabMeasuredFromScreenColumn(t *testing.T) {
+	const width, height = 40, 6
+	for _, tc := range []struct {
+		marker string
+		prefix int
+	}{
+		{"- ", 2},
+		{"> - ", 4},
+		{"100. ", 5},
+	} {
+		t.Run(fmt.Sprintf("prefix %d", tc.prefix), func(t *testing.T) {
+			a := finalizedReply(tc.marker + strings.Repeat("x", width-tc.prefix-1) + " a\tZ")
+			var captured []string
+			a.input.osc52 = func(seq string) error { captured = append(captured, seq); return nil }
+			cells, _, _ := drawTranscriptPane(t, a, width, height).GetContents()
+			text := a.transcript.view.GetText(true)
+			aOff := strings.Index(text, "a\tZ")
+			if aOff < 0 {
+				t.Fatalf("GetText(true) = %q, want it to keep the literal tab", text)
+			}
+			y, xA, xZ := -1, -1, -1
+			for row := 0; row < height && y < 0; row++ {
+				for x := 0; x < width; x++ {
+					switch string(cells[row*width+x].Runes) {
+					case "a":
+						xA = x
+					case "Z":
+						y, xZ = row, x
+					}
+				}
+			}
+			if y < 0 || xA != tc.prefix || xZ <= xA+1 {
+				t.Fatalf("drawn a at column %d and Z at (%d,%d), want a at %d on a continuation row before the tab", xA, xZ, y, tc.prefix)
+			}
+			for x := 0; x <= xZ; x++ {
+				want, wantOnText := aOff+1, true
+				switch {
+				case x < xA:
+					want, wantOnText = aOff, false
+				case x == xA:
+					want = aOff
+				case x == xZ:
+					want = aOff + 2
+				}
+				a.transcript.mu.Lock()
+				off, onText := a.transcript.offsetRowAt(x, y)
+				a.transcript.mu.Unlock()
+				if off != want || onText != wantOnText {
+					t.Fatalf("cell (%d,%d) maps to (%d,%v), want (%d,%v)", x, y, off, onText, want, wantOnText)
+				}
+			}
+
+			a.handleAppMouse(tcell.NewEventMouse(xA+1, y, tcell.Button1, tcell.ModNone), tview.MouseLeftDown)
+			a.handleAppMouse(tcell.NewEventMouse(xZ+1, y, tcell.Button1, tcell.ModNone), tview.MouseMove)
+			cells, _, _ = drawTranscriptPane(t, a, width, height).GetContents()
+			for row := 0; row < height; row++ {
+				for x := 0; x < width; x++ {
+					_, _, attr := cells[row*width+x].Style.Decompose()
+					want := row == y && x > xA && x <= xZ
+					if got := attr&tcell.AttrReverse != 0; got != want {
+						t.Fatalf("cell (%d,%d) %q reverse = %v, want %v", x, row, string(cells[row*width+x].Runes), got, want)
+					}
+				}
+			}
+			a.handleAppMouse(tcell.NewEventMouse(xZ+1, y, tcell.Button1, tcell.ModNone), tview.MouseLeftUp)
+			if want := osc52Sequence("\tZ"); len(captured) != 1 || captured[0] != want {
+				t.Fatalf("osc52 sink = %q, want exactly one %q", captured, want)
+			}
+		})
+	}
+}
+
+func TestTranscriptSelection_HangingNeedsWidthPastThePrefix(t *testing.T) {
+	a := finalizedReply("> - ab cd ef")
+	raw := a.transcript.view.GetText(false)
+	text := a.transcript.view.GetText(true)
+	line := strings.SplitN(raw, "\n", 2)[0]
+
+	drawTranscriptPane(t, a, 4, 20)
+	if got := strings.SplitN(a.transcript.view.paintText, "\n", 2)[0]; got != line {
+		t.Fatalf("paint line at width 4 = %q, want it unchanged %q", got, line)
+	}
+	rows := transcriptRows(raw, text, 4)
+	if fmt.Sprint(rows) != fmt.Sprint(wrapRows(text, 4)) {
+		t.Fatalf("rows at width 4 = %v, want ordinary wrapping %v", rows, wrapRows(text, 4))
+	}
+	if got := a.transcript.view.paint.GetWrappedLineCount(); got != len(rows) {
+		t.Fatalf("painted rows at width 4 = %d, selection rows = %d", got, len(rows))
+	}
+
+	drawTranscriptPane(t, a, 5, 20)
+	rows = transcriptRows(raw, text, 5)
+	if rows[0].prefixWidth != 0 || rows[1].prefixWidth != 4 {
+		t.Fatalf("rows at width 5 = %v, want continuation rows behind a 4-cell prefix", rows)
+	}
+	if got := a.transcript.view.paint.GetWrappedLineCount(); got != len(rows) {
+		t.Fatalf("painted rows at width 5 = %d, selection rows = %d", got, len(rows))
+	}
+}
+
+func TestTranscriptSelection_HangingRowsKeepInlineStyles(t *testing.T) {
+	const width = 40
+	a := finalizedReply("- **alpha beta gamma delta epsilon zeta eta** tail `kappa lambda mu nu xi omicron pi rho` end")
+	screen := drawTranscriptPane(t, a, width, 6)
+	cells, _, _ := screen.GetContents()
+	if got, want := paneRows(t, a, width, 6), []string{
+		"• alpha beta gamma delta epsilon zeta",
+		"  eta tail kappa lambda mu nu xi",
+		"  omicron pi rho end",
+		"  [Copy response]",
+	}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	style := func(x, y int) (tcell.Color, bool) {
+		fg, _, attr := cells[y*width+x].Style.Decompose()
+		return fg, attr&tcell.AttrBold != 0
+	}
+	plainFg, _ := style(0, 0)
+	codeFg := tcell.GetColor("#4e9a06")
+	checks := []struct {
+		x, y int
+		fg   tcell.Color
+		bold bool
+	}{
+		{2, 0, plainFg, true},
+		{0, 1, plainFg, false},
+		{1, 1, plainFg, false},
+		{2, 1, plainFg, true},
+		{4, 1, plainFg, true},
+		{6, 1, plainFg, false},
+		{11, 1, codeFg, false},
+		{0, 2, plainFg, false},
+		{1, 2, plainFg, false},
+		{2, 2, codeFg, false},
+		{16, 2, plainFg, false},
+	}
+	for _, c := range checks {
+		if fg, bold := style(c.x, c.y); fg != c.fg || bold != c.bold {
+			t.Errorf("cell (%d,%d) %q: fg %v bold %v, want fg %v bold %v", c.x, c.y, string(cells[c.y*width+c.x].Runes), fg, bold, c.fg, c.bold)
+		}
+	}
+}
+
+func TestTranscriptCodeCopy_ControlsInsideHangingListKeepTheirCells(t *testing.T) {
+	const body = "make build --flag=1\n"
+	a := finalizedReply("- alpha beta gamma delta epsilon zeta eta\n\n  ```sh\n  make build --flag=1\n  ```")
+	const response = "• alpha beta gamma delta epsilon zeta eta\nmake build --flag=1"
+	hits := transcriptCopyHits(t, a, 16, 20, map[string]string{
+		body:     codeCopyNotice,
+		response: responseCopyNotice,
+	})
+	if got := hits[body]; got != statusCopyControl {
+		t.Errorf("the cells that copy the block spell %q, want exactly %q", got, statusCopyControl)
+	}
+	if got := hits[response]; got != responseCopyControl {
+		t.Errorf("the cells that copy the response spell %q, want exactly %q", got, responseCopyControl)
+	}
+}
+
+func TestTranscriptSelection_HangingFallsBackWhenTviewParsesEscapedText(t *testing.T) {
+	a := finalizedReply("- [::b:x] alpha beta gamma delta epsilon zeta eta theta iota kappa")
+	raw := a.transcript.view.GetText(false)
+	text := a.transcript.view.GetText(true)
+	if got, want := paneRows(t, a, 40, 6), []string{
+		"•  alpha beta gamma delta epsilon zeta",
+		"eta theta iota kappa",
+		"  [Copy response]",
+	}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if a.transcript.view.paintText != raw {
+		t.Fatalf("paint text = %q, want it unchanged %q", a.transcript.view.paintText, raw)
+	}
+	if rows := transcriptRows(raw, text, 40); fmt.Sprint(rows) != fmt.Sprint(wrapRows(text, 40)) {
+		t.Fatalf("rows = %v, want ordinary wrapping %v", rows, wrapRows(text, 40))
+	}
+}
+
+func TestTranscriptSelection_HangingFallsBackWhenAGlyphOverflowsThePrefix(t *testing.T) {
+	const width, height = 5, 12
+	a := finalizedReply("> - 界界")
+	raw := a.transcript.view.GetText(false)
+	text := a.transcript.view.GetText(true)
+	var captured []string
+	a.input.osc52 = func(seq string) error { captured = append(captured, seq); return nil }
+	cells, _, _ := drawTranscriptPane(t, a, width, height).GetContents()
+	rows := transcriptRows(raw, text, width)
+	if fmt.Sprint(rows) != fmt.Sprint(wrapRows(text, width)) {
+		t.Fatalf("rows = %v, want ordinary wrapping %v", rows, wrapRows(text, width))
+	}
+	if got := a.transcript.view.paint.GetWrappedLineCount(); got != len(rows) {
+		t.Fatalf("painted rows = %d, selection rows = %d", got, len(rows))
+	}
+	if got := paneRows(t, a, width, height)[:2]; strings.Join(got, "\n") != "│ •\n界 界" {
+		t.Fatalf("rows = %q, want the glyphs wrapped together below the marker", got)
+	}
+
+	first := strings.Index(text, "界")
+	var glyphs [][2]int
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			if string(cells[y*width+x].Runes) != "界" {
+				continue
+			}
+			want := first + len("界")*len(glyphs)
+			glyphs = append(glyphs, [2]int{x, y})
+			for _, cx := range []int{x, x + 1} {
+				a.transcript.mu.Lock()
+				off, onText := a.transcript.offsetRowAt(cx, y)
+				a.transcript.mu.Unlock()
+				if off != want || !onText {
+					t.Fatalf("cell (%d,%d) maps to (%d,%v), want (%d,true)", cx, y, off, onText, want)
+				}
+			}
+		}
+	}
+	if len(glyphs) != 2 {
+		t.Fatalf("drawn glyphs at %v, want two", glyphs)
+	}
+
+	last := glyphs[1]
+	a.handleAppMouse(tcell.NewEventMouse(glyphs[0][0], glyphs[0][1], tcell.Button1, tcell.ModNone), tview.MouseLeftDown)
+	a.handleAppMouse(tcell.NewEventMouse(last[0]+2, last[1], tcell.Button1, tcell.ModNone), tview.MouseMove)
+	cells, _, _ = drawTranscriptPane(t, a, width, height).GetContents()
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			_, _, attr := cells[y*width+x].Style.Decompose()
+			want := y == last[1] && x < last[0]+2
+			if want && len(cells[y*width+x].Runes) == 0 {
+				continue
+			}
+			if got := attr&tcell.AttrReverse != 0; got != want {
+				t.Fatalf("cell (%d,%d) %q reverse = %v, want %v", x, y, string(cells[y*width+x].Runes), got, want)
+			}
+		}
+	}
+	a.handleAppMouse(tcell.NewEventMouse(last[0]+2, last[1], tcell.Button1, tcell.ModNone), tview.MouseLeftUp)
+	if want := osc52Sequence("界界"); len(captured) != 1 || captured[0] != want {
+		t.Fatalf("osc52 sink = %q, want exactly one %q", captured, want)
+	}
+
+	hits := transcriptCopyHits(t, a, width, height, map[string]string{"│ • 界界": responseCopyNotice})
+	if got := hits["│ • 界界"]; got != responseCopyControl {
+		t.Errorf("the cells that copy the response spell %q, want exactly %q", got, responseCopyControl)
+	}
+}
+
+type copyTimer struct {
+	delay time.Duration
+	fire  func()
+}
+
+func captureTimers(a *App) *[]copyTimer {
+	timers := new([]copyTimer)
+	a.afterFunc = func(d time.Duration, f func()) { *timers = append(*timers, copyTimer{delay: d, fire: f}) }
+	return timers
+}
+
+func copyFixtures() []struct {
+	name, notice string
+	open         func(t *testing.T) (*App, func())
+} {
+	clickAt := func(a *App, x, y int) {
+		a.handleAppMouse(tcell.NewEventMouse(x, y, tcell.Button1, tcell.ModNone), tview.MouseLeftDown)
+		a.handleAppMouse(nil, tview.MouseLeftUp)
+	}
+	return []struct {
+		name, notice string
+		open         func(t *testing.T) (*App, func())
+	}{
+		{"session id", "Session ID copied", func(t *testing.T) (*App, func()) {
+			state := fixtureState()
+			a := New(nil)
+			a.input.osc52 = func(string) error { return nil }
+			a.SetStatusLineState(state)
+			a.ShowStatus(RenderStatus(BuildStatusSnapshot(state)))
+			drawPrimitive(t, a.status, 80, 30)
+			return a, func() { clickAt(a, len(statusSessionPrefix)+len(state.sessionID)+1, 2) }
+		}},
+		{"response", "Response copied", func(t *testing.T) (*App, func()) {
+			a := finalizedReply("the answer")
+			a.input.osc52 = func(string) error { return nil }
+			drawTranscriptPane(t, a, 40, 8)
+			return a, func() { clickAt(a, 2, 1) }
+		}},
+		{"code block", "Code block copied", func(t *testing.T) (*App, func()) {
+			a := finalizedReply("```sh\ncd /tmp\n```")
+			a.input.osc52 = func(string) error { return nil }
+			drawTranscriptPane(t, a, 40, 8)
+			return a, func() { clickAt(a, 2, 1) }
+		}},
+	}
+}
+
+func TestCopyNotice_ClearsWhenItsTimerFires(t *testing.T) {
+	for _, fx := range copyFixtures() {
+		t.Run(fx.name, func(t *testing.T) {
+			a, click := fx.open(t)
+			timers := captureTimers(a)
+			click()
+
+			if got := a.NoticeText(); got != fx.notice {
+				t.Fatalf("notice = %q, want %q", got, fx.notice)
+			}
+			if len(*timers) != 1 || (*timers)[0].delay != 4*time.Second {
+				t.Fatalf("timers = %+v, want exactly one scheduled for 4s", *timers)
+			}
+
+			a.transcript.append("a committed tool line")
+			a.transcript.appendDelta("a streamed delta")
+			if got := a.NoticeText(); got != fx.notice {
+				t.Fatalf("notice = %q after new output, want %q kept until the timer fires", got, fx.notice)
+			}
+
+			(*timers)[0].fire()
+			if got := a.NoticeText(); got != "" {
+				t.Fatalf("notice = %q after the timer fired, want it cleared", got)
+			}
+		})
+	}
+}
+
+func TestCopyNotice_TimerLeavesANewerNotice(t *testing.T) {
+	for _, fx := range copyFixtures() {
+		t.Run(fx.name+" replaced by another notice", func(t *testing.T) {
+			a, click := fx.open(t)
+			timers := captureTimers(a)
+			click()
+			a.Notice("model apply failed")
+
+			(*timers)[0].fire()
+			if got := a.NoticeText(); got != "model apply failed" {
+				t.Fatalf("notice = %q, want the newer notice left in place", got)
+			}
+		})
+		t.Run(fx.name+" copied twice", func(t *testing.T) {
+			a, click := fx.open(t)
+			timers := captureTimers(a)
+			click()
+			click()
+			if len(*timers) != 2 {
+				t.Fatalf("timers = %d, want one per copy", len(*timers))
+			}
+
+			(*timers)[0].fire()
+			if got := a.NoticeText(); got != fx.notice {
+				t.Fatalf("notice = %q after the first copy's timer, want the second copy's %q kept", got, fx.notice)
+			}
+			(*timers)[1].fire()
+			if got := a.NoticeText(); got != "" {
+				t.Fatalf("notice = %q after the second copy's timer, want it cleared", got)
+			}
+		})
+	}
+}
+
+func TestCopyNotice_PlainNoticesGetNoTimer(t *testing.T) {
+	a := finalizedReply("the answer")
+	a.input.osc52 = func(string) error { return errors.New("stdout is closed") }
+	drawTranscriptPane(t, a, 40, 8)
+	timers := captureTimers(a)
+
+	a.handleAppMouse(tcell.NewEventMouse(2, 1, tcell.Button1, tcell.ModNone), tview.MouseLeftDown)
+	a.handleAppMouse(nil, tview.MouseLeftUp)
+	if got := a.NoticeText(); !strings.HasPrefix(got, "Could not copy: ") {
+		t.Fatalf("notice = %q, want the copy failure", got)
+	}
+	a.Notice("model apply failed")
+
+	if len(*timers) != 0 {
+		t.Fatalf("timers = %+v, want none for plain notices", *timers)
 	}
 }

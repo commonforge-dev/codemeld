@@ -155,7 +155,7 @@ func TestModesIntegration_CapturedRequestCarriesSystemMessageAndModeFilteredTool
 	}
 
 	got := toolNames(gotReq.Tools)
-	want := []string{"ask_user", "bash", "create", "delegate", "delete", "edit", "file_count", "glob", "grep", "list", "mkdir", "move", "read", "read_image", "suggest_followup", "tree", "web_fetch", "web_search"}
+	want := []string{"ask_user", "bash", "create", "delete", "edit", "file_count", "general_agent", "glob", "grep", "list", "mkdir", "move", "read", "read_image", "suggest_followup", "tree", "web_fetch", "web_search"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("advertised tools on the captured request = %v, want %v (mode-filtered set for Build)", got, want)
 	}

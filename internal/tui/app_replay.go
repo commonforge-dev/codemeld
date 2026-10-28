@@ -10,8 +10,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/rivo/tview"
-
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/provider"
 	"codemeld.dev/codemeld/internal/sessions"
@@ -176,12 +174,9 @@ func webActivityBlock(calls []sessions.ToolCall) string {
 		if !ok {
 			continue
 		}
-		lines = append(lines, tview.Escape(line))
+		lines = append(lines, line)
 	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return strings.Join(lines, "\n")
+	return toolActivityBlockText(lines)
 }
 
 // results holds only this call's own response group, so an id a later round reuses can never

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
@@ -16,6 +17,7 @@ import (
 	"codemeld.dev/codemeld/internal/locks"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/securitystate"
+	"codemeld.dev/codemeld/internal/subagent"
 )
 
 func blockedPathsFromLayers(home, projectRoot string, layers []securitystate.LayerSnapshot) (*permissions.BlockedPaths, error) {
@@ -35,6 +37,141 @@ func blockedPathsFromLayers(home, projectRoot string, layers []securitystate.Lay
 		reread.files = append(reread.files, file)
 	}
 	return permissions.NewLiveBlockedPaths(home, projectRoot, reread.combined(), reread.reload), nil
+}
+
+// The list built here only decides whether recovery may start; every recovery action rereads the
+// layers through Refresh.
+func recoveryPolicy(home, projectRoot string, global map[string]any, trusted bool) subagent.RecoveryPolicy {
+	trusted = trusted && projectRoot != ""
+	policy := subagent.RecoveryPolicy{Refresh: func() (*permissions.BlockedPaths, error) {
+		return recoveryBlockedPaths(home, projectRoot, trusted)
+	}}
+	var composition ConfigComposition
+	var err error
+	if trusted {
+		if composition.ProjectLayer, composition.ProjectPresent, err = readAdmittedProjectSettingsLayer(projectRoot); err == nil {
+			composition.LocalLayer, composition.LocalPresent, err = readAdmittedLocalSettingsLayer(projectRoot)
+		}
+	}
+	if err == nil {
+		policy.Blocked, err = blockedPathsFromLayers(home, projectRoot, settingsLayerSnapshots(home, projectRoot, global, trusted, composition))
+	}
+	if err != nil {
+		policy.Blocked, policy.Unavailable = nil, err.Error()
+	}
+	return policy
+}
+
+func recoveryBlockedPaths(home, projectRoot string, trusted bool) (*permissions.BlockedPaths, error) {
+	files := []blockedSettingsFile{{path: SettingsPath(home), kind: securitystate.LayerGlobal}}
+	if trusted {
+		files = append(files,
+			blockedSettingsFile{path: projectSettingsPath(projectRoot), kind: securitystate.LayerProject},
+			blockedSettingsFile{path: config.LocalSettingsPath(projectRoot), kind: securitystate.LayerLocal})
+	}
+	var entries []permissions.BlockedEntry
+	for _, file := range files {
+		data, found, err := readLockedSettings(file.path)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("%s: %w", file.path, err)
+		case !found && file.kind == securitystate.LayerGlobal:
+			return nil, fmt.Errorf("%s: %w", file.path, fs.ErrNotExist)
+		case !found:
+			continue
+		}
+		validate, _ := settingsLayerValidator(file.kind)
+		raw, _, err := validate(data, file.path)
+		if err != nil {
+			return nil, err
+		}
+		layerEntries, err := blockedLayerEntries(home, file.path, raw)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, layerEntries...)
+	}
+	return permissions.NewBlockedPaths(home, entries), nil
+}
+
+func readLockedSettings(path string) (data []byte, found bool, err error) {
+	data, _, found, err = readLockedSettingsInfo(path)
+	return data, found, err
+}
+
+func readLockedSettingsInfo(path string) (data []byte, info fs.FileInfo, found bool, err error) {
+	dir, name := filepath.Dir(path), filepath.Base(path)
+	parent, err := openSettingsDir(dir)
+	switch {
+	case errors.Is(err, unix.ENOENT):
+		return nil, nil, false, nil
+	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
+		return nil, nil, false, fmt.Errorf("the settings folder can't be locked: %w", err)
+	case err != nil:
+		return nil, nil, false, err
+	}
+	defer func() { _ = parent.Close() }()
+	release, _, err := locks.AcquireAt(parent, name+".lock", 0)
+	if release == nil {
+		return nil, nil, false, fmt.Errorf("the settings lock could not be taken: %w", err)
+	}
+	defer release()
+	data, info, err = readHeldSettings(parent, name)
+	switch {
+	case !sameSettingsDir(parent, dir):
+		return nil, nil, false, errSettingsChanged
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, nil, false, nil
+	case err != nil:
+		return nil, nil, false, err
+	}
+	return data, info, true, nil
+}
+
+type writableFoldersReader struct {
+	path, home, projectRoot string
+
+	mu      sync.Mutex
+	info    fs.FileInfo
+	folders []string
+}
+
+func newWritableFoldersReader(cache *config.Cache) *writableFoldersReader {
+	r := &writableFoldersReader{home: cache.LaunchHome(), projectRoot: cache.ProjectRoot()}
+	if r.projectRoot != "" && slices.Contains(cache.LayerPaths(), projectSettingsPath(r.projectRoot)) {
+		r.path = projectSettingsPath(r.projectRoot)
+	}
+	return r
+}
+
+func (r *writableFoldersReader) current() []string {
+	if r.path == "" || r.home == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	info, err := os.Lstat(r.path)
+	if err == nil && r.info != nil && sameSettingsStat(r.info, nil, info, nil) {
+		return slices.Clone(r.folders)
+	}
+	r.info, r.folders = nil, nil
+	if err != nil {
+		return nil
+	}
+	data, settled, found, err := readLockedSettingsInfo(r.path)
+	if err != nil || !found {
+		return nil
+	}
+	raw, _, err := config.ValidateProjectSettingsBytes(data, r.path)
+	if err != nil {
+		return nil
+	}
+	folders, _, err := permissions.ParseWritableFolders(raw["writable_folders"], r.home, r.projectRoot)
+	if err != nil {
+		return nil
+	}
+	r.info, r.folders = settled, folders
+	return slices.Clone(folders)
 }
 
 func blockedEntriesFromLayers(home string, layers []securitystate.LayerSnapshot) ([]permissions.BlockedEntry, error) {

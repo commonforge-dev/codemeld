@@ -127,19 +127,19 @@ type authorizedScopeInvoker interface {
 	InvokeWithAuthorizedScope(ctx context.Context, args map[string]any, resolvedTarget string, scope string, scopeIdentity filetools.ScopeIdentity) (tools.Result, error)
 }
 
-// preparedDelegateTool is the package-local seam for the delegate tool: its child write and delete
+// preparedGeneralAgentTool is the package-local seam for the general_agent tool: its child write and delete
 // declarations are canonicalized before authorization and carried into the mode-auth context, so a
 // parent ceiling judges the exact sets the child is built from. Preparation and invocation are one
 // interface because invocation must not resolve the raw declarations a second time — satisfying the
 // seam guarantees an ancestor or symlink swap in between cannot widen the child's ceiling. The argument
 // and containment rules live in the tool, so internal/dispatch carries no delegation policy, exactly as
 // targetScopedTool's resolution does.
-type preparedDelegateTool interface {
+type preparedGeneralAgentTool interface {
 	// schedulerTargets adds the missing directories the child's authorized creates would make to
 	// the declared write and delete leaves, move endpoints, and directories. It is ordering data and never
 	// part of the child's ceiling.
-	PrepareDelegate(args map[string]any) (instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, schedulerTargets []string, err error)
-	InvokeWithPreparedDelegate(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error)
+	PrepareGeneralAgent(args map[string]any) (instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool, schedulerTargets []string, err error)
+	InvokeWithPreparedGeneralAgent(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error)
 }
 
 // multiScopeFileTool is the package-local seam for a mutating structured file tool whose authorization
@@ -203,14 +203,14 @@ type PreparedTool struct {
 	multi        multiScopeFileTool
 	resolvedMove filetools.ResolvedMove
 
-	delegate            preparedDelegateTool
-	delegateInstruction string
-	delegateWrite       map[string]bool
-	delegateDelete      map[string]bool
-	delegateMoves       map[permissions.MovePair]bool
-	delegateDirs        map[string]bool
-	delegateTargets     []string
-	delegateRefusal     error
+	generalAgent            preparedGeneralAgentTool
+	generalAgentInstruction string
+	generalAgentWrite       map[string]bool
+	generalAgentDelete      map[string]bool
+	generalAgentMoves       map[permissions.MovePair]bool
+	generalAgentDirs        map[string]bool
+	generalAgentTargets     []string
+	generalAgentRefusal     error
 
 	scope          string
 	scopeIdentity  filetools.ScopeIdentity
@@ -250,25 +250,21 @@ func (p PreparedTool) PreparedMove() (source, destination string) {
 	return p.resolvedMove.Source, p.resolvedMove.Destination
 }
 
-// DelegateRefusal is the delegate tool's own rejection of this call's arguments, if preparation made
-// one. Such a call carries no candidate, so authorization judges it as an empty declaration: a
-// caller that authorizes it first gets the ceiling's answer, and one that does not gets the refusal
-// to hand back to the model.
-func (p PreparedTool) DelegateRefusal() error { return p.delegateRefusal }
+func (p PreparedTool) GeneralAgentRefusal() error { return p.generalAgentRefusal }
 
-func (p PreparedTool) DelegatePrepared() bool { return p.delegate != nil }
+func (p PreparedTool) GeneralAgentPrepared() bool { return p.generalAgent != nil }
 
-// DelegateDeclaredWrite is the child's canonical write ceiling. Each caller gets its own copy, so an
+// GeneralAgentDeclaredWrite is the child's canonical write ceiling. Each caller gets its own copy, so an
 // authorizer that observes the declaration cannot widen what the child is built from.
-func (p PreparedTool) DelegateDeclaredWrite() map[string]bool { return copyDeclared(p.delegateWrite) }
+func (p PreparedTool) GeneralAgentDeclaredWrite() map[string]bool { return copyDeclared(p.generalAgentWrite) }
 
-func (p PreparedTool) DelegateDeclaredDelete() map[string]bool { return copyDeclared(p.delegateDelete) }
+func (p PreparedTool) GeneralAgentDeclaredDelete() map[string]bool { return copyDeclared(p.generalAgentDelete) }
 
-// DelegateSchedulerTargets is the path set this call mutates for write-conflict ordering: the
+// GeneralAgentSchedulerTargets is the path set this call mutates for write-conflict ordering: the
 // declared write and delete leaves, move endpoints, and directories plus the missing parents the
 // child's authorized creates and mkdirs would make.
 // Those parents order the call and grant the child nothing.
-func (p PreparedTool) DelegateSchedulerTargets() []string { return slices.Clone(p.delegateTargets) }
+func (p PreparedTool) GeneralAgentSchedulerTargets() []string { return slices.Clone(p.generalAgentTargets) }
 
 func copyDeclared[K comparable](declared map[K]bool) map[K]bool {
 	if declared == nil {
@@ -323,10 +319,10 @@ func (p PreparedTool) authorizationInputs() (permissions.MatchRequest, PromptDis
 		display.GrantStoredSubject = capability
 	}
 	modeCtx := p.modeCtx
-	modeCtx.DelegateWrite = p.DelegateDeclaredWrite()
-	modeCtx.DelegateDelete = p.DelegateDeclaredDelete()
-	modeCtx.DelegateMoves = copyDeclared(p.delegateMoves)
-	modeCtx.DelegateDirs = copyDeclared(p.delegateDirs)
+	modeCtx.GeneralAgentWrite = p.GeneralAgentDeclaredWrite()
+	modeCtx.GeneralAgentDelete = p.GeneralAgentDeclaredDelete()
+	modeCtx.GeneralAgentMoves = copyDeclared(p.generalAgentMoves)
+	modeCtx.GeneralAgentDirs = copyDeclared(p.generalAgentDirs)
 	return req, display, modeCtx
 }
 
@@ -336,7 +332,7 @@ func PrepareTool(ctx context.Context, name string, args map[string]any, home str
 	return prepareTool(ctx, name, args, home, processCWD, registry, policy, false)
 }
 
-// launch prepares one operation a delegate declared rather than a call to run: there is no edit
+// launch prepares one operation a general_agent call declared rather than a call to run: there is no edit
 // content to preview, and a declared delete may name a target the child has yet to create.
 func prepareTool(ctx context.Context, name string, args map[string]any, home string, processCWD string, registry *tools.Registry, policy securitystate.Policy, launch bool) (PreparedTool, error) {
 	tool, ok := registry.Lookup(name)
@@ -350,10 +346,6 @@ func prepareTool(ctx context.Context, name string, args map[string]any, home str
 		return PreparedTool{}, refusal
 	}
 
-	// the mode-authorization context for a structured tool. The operation class comes
-	// from the single read-only classification (Advertise().ReadOnly), so mode posture and tool
-	// advertising never disagree about whether a tool mutates. The production binding overlays the
-	// active mode and project root.
 	prepared := PreparedTool{
 		name: name,
 		tool: tool,
@@ -460,8 +452,8 @@ func prepareTool(ctx context.Context, name string, args map[string]any, home str
 		}
 	}
 
-	if delegateTool, ok := tool.(preparedDelegateTool); ok {
-		instruction, write, remove, moves, dirs, schedulerTargets, err := delegateTool.PrepareDelegate(args)
+	if generalAgentTool, ok := tool.(preparedGeneralAgentTool); ok {
+		instruction, write, remove, moves, dirs, schedulerTargets, err := generalAgentTool.PrepareGeneralAgent(args)
 		if err != nil {
 			// A declaration that does not resolve leaves the call with no candidate, which is an
 			// unbounded child rather than a subset of anything. Whether a ceiling is judging the call is
@@ -469,15 +461,20 @@ func prepareTool(ctx context.Context, name string, args map[string]any, home str
 			// whatever its declaration holds and must deny there, while a top-level call under
 			// no ceiling was never a permission question — so the refusal is carried on the prepared
 			// call rather than returned from here.
-			prepared.delegateRefusal = err
+			prepared.generalAgentRefusal = err
+			prepared.modeCtx.GeneralAgentRefused = true
 		} else {
-			prepared.delegate = delegateTool
-			prepared.delegateInstruction = instruction
-			prepared.delegateWrite = copyDeclared(write)
-			prepared.delegateDelete = copyDeclared(remove)
-			prepared.delegateMoves = copyDeclared(moves)
-			prepared.delegateDirs = copyDeclared(dirs)
-			prepared.delegateTargets = slices.Clone(schedulerTargets)
+			prepared.generalAgent = generalAgentTool
+			prepared.generalAgentInstruction = instruction
+			prepared.generalAgentWrite = copyDeclared(write)
+			prepared.generalAgentDelete = copyDeclared(remove)
+			prepared.generalAgentMoves = copyDeclared(moves)
+			prepared.generalAgentDirs = copyDeclared(dirs)
+			prepared.generalAgentTargets = slices.Clone(schedulerTargets)
+			prepared.modeCtx.GeneralAgentResolved = true
+			if len(write)+len(remove)+len(moves)+len(dirs) == 0 {
+				prepared.modeCtx.Class = permissions.ClassReadOnly
+			}
 		}
 	}
 
@@ -524,15 +521,15 @@ func DispatchPreparedTool(ctx context.Context, prepared PreparedTool, authorizer
 
 // A top-level call's request under its own name can only refuse it; what starts the child is the
 // approval of every operation it declares, each authorized as the same direct call would be.
-func DispatchPreparedDelegate(ctx context.Context, prepared PreparedTool, authorizer Authorizer, childCeiling bool) (tools.Result, error) {
+func DispatchPreparedGeneralAgent(ctx context.Context, prepared PreparedTool, authorizer Authorizer, childCeiling bool) (tools.Result, error) {
 	if childCeiling {
 		return DispatchPreparedTool(ctx, prepared, authorizer)
 	}
-	if prepared.delegate == nil {
-		if prepared.delegateRefusal != nil {
-			return tools.Result{}, prepared.delegateRefusal
+	if prepared.generalAgent == nil {
+		if prepared.generalAgentRefusal != nil {
+			return tools.Result{}, prepared.generalAgentRefusal
 		}
-		return tools.Result{}, fmt.Errorf("dispatch: %s is not a prepared delegate call", prepared.name)
+		return tools.Result{}, fmt.Errorf("dispatch: %s is not a prepared general_agent call", prepared.name)
 	}
 	ops, err := prepared.launchOperations(ctx)
 	if err != nil {
@@ -554,8 +551,8 @@ func DispatchPreparedDelegate(ctx context.Context, prepared PreparedTool, author
 	if err := ctx.Err(); err != nil {
 		return tools.Result{}, err
 	}
-	return prepared.delegate.InvokeWithPreparedDelegate(ctx, prepared.delegateInstruction, prepared.DelegateDeclaredWrite(), prepared.DelegateDeclaredDelete(),
-		copyDeclared(prepared.delegateMoves), copyDeclared(prepared.delegateDirs))
+	return prepared.generalAgent.InvokeWithPreparedGeneralAgent(ctx, prepared.generalAgentInstruction, prepared.GeneralAgentDeclaredWrite(), prepared.GeneralAgentDeclaredDelete(),
+		copyDeclared(prepared.generalAgentMoves), copyDeclared(prepared.generalAgentDirs))
 }
 
 func (p PreparedTool) launchOperations(ctx context.Context) ([]PreparedTool, error) {
@@ -570,12 +567,12 @@ func (p PreparedTool) launchOperations(ctx context.Context) ([]PreparedTool, err
 			got = []string{op.resolvedMove.Source, op.resolvedMove.Destination}
 		}
 		if !slices.Equal(got, want) {
-			return &filetools.TargetError{Kind: name, Reason: "the declared path no longer resolves to the target the delegate call was prepared with"}
+			return &filetools.TargetError{Kind: name, Reason: "the declared path no longer resolves to the target the general_agent call was prepared with"}
 		}
 		ops = append(ops, op)
 		return nil
 	}
-	for _, path := range slices.Sorted(maps.Keys(p.delegateWrite)) {
+	for _, path := range slices.Sorted(maps.Keys(p.generalAgentWrite)) {
 		name := filetools.EditToolName
 		if _, err := os.Lstat(path); err != nil {
 			name = filetools.CreateToolName
@@ -584,12 +581,12 @@ func (p PreparedTool) launchOperations(ctx context.Context) ([]PreparedTool, err
 			return nil, err
 		}
 	}
-	for _, path := range slices.Sorted(maps.Keys(p.delegateDelete)) {
+	for _, path := range slices.Sorted(maps.Keys(p.generalAgentDelete)) {
 		if err := add(filetools.DeleteToolName, map[string]any{"path": path}, path); err != nil {
 			return nil, err
 		}
 	}
-	moves := slices.SortedFunc(maps.Keys(p.delegateMoves), func(a, b permissions.MovePair) int {
+	moves := slices.SortedFunc(maps.Keys(p.generalAgentMoves), func(a, b permissions.MovePair) int {
 		return cmp.Or(cmp.Compare(a.Source, b.Source), cmp.Compare(a.Destination, b.Destination))
 	})
 	for _, pair := range moves {
@@ -597,7 +594,7 @@ func (p PreparedTool) launchOperations(ctx context.Context) ([]PreparedTool, err
 			return nil, err
 		}
 	}
-	for _, dir := range slices.Sorted(maps.Keys(p.delegateDirs)) {
+	for _, dir := range slices.Sorted(maps.Keys(p.generalAgentDirs)) {
 		if err := add(filetools.MkdirToolName, map[string]any{"path": dir}, dir); err != nil {
 			return nil, err
 		}
@@ -638,16 +635,16 @@ func InvokeDecided(ctx context.Context, prepared PreparedTool, decision permissi
 	}
 	// An authorized call whose declaration never resolved still starts nothing: its refusal is the
 	// model's corrective, reached only once no ceiling has denied the call ahead of it.
-	if prepared.delegateRefusal != nil {
-		return tools.Result{}, prepared.delegateRefusal
+	if prepared.generalAgentRefusal != nil {
+		return tools.Result{}, prepared.generalAgentRefusal
 	}
 	if err := ctx.Err(); err != nil {
 		return tools.Result{}, err
 	}
 
-	if prepared.delegate != nil {
-		return prepared.delegate.InvokeWithPreparedDelegate(ctx, prepared.delegateInstruction, prepared.DelegateDeclaredWrite(), prepared.DelegateDeclaredDelete(),
-			copyDeclared(prepared.delegateMoves), copyDeclared(prepared.delegateDirs))
+	if prepared.generalAgent != nil {
+		return prepared.generalAgent.InvokeWithPreparedGeneralAgent(ctx, prepared.generalAgentInstruction, prepared.GeneralAgentDeclaredWrite(), prepared.GeneralAgentDeclaredDelete(),
+			copyDeclared(prepared.generalAgentMoves), copyDeclared(prepared.generalAgentDirs))
 	}
 
 	// This assertion runs before the path-only seam below so the four mutating file tools can never fall

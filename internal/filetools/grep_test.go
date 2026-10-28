@@ -93,6 +93,24 @@ func TestGrepTool_AdvertiseMetadata(t *testing.T) {
 	if len(props) != len(want) {
 		t.Fatalf("Parameters.properties has %d keys, want exactly %d (%v)", len(props), len(want), want)
 	}
+	assertOutsideScanAdvertise(t, md, "directory or file outside the project is searched without asking", "such a search asks first")
+	if strings.Contains(md.Description, "across the project") {
+		t.Errorf("tool description still says %q; got %q", "across the project", md.Description)
+	}
+}
+
+func assertOutsideScanAdvertise(t *testing.T, md tools.Metadata, outsideNoPrompt, brokenSettingsAsks string) {
+	t.Helper()
+	assertReadPathContract(t, md)
+	desc := pathDescription(t, md)
+	for _, want := range []string{outsideNoPrompt, brokenSettingsAsks, "Defaults to the project root when omitted", "Relative paths resolve against the project root"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("path description missing %q; got %q", want, desc)
+		}
+	}
+	if !strings.Contains(md.Description, "inside or outside the project") {
+		t.Errorf("tool description does not state inside-or-outside scope; got %q", md.Description)
+	}
 }
 
 // TestGrepTool_OrderingPathThenLine pins Done-when 1: matches are emitted by ascending

@@ -167,11 +167,6 @@ func TestChildAgentPayloads_RejectMalformed(t *testing.T) {
 			p.InvocationID = "not-an-id"
 			return p
 		}()},
-		{"start empty declared list", func() EventPayload {
-			p := validChildStart(invocation)
-			p.DeclaredPaths = nil
-			return p
-		}()},
 		{"start over-cap declared list", func() EventPayload {
 			p := validChildStart(invocation)
 			p.DeclaredPaths = overDeclared
@@ -740,16 +735,9 @@ func TestChildAgentStart_DeclaredDirsValidation(t *testing.T) {
 		return out
 	}
 
-	empty := validChildStart(ids.NewV7())
-	empty.DeclaredPaths = nil
-	_, err := Append(newStore(), empty)
-	if err == nil || !strings.Contains(err.Error(), "declared_delete_paths, declared_move_pairs or declared_dirs") {
-		t.Errorf("Append(no path in any form) error = %v, want a refusal naming all four forms", err)
-	}
-
 	union := validChildStart(ids.NewV7())
 	union.DeclaredPaths, union.DeclaredDirs = paths("f", 31), paths("d", 2)
-	_, err = Append(newStore(), union)
+	_, err := Append(newStore(), union)
 	if err == nil || !strings.Contains(err.Error(), "declared_paths, declared_delete_paths, declared_move_pairs and declared_dirs exceeds") {
 		t.Errorf("Append(33 distinct paths with directories) error = %v, want the shared cap naming all four forms", err)
 	}
@@ -785,30 +773,78 @@ func TestChildAgentStart_ReaderWithoutDeclaredDirs(t *testing.T) {
 
 	mixed := validChildStart(ids.NewV7())
 	mixed.DeclaredDirs = childDeclared("build")
-	dirOnly := validChildStart(ids.NewV7())
-	dirOnly.DeclaredPaths, dirOnly.DeclaredDirs = []string{}, childDeclared("build")
-	for _, tc := range []struct {
-		name    string
-		start   ChildAgentStart
-		wantErr bool
-	}{
-		{"a mixed start keeps its known forms and drops the directories", mixed, false},
-		{"a directory-only start is refused", dirOnly, true},
+	raw, err := json.Marshal(mixed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidatePayload(KindChildAgentStart, raw); err != nil {
+		t.Fatalf("ValidatePayload() error = %v, want the current reader to accept it", err)
+	}
+	var old ChildAgentStart
+	mustUnmarshal(t, raw, &old)
+	old.DeclaredDirs = nil
+	if err := old.validate(); err != nil {
+		t.Fatalf("validate() without declared_dirs error = %v, want a mixed start to keep its known forms", err)
+	}
+}
+
+func TestEmitChildAgentPair_ReadOnlyChildRoundTrips(t *testing.T) {
+	sess := newSession()
+	store := sessions.New("unused-in-tests", sess)
+	invocation := ids.NewV7()
+	start := validChildStart(invocation)
+	start.DeclaredPaths = []string{}
+	if err := EmitChildAgentStart(store, childRoot, start); err != nil {
+		t.Fatalf("EmitChildAgentStart() error = %v, want a child with no declared path admitted", err)
+	}
+	end := validChildEnd(invocation)
+	end.WrittenPaths = []string{}
+	if err := EmitChildAgentEnd(store, childRoot, end); err != nil {
+		t.Fatalf("EmitChildAgentEnd() error = %v", err)
+	}
+
+	evs := reloadAll(t, sess)
+	if len(evs) != 2 || evs[0].Kind != KindChildAgentStart || evs[1].Kind != KindChildAgentEnd {
+		t.Fatalf("persisted records = %+v, want one start then one end", evs)
+	}
+	for _, ev := range evs {
+		if err := ValidatePayload(ev.Kind, ev.Payload); err != nil {
+			t.Fatalf("ValidatePayload(%q) rejected the read-only child record: %v", ev.Kind, err)
+		}
+	}
+	var fields map[string]json.RawMessage
+	mustUnmarshal(t, evs[0].Payload, &fields)
+	if got := string(fields["declared_paths"]); got != "[]" {
+		t.Errorf("declared_paths = %s, want []", got)
+	}
+	for _, absent := range []string{"declared_delete_paths", "declared_move_pairs", "declared_dirs"} {
+		if raw, ok := fields[absent]; ok {
+			t.Errorf("%s = %s, want the field omitted", absent, raw)
+		}
+	}
+	var gotEnd ChildAgentEnd
+	mustUnmarshal(t, evs[1].Payload, &gotEnd)
+	if gotEnd.InvocationID != invocation {
+		t.Errorf("end invocation_id = %q, want the start's %q", gotEnd.InvocationID, invocation)
+	}
+
+	omitted := validChildStart(ids.NewV7())
+	omitted.DeclaredPaths = nil
+	if _, err := Append(newStore(), omitted); err != nil {
+		t.Errorf("Append(nil declared_paths) error = %v, want accepted", err)
+	}
+	for name, mutate := range map[string]func(*ChildAgentStart){
+		"missing model":      func(p *ChildAgentStart) { p.ModelID = "" },
+		"zero step cap":      func(p *ChildAgentStart) { p.StepCap = 0 },
+		"bad digest":         func(p *ChildAgentStart) { p.InstructionDigest = "x" },
+		"bad invocation id":  func(p *ChildAgentStart) { p.InvocationID = "not-an-id" },
+		"empty instructions": func(p *ChildAgentStart) { p.InstructionBytes = 0 },
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			raw, err := json.Marshal(tc.start)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := ValidatePayload(KindChildAgentStart, raw); err != nil {
-				t.Fatalf("ValidatePayload() error = %v, want the current reader to accept it", err)
-			}
-			var old ChildAgentStart
-			mustUnmarshal(t, raw, &old)
-			old.DeclaredDirs = nil
-			if err := old.validate(); (err != nil) != tc.wantErr {
-				t.Fatalf("validate() without declared_dirs error = %v, want error: %v", err, tc.wantErr)
-			}
-		})
+		bad := validChildStart(ids.NewV7())
+		bad.DeclaredPaths = []string{}
+		mutate(&bad)
+		if _, err := Append(newStore(), bad); err == nil {
+			t.Errorf("Append(read-only start with %s) = nil error, want rejected", name)
+		}
 	}
 }

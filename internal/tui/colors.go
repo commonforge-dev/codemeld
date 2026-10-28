@@ -19,6 +19,8 @@ const (
 	codeBlockText = "#8ae234"
 	codeBlockFill = "#2f343f"
 
+	toolActivityColor = "#6b7480"
+
 	// colorMode* are the per-mode fills of the bottom bar's filled mode pill: each
 	// is used as the pill BACKGROUND, with white (chromeOnFillText) text over it, so the
 	// active mode reads as a solid colored rectangle rather than bare colored text. plan is

@@ -3,15 +3,18 @@ package subagent
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
 
+	"codemeld.dev/codemeld/internal/filetools"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/sessions"
 )
@@ -114,7 +117,7 @@ func TestRecover_PutsBackTheWritesOfAWriterProcessThatExited(t *testing.T) {
 		t.Fatalf("stat the exited writer's record: %v", err)
 	}
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if got := readFile(t, target); got != "ORIGINAL\n" {
 		t.Fatalf("%s = %q, want its pre-run bytes read back from disk", target, got)
@@ -133,6 +136,19 @@ func (f *fixture) openNested(t *testing.T, parent *Journal, declared ...string) 
 	}
 	t.Cleanup(j.Close)
 	return j
+}
+
+func (f *fixture) policy(blocked ...string) RecoveryPolicy {
+	refresh := func() (*permissions.BlockedPaths, error) { return f.blockedList(blocked...), nil }
+	return RecoveryPolicy{Blocked: f.blockedList(blocked...), Refresh: refresh}
+}
+
+func (f *fixture) blockedList(blocked ...string) *permissions.BlockedPaths {
+	entries := make([]permissions.BlockedEntry, 0, len(blocked))
+	for _, path := range blocked {
+		entries = append(entries, permissions.BlockedEntry{Path: path, Source: "settings.yaml"})
+	}
+	return permissions.NewBlockedPaths(f.home, entries)
 }
 
 func answer(choice Choice) func(Unresolved) Choice {
@@ -155,7 +171,7 @@ func TestRecover_PutsBackTheWritesOfAnOrphanedChild(t *testing.T) {
 	f.childCreate(t, j, created, "CHILD MADE THIS\n")
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if got := readFile(t, edited); got != "ORIGINAL\n" {
 		t.Fatalf("%s = %q, want its pre-run bytes", edited, got)
@@ -188,7 +204,7 @@ func TestRecover_SkipsAJournalWhoseLockIsHeldWithoutReadingItsRecord(t *testing.
 			}
 		}},
 		{name: "an unsupported schema", record: func(t *testing.T, j *Journal) {
-			rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalAnswerSchemaVersion + 1 })
+			rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalCompletedSchemaVersion + 1 })
 		}},
 		{name: "a mismatched directory identity", record: func(t *testing.T, j *Journal) {
 			rewriteRecord(t, j, func(rec *journalRecord) { rec.DirIno++ })
@@ -203,7 +219,7 @@ func TestRecover_SkipsAJournalWhoseLockIsHeldWithoutReadingItsRecord(t *testing.
 			tc.record(t, j)
 			before, _ := os.ReadFile(recordPath(j))
 
-			report := Recover(f.home, f.project, answer(ChoiceRestore))
+			report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 			if got := readFile(t, target); got != "CHILD\n" {
 				t.Fatalf("%s = %q, want the running writer's file untouched", target, got)
@@ -272,7 +288,7 @@ func TestRecover_LeavesAJournalItCannotTellHasEnded(t *testing.T) {
 			tc.lock(t, j)
 			before := readBytes(t, recordPath(j))
 
-			report := Recover(f.home, f.project, answer(ChoiceRestore))
+			report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 			if got := readFile(t, target); got != "CHILD\n" {
 				t.Fatalf("%s = %q, want the file left as it is", target, got)
@@ -300,7 +316,7 @@ func TestRecover_LeavesAJournalItCannotTellHasEnded(t *testing.T) {
 			}
 		}
 
-		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 			t.Fatalf("report = %+v, want record-less storage passed over in silence", report)
 		}
 		if got := readFile(t, target); got != "CHILD\n" {
@@ -321,7 +337,7 @@ func TestRecover_LeavesAJournalItCannotTellHasEnded(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(j.Path(), journalDirMode) })
 
-		report := Recover(f.home, f.project, answer(ChoiceRestore))
+		report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 		if len(report.LeftAlone) != 0 || len(report.Retained) != 1 || report.Retained[0].Path != j.Path() ||
 			!strings.Contains(strings.Join(report.Retained[0].Notes, "\n"), "permission denied") {
@@ -343,7 +359,7 @@ func TestRecover_SkipsARecordLessDirectoryWhoseLockIsFree(t *testing.T) {
 		t.Fatalf("remove the record: %v", err)
 	}
 
-	if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+	if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 		t.Fatalf("report = %+v, want record-less residue passed over in silence", report)
 	}
 	if got := readFile(t, target); got != "CHILD\n" {
@@ -384,7 +400,7 @@ func TestRecover_DefersEveryJournalAboveADescendantAnotherProcessHolds(t *testin
 		before[j.Path()] = string(readBytes(t, recordPath(j)))
 	}
 
-	if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+	if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 		t.Fatalf("report = %+v, want a deferred chain to add nothing", report)
 	}
 	if got := readFile(t, target); got != "GRANDCHILD\n" {
@@ -397,7 +413,7 @@ func TestRecover_DefersEveryJournalAboveADescendantAnotherProcessHolds(t *testin
 	}
 
 	release()
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if got := readFile(t, target); got != "ORIGINAL\n" {
 		t.Fatalf("%s = %q, want the parent's pre-run bytes once the descendant is free", target, got)
@@ -435,7 +451,7 @@ func TestRecover_RetainsEveryJournalAboveADescendantItCannotUse(t *testing.T) {
 			tc.unavailable(t, grandchild)
 			before := readBytes(t, recordPath(grandchild))
 
-			report := Recover(f.home, f.project, answer(ChoiceRestore))
+			report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 			if got := readFile(t, target); got != "GRANDCHILD\n" {
 				t.Fatalf("%s = %q, want no project write while a descendant is unavailable", target, got)
@@ -469,7 +485,7 @@ func TestRecover_OffersARetainedJournalAgainInTheSameProcess(t *testing.T) {
 	}
 
 	for pass := 1; pass <= 2; pass++ {
-		report := Recover(f.home, f.project, nil)
+		report := Recover(f.home, f.project, f.policy(), nil)
 		if len(report.Retained) != 1 || report.Retained[0].Path != j.Path() {
 			t.Fatalf("pass %d retained = %+v, want the retained journal offered again", pass, report.Retained)
 		}
@@ -496,7 +512,7 @@ func TestRecover_CleansUpACommittedSurvivorWithoutComparingAPath(t *testing.T) {
 	}
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, answer(ChoiceRestore))
+	report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 	if got := readFile(t, target); got != "A THIRD WRITER\n" {
 		t.Fatalf("%s = %q, want a committed survivor to compare and restore nothing", target, got)
@@ -504,6 +520,40 @@ func TestRecover_CleansUpACommittedSurvivorWithoutComparingAPath(t *testing.T) {
 	assertGone(t, j.Path())
 	if !report.Empty() {
 		t.Fatalf("report = %+v, want a cleanup-only survivor to report nothing", report)
+	}
+}
+
+func TestRecover_AttributesACompletedCommittedSurvivorWhoseCleanupFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	j.rec.Completed = true
+	j.rec.Lifecycle = lifecycleCommitted
+	if err := j.flush(); err != nil {
+		t.Fatalf("flush the completed and committed markers: %v", err)
+	}
+	orphan(t, j)
+	if err := os.Chmod(j.Path(), 0o500); err != nil {
+		t.Fatalf("remove write permission: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(j.Path(), journalDirMode) })
+
+	report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+	if got := readFile(t, target); got != "CHILD\n" {
+		t.Fatalf("%s = %q, want the child's work left as it is", target, got)
+	}
+	if rec := onDiskRecord(t, j); !rec.Completed || rec.Lifecycle != lifecycleCommitted {
+		t.Fatalf("record = %+v, want the completed committed record still on disk", rec)
+	}
+	if len(report.Retained) != 1 || report.Retained[0].Path != j.Path() || !report.Retained[0].Completed || !report.Retained[0].Committed || report.Retained[0].Unanswered != 0 ||
+		!strings.Contains(strings.Join(report.Retained[0].Notes, "\n"), "the committed journal could not be removed") ||
+		len(report.Restored) != 0 || len(report.Kept) != 0 {
+		t.Fatalf("report = %+v, want the cleanup failure retained as completed work", report)
 	}
 }
 
@@ -526,7 +576,7 @@ func TestRecover_ProcessesLinkedTransferReadyDescendantsDeepestFirst(t *testing.
 		orphan(t, child)
 		orphan(t, grandchild)
 
-		report := Recover(f.home, f.project, nil)
+		report := Recover(f.home, f.project, f.policy(), nil)
 
 		if got := readFile(t, target); got != "ORIGINAL\n" {
 			t.Fatalf("%s = %q, want the parent's pre-run bytes", target, got)
@@ -553,7 +603,7 @@ func TestRecover_ProcessesLinkedTransferReadyDescendantsDeepestFirst(t *testing.
 		orphan(t, child)
 
 		crashAt(t, "child_absorbed")
-		report := Recover(f.home, f.project, nil)
+		report := Recover(f.home, f.project, f.policy(), nil)
 
 		assertRecordPresent(t, child)
 		assertRecordPresent(t, parent)
@@ -563,7 +613,7 @@ func TestRecover_ProcessesLinkedTransferReadyDescendantsDeepestFirst(t *testing.
 
 		// The handover is the only thing that failed, so the next launch completes it rather than
 		// leaving the pair behind for good.
-		if second := Recover(f.home, f.project, nil); len(second.Retained) != 0 {
+		if second := Recover(f.home, f.project, f.policy(), nil); len(second.Retained) != 0 {
 			t.Fatalf("retained = %+v, want the resumed handover to complete", second.Retained)
 		}
 		if got := readFile(t, target); got != "ORIGINAL\n" {
@@ -605,7 +655,7 @@ func TestRecover_ReconcilesAPendingWriteBeforeItCompares(t *testing.T) {
 			}
 			orphan(t, j)
 
-			Recover(f.home, f.project, nil)
+			Recover(f.home, f.project, f.policy(), nil)
 
 			if got := readFile(t, target); got != tc.wantFile {
 				t.Fatalf("%s = %q, want %q", target, got, tc.wantFile)
@@ -638,7 +688,7 @@ func TestRecover_RetainsAPendingWriteWhoseParentCannotBeSynced(t *testing.T) {
 	orphan(t, j)
 	failSyncOnce(t)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if got := readFile(t, target); got != "CHILD\n" {
 		t.Fatalf("%s = %q, want the write left alone after a failed durability retry", target, got)
@@ -668,11 +718,11 @@ func TestRecover_ResumesAcrossEveryWriteAheadBoundary(t *testing.T) {
 			orphan(t, j)
 
 			crashAt(t, label)
-			if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+			if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 				t.Fatalf("retained = %+v, want the interrupted pass to report the journal", report.Retained)
 			}
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			if len(report.Retained) != 0 {
 				t.Fatalf("retained = %+v, want the resumed pass to complete", report.Retained)
@@ -698,7 +748,7 @@ func TestRecover_RetriesTheRemovalParentSyncAResumedPassStillOwes(t *testing.T) 
 	orphan(t, j)
 	failSyncOnce(t)
 
-	if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+	if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 		t.Fatalf("retained = %+v, want the failed removal sync to retain the journal", report.Retained)
 	}
 	assertGone(t, created)
@@ -706,7 +756,7 @@ func TestRecover_RetriesTheRemovalParentSyncAResumedPassStillOwes(t *testing.T) 
 		t.Fatalf("progress = %q, want the removal still owed its parent sync", got.Paths[0].Progress)
 	}
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want the retried sync to complete the rollback", report.Retained)
@@ -722,7 +772,7 @@ func TestRecover_TakesBackACreatedFileOnlyWhileItMatches(t *testing.T) {
 		f.childCreate(t, j, created, "CHILD MADE THIS\n")
 		orphan(t, j)
 
-		report := Recover(f.home, f.project, nil)
+		report := Recover(f.home, f.project, f.policy(), nil)
 
 		assertGone(t, created)
 		assertGone(t, j.Path())
@@ -741,7 +791,7 @@ func TestRecover_TakesBackACreatedFileOnlyWhileItMatches(t *testing.T) {
 		}
 		orphan(t, j)
 
-		report := Recover(f.home, f.project, nil)
+		report := Recover(f.home, f.project, f.policy(), nil)
 
 		if got := readFile(t, created); got != "SOMEONE ELSE\n" {
 			t.Fatalf("%s = %q, want the replacement kept", created, got)
@@ -773,7 +823,7 @@ func TestRecover_PersistsTheUsersChoiceForAChangedPath(t *testing.T) {
 		f, j, target := changed(t)
 
 		asked := 0
-		report := Recover(f.home, f.project, func(Unresolved) Choice {
+		report := Recover(f.home, f.project, f.policy(), func(Unresolved) Choice {
 			asked++
 			return ChoiceKeep
 		})
@@ -806,12 +856,12 @@ func TestRecover_PersistsTheUsersChoiceForAChangedPath(t *testing.T) {
 		orphan(t, j)
 
 		crashAt(t, "restoring")
-		if report := Recover(f.home, f.project, answer(ChoiceKeep)); !slices.Contains(report.Kept, kept) {
+		if report := Recover(f.home, f.project, f.policy(), answer(ChoiceKeep)); !slices.Contains(report.Kept, kept) {
 			t.Fatalf("kept = %v, want the answered path named", report.Kept)
 		}
 
 		var asked []string
-		report := Recover(f.home, f.project, func(u Unresolved) Choice {
+		report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 			asked = append(asked, u.Path)
 			return ChoiceDefer
 		})
@@ -832,7 +882,7 @@ func TestRecover_PersistsTheUsersChoiceForAChangedPath(t *testing.T) {
 	t.Run("choosing to restore puts the captured state back over the change", func(t *testing.T) {
 		f, j, target := changed(t)
 
-		report := Recover(f.home, f.project, answer(ChoiceRestore))
+		report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 		if got := readFile(t, target); got != "ORIGINAL\n" {
 			t.Fatalf("%s = %q, want the captured pre-run bytes", target, got)
@@ -846,7 +896,7 @@ func TestRecover_PersistsTheUsersChoiceForAChangedPath(t *testing.T) {
 	t.Run("deferring leaves the path and the journal for the next launch", func(t *testing.T) {
 		f, j, target := changed(t)
 
-		report := Recover(f.home, f.project, answer(ChoiceDefer))
+		report := Recover(f.home, f.project, f.policy(), answer(ChoiceDefer))
 
 		if got := readFile(t, target); got != "A HAND EDIT\n" {
 			t.Fatalf("%s = %q, want a deferred path left alone", target, got)
@@ -864,7 +914,7 @@ func TestRecover_PersistsTheUsersChoiceForAChangedPath(t *testing.T) {
 		f, j, target := changed(t)
 
 		crashAt(t, "kept")
-		report := Recover(f.home, f.project, answer(ChoiceKeep))
+		report := Recover(f.home, f.project, f.policy(), answer(ChoiceKeep))
 
 		if len(report.Kept) != 0 {
 			t.Fatalf("kept = %v, want an unrecorded answer not reported", report.Kept)
@@ -889,7 +939,7 @@ func TestRecover_ReportsAJournalItCannotRead(t *testing.T) {
 		t.Fatalf("corrupt the record: %v", err)
 	}
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 1 || len(report.Retained[0].Notes) == 0 {
 		t.Fatalf("retained = %+v, want the unreadable journal reported", report.Retained)
@@ -922,7 +972,7 @@ func TestRecover_LoadsOnlyARecordFromTheDirectoryItNames(t *testing.T) {
 		}
 	}
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if got := readFile(t, target); got != "CHILD\n" {
 		t.Fatalf("%s = %q, want a record from a swapped directory refused", target, got)
@@ -945,7 +995,7 @@ func TestRecover_ReportsAJournalFolderItCannotOpen(t *testing.T) {
 		t.Fatalf("plant a file where the folder belongs: %v", err)
 	}
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 1 || report.Retained[0].Path != folder {
 		t.Fatalf("retained = %+v, want the unopenable folder named", report.Retained)
@@ -956,7 +1006,7 @@ func TestRecover_DoesNothingWhenNoJournalWasLeftBehind(t *testing.T) {
 	f := newFixture(t)
 	f.seed(t, "a.txt", "ORIGINAL\n")
 
-	if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+	if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 		t.Fatalf("report = %+v, want nothing reported when no journal exists", report)
 	}
 	if _, err := os.Stat(filepath.Join(f.home, ".codemeld")); !os.IsNotExist(err) {
@@ -989,7 +1039,7 @@ func TestRecover_RestoresEveryDeleteStateOfAnOrphanedChild(t *testing.T) {
 	}
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1018,11 +1068,11 @@ func TestRecover_ResumesADeleteRollbackAcrossItsWriteAheadBoundaries(t *testing.
 			orphan(t, j)
 
 			crashAt(t, label)
-			if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+			if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 				t.Fatalf("retained = %+v, want the interrupted pass to report the journal", report.Retained)
 			}
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			if len(report.Retained) != 0 {
 				t.Fatalf("retained = %+v, want the resumed pass to complete", report.Retained)
@@ -1044,7 +1094,7 @@ func TestRecover_PreservesAnExternalChangeToADeletedPath(t *testing.T) {
 	}
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if got := readFile(t, target); got != "THIRD PARTY\n" {
 		t.Fatalf("%s = %q, want the external change left alone", target, got)
@@ -1064,7 +1114,7 @@ func TestRecover_LeavesASameContentReplacementOfADeletedPath(t *testing.T) {
 			replaced := f.replaceDeleted(t, j, tc, target)
 			orphan(t, j)
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			assertSameEntry(t, target, replaced)
 			assertRecordPresent(t, j)
@@ -1080,7 +1130,7 @@ func TestRecover_ResumesAnInterruptedRestoreOnlyThroughTheEntryItPublished(t *te
 		t.Helper()
 		orphan(t, j)
 		interruptRestore(t, j, func() {
-			if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+			if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 				t.Fatalf("retained = %+v, want the interrupted pass to report the journal", report.Retained)
 			}
 		})
@@ -1097,7 +1147,7 @@ func TestRecover_ResumesAnInterruptedRestoreOnlyThroughTheEntryItPublished(t *te
 				t.Fatalf("lstat the restored entry: %v", err)
 			}
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			if len(report.Retained) != 0 {
 				t.Fatalf("retained = %+v, want the resumed restore to complete", report.Retained)
@@ -1113,7 +1163,7 @@ func TestRecover_ResumesAnInterruptedRestoreOnlyThroughTheEntryItPublished(t *te
 			interrupted(t, f, j)
 			replaced := swapInSameContent(t, tc, target)
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			assertSameEntry(t, target, replaced)
 			assertRecordPresent(t, j)
@@ -1133,7 +1183,7 @@ func TestRecover_RetainsARestoreWhoseIdentityNeverBecameDurable(t *testing.T) {
 			f.mustDelete(t, j, target)
 			orphan(t, j)
 			tc.interrupt(t)
-			if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+			if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 				t.Fatalf("retained = %+v, want the interrupted pass to report the journal", report.Retained)
 			}
 			left, err := os.Lstat(target)
@@ -1141,7 +1191,7 @@ func TestRecover_RetainsARestoreWhoseIdentityNeverBecameDurable(t *testing.T) {
 				t.Fatalf("lstat the entry the interrupted pass left: %v", err)
 			}
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			assertSameEntry(t, target, left)
 			assertRecordPresent(t, j)
@@ -1165,7 +1215,7 @@ func TestRecover_RestoresNothingThroughASymlinkPlantedAboveARecreatedDirectory(t
 	orphan(t, j)
 	outside := escapeRecreatedDir(t, tree)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	assertGone(t, filepath.Join(outside, "tree", "leaf.txt"))
 	assertRecordPresent(t, j)
@@ -1216,7 +1266,7 @@ func TestRecover_SettlesAPendingDeletionOnlyWhenItCanBeProved(t *testing.T) {
 				failSyncOnce(t)
 			}
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			assertContent(t, target, tc.want)
 			if tc.wantRetained {
@@ -1246,7 +1296,7 @@ func TestRecover_RestoresEachDeleteSequenceFromItsOneHistory(t *testing.T) {
 			seq.run(t, f, j, target)
 			orphan(t, j)
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			if len(report.Retained) != 0 {
 				t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1274,7 +1324,7 @@ func TestRecover_ReadsJournalsOfBothSchemaVersions(t *testing.T) {
 	orphan(t, writeOnly)
 	orphan(t, withDeletes)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want both schemas recovered", report.Retained)
@@ -1311,7 +1361,7 @@ func TestRecover_UndoesTwoCompletedFileMovesInReverseJournalOrder(t *testing.T) 
 	}
 	t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1344,7 +1394,7 @@ func TestRecover_ReturnsAMovedDirectoryWholeWithItsModeAndIdentity(t *testing.T)
 	f.mustMove(t, j, tree, renamed)
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1366,7 +1416,7 @@ func TestRecover_RemovesTheChildsWritesBeneathADirectoryItMoved(t *testing.T) {
 	mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1391,7 +1441,7 @@ func TestRecover_CarriesAnOutsideEditInsideAMovedDirectoryBackWithIt(t *testing.
 	replaceFile(t, filepath.Join(moved, "leaf.txt"), "A THIRD WRITER\n")
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1416,7 +1466,7 @@ func TestRecover_ClearsASourceTheChildRecreatedBeforeRenamingTheMovedEntryHome(t
 	mustSucceed(t, f.childCreate(t, j, source, "CHILD REMADE THIS\n"))
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want a clean recovery", report.Retained)
@@ -1439,7 +1489,7 @@ func TestRecover_HoldsTheGroupOfAMoveWhoseSourceSomeoneElseRecreated(t *testing.
 	orphan(t, j)
 	before := captureEntries(t, a, b, c)
 
-	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+	report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 		if len(u.Moves) > 0 {
 			return ChoiceDefer
 		}
@@ -1466,14 +1516,14 @@ func TestRecover_RecordsACompletedPairAlreadyAtBothPreRunStatesAsUndone(t *testi
 	orphan(t, j)
 
 	crashAt(t, "restored")
-	if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+	if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 		t.Fatalf("retained = %+v, want the interrupted pass to report the journal", report.Retained)
 	}
 	if got := onDiskRecord(t, j).Moves; len(got) != 1 || got[0].State != moveUndone {
 		t.Fatalf("journalled moves = %+v, want the settled pair recorded as undone", got)
 	}
 
-	report := Recover(f.home, f.project, nil)
+	report := Recover(f.home, f.project, f.policy(), nil)
 
 	if len(report.Retained) != 0 {
 		t.Fatalf("retained = %+v, want the resumed pass to complete", report.Retained)
@@ -1655,7 +1705,7 @@ func TestRecover_SettlesAPendingMoveOnlyFromBothEndpointsTogether(t *testing.T) 
 				onJournalStep(t, "move_undoing", func() { atUndoBegan = recordIn(t, j.Path()) })
 			}
 
-			report := Recover(f.home, f.project, answer(ChoiceRestore))
+			report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 			if tc.wantHeld || tc.interrupt != nil {
 				assertEntriesUnchanged(t, before)
@@ -1677,7 +1727,7 @@ func TestRecover_SettlesAPendingMoveOnlyFromBothEndpointsTogether(t *testing.T) 
 					assertHeldMoves(t, report.Retained[0], []permissions.MovePair{pairOf(source, destination)}, unresolvedMoveCause)
 					return
 				}
-				report = Recover(f.home, f.project, answer(ChoiceRestore))
+				report = Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 			}
 
 			if len(report.Retained) != 0 {
@@ -1706,16 +1756,16 @@ func TestRecover_LeavesANewerSchemaJournalAndEveryProjectPathUntouched(t *testin
 	j := f.openScopes(t, nil, []string{target})
 	f.mustDelete(t, j, target)
 	orphan(t, j)
-	rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalAnswerSchemaVersion + 1 })
+	rewriteRecord(t, j, func(rec *journalRecord) { rec.SchemaVersion = journalCompletedSchemaVersion + 1 })
 
-	report := Recover(f.home, f.project, answer(ChoiceRestore))
+	report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 	assertGone(t, target)
 	assertRecordPresent(t, j)
 	if len(report.Retained) != 1 || len(report.Restored) != 0 {
 		t.Fatalf("report = %+v, want the unreadable journal retained and nothing restored", report)
 	}
-	if got := onDiskRecord(t, j).SchemaVersion; got != journalAnswerSchemaVersion+1 {
+	if got := onDiskRecord(t, j).SchemaVersion; got != journalCompletedSchemaVersion+1 {
 		t.Fatalf("schema_version = %d, want the record left as it was", got)
 	}
 }
@@ -1933,7 +1983,7 @@ func buildContainedMoves(t *testing.T, f *fixture, beforeLast func()) *linkedMov
 func assertGroupHeld(t *testing.T, f *fixture, lm *linkedMoves, before []entrySnapshot, cause string) {
 	t.Helper()
 	var asked []string
-	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+	report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 		if len(u.Moves) > 0 {
 			return ChoiceDefer
 		}
@@ -2000,7 +2050,7 @@ func TestRecover_HoldsAGroupWhoseJournalledPathInsideAMovedEntryCannotBePutBack(
 	before := captureEntries(t, tree, inner, other, moved, filepath.Join(moved, "other"), created)
 
 	var asked []string
-	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+	report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 		asked = append(asked, u.Path)
 		return ChoiceDefer
 	})
@@ -2047,7 +2097,7 @@ func TestRecover_ResumesAMoveUndoInterruptedAtEachDurablePoint(t *testing.T) {
 			orphan(t, j)
 
 			tc.interrupt(t)
-			if report := Recover(f.home, f.project, nil); len(report.Retained) != 1 {
+			if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 1 {
 				t.Fatalf("retained = %+v, want the interrupted pass to report the journal", report.Retained)
 			}
 
@@ -2065,7 +2115,7 @@ func TestRecover_ResumesAMoveUndoInterruptedAtEachDurablePoint(t *testing.T) {
 				t.Fatalf("journalled moves after the interrupted pass = %+v, want one move recorded as %q", got, tc.wantState)
 			}
 
-			report := Recover(f.home, f.project, nil)
+			report := Recover(f.home, f.project, f.policy(), nil)
 
 			if len(report.Retained) != 0 {
 				t.Fatalf("retained = %+v, want the resumed pass to complete", report.Retained)
@@ -2088,7 +2138,7 @@ func TestRecover_RemovesOnlyTheJournalOfACommittedMoveSurvivor(t *testing.T) {
 	orphan(t, j)
 	before := captureEntries(t, source, destination)
 
-	report := Recover(f.home, f.project, answer(ChoiceRestore))
+	report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 	assertEntriesUnchanged(t, before)
 	assertGone(t, j.Path())
@@ -2212,7 +2262,7 @@ func TestRecover_SettlesAnOrphanedChildsDeclaredDirectoriesLikeALiveRollback(t *
 			}
 			orphan(t, j)
 
-			report := Recover(f.home, f.project, func(u Unresolved) Choice {
+			report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 				t.Fatalf("asked about %s, want nothing left to ask", u.Path)
 				return ChoiceDefer
 			})
@@ -2261,7 +2311,7 @@ func TestRecover_ReportsARetainedDirectoryAtEveryLaunchWithoutOfferingIt(t *test
 
 			for launch := 1; launch <= 2; launch++ {
 				var asked []string
-				report := Recover(f.home, f.project, func(u Unresolved) Choice {
+				report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 					asked = append(asked, u.Path)
 					return ChoiceDefer
 				})
@@ -2294,7 +2344,7 @@ func TestRecover_KeepsTheChoiceOfADeletePathAlsoDeclaredAsADirectory(t *testing.
 	orphan(t, j)
 
 	var asked []string
-	report := Recover(f.home, f.project, func(u Unresolved) Choice {
+	report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 		asked = append(asked, u.Path)
 		return ChoiceKeep
 	})
@@ -2337,7 +2387,7 @@ func TestRecover_NeverOffersADirectoryOnlyDeclarationAnotherWriterFilled(t *test
 			orphan(t, j)
 
 			var asked []string
-			Recover(f.home, f.project, func(u Unresolved) Choice {
+			Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 				asked = append(asked, u.Path)
 				return ChoiceRestore
 			})
@@ -2375,7 +2425,7 @@ func TestRecover_OffersADeletePathWhoseDirectoryCreationIsUnsettled(t *testing.T
 			orphan(t, j)
 
 			var asked []string
-			report := Recover(f.home, f.project, func(u Unresolved) Choice {
+			report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 				asked = append(asked, u.Path)
 				return tc.choice
 			})
@@ -2435,7 +2485,7 @@ func TestRecover_RetainsADirectoryFirstMadeAsADeclaredFilesParent(t *testing.T) 
 					}
 				} else {
 					orphan(t, j)
-					report := Recover(f.home, f.project, func(u Unresolved) Choice {
+					report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
 						t.Fatalf("asked about %s, want nothing offered", u.Path)
 						return ChoiceDefer
 					})
@@ -2448,5 +2498,2204 @@ func TestRecover_RetainsADirectoryFirstMadeAsADeclaredFilesParent(t *testing.T) 
 				assertRecordPresent(t, j)
 			})
 		}
+	}
+}
+
+type listSwitch struct {
+	blocked []string
+	err     error
+	calls   int
+	onCall  func(call int)
+}
+
+func (f *fixture) switchPolicy(s *listSwitch) RecoveryPolicy {
+	return RecoveryPolicy{Blocked: f.blockedList(), Refresh: func() (*permissions.BlockedPaths, error) {
+		s.calls++
+		if s.onCall != nil {
+			s.onCall(s.calls)
+		}
+		if s.err != nil {
+			return nil, s.err
+		}
+		return f.blockedList(s.blocked...), nil
+	}}
+}
+
+func neverAsked(t *testing.T) func(Unresolved) Choice {
+	return func(u Unresolved) Choice {
+		t.Errorf("asked about %+v, want no question", u)
+		return ChoiceDefer
+	}
+}
+
+func blockedNote(label, entry string) string { return label + ": a blocked path is involved: " + entry }
+
+func assertPolicyHeld(t *testing.T, report Report, j *Journal, notes ...string) {
+	t.Helper()
+	i := slices.IndexFunc(report.Retained, func(r RetainedJournal) bool { return r.Path == j.Path() })
+	if i < 0 {
+		t.Fatalf("retained = %+v, want %s reported", report.Retained, j.Path())
+	}
+	got := report.Retained[i]
+	for _, note := range notes {
+		if !slices.Contains(got.Notes, note) {
+			t.Fatalf("notes = %q, want %q", got.Notes, note)
+		}
+	}
+	if got.PolicyNotes != len(notes) || len(got.Moves) != 0 || slices.ContainsFunc(report.LeftAlone, func(l LeftAloneJournal) bool { return l.Path == j.Path() }) {
+		t.Fatalf("retained = %+v, want %d policy notes and no held moves", got, len(notes))
+	}
+	assertRecordPresent(t, j)
+}
+
+func TestRecover_LeavesAMovedDirectoryAloneOnceABlockedPathLiesInIt(t *testing.T) {
+	f := newFixture(t)
+	f.seed(t, "a/keep.txt", "KEEP\n")
+	a, b := filepath.Join(f.project, "a"), filepath.Join(f.project, "b")
+	j := f.openMoves(t, nil, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	orphan(t, j)
+	secret := filepath.Join(b, "secret")
+	if err := os.MkdirAll(secret, 0o700); err != nil {
+		t.Fatalf("make the blocked folder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secret, "token.txt"), []byte("TOKEN\n"), 0o600); err != nil {
+		t.Fatalf("write the blocked file: %v", err)
+	}
+	before := readBytes(t, recordPath(j))
+
+	report := Recover(f.home, f.project, f.policy(secret), neverAsked(t))
+
+	assertContent(t, filepath.Join(secret, "token.txt"), "TOKEN\n")
+	assertContent(t, filepath.Join(b, "keep.txt"), "KEEP\n")
+	assertGone(t, a)
+	assertPolicyHeld(t, report, j, blockedNote(a+" -> "+b, secret))
+	if len(report.Restored) != 0 {
+		t.Fatalf("restored = %v, want nothing put back", report.Restored)
+	}
+	if got := onDiskRecord(t, j).Moves; !slices.Equal(got, recordFrom(t, before).Moves) {
+		t.Fatalf("moves = %+v, want the move still recorded as it was", got)
+	}
+
+	report = Recover(f.home, f.project, f.policy(), nil)
+
+	if len(report.Retained) != 0 {
+		t.Fatalf("retained = %+v, want a clean recovery once nothing is blocked", report.Retained)
+	}
+	assertContent(t, filepath.Join(a, "secret", "token.txt"), "TOKEN\n")
+	assertGone(t, b)
+	assertGone(t, j.Path())
+}
+
+func TestRecover_HoldsAWholeLinkedGroupOverABlockedEndpointOrDescendant(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry func(source, destination string) string
+	}{
+		{"the destination itself", func(_, destination string) string { return destination }},
+		{"an absent path under the destination", func(_, destination string) string { return filepath.Join(destination, "absent") }},
+		{"a path under the source only", func(source, _ string) string { return filepath.Join(source, "ghost") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.seed(t, "tree/leaf.txt", "LEAF\n")
+			tree := filepath.Join(f.project, "tree")
+			moved, again := filepath.Join(f.project, "moved"), filepath.Join(f.project, "again")
+			created := filepath.Join(again, "sub", "new.txt")
+			pending := filepath.Join(again, "pending.txt")
+			j := f.openMoves(t, []string{created, pending}, pairOf(tree, moved), pairOf(moved, again))
+			f.mustMove(t, j, tree, moved)
+			f.mustMove(t, j, moved, again)
+			mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
+			crashAt(t, "reconciled")
+			f.childCreate(t, j, pending, "PENDING\n")
+			orphan(t, j)
+			assertPendingRecords(t, onDiskRecord(t, j), true, pending)
+			entry := tc.entry(tree, again)
+			before := captureEntries(t, tree, moved, again)
+			record := recordFrom(t, readBytes(t, recordPath(j)))
+
+			report := Recover(f.home, f.project, f.policy(entry), neverAsked(t))
+
+			assertEntriesUnchanged(t, before)
+			assertPolicyHeld(t, report, j, blockedNote(tree+" -> "+moved, entry))
+			if got := onDiskRecord(t, j).Moves; !slices.Equal(got, record.Moves) {
+				t.Fatalf("moves = %+v, want the group's records untouched", got)
+			}
+			assertPendingRecords(t, onDiskRecord(t, j), true, pending)
+		})
+	}
+}
+
+func recordFrom(t *testing.T, data []byte) journalRecord {
+	t.Helper()
+	var rec journalRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("decode the record: %v", err)
+	}
+	return rec
+}
+
+func TestRecover_PutsBackUnrelatedWorkInAJournalWhoseOtherGroupIsBlocked(t *testing.T) {
+	f := newFixture(t)
+	f.seed(t, "tree/leaf.txt", "LEAF\n")
+	tree, moved := filepath.Join(f.project, "tree"), filepath.Join(f.project, "moved")
+	x := f.seed(t, "x.txt", "X\n")
+	y := filepath.Join(f.project, "y.txt")
+	edited := f.seed(t, "e.txt", "ORIGINAL\n")
+	j := f.openMoves(t, []string{edited}, pairOf(tree, moved), pairOf(x, y))
+	f.mustMove(t, j, tree, moved)
+	f.mustMove(t, j, x, y)
+	f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+	orphan(t, j)
+	secret := filepath.Join(moved, "secret")
+	before := captureEntries(t, tree, moved)
+
+	report := Recover(f.home, f.project, f.policy(secret), neverAsked(t))
+
+	assertEntriesUnchanged(t, before)
+	assertContent(t, x, "X\n")
+	assertGone(t, y)
+	assertContent(t, edited, "ORIGINAL\n")
+	assertPolicyHeld(t, report, j, blockedNote(tree+" -> "+moved, secret))
+	for _, path := range []string{x, edited} {
+		if !slices.Contains(report.Restored, path) {
+			t.Fatalf("restored = %v, want %s put back", report.Restored, path)
+		}
+	}
+}
+
+func TestRecover_HoldsASinglePathTheListBlocks(t *testing.T) {
+	f := newFixture(t)
+	blocked := f.seed(t, "a.txt", "ORIGINAL\n")
+	other := f.seed(t, "b.txt", "ORIGINAL\n")
+	j := f.open(t, blocked, other)
+	f.childEdit(t, j, blocked, "ORIGINAL", "CHILD")
+	f.childEdit(t, j, other, "ORIGINAL", "CHILD")
+	orphan(t, j)
+
+	report := Recover(f.home, f.project, f.policy(blocked), neverAsked(t))
+
+	assertContent(t, blocked, "CHILD\n")
+	assertContent(t, other, "ORIGINAL\n")
+	assertPolicyHeld(t, report, j, blockedNote(blocked, blocked))
+
+	if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 0 {
+		t.Fatalf("retained = %+v, want the path put back once it is no longer blocked", report.Retained)
+	}
+	assertContent(t, blocked, "ORIGINAL\n")
+	assertGone(t, j.Path())
+}
+
+func heldFileMove(t *testing.T, f *fixture) (j *Journal, a, b string) {
+	t.Helper()
+	a = f.seed(t, "a.txt", "ORIGINAL\n")
+	b = filepath.Join(f.project, "b.txt")
+	j = f.openMoves(t, nil, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	replaceFile(t, b, "A THIRD WRITER\n")
+	orphan(t, j)
+	return j, a, b
+}
+
+func TestRecover_ARecordedRestoreWaitsOutABlockAndReplaysAfterIt(t *testing.T) {
+	f := newFixture(t)
+	j, a, b := heldFileMove(t, f)
+	crashAt(t, "move_undoing")
+	Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
+	answers := onDiskRecord(t, j).Answers
+	if len(answers) != 1 || answers[0].Choice != ChoiceRestore {
+		t.Fatalf("answers = %+v, want one recorded Restore", answers)
+	}
+	before := captureEntries(t, a, b)
+
+	report := Recover(f.home, f.project, f.policy(b), neverAsked(t))
+
+	assertEntriesUnchanged(t, before)
+	assertPolicyHeld(t, report, j, blockedNote(a+" -> "+b, b))
+	if got := onDiskRecord(t, j).Answers; !slices.EqualFunc(got, answers, func(x, y groupAnswer) bool { return x.Choice == y.Choice && slices.Equal(x.Endpoints, y.Endpoints) }) {
+		t.Fatalf("answers = %+v, want the recorded Restore kept (%+v)", got, answers)
+	}
+
+	report = Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+	if len(report.Retained) != 0 {
+		t.Fatalf("retained = %+v, want the recorded Restore replayed", report.Retained)
+	}
+	assertContent(t, a, "ORIGINAL\n")
+	assertGone(t, b)
+	assertGone(t, j.Path())
+}
+
+func TestRecover_ABlockAddedWhileAQuestionIsOpenStopsTheAnswer(t *testing.T) {
+	for _, choice := range []Choice{ChoiceRestore, ChoiceKeep} {
+		t.Run(string(choice), func(t *testing.T) {
+			f := newFixture(t)
+			j, a, b := heldFileMove(t, f)
+			before := captureEntries(t, a, b)
+			list := &listSwitch{}
+			asked := 0
+
+			report := Recover(f.home, f.project, f.switchPolicy(list), func(u Unresolved) Choice {
+				asked++
+				list.blocked = []string{b}
+				return choice
+			})
+
+			if asked != 1 {
+				t.Fatalf("asked %d times, want the group asked about once", asked)
+			}
+			assertEntriesUnchanged(t, before)
+			assertPolicyHeld(t, report, j, blockedNote(a+" -> "+b, b))
+			if got := onDiskRecord(t, j).Answers; len(got) != 0 {
+				t.Fatalf("answers = %+v, want no answer recorded under the new block", got)
+			}
+		})
+	}
+}
+
+func TestRecover_ABlockAddedWhileAPathQuestionIsOpenStopsTheAnswer(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	replaceFile(t, target, "A HAND EDIT\n")
+	orphan(t, j)
+	list := &listSwitch{}
+
+	report := Recover(f.home, f.project, f.switchPolicy(list), func(Unresolved) Choice {
+		list.blocked = []string{target}
+		return ChoiceRestore
+	})
+
+	assertContent(t, target, "A HAND EDIT\n")
+	assertPolicyHeld(t, report, j, blockedNote(target, target))
+	if got := onDiskRecord(t, j).Paths[0]; got.KeptByUser || got.Progress == rollbackRestored {
+		t.Fatalf("record = %+v, want no answer adopted under the new block", got)
+	}
+}
+
+func TestRecover_AnUnreadableListLeavesEveryJournalByteForByte(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy func(f *fixture) RecoveryPolicy
+	}{
+		{"no policy", func(*fixture) RecoveryPolicy { return RecoveryPolicy{} }},
+		{"an unavailable reason", func(f *fixture) RecoveryPolicy {
+			p := f.policy()
+			p.Blocked, p.Unavailable = nil, "settings.yaml is not valid YAML"
+			return p
+		}},
+		{"a failing refresh", func(f *fixture) RecoveryPolicy {
+			return f.switchPolicy(&listSwitch{err: errors.New("the settings lock is busy")})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			edited := f.seed(t, "a.txt", "ORIGINAL\n")
+			changed := f.seed(t, "b.txt", "ORIGINAL\n")
+			source, destination := f.seed(t, "m.txt", "MOVED\n"), filepath.Join(f.project, "n.txt")
+			j := f.openMoves(t, []string{edited, changed}, pairOf(source, destination))
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			f.childEdit(t, j, changed, "ORIGINAL", "CHILD")
+			f.mustMove(t, j, source, destination)
+			replaceFile(t, changed, "A HAND EDIT\n")
+			replaceFile(t, destination, "A THIRD WRITER\n")
+			orphan(t, j)
+			live := f.open(t, f.seed(t, "c.txt", "ORIGINAL\n"))
+			liveRecord := readBytes(t, recordPath(live))
+			record := readBytes(t, recordPath(j))
+			group := captureEntries(t, source, destination)
+
+			report := Recover(f.home, f.project, tc.policy(f), neverAsked(t))
+
+			assertEntriesUnchanged(t, group)
+
+			if got := readBytes(t, recordPath(j)); string(got) != string(record) {
+				t.Fatalf("record changed:\n%s\nwant\n%s", got, record)
+			}
+			if got := readBytes(t, recordPath(live)); string(got) != string(liveRecord) {
+				t.Fatalf("live writer's record changed")
+			}
+			assertContent(t, edited, "CHILD\n")
+			assertContent(t, changed, "A HAND EDIT\n")
+			if len(report.Retained) != 1 || report.Retained[0].Path != j.Path() || !slices.Equal(report.Retained[0].Notes, []string{listUnavailable}) || report.Retained[0].PolicyNotes != 1 || len(report.Restored) != 0 {
+				t.Fatalf("report = %+v, want only the orphan held for the unreadable list", report)
+			}
+
+			Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
+
+			assertContent(t, edited, "ORIGINAL\n")
+			assertContent(t, changed, "ORIGINAL\n")
+			assertContent(t, source, "MOVED\n")
+			assertGone(t, destination)
+			assertGone(t, j.Path())
+		})
+	}
+}
+
+func TestRecover_LosingTheListMidPassKeepsFinishedWorkAndStopsTheRest(t *testing.T) {
+	f := newFixture(t)
+	first := f.seed(t, "a.txt", "ORIGINAL\n")
+	second := f.seed(t, "b.txt", "ORIGINAL\n")
+	j := f.open(t, first, second)
+	f.childEdit(t, j, first, "ORIGINAL", "CHILD")
+	f.childEdit(t, j, second, "ORIGINAL", "CHILD")
+	orphan(t, j)
+	var atLoss []byte
+	list := &listSwitch{}
+	list.onCall = func(int) {
+		if atLoss == nil && onDiskRecord(t, j).Paths[0].Progress == rollbackRestored {
+			atLoss = readBytes(t, recordPath(j))
+			list.err = errors.New("the settings file changed during the read")
+		}
+	}
+
+	report := Recover(f.home, f.project, f.switchPolicy(list), neverAsked(t))
+
+	assertContent(t, first, "ORIGINAL\n")
+	assertContent(t, second, "CHILD\n")
+	if got := readBytes(t, recordPath(j)); string(got) != string(atLoss) {
+		t.Fatalf("record changed after the list was lost:\n%s\nwant\n%s", got, atLoss)
+	}
+	if rec := onDiskRecord(t, j); rec.Paths[0].Progress != rollbackRestored || rec.Paths[1].Progress == rollbackRestored {
+		t.Fatalf("paths = %+v, want only the first put back durably", rec.Paths)
+	}
+	if !slices.Equal(report.Restored, []string{first}) || len(report.Retained) != 1 || !slices.Equal(report.Retained[0].Notes, []string{listUnavailable}) {
+		t.Fatalf("report = %+v, want the first path put back and the journal held", report)
+	}
+
+	if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 0 {
+		t.Fatalf("retained = %+v, want the rest recovered on a healthy launch", report.Retained)
+	}
+	assertContent(t, second, "ORIGINAL\n")
+	assertGone(t, j.Path())
+}
+
+func TestRecover_HoldsAPolicyHeldNestedJournalAndTheParentWorkOverIt(t *testing.T) {
+	f := newFixture(t)
+	f.seed(t, "x/note.txt", "NOTE\n")
+	x, y := filepath.Join(f.project, "x"), filepath.Join(f.project, "y")
+	note := filepath.Join(y, "note.txt")
+	unrelated := f.seed(t, "u.txt", "ORIGINAL\n")
+	parent := f.open(t, note, unrelated)
+	child, err := OpenJournal(JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), DeclaredMoves: []permissions.MovePair{pairOf(x, y)}, Parent: parent})
+	if err != nil {
+		t.Fatalf("OpenJournal nested: %v", err)
+	}
+	t.Cleanup(child.Close)
+	f.mustMove(t, child, x, y)
+	if err := child.MarkTransferReady(); err != nil {
+		t.Fatalf("MarkTransferReady: %v", err)
+	}
+	f.childEdit(t, parent, unrelated, "ORIGINAL", "PARENT")
+	orphan(t, parent)
+	orphan(t, child)
+	secret := filepath.Join(y, "secret")
+	before := captureEntries(t, x, y)
+	childMoves := onDiskRecord(t, child).Moves
+
+	report := Recover(f.home, f.project, f.policy(secret), neverAsked(t))
+
+	assertEntriesUnchanged(t, before)
+	assertContent(t, unrelated, "ORIGINAL\n")
+	held := blockedNote(x+" -> "+y, secret)
+	assertPolicyHeld(t, report, child, held)
+	assertPolicyHeld(t, report, parent, held)
+	if got := onDiskRecord(t, child); got.Lifecycle != lifecycleTransferReady || !slices.Equal(got.Moves, childMoves) {
+		t.Fatalf("child record = %+v, want it kept transfer-ready and unabsorbed", got)
+	}
+	if got := onDiskRecord(t, parent); len(got.Moves) != 0 || !slices.ContainsFunc(got.Children, func(c childLink) bool { return c.Dir == filepath.Base(child.Path()) && !c.Absorbed }) {
+		t.Fatalf("parent record = %+v, want the child still linked and unabsorbed", got)
+	}
+}
+
+func failingFrom(call int) *listSwitch {
+	s := &listSwitch{}
+	s.onCall = func(c int) {
+		if c >= call {
+			s.err = errors.New("the settings lock is busy")
+		}
+	}
+	return s
+}
+
+func assertHeldForTheList(t *testing.T, report Report, j *Journal) {
+	t.Helper()
+	i := slices.IndexFunc(report.Retained, func(r RetainedJournal) bool { return r.Path == j.Path() })
+	if i < 0 || !slices.Equal(report.Retained[i].Notes, []string{listUnavailable}) || report.Retained[i].PolicyNotes != 1 {
+		t.Fatalf("retained = %+v, want %s held for the unreadable list", report.Retained, j.Path())
+	}
+}
+
+func TestRecover_AFailedRefreshStopsEveryDurableFinalization(t *testing.T) {
+	t.Run("committed cleanup", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		j.rec.Lifecycle = lifecycleCommitted
+		if err := j.flush(); err != nil {
+			t.Fatalf("flush the committed marker: %v", err)
+		}
+		orphan(t, j)
+		record := readBytes(t, recordPath(j))
+
+		report := Recover(f.home, f.project, f.switchPolicy(failingFrom(1)), neverAsked(t))
+
+		if got := readBytes(t, recordPath(j)); string(got) != string(record) {
+			t.Fatalf("record changed:\n%s\nwant\n%s", got, record)
+		}
+		assertHeldForTheList(t, report, j)
+
+		Recover(f.home, f.project, f.policy(), nil)
+		assertGone(t, j.Path())
+	})
+
+	t.Run("transfer-ready absorption", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		parent := f.open(t, target)
+		child := f.openNested(t, parent, target)
+		f.childEdit(t, child, target, "ORIGINAL", "CHILD")
+		if err := child.MarkTransferReady(); err != nil {
+			t.Fatalf("MarkTransferReady: %v", err)
+		}
+		orphan(t, parent)
+		orphan(t, child)
+		parentRecord, childRecord := readBytes(t, recordPath(parent)), readBytes(t, recordPath(child))
+
+		report := Recover(f.home, f.project, f.switchPolicy(failingFrom(2)), neverAsked(t))
+
+		if got := readBytes(t, recordPath(child)); string(got) != string(childRecord) {
+			t.Fatalf("child record changed:\n%s\nwant\n%s", got, childRecord)
+		}
+		if got := readBytes(t, recordPath(parent)); string(got) != string(parentRecord) {
+			t.Fatalf("parent record changed:\n%s\nwant\n%s", got, parentRecord)
+		}
+		assertContent(t, target, "CHILD\n")
+		assertHeldForTheList(t, report, child)
+		assertHeldForTheList(t, report, parent)
+
+		Recover(f.home, f.project, f.policy(), nil)
+		assertContent(t, target, "ORIGINAL\n")
+		assertGone(t, child.Path())
+		assertGone(t, parent.Path())
+	})
+
+	t.Run("linked-parent retention", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		parent, child, grandchild := transferReadyChain(t, f, target)
+		if err := os.WriteFile(recordPath(grandchild), []byte("{not json"), journalRecordMode); err != nil {
+			t.Fatalf("corrupt the record: %v", err)
+		}
+		parentRecord, childRecord := readBytes(t, recordPath(parent)), readBytes(t, recordPath(child))
+
+		Recover(f.home, f.project, f.switchPolicy(failingFrom(1)), neverAsked(t))
+
+		if got := readBytes(t, recordPath(child)); string(got) != string(childRecord) {
+			t.Fatalf("child record changed:\n%s\nwant\n%s", got, childRecord)
+		}
+		if got := readBytes(t, recordPath(parent)); string(got) != string(parentRecord) {
+			t.Fatalf("parent record changed:\n%s\nwant\n%s", got, parentRecord)
+		}
+		assertContent(t, target, "GRANDCHILD\n")
+	})
+
+	t.Run("final cleanup after a completed action", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		orphan(t, j)
+		var atLoss []byte
+		list := &listSwitch{}
+		list.onCall = func(int) {
+			if atLoss == nil && onDiskRecord(t, j).Paths[0].Progress == rollbackRestored {
+				atLoss = readBytes(t, recordPath(j))
+				list.err = errors.New("the settings lock is busy")
+			}
+		}
+
+		report := Recover(f.home, f.project, f.switchPolicy(list), neverAsked(t))
+
+		assertContent(t, target, "ORIGINAL\n")
+		if atLoss == nil {
+			t.Fatal("the path was never put back before the list was lost")
+		}
+		if got := readBytes(t, recordPath(j)); string(got) != string(atLoss) {
+			t.Fatalf("record changed after the list was lost:\n%s\nwant\n%s", got, atLoss)
+		}
+		if !slices.Equal(report.Restored, []string{target}) {
+			t.Fatalf("restored = %v, want the finished restore reported", report.Restored)
+		}
+		assertHeldForTheList(t, report, j)
+
+		if report := Recover(f.home, f.project, f.policy(), nil); len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want the journal removed on a healthy launch", report.Retained)
+		}
+		assertGone(t, j.Path())
+	})
+}
+
+func TestRecover_ARecordedKeepWaitsOutABlockBeforeItSettles(t *testing.T) {
+	answeredRecord := func(t *testing.T, f *fixture) (j *Journal, a, b string, answered []byte) {
+		t.Helper()
+		j, a, b = heldFileMove(t, f)
+		beforeJournalStep = func(step string) error {
+			if step == "group_kept" && answered == nil {
+				answered = readBytes(t, recordPath(j))
+				return errors.New("simulated crash at group_kept")
+			}
+			return nil
+		}
+		Recover(f.home, f.project, f.policy(), answer(ChoiceKeep))
+		beforeJournalStep = func(string) error { return nil }
+		if err := os.WriteFile(recordPath(j), answered, journalRecordMode); err != nil {
+			t.Fatalf("leave the record as the crash did: %v", err)
+		}
+		rec := onDiskRecord(t, j)
+		if len(rec.Answers) != 1 || rec.Answers[0].Choice != ChoiceKeep || slices.ContainsFunc(rec.Paths, func(pr pathRecord) bool { return pr.KeptByUser }) {
+			t.Fatalf("record = %+v, want one durable Keep answer not yet settled", rec)
+		}
+		return j, a, b, answered
+	}
+	unsettled := func(t *testing.T, j *Journal, answered []byte) {
+		t.Helper()
+		rec, want := onDiskRecord(t, j), recordFrom(t, answered)
+		if !reflect.DeepEqual(rec.Answers, want.Answers) || !reflect.DeepEqual(rec.Paths, want.Paths) || !slices.Equal(rec.Moves, want.Moves) {
+			t.Fatalf("record = %+v, want the Keep answer and its records left unsettled (%+v)", rec, want)
+		}
+	}
+
+	t.Run("a block", func(t *testing.T) {
+		f := newFixture(t)
+		t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+		j, a, b, answered := answeredRecord(t, f)
+		before := captureEntries(t, a, b)
+
+		list := &listSwitch{}
+		list.onCall = func(call int) {
+			if call >= 2 {
+				list.blocked = []string{b}
+			}
+		}
+
+		report := Recover(f.home, f.project, f.switchPolicy(list), neverAsked(t))
+
+		assertEntriesUnchanged(t, before)
+		assertPolicyHeld(t, report, j, blockedNote(a+" -> "+b, b))
+		unsettled(t, j, answered)
+
+		if report := Recover(f.home, f.project, f.policy(), neverAsked(t)); len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want the recorded Keep settled once nothing is blocked", report.Retained)
+		}
+		assertContent(t, b, "A THIRD WRITER\n")
+		assertGone(t, a)
+		assertGone(t, j.Path())
+	})
+
+	t.Run("a failed refresh", func(t *testing.T) {
+		f := newFixture(t)
+		t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+		j, a, b, answered := answeredRecord(t, f)
+		before := captureEntries(t, a, b)
+
+		report := Recover(f.home, f.project, f.switchPolicy(failingFrom(2)), neverAsked(t))
+
+		assertEntriesUnchanged(t, before)
+		if got := readBytes(t, recordPath(j)); string(got) != string(answered) {
+			t.Fatalf("record changed:\n%s\nwant\n%s", got, answered)
+		}
+		assertHeldForTheList(t, report, j)
+	})
+}
+
+func TestRecover_ABlockAddedAfterClassificationHoldsTheWholeGroupAtEachOperation(t *testing.T) {
+	type built struct {
+		j       *Journal
+		watched []string
+		trigger func(call int) bool
+	}
+	for _, op := range []struct {
+		name  string
+		build func(t *testing.T, f *fixture, a, b, unrelated string) built
+	}{
+		{"early path restoration", func(t *testing.T, f *fixture, a, b, unrelated string) built {
+			created := filepath.Join(b, "new.txt")
+			j := f.openMoves(t, []string{created, unrelated}, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
+			f.childEdit(t, j, unrelated, "ORIGINAL", "CHILD")
+			return built{j: j, watched: []string{created}, trigger: func(call int) bool { return call >= 2 }}
+		}},
+		{"pending reconciliation", func(t *testing.T, f *fixture, a, b, unrelated string) built {
+			pending := filepath.Join(b, "pending.txt")
+			j := f.openMoves(t, []string{pending, unrelated}, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			f.childEdit(t, j, unrelated, "ORIGINAL", "CHILD")
+			crashAt(t, "reconciled")
+			f.childCreate(t, j, pending, "PENDING\n")
+			assertPendingRecords(t, onDiskRecord(t, j), true, pending)
+			return built{j: j, watched: []string{pending}, trigger: func(call int) bool { return call >= 2 }}
+		}},
+		{"created-directory cleanup", func(t *testing.T, f *fixture, a, b, unrelated string) built {
+			sub := filepath.Join(b, "sub")
+			created := filepath.Join(sub, "new.txt")
+			j := f.openMoves(t, []string{created, unrelated}, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
+			f.childEdit(t, j, unrelated, "ORIGINAL", "CHILD")
+			return built{j: j, watched: []string{sub}, trigger: func(int) bool {
+				_, err := os.Lstat(created)
+				return errors.Is(err, os.ErrNotExist)
+			}}
+		}},
+	} {
+		for _, block := range []struct {
+			name  string
+			entry func(a, b string) string
+		}{
+			{"a destination sibling", func(_, b string) string { return filepath.Join(b, "secret") }},
+			{"a source-only descendant", func(a, _ string) string { return filepath.Join(a, "ghost") }},
+		} {
+			t.Run(op.name+"/"+block.name, func(t *testing.T) {
+				f := newFixture(t)
+				f.seed(t, "a/keep.txt", "KEEP\n")
+				a, b := filepath.Join(f.project, "a"), filepath.Join(f.project, "b")
+				unrelated := f.seed(t, "u.txt", "ORIGINAL\n")
+				fx := op.build(t, f, a, b, unrelated)
+				orphan(t, fx.j)
+				entry := block.entry(a, b)
+				var before []entrySnapshot
+				var record journalRecord
+				list := &listSwitch{}
+				list.onCall = func(call int) {
+					if before == nil && fx.trigger(call) {
+						before = captureEntries(t, append([]string{a, b}, fx.watched...)...)
+						record = onDiskRecord(t, fx.j)
+						list.blocked = []string{entry}
+					}
+				}
+
+				report := Recover(f.home, f.project, f.switchPolicy(list), neverAsked(t))
+
+				if before == nil {
+					t.Fatal("the block was never added")
+				}
+				assertEntriesUnchanged(t, before)
+				if got := onDiskRecord(t, fx.j); !reflect.DeepEqual(got.Paths[:len(got.Paths)-1], record.Paths[:len(record.Paths)-1]) || !slices.Equal(got.Moves, record.Moves) {
+					t.Fatalf("record = %+v, want the group's path, pending and directory records as they were (%+v)", got, record)
+				}
+				assertContent(t, unrelated, "ORIGINAL\n")
+				assertPolicyHeld(t, report, fx.j, blockedNote(a+" -> "+b, entry))
+			})
+		}
+	}
+}
+
+func TestRecover_ABlockAddedWhileAPathQuestionInsideAGroupIsOpenHoldsTheGroup(t *testing.T) {
+	f := newFixture(t)
+	f.seed(t, "a/keep.txt", "KEEP\n")
+	a, b := filepath.Join(f.project, "a"), filepath.Join(f.project, "b")
+	created := filepath.Join(b, "new.txt")
+	j := f.openMoves(t, []string{created}, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
+	replaceFile(t, created, "A THIRD WRITER\n")
+	orphan(t, j)
+	before := captureEntries(t, a, b, created)
+	lastKnown := pathIn(t, onDiskRecord(t, j), created).LastKnown
+	entry := filepath.Join(b, "secret")
+	list := &listSwitch{}
+	asked := false
+
+	report := Recover(f.home, f.project, f.switchPolicy(list), func(u Unresolved) Choice {
+		if u.Path != created {
+			return ChoiceDefer
+		}
+		asked = true
+		list.blocked = []string{entry}
+		return ChoiceRestore
+	})
+
+	if !asked {
+		t.Fatal("the path inside the moved directory was never asked about")
+	}
+	assertEntriesUnchanged(t, before)
+	if got := pathIn(t, onDiskRecord(t, j), created).LastKnown; !reflect.DeepEqual(got, lastKnown) {
+		t.Fatalf("last known = %+v, want no answer adopted under the new block (%+v)", got, lastKnown)
+	}
+	if i := slices.IndexFunc(report.Retained, func(r RetainedJournal) bool { return r.Path == j.Path() }); i < 0 || !slices.Contains(report.Retained[i].Notes, blockedNote(a+" -> "+b, entry)) {
+		t.Fatalf("retained = %+v, want the group held for the new block", report.Retained)
+	}
+}
+
+func TestRecover_AsksOneQuestionPerHeldGroupInJournalOrderBeforeAnyPath(t *testing.T) {
+	f := newFixture(t)
+	a := f.seedMode(t, "a.txt", "A ORIGINAL\n", 0o640)
+	c := f.seedMode(t, "c.txt", "C ORIGINAL\n", 0o600)
+	b := filepath.Join(f.project, "b.txt")
+	x := f.seed(t, "x.txt", "X ORIGINAL\n")
+	y := filepath.Join(f.project, "y.txt")
+	edited := f.seed(t, "e.txt", "ORIGINAL\n")
+	deleted := f.seed(t, "d.txt", "ORIGINAL\n")
+	j := f.openConfig(t, JournalConfig{Declared: []string{edited}, DeclaredDelete: []string{deleted}, DeclaredMoves: []permissions.MovePair{pairOf(a, b), pairOf(c, a), pairOf(x, y)}})
+	f.mustMove(t, j, a, b)
+	f.mustMove(t, j, c, a)
+	f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+	f.mustDelete(t, j, deleted)
+	crashAt(t, "move_completed")
+	f.mustMove(t, j, x, y)
+	replaceFile(t, b, "A THIRD WRITER\n")
+	replaceFile(t, x, "X THIRD WRITER\n")
+	replaceFile(t, edited, "A HAND EDIT\n")
+	replaceFile(t, deleted, "A HAND EDIT\n")
+	orphan(t, j)
+	moves := onDiskRecord(t, j).Moves
+	if len(moves) != 3 || slices.ContainsFunc(moves, func(m moveRecord) bool { return m.ID == (moveID{}) }) || moves[2].State != movePending {
+		t.Fatalf("journalled moves = %+v, want three with identities and the last left pending", moves)
+	}
+
+	var asked []Unresolved
+	Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+		asked = append(asked, u)
+		return ChoiceDefer
+	})
+
+	want := []Unresolved{
+		{Moves: []UnresolvedMove{{ID: moves[0].ID, Source: a, Destination: b}, {ID: moves[1].ID, Source: c, Destination: a}}, Choices: []Choice{ChoiceKeep, ChoiceRestore, ChoiceDefer}},
+		{Moves: []UnresolvedMove{{ID: moves[2].ID, Source: x, Destination: y, Pending: true}}, Choices: []Choice{ChoiceKeep, ChoiceDefer}, RestoreRefusal: unresolvedMoveCause},
+		{Path: deleted},
+		{Path: edited},
+	}
+	if !reflect.DeepEqual(asked, want) {
+		t.Fatalf("questions = %+v, want one per held group in journal order and then each changed path (%+v)", asked, want)
+	}
+}
+
+func TestRecover_AsksAboutAPolicyHeldGroupOnlyOnceThePolicyPermits(t *testing.T) {
+	f := newFixture(t)
+	j, a, b := heldFileMove(t, f)
+	before := captureEntries(t, a, b)
+
+	report := Recover(f.home, f.project, f.policy(b), neverAsked(t))
+
+	assertEntriesUnchanged(t, before)
+	assertPolicyHeld(t, report, j, blockedNote(a+" -> "+b, b))
+
+	var asked []Unresolved
+	Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+		asked = append(asked, u)
+		return ChoiceDefer
+	})
+
+	if len(asked) != 1 || len(asked[0].Moves) != 1 || asked[0].Moves[0].Source != a || asked[0].Moves[0].Destination != b {
+		t.Fatalf("questions = %+v, want the group asked about once the block is gone", asked)
+	}
+	assertEntriesUnchanged(t, before)
+	assertRecordPresent(t, j)
+}
+
+func TestRecover_RetriesAnInterruptedUndoWithoutAQuestionAndReportsItRetryOnly(t *testing.T) {
+	f := newFixture(t)
+	a := f.seed(t, "a.txt", "ORIGINAL\n")
+	b := filepath.Join(f.project, "b.txt")
+	j := f.openMoves(t, nil, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	orphan(t, j)
+	crashAt(t, "move_undone")
+	Recover(f.home, f.project, f.policy(), nil)
+	if got := onDiskRecord(t, j).Moves; len(got) != 1 || got[0].State != moveUndoing {
+		t.Fatalf("journalled moves = %+v, want the undo recorded as begun", got)
+	}
+	replaceFile(t, a, "A THIRD WRITER\n")
+	before := captureEntries(t, a, b)
+
+	for launch := 1; launch <= 2; launch++ {
+		report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+		assertEntriesUnchanged(t, before)
+		if len(report.Retained) != 1 || len(report.Retained[0].Moves) != 1 || !report.Retained[0].Moves[0].Resumes {
+			t.Fatalf("launch %d retained = %+v, want the interrupted undo reported as retried, not asked about", launch, report.Retained)
+		}
+	}
+}
+
+func TestRecover_KeepLeavesEveryNamedEndpointAsItIs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, f *fixture) (j *Journal, endpoints []string, atQuestion func(t *testing.T))
+	}{
+		{"a write the child made at an endpoint", func(t *testing.T, f *fixture) (*Journal, []string, func(t *testing.T)) {
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			b := filepath.Join(f.project, "b.txt")
+			j := f.openMoves(t, []string{a}, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			mustSucceed(t, f.childCreate(t, j, a, "CHILD REMADE THIS\n"))
+			replaceFile(t, b, "A THIRD WRITER\n")
+			return j, []string{a, b}, nil
+		}},
+		{"a delete the child made at an endpoint", func(t *testing.T, f *fixture) (*Journal, []string, func(t *testing.T)) {
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			b := filepath.Join(f.project, "b.txt")
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{b}, DeclaredMoves: []permissions.MovePair{pairOf(a, b)}})
+			f.mustMove(t, j, a, b)
+			f.mustDelete(t, j, b)
+			replaceFile(t, a, "A THIRD WRITER\n")
+			return j, []string{a, b}, nil
+		}},
+		{"a directory the child made at an endpoint beside a write beneath the moved directory", func(t *testing.T, f *fixture) (*Journal, []string, func(t *testing.T)) {
+			f.seed(t, "tree/leaf.txt", "LEAF\n")
+			tree, moved := filepath.Join(f.project, "tree"), filepath.Join(f.project, "moved")
+			created := filepath.Join(moved, "new.txt")
+			j := f.openConfig(t, JournalConfig{Declared: []string{created}, DeclaredDirs: []string{tree}, DeclaredMoves: []permissions.MovePair{pairOf(tree, moved)}})
+			f.mustMove(t, j, tree, moved)
+			mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
+			mustSucceed(t, f.childMkdir(t, j, tree))
+			if err := os.WriteFile(filepath.Join(tree, "outside.txt"), []byte("OUTSIDE\n"), 0o644); err != nil {
+				t.Fatalf("write an outside entry: %v", err)
+			}
+			return j, []string{tree, moved}, func(t *testing.T) {
+				assertGone(t, created)
+				assertContent(t, filepath.Join(moved, "leaf.txt"), "LEAF\n")
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, endpoints, atQuestion := tc.build(t, f)
+			orphan(t, j)
+			identities := make([]os.FileInfo, 0, len(endpoints))
+			for _, path := range endpoints {
+				identities = append(identities, lstatEntry(t, path))
+			}
+			var asked []entrySnapshot
+
+			report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+				if len(u.Moves) == 0 {
+					t.Fatalf("asked about %s, want only the group asked about", u.Path)
+				}
+				if atQuestion != nil {
+					atQuestion(t)
+				}
+				asked = captureEntries(t, endpoints...)
+				return ChoiceKeep
+			})
+
+			if asked == nil {
+				t.Fatal("the group was never asked about")
+			}
+			assertEntriesUnchanged(t, asked)
+			for i, path := range endpoints {
+				if identities[i] != nil {
+					assertSameEntry(t, path, identities[i])
+				}
+			}
+			if !slices.Equal(report.Kept, endpoints) || len(report.Retained) != 0 {
+				t.Fatalf("report = %+v, want every endpoint reported kept and nothing retained", report)
+			}
+			assertGone(t, j.Path())
+			if report := Recover(f.home, f.project, f.policy(), neverAsked(t)); !report.Empty() {
+				t.Fatalf("report = %+v, want nothing left to recover", report)
+			}
+		})
+	}
+}
+
+func TestRecover_AKeptGroupIsNeitherAskedNorReportedAgainWhileItsJournalSurvives(t *testing.T) {
+	f := newFixture(t)
+	a := f.seed(t, "a.txt", "ORIGINAL\n")
+	b := filepath.Join(f.project, "b.txt")
+	edited := f.seed(t, "e.txt", "ORIGINAL\n")
+	j := f.openMoves(t, []string{edited}, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+	replaceFile(t, b, "A THIRD WRITER\n")
+	replaceFile(t, edited, "A HAND EDIT\n")
+	orphan(t, j)
+
+	report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+		if len(u.Moves) > 0 {
+			return ChoiceKeep
+		}
+		return ChoiceDefer
+	})
+
+	if !slices.Equal(report.Kept, []string{a, b}) {
+		t.Fatalf("kept = %v, want the group's endpoints", report.Kept)
+	}
+	assertRecordPresent(t, j)
+	before := captureEntries(t, a, b, edited)
+	for launch := 1; launch <= 2; launch++ {
+		var asked []string
+		report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+			if len(u.Moves) > 0 {
+				t.Errorf("launch %d asked about the kept group %+v", launch, u.Moves)
+			}
+			asked = append(asked, u.Path)
+			return ChoiceDefer
+		})
+
+		if !slices.Equal(asked, []string{edited}) {
+			t.Fatalf("launch %d asked about %v, want only %s", launch, asked, edited)
+		}
+		if len(report.Retained) != 1 || len(report.Retained[0].Moves) != 0 || slices.ContainsFunc(report.Retained[0].Notes, func(n string) bool {
+			return strings.HasPrefix(n, a) || strings.HasPrefix(n, b)
+		}) {
+			t.Fatalf("launch %d retained = %+v, want the kept group's moves absent from the report", launch, report.Retained)
+		}
+		assertEntriesUnchanged(t, before)
+	}
+}
+
+func TestRecover_RestorePutsEveryEndpointBackToItsPreRunState(t *testing.T) {
+	t.Run("files, one replaced by an outside file", func(t *testing.T) {
+		f := newFixture(t)
+		a := f.seedMode(t, "a.txt", "A ORIGINAL\n", 0o640)
+		c := f.seedMode(t, "c.txt", "C ORIGINAL\n", 0o600)
+		b := filepath.Join(f.project, "b.txt")
+		j := f.openMoves(t, nil, pairOf(a, b), pairOf(c, a))
+		f.mustMove(t, j, a, b)
+		f.mustMove(t, j, c, a)
+		replaceFile(t, b, "A THIRD WRITER\n")
+		orphan(t, j)
+
+		report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
+
+		assertFile(t, a, "A ORIGINAL\n", 0o640)
+		assertFile(t, c, "C ORIGINAL\n", 0o600)
+		assertGone(t, b)
+		assertGone(t, j.Path())
+		for _, path := range []string{a, b, c} {
+			if !slices.Contains(report.Restored, path) {
+				t.Fatalf("restored = %v, want %s named", report.Restored, path)
+			}
+		}
+		if len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want nothing left", report.Retained)
+		}
+	})
+
+	t.Run("a directory renamed back whole with entries in it", func(t *testing.T) {
+		f := newFixture(t)
+		f.seedMode(t, "tree/leaf.txt", "LEAF\n", 0o600)
+		tree := f.dir(t, "tree", 0o750)
+		identity := lstatEntry(t, tree)
+		a := f.seedMode(t, "a.txt", "A ORIGINAL\n", 0o640)
+		moved := filepath.Join(f.project, "moved")
+		inMoved := filepath.Join(moved, "a.txt")
+		j := f.openMoves(t, nil, pairOf(tree, moved), pairOf(a, inMoved))
+		f.mustMove(t, j, tree, moved)
+		f.mustMove(t, j, a, inMoved)
+		replaceFile(t, inMoved, "A THIRD WRITER\n")
+		if err := os.WriteFile(filepath.Join(moved, "outside.txt"), []byte("OUTSIDE\n"), 0o644); err != nil {
+			t.Fatalf("write an outside entry: %v", err)
+		}
+		orphan(t, j)
+		var asked []Unresolved
+
+		report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+			asked = append(asked, u)
+			return ChoiceRestore
+		})
+
+		if len(asked) != 1 || !slices.Contains(asked[0].Choices, ChoiceRestore) {
+			t.Fatalf("questions = %+v, want one group question offering Restore", asked)
+		}
+		assertDir(t, tree, 0o750)
+		assertSameEntry(t, tree, identity)
+		assertFile(t, filepath.Join(tree, "leaf.txt"), "LEAF\n", 0o600)
+		assertContent(t, filepath.Join(tree, "outside.txt"), "OUTSIDE\n")
+		assertFile(t, a, "A ORIGINAL\n", 0o640)
+		assertGone(t, moved)
+		assertGone(t, j.Path())
+		if len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want nothing left", report.Retained)
+		}
+	})
+}
+
+func TestRecover_WithholdsRestoreAndSaysWhyWhenItCannotBeDoneSafely(t *testing.T) {
+	movedTree := func(t *testing.T, f *fixture, cfg JournalConfig) (j *Journal, tree, moved string) {
+		t.Helper()
+		f.seed(t, "tree/leaf.txt", "LEAF\n")
+		tree, moved = filepath.Join(f.project, "tree"), filepath.Join(f.project, "moved")
+		cfg.DeclaredMoves = append(cfg.DeclaredMoves, pairOf(tree, moved))
+		j = f.openConfig(t, cfg)
+		f.mustMove(t, j, tree, moved)
+		return j, tree, moved
+	}
+	for _, tc := range []struct {
+		name    string
+		build   func(t *testing.T, f *fixture) (j *Journal, watch []string)
+		refusal string
+	}{
+		{"an unresolved pending move", func(t *testing.T, f *fixture) (*Journal, []string) {
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			b := filepath.Join(f.project, "b.txt")
+			j := f.openMoves(t, nil, pairOf(a, b))
+			crashAt(t, "move_completed")
+			f.mustMove(t, j, a, b)
+			replaceFile(t, a, "A THIRD WRITER\n")
+			return j, []string{a, b}
+		}, unresolvedMoveCause},
+		{"a moved directory that was deleted", func(t *testing.T, f *fixture) (*Journal, []string) {
+			j, tree, moved := movedTree(t, f, JournalConfig{})
+			clearEntry(t, moved)
+			return j, []string{tree, moved}
+		}, "was deleted or replaced, so its contents cannot be restored"},
+		{"a moved directory that was replaced", func(t *testing.T, f *fixture) (*Journal, []string) {
+			j, tree, moved := movedTree(t, f, JournalConfig{})
+			replaceWithSameContent(t, moved)
+			return j, []string{tree, moved}
+		}, "was deleted or replaced, so its contents cannot be restored"},
+		{"a directory the child made at the source holding an outside entry", func(t *testing.T, f *fixture) (*Journal, []string) {
+			j, tree, moved := movedTree(t, f, JournalConfig{DeclaredDirs: []string{filepath.Join(f.project, "tree")}})
+			mustSucceed(t, f.childMkdir(t, j, tree))
+			if err := os.WriteFile(filepath.Join(tree, "outside.txt"), []byte("OUTSIDE\n"), 0o644); err != nil {
+				t.Fatalf("write an outside entry: %v", err)
+			}
+			return j, []string{tree, moved}
+		}, "now holds entries"},
+		{"a directory the child made at the source holding the child's own entry", func(t *testing.T, f *fixture) (*Journal, []string) {
+			own := filepath.Join(f.project, "tree", "new.txt")
+			j, tree, moved := movedTree(t, f, JournalConfig{Declared: []string{own}, DeclaredDirs: []string{filepath.Join(f.project, "tree")}})
+			mustSucceed(t, f.childMkdir(t, j, tree))
+			mustSucceed(t, f.childCreate(t, j, own, "CHILD MADE THIS\n"))
+			replaceFile(t, own, "A HAND EDIT\n")
+			return j, []string{tree, moved}
+		}, "now holds entries"},
+		{"a moved directory with entries that would have to be removed to put it back", func(t *testing.T, f *fixture) (*Journal, []string) {
+			j, tree, moved := movedTree(t, f, JournalConfig{})
+			if err := os.Chmod(moved, 0o700); err != nil {
+				t.Fatalf("chmod the moved directory: %v", err)
+			}
+			return j, []string{tree, moved}
+		}, "holds entries, so it cannot be removed to put the path back"},
+		{"an unresolved rollback beneath the moved directory", func(t *testing.T, f *fixture) (*Journal, []string) {
+			created := filepath.Join(f.project, "moved", "new.txt")
+			j, tree, moved := movedTree(t, f, JournalConfig{Declared: []string{created}})
+			mustSucceed(t, f.childCreate(t, j, created, "CHILD MADE THIS\n"))
+			replaceFile(t, created, "A HAND EDIT\n")
+			return j, []string{tree, moved}
+		}, unrestoredDescendantCause},
+		{"a destination also declared for deletion", func(t *testing.T, f *fixture) (*Journal, []string) {
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			b := filepath.Join(f.project, "b.txt")
+			j := f.openConfig(t, JournalConfig{DeclaredDelete: []string{b}, DeclaredMoves: []permissions.MovePair{pairOf(a, b)}})
+			f.mustMove(t, j, a, b)
+			replaceFile(t, b, "A THIRD WRITER\n")
+			return j, []string{a, b}
+		}, "cannot be proven that a moved directory is still intact"},
+		{"an endpoint whose parent directory was replaced", func(t *testing.T, f *fixture) (*Journal, []string) {
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			sub := f.dir(t, "sub", 0o755)
+			b := filepath.Join(sub, "b.txt")
+			j := f.openMoves(t, nil, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			replaceWithSameContent(t, sub)
+			return j, []string{a, sub}
+		}, "could not be safely reopened"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, watch := tc.build(t, f)
+			orphan(t, j)
+			before := captureEntries(t, watch...)
+			var groups []Unresolved
+
+			report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+				if len(u.Moves) == 0 {
+					return ChoiceDefer
+				}
+				groups = append(groups, u)
+				return ChoiceRestore
+			})
+
+			if len(groups) != 1 || !slices.Equal(groups[0].Choices, []Choice{ChoiceKeep, ChoiceDefer}) || !strings.Contains(groups[0].RestoreRefusal, tc.refusal) {
+				t.Fatalf("group questions = %+v, want one without Restore saying %q", groups, tc.refusal)
+			}
+			assertEntriesUnchanged(t, before)
+			if got := onDiskRecord(t, j).Answers; len(got) != 0 {
+				t.Fatalf("answers = %+v, want none recorded", got)
+			}
+			if len(report.Retained) != 1 || report.Retained[0].Path != j.Path() {
+				t.Fatalf("retained = %+v, want the journal kept", report.Retained)
+			}
+		})
+	}
+}
+
+func TestRecover_AnEndpointChangedWhileTheQuestionIsOpenStopsARestore(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, a, b string)
+	}{
+		{"the destination replaced again", func(t *testing.T, _, b string) { replaceFile(t, b, "A LATER WRITER\n") }},
+		{"an outside file at the source", func(t *testing.T, a, _ string) { replaceFile(t, a, "A LATER WRITER\n") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, a, b := heldFileMove(t, f)
+			record := onDiskRecord(t, j)
+			var during []entrySnapshot
+
+			report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+				if !slices.Contains(u.Choices, ChoiceRestore) {
+					t.Fatalf("question = %+v, want Restore offered before the change", u)
+				}
+				tc.change(t, a, b)
+				during = captureEntries(t, a, b)
+				return ChoiceRestore
+			})
+
+			assertEntriesUnchanged(t, during)
+			if rec := onDiskRecord(t, j); len(rec.Answers) != 0 || !slices.Equal(rec.Moves, record.Moves) || rec.MoveSeq != record.MoveSeq {
+				t.Fatalf("record = %+v, want no answer published", rec)
+			}
+			note := a + " -> " + b + ": these moves were not put back and are asked about again at the next launch: an endpoint changed while the question was open"
+			if len(report.Retained) != 1 || !slices.Contains(report.Retained[0].Notes, note) {
+				t.Fatalf("retained = %+v, want %q", report.Retained, note)
+			}
+		})
+	}
+}
+
+func TestRecover_DeferRecordsNothingAndAsksTheSameQuestionAtTheNextLaunch(t *testing.T) {
+	f := newFixture(t)
+	a := f.seed(t, "a.txt", "ORIGINAL\n")
+	b := filepath.Join(f.project, "b.txt")
+	edited := f.seed(t, "e.txt", "ORIGINAL\n")
+	j := f.openMoves(t, []string{edited}, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+	replaceFile(t, b, "A THIRD WRITER\n")
+	orphan(t, j)
+	before := captureEntries(t, a, b)
+	record := onDiskRecord(t, j)
+	var first []Unresolved
+
+	report := Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+		first = append(first, u)
+		return ChoiceDefer
+	})
+
+	if len(first) != 1 || len(first[0].Moves) != 1 {
+		t.Fatalf("questions = %+v, want the group asked about once", first)
+	}
+	assertEntriesUnchanged(t, before)
+	assertContent(t, edited, "ORIGINAL\n")
+	if !slices.Contains(report.Restored, edited) {
+		t.Fatalf("restored = %v, want the unrelated write put back", report.Restored)
+	}
+	rec := onDiskRecord(t, j)
+	if len(rec.Answers) != 0 || !slices.Equal(rec.Moves, record.Moves) || slices.ContainsFunc(rec.Paths, func(pr pathRecord) bool { return pr.KeptByUser }) {
+		t.Fatalf("record = %+v, want no answer recorded", rec)
+	}
+	var second []Unresolved
+
+	Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+		second = append(second, u)
+		return ChoiceDefer
+	})
+
+	if !reflect.DeepEqual(second, first) {
+		t.Fatalf("next launch questions = %+v, want the same %+v", second, first)
+	}
+	assertEntriesUnchanged(t, before)
+	assertRecordPresent(t, j)
+}
+
+func TestRecover_FinishesARecordedAnswerAfterALaunchInterruptedAtEachDurablePoint(t *testing.T) {
+	for _, tc := range []struct {
+		choice Choice
+		crash  string
+		a, b   string
+	}{
+		{ChoiceKeep, "group_kept", "", "A THIRD WRITER\n"},
+		{ChoiceRestore, "move_undoing", "ORIGINAL\n", ""},
+		{ChoiceRestore, "move_undone", "ORIGINAL\n", ""},
+		{ChoiceRestore, "restoring", "ORIGINAL\n", ""},
+		{ChoiceRestore, "restored", "ORIGINAL\n", ""},
+	} {
+		for _, next := range []struct {
+			name string
+			ask  func(t *testing.T) func(Unresolved) Choice
+		}{
+			{"interactive", neverAsked},
+			{"headless", func(*testing.T) func(Unresolved) Choice { return nil }},
+		} {
+			t.Run(string(tc.choice)+"/"+tc.crash+"/"+next.name, func(t *testing.T) {
+				f := newFixture(t)
+				j, a, b := heldFileMove(t, f)
+				crashAt(t, tc.crash)
+				Recover(f.home, f.project, f.policy(), answer(tc.choice))
+				rec := onDiskRecord(t, j)
+				if len(rec.Answers) != 1 || rec.Answers[0].Choice != tc.choice || len(rec.Moves) != 1 {
+					t.Fatalf("record = %+v, want the answer and its move recorded before the interruption", rec)
+				}
+
+				report := Recover(f.home, f.project, f.policy(), next.ask(t))
+
+				if len(report.Retained) != 0 {
+					t.Fatalf("retained = %+v, want the recorded answer finished", report.Retained)
+				}
+				assertContent(t, a, tc.a)
+				assertContent(t, b, tc.b)
+				assertGone(t, j.Path())
+			})
+		}
+	}
+}
+
+func TestRecover_ReplaysARecordedAnswerBeforeReconcilingRollingBackOrAbsorbing(t *testing.T) {
+	read := func(path string) string {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
+
+	t.Run("pending reconciliation and ordinary rollback", func(t *testing.T) {
+		f := newFixture(t)
+		a := f.seed(t, "a.txt", "ORIGINAL\n")
+		b := filepath.Join(f.project, "b.txt")
+		x := f.seed(t, "x.txt", "X ORIGINAL\n")
+		y := filepath.Join(f.project, "y.txt")
+		edited := f.seed(t, "e.txt", "ORIGINAL\n")
+		pending := f.seed(t, "p.txt", "ORIGINAL\n")
+		j := f.openMoves(t, []string{edited, pending}, pairOf(a, b), pairOf(x, y))
+		f.mustMove(t, j, a, b)
+		f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+		crashAt(t, "move_completed")
+		f.mustMove(t, j, x, y)
+		resumeFromDisk(t, j)
+		crashAt(t, "reconciled")
+		f.childEdit(t, j, pending, "ORIGINAL", "CHILD")
+		replaceFile(t, b, "A THIRD WRITER\n")
+		orphan(t, j)
+		crashAt(t, "move_undoing")
+		Recover(f.home, f.project, f.policy(edited, pending, x), answer(ChoiceRestore))
+		rec := onDiskRecord(t, j)
+		assertPendingRecords(t, rec, true, pending)
+		if len(rec.Answers) != 1 || rec.Moves[1].State != movePending {
+			t.Fatalf("record = %+v, want the recorded Restore beside a pending move and a pending write", rec)
+		}
+		replayedBy := make(map[string]bool)
+		beforeJournalStep = func(step string) error {
+			done := read(a) == "ORIGINAL\n" && read(b) == ""
+			for label, reached := range map[string]bool{
+				"move reconciliation":  step == "move_completed",
+				"write reconciliation": step == "reconciled",
+				"rollback":             read(edited) == "ORIGINAL\n",
+			} {
+				if _, seen := replayedBy[label]; reached && !seen {
+					replayedBy[label] = done
+				}
+			}
+			return nil
+		}
+		t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+
+		report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+		for _, label := range []string{"move reconciliation", "write reconciliation", "rollback"} {
+			if done, seen := replayedBy[label]; !seen || !done {
+				t.Fatalf("%s seen = %v, replay finished before it = %v; want the recorded Restore finished first", label, seen, done)
+			}
+		}
+		if len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want everything recovered", report.Retained)
+		}
+		assertContent(t, a, "ORIGINAL\n")
+		assertContent(t, x, "X ORIGINAL\n")
+		assertContent(t, edited, "ORIGINAL\n")
+		assertContent(t, pending, "ORIGINAL\n")
+		assertGone(t, j.Path())
+	})
+
+	t.Run("transfer-ready absorption", func(t *testing.T) {
+		f := newFixture(t)
+		a := f.seed(t, "a.txt", "ORIGINAL\n")
+		b := filepath.Join(f.project, "b.txt")
+		parent := f.open(t, a, b)
+		child, err := OpenJournal(JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), DeclaredMoves: []permissions.MovePair{pairOf(a, b)}, Parent: parent})
+		if err != nil {
+			t.Fatalf("OpenJournal nested: %v", err)
+		}
+		t.Cleanup(child.Close)
+		f.mustMove(t, child, a, b)
+		replaceFile(t, b, "A THIRD WRITER\n")
+		if err := child.MarkTransferReady(); err != nil {
+			t.Fatalf("MarkTransferReady: %v", err)
+		}
+		rewriteRecord(t, child, func(rec *journalRecord) {
+			rec.Answers = []groupAnswer{{Members: []moveID{rec.Moves[0].ID}, Endpoints: []string{a, b}, Choice: ChoiceKeep}}
+		})
+		orphan(t, parent)
+		orphan(t, child)
+		var steps []string
+		beforeJournalStep = func(step string) error {
+			steps = append(steps, step)
+			return nil
+		}
+		t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+
+		report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+		kept, absorbed := slices.Index(steps, "group_kept"), slices.Index(steps, "child_absorbed")
+		if kept < 0 || absorbed < kept {
+			t.Fatalf("steps = %v, want the recorded Keep settled before the parent absorbs the journal", steps)
+		}
+		if len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want both journals recovered", report.Retained)
+		}
+		assertGone(t, a)
+		assertContent(t, b, "A THIRD WRITER\n")
+		assertGone(t, child.Path())
+		assertGone(t, parent.Path())
+	})
+}
+
+func TestRecover_AFailedAnswerPublicationSettlesNothingAndChangesNoEndpoint(t *testing.T) {
+	for _, choice := range []Choice{ChoiceKeep, ChoiceRestore} {
+		t.Run(string(choice), func(t *testing.T) {
+			f := newFixture(t)
+			j, a, b := heldFileMove(t, f)
+			before := captureEntries(t, a, b)
+			record := onDiskRecord(t, j)
+			crashAt(t, "group_answered")
+
+			report := Recover(f.home, f.project, f.policy(), answer(choice))
+
+			assertEntriesUnchanged(t, before)
+			rec := onDiskRecord(t, j)
+			if len(rec.Answers) != 0 || !slices.Equal(rec.Moves, record.Moves) || rec.MoveSeq != record.MoveSeq || !reflect.DeepEqual(rec.Paths, record.Paths) {
+				t.Fatalf("record = %+v, want no answer and every member as it was (%+v)", rec, record)
+			}
+			if len(report.Kept) != 0 || len(report.Restored) != 0 || len(report.Retained) != 1 {
+				t.Fatalf("report = %+v, want nothing kept or put back and the journal retained", report)
+			}
+			asked := 0
+			Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+				asked++
+				return ChoiceDefer
+			})
+			if asked != 1 {
+				t.Fatalf("asked %d times at the next launch, want the group asked about again", asked)
+			}
+		})
+	}
+}
+
+func TestRecover_RetainsAJournalWithABadAnswerWithoutTouchingAProjectPath(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		edit   func(rec *journalRecord, a, b, c string)
+		reason string
+	}{
+		{"an unknown choice", func(rec *journalRecord, _, _, _ string) { rec.Answers[0].Choice = "maybe" }, "malformed move answer"},
+		{"a recorded Defer", func(rec *journalRecord, _, _, _ string) { rec.Answers[0].Choice = ChoiceDefer }, "malformed move answer"},
+		{"no members", func(rec *journalRecord, _, _, _ string) { rec.Answers[0].Members, rec.Answers[0].Endpoints = nil, nil }, "malformed move answer"},
+		{"a duplicate member", func(rec *journalRecord, _, _, _ string) {
+			rec.Answers[0].Members = append(rec.Answers[0].Members, rec.Moves[0].ID)
+		}, "does not hold exactly once"},
+		{"an unknown member", func(rec *journalRecord, _, _, _ string) {
+			rec.Answers[0].Members[1] = moveID{Invocation: "inv-9999", Seq: 1}
+		}, "does not hold exactly once"},
+		{"a move answered twice", func(rec *journalRecord, _, _, _ string) {
+			rec.Answers = append(rec.Answers, rec.Answers[0])
+		}, "does not hold exactly once"},
+		{"endpoints that are not its moves'", func(rec *journalRecord, a, _, c string) { rec.Answers[0].Endpoints = []string{a, c} }, "endpoints that are not its moves'"},
+		{"a Keep with adopted states", func(rec *journalRecord, a, b, c string) {
+			rec.Answers[0].Adopted = []adoptedState{{Path: a}, {Path: b}, {Path: c}}
+		}, "adopted states do not match"},
+		{"a Restore without adopted states", func(rec *journalRecord, _, _, _ string) { rec.Answers[0].Choice = ChoiceRestore }, "adopted states do not match"},
+		{"an answer leaving out a linked move", func(rec *journalRecord, a, b, _ string) {
+			rec.Answers[0].Members, rec.Answers[0].Endpoints = rec.Answers[0].Members[:1], []string{a, b}
+		}, "leaves out the linked move"},
+		{"a move identity that is not its own", func(rec *journalRecord, _, _, _ string) {
+			rec.Moves[1].ID = rec.Moves[0].ID
+		}, "has an identity that is not its own"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			b, c := filepath.Join(f.project, "b.txt"), filepath.Join(f.project, "c.txt")
+			edited := f.seed(t, "e.txt", "ORIGINAL\n")
+			j := f.openMoves(t, []string{edited}, pairOf(a, b), pairOf(b, c))
+			f.mustMove(t, j, a, b)
+			f.mustMove(t, j, b, c)
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			replaceFile(t, c, "A THIRD WRITER\n")
+			orphan(t, j)
+			rewriteRecord(t, j, func(rec *journalRecord) {
+				rec.Answers = []groupAnswer{{Members: []moveID{rec.Moves[0].ID, rec.Moves[1].ID}, Endpoints: []string{a, b, c}, Choice: ChoiceKeep}}
+				tc.edit(rec, a, b, c)
+			})
+			record := readBytes(t, recordPath(j))
+			before := captureEntries(t, a, b, c, edited)
+
+			report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+			assertEntriesUnchanged(t, before)
+			if got := readBytes(t, recordPath(j)); string(got) != string(record) {
+				t.Fatalf("record changed:\n%s\nwant\n%s", got, record)
+			}
+			if len(report.Retained) != 1 || report.Retained[0].Path != j.Path() || len(report.Restored) != 0 || !strings.Contains(strings.Join(report.Retained[0].Notes, "\n"), tc.reason) {
+				t.Fatalf("report = %+v, want the journal retained for %q and nothing put back", report, tc.reason)
+			}
+		})
+	}
+}
+
+type completedRun struct {
+	f                        *fixture
+	j                        *Journal
+	edited, outside, created string
+}
+
+func newCompletedRun(t *testing.T) completedRun {
+	t.Helper()
+	f := newFixture(t)
+	r := completedRun{f: f, edited: f.seed(t, "a.txt", "ORIGINAL\n"), outside: f.seed(t, "b.txt", "ORIGINAL\n"), created: filepath.Join(f.project, "made/new.txt")}
+	r.j = f.open(t, r.edited, r.outside, r.created)
+	f.childEdit(t, r.j, r.edited, "ORIGINAL", "CHILD")
+	f.childCreate(t, r.j, r.created, "CHILD MADE THIS\n")
+	replaceFile(t, r.outside, "OUTSIDE\n")
+	finishCompleted(t, r.j)
+	return r
+}
+
+func finishCompleted(t *testing.T, j *Journal) {
+	t.Helper()
+	if outcome := j.Finish(ReasonCompleted); outcome.JournalPath == "" {
+		t.Fatalf("outcome = %+v, want the end-of-run check to keep the journal", outcome)
+	}
+	orphan(t, j)
+}
+
+func (r completedRun) assertChildState(t *testing.T) {
+	t.Helper()
+	assertContent(t, r.edited, "CHILD\n")
+	assertContent(t, r.created, "CHILD MADE THIS\n")
+	assertContent(t, r.outside, "OUTSIDE\n")
+}
+
+func answers(t *testing.T, asked *[]Unresolved, byKey map[string]Choice) func(Unresolved) Choice {
+	return func(u Unresolved) Choice {
+		*asked = append(*asked, u)
+		key := u.Path
+		if key == "" {
+			key = u.Moves[0].Source
+		}
+		choice, ok := byKey[key]
+		if !ok {
+			t.Errorf("asked about %+v, want no question", u)
+			return ChoiceDefer
+		}
+		return choice
+	}
+}
+
+func askedPaths(asked []Unresolved) []string {
+	var out []string
+	for _, u := range asked {
+		if u.Path != "" {
+			out = append(out, u.Path)
+		} else {
+			out = append(out, u.Moves[0].Source+" -> "+u.Moves[0].Destination)
+		}
+	}
+	return out
+}
+
+func assertCompletedRetained(t *testing.T, report Report, unanswered int) RetainedJournal {
+	t.Helper()
+	if len(report.Retained) != 1 || !report.Retained[0].Completed || report.Retained[0].Unanswered != unanswered {
+		t.Fatalf("retained = %+v, want one completed journal with %d unanswered questions", report.Retained, unanswered)
+	}
+	if len(report.Restored) != 0 || len(report.Kept) != 0 {
+		t.Fatalf("report = %+v, want nothing attributed to an interrupted child", report)
+	}
+	return report.Retained[0]
+}
+
+func TestRecover_LeavesACompletedChildsWorkWhenNoOneCanAnswer(t *testing.T) {
+	r := newCompletedRun(t)
+
+	for launch := 1; launch <= 2; launch++ {
+		report := Recover(r.f.home, r.f.project, r.f.policy(), nil)
+
+		r.assertChildState(t)
+		assertRecordPresent(t, r.j)
+		if !onDiskRecord(t, r.j).Completed {
+			t.Fatalf("launch %d: the completion marker was lost", launch)
+		}
+		assertCompletedRetained(t, report, 3)
+		if len(report.CompletedRestored) != 0 || len(report.CompletedKept) != 0 {
+			t.Fatalf("launch %d: report = %+v, want nothing settled without an answer", launch, report)
+		}
+	}
+}
+
+func TestRecover_AsksAboutEveryChangedPathOfACompletedChild(t *testing.T) {
+	t.Run("keep", func(t *testing.T) {
+		r := newCompletedRun(t)
+		var asked []Unresolved
+
+		report := Recover(r.f.home, r.f.project, r.f.policy(), answers(t, &asked, map[string]Choice{r.edited: ChoiceKeep, r.outside: ChoiceKeep, r.created: ChoiceKeep}))
+
+		if got := askedPaths(asked); !slices.Equal(got, []string{r.edited, r.outside, r.created}) {
+			t.Fatalf("asked about %v, want every changed path once", got)
+		}
+		for _, u := range asked {
+			if !u.Completed || !slices.Contains(u.Choices, ChoiceRestore) {
+				t.Fatalf("question = %+v, want a completed-child question offering put back", u)
+			}
+		}
+		if asked[0].Reason != "" || !strings.Contains(asked[1].Reason, "it was changed outside the child agent's journalled writes") {
+			t.Fatalf("reasons = %q, %q, want none for the confirmed edit and the outside change named", asked[0].Reason, asked[1].Reason)
+		}
+		r.assertChildState(t)
+		assertGone(t, r.j.Path())
+		if !slices.Equal(report.CompletedKept, []string{r.edited, r.outside, r.created}) || len(report.Kept) != 0 || len(report.Retained) != 0 {
+			t.Fatalf("report = %+v, want every path reported kept for the completed child", report)
+		}
+	})
+
+	t.Run("put back", func(t *testing.T) {
+		r := newCompletedRun(t)
+
+		report := Recover(r.f.home, r.f.project, r.f.policy(), answer(ChoiceRestore))
+
+		assertContent(t, r.edited, "ORIGINAL\n")
+		assertContent(t, r.outside, "ORIGINAL\n")
+		assertGone(t, r.created)
+		assertGone(t, filepath.Dir(r.created))
+		assertGone(t, r.j.Path())
+		for _, path := range []string{r.edited, r.outside, r.created} {
+			if !slices.Contains(report.CompletedRestored, path) {
+				t.Fatalf("report = %+v, want %s reported put back for the completed child", report, path)
+			}
+		}
+		if len(report.Restored) != 0 || len(report.Retained) != 0 {
+			t.Fatalf("report = %+v, want nothing else", report)
+		}
+	})
+
+	t.Run("decide later", func(t *testing.T) {
+		r := newCompletedRun(t)
+
+		report := Recover(r.f.home, r.f.project, r.f.policy(), answer(ChoiceDefer))
+
+		r.assertChildState(t)
+		assertRecordPresent(t, r.j)
+		assertCompletedRetained(t, report, 3)
+	})
+
+	t.Run("a durability failure outlives every answer", func(t *testing.T) {
+		f := newFixture(t)
+		edited := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, edited)
+		failSyncOnce(t)
+		f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+		finishCompleted(t, j)
+
+		report := Recover(f.home, f.project, f.policy(), answer(ChoiceKeep))
+
+		assertContent(t, edited, "CHILD\n")
+		assertRecordPresent(t, j)
+		retained := assertCompletedRetained(t, report, 0)
+		if !slices.Equal(report.CompletedKept, []string{edited}) || !strings.Contains(strings.Join(retained.Notes, "|"), "could not be made durable") {
+			t.Fatalf("report = %+v, want the path kept and the durability failure named", report)
+		}
+	})
+
+	t.Run("a policy hold outlives every answer", func(t *testing.T) {
+		r := newCompletedRun(t)
+		var asked []Unresolved
+
+		report := Recover(r.f.home, r.f.project, r.f.policy(r.outside), answers(t, &asked, map[string]Choice{r.edited: ChoiceKeep, r.created: ChoiceKeep}))
+
+		r.assertChildState(t)
+		assertRecordPresent(t, r.j)
+		retained := assertCompletedRetained(t, report, 0)
+		if retained.PolicyNotes != 1 || !slices.Contains(retained.Notes, blockedNote(r.outside, r.outside)) {
+			t.Fatalf("retained = %+v, want the blocked path named as the remaining hold", retained)
+		}
+	})
+}
+
+func TestRecover_ACompletedChildsMixedAnswersTouchOnlyAuthorizedPaths(t *testing.T) {
+	t.Run("files across repeated launches", func(t *testing.T) {
+		r := newCompletedRun(t)
+		var asked []Unresolved
+
+		Recover(r.f.home, r.f.project, r.f.policy(), answers(t, &asked, map[string]Choice{r.edited: ChoiceKeep, r.created: ChoiceRestore, r.outside: ChoiceDefer}))
+
+		assertContent(t, r.edited, "CHILD\n")
+		assertGone(t, r.created)
+		assertGone(t, filepath.Dir(r.created))
+		assertContent(t, r.outside, "OUTSIDE\n")
+		assertRecordPresent(t, r.j)
+
+		asked = nil
+		report := Recover(r.f.home, r.f.project, r.f.policy(), answers(t, &asked, map[string]Choice{r.outside: ChoiceDefer}))
+		if got := askedPaths(asked); !slices.Equal(got, []string{r.outside}) {
+			t.Fatalf("asked about %v, want only the deferred path", got)
+		}
+		assertContent(t, r.edited, "CHILD\n")
+		assertContent(t, r.outside, "OUTSIDE\n")
+		assertCompletedRetained(t, report, 1)
+
+		Recover(r.f.home, r.f.project, r.f.policy(), answers(t, &asked, map[string]Choice{r.outside: ChoiceRestore}))
+		assertContent(t, r.outside, "ORIGINAL\n")
+		assertContent(t, r.edited, "CHILD\n")
+		assertGone(t, r.j.Path())
+	})
+
+	parents := func(t *testing.T) (f *fixture, j *Journal, x, y, outside string) {
+		f = newFixture(t)
+		x, y, outside = filepath.Join(f.project, "made/x.txt"), filepath.Join(f.project, "made/y.txt"), f.seed(t, "o.txt", "ORIGINAL\n")
+		j = f.open(t, x, y, outside)
+		f.childCreate(t, j, x, "X\n")
+		f.childCreate(t, j, y, "Y\n")
+		replaceFile(t, outside, "OUTSIDE\n")
+		finishCompleted(t, j)
+		return f, j, x, y, outside
+	}
+
+	t.Run("a created parent follows the last path that needs it", func(t *testing.T) {
+		f, j, x, y, outside := parents(t)
+		var asked []Unresolved
+
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{x: ChoiceRestore, y: ChoiceDefer, outside: ChoiceKeep}))
+
+		assertGone(t, x)
+		assertContent(t, y, "Y\n")
+		assertRecordPresent(t, j)
+
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{y: ChoiceRestore}))
+
+		assertGone(t, y)
+		assertGone(t, filepath.Dir(x))
+		assertContent(t, outside, "OUTSIDE\n")
+		assertGone(t, j.Path())
+	})
+
+	t.Run("a kept file keeps the created parent it needs", func(t *testing.T) {
+		f, j, x, y, outside := parents(t)
+		var asked []Unresolved
+
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{x: ChoiceRestore, y: ChoiceKeep, outside: ChoiceKeep}))
+
+		assertGone(t, x)
+		assertContent(t, y, "Y\n")
+		assertGone(t, j.Path())
+	})
+
+	moved := func(t *testing.T) (f *fixture, j *Journal, tree, dest, created, outside string) {
+		f = newFixture(t)
+		tree = f.dir(t, "tree", 0o755)
+		f.seed(t, "tree/keep.txt", "TREE\n")
+		dest = filepath.Join(f.project, "moved")
+		created = filepath.Join(dest, "new.txt")
+		outside = f.seed(t, "o.txt", "ORIGINAL\n")
+		j = f.openMoves(t, []string{created, outside}, pairOf(tree, dest))
+		f.mustMove(t, j, tree, dest)
+		mustSucceed(t, f.childCreate(t, j, created, "CHILD\n"))
+		replaceFile(t, outside, "OUTSIDE\n")
+		finishCompleted(t, j)
+		return f, j, tree, dest, created, outside
+	}
+
+	t.Run("a changed path beneath a moved directory and its group are put back in one pass", func(t *testing.T) {
+		f, j, tree, dest, created, outside := moved(t)
+		var asked []Unresolved
+
+		report := Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{created: ChoiceRestore, outside: ChoiceKeep, tree: ChoiceRestore}))
+
+		if got := askedPaths(asked); !slices.Equal(got, []string{created, outside, tree + " -> " + dest}) {
+			t.Fatalf("asked about %v, want the path beneath the moved directory before its group", got)
+		}
+		if group := asked[2]; !group.Completed || !slices.Contains(group.Choices, ChoiceRestore) {
+			t.Fatalf("group question = %+v, want put back offered once the path beneath is scheduled", group)
+		}
+		assertContent(t, filepath.Join(tree, "keep.txt"), "TREE\n")
+		assertGone(t, filepath.Join(tree, "new.txt"))
+		assertGone(t, dest)
+		assertContent(t, outside, "OUTSIDE\n")
+		assertGone(t, j.Path())
+		if len(report.Retained) != 0 {
+			t.Fatalf("retained = %+v, want a settled journal", report.Retained)
+		}
+	})
+
+	t.Run("a deferred path beneath a moved directory holds its group across launches", func(t *testing.T) {
+		f, j, tree, dest, created, outside := moved(t)
+		var asked []Unresolved
+
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{created: ChoiceDefer, outside: ChoiceKeep, tree: ChoiceRestore}))
+
+		if group := asked[2]; slices.Contains(group.Choices, ChoiceRestore) || group.RestoreRefusal == "" {
+			t.Fatalf("group question = %+v, want put back withheld with a reason", group)
+		}
+		assertContent(t, created, "CHILD\n")
+		assertGone(t, tree)
+		assertRecordPresent(t, j)
+
+		asked = nil
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{created: ChoiceRestore, tree: ChoiceRestore}))
+
+		if got := askedPaths(asked); !slices.Equal(got, []string{created, tree + " -> " + dest}) {
+			t.Fatalf("asked about %v, want the kept path not asked again", got)
+		}
+		assertContent(t, filepath.Join(tree, "keep.txt"), "TREE\n")
+		assertGone(t, dest)
+		assertContent(t, outside, "OUTSIDE\n")
+		assertGone(t, j.Path())
+	})
+
+	t.Run("a kept path beneath a moved directory is never moved by its group's put back", func(t *testing.T) {
+		f, j, tree, _, created, outside := moved(t)
+		var asked []Unresolved
+
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{created: ChoiceKeep, outside: ChoiceKeep, tree: ChoiceRestore}))
+
+		assertContent(t, created, "CHILD\n")
+		assertGone(t, tree)
+		assertRecordPresent(t, j)
+	})
+
+	for _, child := range []Choice{ChoiceDefer, ChoiceKeep} {
+		t.Run("a recreated directory stays while a deleted file inside it is answered "+string(child), func(t *testing.T) {
+			f := newFixture(t)
+			d := f.dir(t, "d", 0o750)
+			file, outside := f.seed(t, "d/file.txt", "ORIGINAL\n"), f.seed(t, "o.txt", "ORIGINAL\n")
+			j := f.openConfig(t, JournalConfig{Declared: []string{outside}, DeclaredDelete: []string{d, file}, DeclaredDirs: []string{d}})
+			f.mustDelete(t, j, file)
+			f.mustDelete(t, j, d)
+			mustSucceed(t, f.childMkdir(t, j, d))
+			replaceFile(t, outside, "OUTSIDE\n")
+			finishCompleted(t, j)
+			info, err := os.Lstat(d)
+			if err != nil {
+				t.Fatalf("stat the recreated directory: %v", err)
+			}
+			dev, ino := identityOf(t, info)
+
+			for launch, byKey := range []map[string]Choice{{d: ChoiceRestore, file: child, outside: ChoiceKeep}, {d: ChoiceRestore, file: child}} {
+				if child == ChoiceKeep && launch == 1 {
+					byKey = map[string]Choice{d: ChoiceRestore}
+				}
+				Recover(f.home, f.project, f.policy(), answers(t, new([]Unresolved), byKey))
+
+				info, err := os.Lstat(d)
+				if err != nil {
+					t.Fatalf("launch %d: stat the recreated directory: %v", launch, err)
+				}
+				if gotDev, gotIno := identityOf(t, info); gotDev != dev || gotIno != ino {
+					t.Fatalf("launch %d: %s was replaced, want the child's directory left while %s is %s", launch, d, file, child)
+				}
+				assertGone(t, file)
+				assertRecordPresent(t, j)
+			}
+		})
+	}
+
+	movedWithDir := func(t *testing.T) (f *fixture, j *Journal, tree, dest, sub, outside string) {
+		f = newFixture(t)
+		tree = f.dir(t, "tree", 0o755)
+		f.seed(t, "tree/keep.txt", "TREE\n")
+		dest = filepath.Join(f.project, "moved")
+		sub = filepath.Join(dest, "sub")
+		outside = f.seed(t, "o.txt", "ORIGINAL\n")
+		j = f.openConfig(t, JournalConfig{Declared: []string{outside}, DeclaredMoves: []permissions.MovePair{pairOf(tree, dest)}, DeclaredDirs: []string{sub}})
+		f.mustMove(t, j, tree, dest)
+		mustSucceed(t, f.childMkdir(t, j, sub))
+		replaceFile(t, outside, "OUTSIDE\n")
+		finishCompleted(t, j)
+		return f, j, tree, dest, sub, outside
+	}
+
+	t.Run("a group's put back settles a directory the child created inside the moved entry", func(t *testing.T) {
+		f, j, tree, dest, _, outside := movedWithDir(t)
+		var asked []Unresolved
+
+		Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{outside: ChoiceKeep, tree: ChoiceRestore}))
+
+		if got := askedPaths(asked); !slices.Equal(got, []string{outside, tree + " -> " + dest}) {
+			t.Fatalf("asked about %v, want no question about the created directory", got)
+		}
+		if group := asked[1]; !slices.Contains(group.Choices, ChoiceRestore) {
+			t.Fatalf("group question = %+v, want put back offered", group)
+		}
+		assertContent(t, filepath.Join(tree, "keep.txt"), "TREE\n")
+		assertGone(t, filepath.Join(tree, "sub"))
+		assertGone(t, dest)
+		assertContent(t, outside, "OUTSIDE\n")
+		assertGone(t, j.Path())
+	})
+
+	t.Run("a deferred group leaves the directory the child created inside the moved entry", func(t *testing.T) {
+		f, j, tree, dest, sub, outside := movedWithDir(t)
+
+		Recover(f.home, f.project, f.policy(), answers(t, new([]Unresolved), map[string]Choice{outside: ChoiceKeep, tree: ChoiceDefer}))
+
+		assertDir(t, sub, 0o755)
+		assertContent(t, filepath.Join(dest, "keep.txt"), "TREE\n")
+		assertGone(t, tree)
+		assertRecordPresent(t, j)
+	})
+}
+
+func TestRecover_RederivesACompletedChildsReasonsAndHoldsUnsafeStates(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(t *testing.T, f *fixture) (*Journal, string, func(t *testing.T))
+		reason string
+	}{
+		{"an unresolved pending write", func(t *testing.T, f *fixture) (*Journal, string, func(t *testing.T)) {
+			target := f.seed(t, "a.txt", "ORIGINAL\n")
+			j := f.open(t, target)
+			if err := j.BeginMutation(target, filetools.JournalState{Exists: true, Data: []byte("ORIGINAL\n"), Mode: 0o644}, filetools.JournalState{Exists: true, Data: []byte("CHILD\n"), Mode: 0o644}); err != nil {
+				t.Fatalf("begin the write: %v", err)
+			}
+			replaceFile(t, target, "OUTSIDE\n")
+			return j, target, func(t *testing.T) { assertContent(t, target, "OUTSIDE\n") }
+		}, "a write the child agent started was never resolved"},
+		{"an unreadable state", func(t *testing.T, f *fixture) (*Journal, string, func(t *testing.T)) {
+			target := f.seed(t, "sub/x.txt", "ORIGINAL\n")
+			j := f.open(t, target)
+			f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+			sub := filepath.Dir(target)
+			if err := os.Rename(sub, sub+".old"); err != nil {
+				t.Fatalf("move the parent aside: %v", err)
+			}
+			f.seed(t, "sub/x.txt", "OTHER\n")
+			return j, target, func(t *testing.T) {
+				assertContent(t, target, "OTHER\n")
+				assertContent(t, filepath.Join(sub+".old", "x.txt"), "CHILD\n")
+			}
+		}, "the target's parent directory could not be safely reopened"},
+		{"an unconfirmed directory", func(t *testing.T, f *fixture) (*Journal, string, func(t *testing.T)) {
+			target := filepath.Join(f.project, "made/new.txt")
+			j := f.open(t, target)
+			if err := j.DirLifecycle(target, f.project).Intent("made"); err != nil {
+				t.Fatalf("record the intent: %v", err)
+			}
+			made := f.dir(t, "made", 0o755)
+			return j, target, func(t *testing.T) { assertDir(t, made, 0o755) }
+		}, "a parent directory the child agent started to create was never confirmed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, target, unchanged := tc.setup(t, f)
+			finishCompleted(t, j)
+
+			for launch := 1; launch <= 2; launch++ {
+				var asked []Unresolved
+				report := Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{target: ChoiceRestore}))
+
+				if len(asked) != 1 || !strings.Contains(asked[0].Reason, tc.reason) || slices.Contains(asked[0].Choices, ChoiceRestore) || asked[0].RestoreRefusal == "" {
+					t.Fatalf("launch %d: asked %+v, want one question naming %q without put back", launch, asked, tc.reason)
+				}
+				unchanged(t)
+				assertRecordPresent(t, j)
+				assertCompletedRetained(t, report, 1)
+			}
+		})
+	}
+
+	t.Run("a third-state path", func(t *testing.T) {
+		r := newCompletedRun(t)
+		var asked []Unresolved
+
+		Recover(r.f.home, r.f.project, r.f.policy(), answers(t, &asked, map[string]Choice{r.edited: ChoiceDefer, r.outside: ChoiceDefer, r.created: ChoiceDefer}))
+
+		if len(asked) != 3 || asked[1].Path != r.outside || asked[1].Reason != "it was changed outside the child agent's journalled writes" {
+			t.Fatalf("asked %+v, want the outside change named as the reason", asked)
+		}
+	})
+}
+
+func TestRecover_NeverOffersACompletedChildsDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, f *fixture) (*Journal, string)
+	}{
+		{"a directory-only journal whose directory was replaced", func(t *testing.T, f *fixture) (*Journal, string) {
+			dir := filepath.Join(f.project, "made")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			if err := os.Remove(dir); err != nil {
+				t.Fatalf("remove the child's directory: %v", err)
+			}
+			f.dir(t, "made", 0o755)
+			return j, dir
+		}},
+		{"an unconfirmed directory intent", func(t *testing.T, f *fixture) (*Journal, string) {
+			target := filepath.Join(f.project, "made/new.txt")
+			j := f.open(t, target)
+			if err := j.DirLifecycle(target, f.project).Intent("made"); err != nil {
+				t.Fatalf("record the intent: %v", err)
+			}
+			return j, filepath.Join(f.project, "made")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, dir := tc.setup(t, f)
+			finishCompleted(t, j)
+			_, statErr := os.Lstat(dir)
+
+			for launch := 1; launch <= 2; launch++ {
+				report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+				retained := assertCompletedRetained(t, report, 0)
+				if !slices.Equal(retained.Dirs, []string{dir}) {
+					t.Fatalf("launch %d: dirs = %v, want %s reported", launch, retained.Dirs, dir)
+				}
+				if _, err := os.Lstat(dir); (err == nil) != (statErr == nil) {
+					t.Fatalf("launch %d: %s changed presence (err=%v, before %v)", launch, dir, err, statErr)
+				}
+				assertRecordPresent(t, j)
+			}
+		})
+	}
+
+	t.Run("a declared directory holding another writer's entry after its file is put back", func(t *testing.T) {
+		f := newFixture(t)
+		dir := filepath.Join(f.project, "made")
+		created, outside := filepath.Join(dir, "new.txt"), f.seed(t, "o.txt", "ORIGINAL\n")
+		j := f.openConfig(t, JournalConfig{Declared: []string{created, outside}, DeclaredDirs: []string{dir}})
+		mustSucceed(t, f.childMkdir(t, j, dir))
+		mustSucceed(t, f.childCreate(t, j, created, "CHILD\n"))
+		stranger := f.seed(t, "made/stranger.txt", "STRANGER\n")
+		replaceFile(t, outside, "OUTSIDE\n")
+		finishCompleted(t, j)
+		var asked []Unresolved
+
+		report := Recover(f.home, f.project, f.policy(), answers(t, &asked, map[string]Choice{created: ChoiceRestore, outside: ChoiceKeep}))
+
+		assertGone(t, created)
+		assertContent(t, stranger, "STRANGER\n")
+		assertRecordPresent(t, j)
+		if retained := assertCompletedRetained(t, report, 0); !slices.Equal(retained.Dirs, []string{dir}) {
+			t.Fatalf("dirs = %v, want %s retained", retained.Dirs, dir)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, f *fixture) (j *Journal, dir string, answer map[string]Choice)
+	}{
+		{"a confirmed declared directory holding another writer's entry while a separate file is kept", func(t *testing.T, f *fixture) (*Journal, string, map[string]Choice) {
+			dir, outside := filepath.Join(f.project, "made"), f.seed(t, "o.txt", "ORIGINAL\n")
+			j := f.openConfig(t, JournalConfig{Declared: []string{outside}, DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			replaceFile(t, outside, "OUTSIDE\n")
+			return j, dir, map[string]Choice{outside: ChoiceKeep}
+		}},
+		{"an implicit parent holding another writer's entry whose file is already at its pre-run state", func(t *testing.T, f *fixture) (*Journal, string, map[string]Choice) {
+			created := filepath.Join(f.project, "made/new.txt")
+			j := f.open(t, created)
+			mustSucceed(t, f.childCreate(t, j, created, "CHILD\n"))
+			if err := os.Remove(created); err != nil {
+				t.Fatalf("remove the child's file: %v", err)
+			}
+			return j, filepath.Dir(created), map[string]Choice{}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			j, dir, answer := tc.setup(t, f)
+			stranger := f.seed(t, "made/stranger.txt", "STRANGER\n")
+			finishCompleted(t, j)
+
+			for _, byKey := range []map[string]Choice{answer, {}} {
+				report := Recover(f.home, f.project, f.policy(), answers(t, new([]Unresolved), byKey))
+
+				if retained := assertCompletedRetained(t, report, 0); !slices.Equal(retained.Dirs, []string{dir}) {
+					t.Fatalf("dirs = %v, want %s retained", retained.Dirs, dir)
+				}
+				assertDir(t, dir, 0o755)
+				assertContent(t, stranger, "STRANGER\n")
+				if rec := onDiskRecord(t, j); !rec.Completed {
+					t.Fatalf("record = %+v, want the completed journal kept", rec)
+				}
+			}
+		})
+	}
+}
+
+func TestRecover_RetainsACompletedChildsUnresolvedImplicitParent(t *testing.T) {
+	assertHeld := func(t *testing.T, j *Journal, report Report, created, dir string) {
+		t.Helper()
+		if retained := assertCompletedRetained(t, report, 0); !slices.Equal(retained.Dirs, []string{dir}) {
+			t.Fatalf("dirs = %v, want %s retained", retained.Dirs, dir)
+		}
+		assertDir(t, dir, 0o755)
+		assertGone(t, created)
+		assertRecordPresent(t, j)
+		rec := onDiskRecord(t, j)
+		if !rec.Completed || !slices.ContainsFunc(pathIn(t, rec, created).Dirs, func(d dirRecord) bool { return d.Rel == "made" && d.Progress != rollbackRestored }) {
+			t.Fatalf("record = %+v, want the completed journal still tracking made", rec)
+		}
+	}
+	stranger := func(t *testing.T) (f *fixture, j *Journal, created, outside, stranger string) {
+		f = newFixture(t)
+		created, outside = filepath.Join(f.project, "made/new.txt"), f.seed(t, "o.txt", "ORIGINAL\n")
+		j = f.open(t, created, outside)
+		mustSucceed(t, f.childCreate(t, j, created, "CHILD\n"))
+		stranger = f.seed(t, "made/stranger.txt", "STRANGER\n")
+		replaceFile(t, outside, "OUTSIDE\n")
+		finishCompleted(t, j)
+		return f, j, created, outside, stranger
+	}
+
+	t.Run("holding another writer's file after every path is answered", func(t *testing.T) {
+		f, j, created, outside, kept := stranger(t)
+
+		for launch, byKey := range []map[string]Choice{{created: ChoiceRestore, outside: ChoiceKeep}, {}} {
+			var asked []Unresolved
+			report := Recover(f.home, f.project, f.policy(), answers(t, &asked, byKey))
+
+			assertHeld(t, j, report, created, filepath.Dir(created))
+			assertContent(t, kept, "STRANGER\n")
+			assertContent(t, outside, "OUTSIDE\n")
+			if launch == 0 && (!slices.Equal(report.CompletedRestored, []string{created}) || !slices.Equal(report.CompletedKept, []string{outside})) {
+				t.Fatalf("report = %+v, want the answered paths settled", report)
+			}
+		}
+	})
+
+	t.Run("replaced after its file is put back", func(t *testing.T) {
+		f, j, created, outside, kept := stranger(t)
+		dir := filepath.Dir(created)
+		Recover(f.home, f.project, f.policy(), answers(t, new([]Unresolved), map[string]Choice{created: ChoiceRestore, outside: ChoiceKeep}))
+		if err := os.Rename(dir, dir+".old"); err != nil {
+			t.Fatalf("move the created parent aside: %v", err)
+		}
+		f.dir(t, "made", 0o755)
+
+		for range 2 {
+			report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+			assertHeld(t, j, report, created, dir)
+			assertContent(t, filepath.Join(dir+".old", filepath.Base(kept)), "STRANGER\n")
+		}
+	})
+
+	t.Run("an unconfirmed intent after its file is put back", func(t *testing.T) {
+		f := newFixture(t)
+		created := filepath.Join(f.project, "made/new.txt")
+		j := f.open(t, created)
+		mustSucceed(t, f.childCreate(t, j, created, "CHILD\n"))
+		if err := j.DirLifecycle(created, f.project).Intent("made"); err != nil {
+			t.Fatalf("record the intent: %v", err)
+		}
+		finishCompleted(t, j)
+
+		for launch, byKey := range []map[string]Choice{{created: ChoiceRestore}, {}} {
+			var asked []Unresolved
+			report := Recover(f.home, f.project, f.policy(), answers(t, &asked, byKey))
+
+			assertHeld(t, j, report, created, filepath.Dir(created))
+			if launch == 0 && !slices.Equal(report.CompletedRestored, []string{created}) {
+				t.Fatalf("report = %+v, want the file put back", report)
+			}
+		}
+	})
+}
+
+func TestRecover_HoldsTheJournalLockWhileACompletedChildsQuestionIsOpen(t *testing.T) {
+	r := newCompletedRun(t)
+	opened := false
+
+	report := Recover(r.f.home, r.f.project, r.f.policy(), func(Unresolved) Choice {
+		if !opened {
+			opened = true
+			before := readBytes(t, recordPath(r.j))
+			if second := Recover(r.f.home, r.f.project, r.f.policy(), neverAsked(t)); !second.Empty() {
+				t.Errorf("second pass report = %+v, want the open journal skipped", second)
+			}
+			if after := readBytes(t, recordPath(r.j)); string(after) != string(before) {
+				t.Errorf("record changed under the open question:\n%s\nwant\n%s", after, before)
+			}
+			r.assertChildState(t)
+		}
+		return ChoiceDefer
+	})
+
+	if !opened {
+		t.Fatal("no question was asked")
+	}
+	r.assertChildState(t)
+	assertRecordPresent(t, r.j)
+	assertCompletedRetained(t, report, 3)
+}
+
+func TestRecover_RechecksACompletedChildsPathBeforePuttingItBack(t *testing.T) {
+	t.Run("a path replaced while its question is open", func(t *testing.T) {
+		r := newCompletedRun(t)
+
+		report := Recover(r.f.home, r.f.project, r.f.policy(), func(u Unresolved) Choice {
+			if u.Path == r.outside {
+				replaceFile(t, r.outside, "NEWER\n")
+			}
+			return ChoiceRestore
+		})
+
+		assertContent(t, r.outside, "NEWER\n")
+		assertContent(t, r.edited, "ORIGINAL\n")
+		assertRecordPresent(t, r.j)
+		if retained := assertCompletedRetained(t, report, 1); !slices.Contains(retained.Notes, r.outside+": it changed while the question was open, so it was not put back") {
+			t.Fatalf("notes = %v, want the changed path reported", retained.Notes)
+		}
+	})
+
+	t.Run("a path blocked before its put back", func(t *testing.T) {
+		r := newCompletedRun(t)
+		s := &listSwitch{}
+
+		report := Recover(r.f.home, r.f.project, r.f.switchPolicy(s), func(u Unresolved) Choice {
+			if u.Path == r.outside {
+				s.blocked = []string{r.outside}
+			}
+			return ChoiceRestore
+		})
+
+		assertContent(t, r.outside, "OUTSIDE\n")
+		assertContent(t, r.edited, "ORIGINAL\n")
+		assertRecordPresent(t, r.j)
+		if retained := assertCompletedRetained(t, report, 0); !slices.Contains(retained.Notes, blockedNote(r.outside, r.outside)) {
+			t.Fatalf("notes = %v, want the newly blocked path held", retained.Notes)
+		}
+	})
+}
+
+func TestRecover_RetainsACompletionMarkerBelowItsSchemaWithoutTouchingAProjectPath(t *testing.T) {
+	for v := 1; v <= 5; v++ {
+		t.Run(fmt.Sprint(v), func(t *testing.T) {
+			r := newCompletedRun(t)
+			rewriteRecord(t, r.j, func(rec *journalRecord) { rec.SchemaVersion = v })
+			record := readBytes(t, recordPath(r.j))
+
+			report := Recover(r.f.home, r.f.project, r.f.policy(), answer(ChoiceRestore))
+
+			r.assertChildState(t)
+			if got := readBytes(t, recordPath(r.j)); string(got) != string(record) {
+				t.Fatalf("record changed:\n%s\nwant\n%s", got, record)
+			}
+			want := fmt.Sprintf("a schema %d journal holds a completion marker", v)
+			if len(report.Retained) != 1 || len(report.CompletedRestored)+len(report.Restored) != 0 || !strings.Contains(strings.Join(report.Retained[0].Notes, "\n"), want) {
+				t.Fatalf("report = %+v, want the journal retained for %q", report, want)
+			}
+		})
 	}
 }

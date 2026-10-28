@@ -33,7 +33,7 @@ func WithChildInvocationID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, childInvocationKey{}, id)
 }
 
-func childInvocationID(ctx context.Context) string {
+func ChildInvocationID(ctx context.Context) string {
 	id, _ := ctx.Value(childInvocationKey{}).(string)
 	return id
 }
@@ -208,7 +208,7 @@ func invokeResolvedCWD(ctx context.Context, actionName string, action *ActionSpe
 	}
 
 	invocationID := runner.NewInvocationID()
-	if err := emit(startPayload(actionName, resolvedCwd, invocationID, childInvocationID(ctx))); err != nil {
+	if err := emit(startPayload(actionName, resolvedCwd, invocationID, ChildInvocationID(ctx))); err != nil {
 		return tools.Result{}, err
 	}
 
@@ -219,7 +219,7 @@ func invokeResolvedCWD(ctx context.Context, actionName string, action *ActionSpe
 	})
 	if err != nil {
 		runErr := fmt.Errorf("%s: %w", toolName(actionName), err)
-		synthesized := endPayload(actionName, tools.Result{ExitCode: -1}, 0, 0, invocationID, cap, childInvocationID(ctx))
+		synthesized := endPayload(actionName, tools.Result{ExitCode: -1}, 0, 0, invocationID, cap, ChildInvocationID(ctx))
 		return tools.Result{}, errors.Join(runErr, emit(synthesized))
 	}
 
@@ -240,7 +240,7 @@ func invokeResolvedCWD(ctx context.Context, actionName string, action *ActionSpe
 		stdoutTotal, stderrTotal = runRes.StdoutTotal, runRes.StderrTotal
 	}
 
-	if err := emit(endPayload(actionName, res, stdoutTotal, stderrTotal, invocationID, cap, childInvocationID(ctx))); err != nil {
+	if err := emit(endPayload(actionName, res, stdoutTotal, stderrTotal, invocationID, cap, ChildInvocationID(ctx))); err != nil {
 		return tools.Result{}, err
 	}
 	return res, nil
@@ -252,7 +252,7 @@ func invokeResolvedCWD(ctx context.Context, actionName string, action *ActionSpe
 // invocation id. cap caps the synthesized end-payload stderr identically to a
 // normal completed run.
 func emitPaired(ctx context.Context, emit EventAppender, actionName, pathScope, invocationID string, res tools.Result, cap int) (tools.Result, error) {
-	childID := childInvocationID(ctx)
+	childID := ChildInvocationID(ctx)
 	if err := emit(startPayload(actionName, pathScope, invocationID, childID)); err != nil {
 		return tools.Result{}, err
 	}

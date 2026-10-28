@@ -3182,7 +3182,7 @@ func TestJournalMove_RecoveryUndoesAnOrphanedMoveJournal(t *testing.T) {
 	}
 	orphan(t, j)
 
-	report := Recover(f.home, f.project, answer(ChoiceRestore))
+	report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore))
 
 	if len(report.Retained) != 0 || !slices.Contains(report.Restored, source) {
 		t.Fatalf("report = %+v, want the move undone and its journal recovered", report)
@@ -3802,7 +3802,7 @@ func TestJournalLock_CloseKeepsARetainedWritersLock(t *testing.T) {
 		j.Close()
 
 		assertLockHeld(t, j)
-		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 			t.Fatalf("report = %+v, want a retained running writer's journal to add nothing", report)
 		}
 		assertContent(t, target, "A HAND EDIT\n")
@@ -3819,7 +3819,7 @@ func TestJournalLock_CloseKeepsARetainedWritersLock(t *testing.T) {
 		orphan(t, parent)
 
 		assertLockHeld(t, child)
-		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 			t.Fatalf("report = %+v, want the held child and its deferred parent to add nothing", report)
 		}
 		assertContent(t, target, "CHILD\n")
@@ -3928,7 +3928,7 @@ func TestJournalRemove_NeverRepublishesARecordItAlreadyUnlinked(t *testing.T) {
 		if !j.writerLock.held {
 			t.Fatal("writer lock released by a failed cleanup")
 		}
-		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 			t.Fatalf("report = %+v, want record-less residue passed over in silence", report)
 		}
 	})
@@ -3953,7 +3953,7 @@ func TestJournalRemove_NeverRepublishesARecordItAlreadyUnlinked(t *testing.T) {
 		if !j.writerLock.held {
 			t.Fatal("writer lock released by a failed cleanup")
 		}
-		if report := Recover(f.home, f.project, answer(ChoiceRestore)); !report.Empty() {
+		if report := Recover(f.home, f.project, f.policy(), answer(ChoiceRestore)); !report.Empty() {
 			t.Fatalf("report = %+v, want record-less residue passed over in silence", report)
 		}
 
@@ -3971,4 +3971,453 @@ func TestJournalRemove_NeverRepublishesARecordItAlreadyUnlinked(t *testing.T) {
 			t.Fatal("writer lock still held after the retried cleanup")
 		}
 	})
+}
+
+func TestJournalSchema_RecoveryReadsEverySupportedVersion(t *testing.T) {
+	builders := map[int]func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)){
+		journalSchemaVersion: func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			target := f.seed(t, "w.txt", "ORIGINAL\n")
+			j := f.open(t, target)
+			f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+			return j, func(t *testing.T) { assertContent(t, target, "ORIGINAL\n") }
+		},
+		journalDeleteSchemaVersion: func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			target := f.seed(t, "d.txt", "ORIGINAL\n")
+			j := f.openScopes(t, nil, []string{target})
+			f.mustDelete(t, j, target)
+			return j, func(t *testing.T) { assertContent(t, target, "ORIGINAL\n") }
+		},
+		journalMoveSchemaVersion: func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			a, b := f.seed(t, "a.txt", "ORIGINAL\n"), filepath.Join(f.project, "b.txt")
+			j := f.openMoves(t, nil, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			rewriteRecord(t, j, func(rec *journalRecord) {
+				rec.SchemaVersion, rec.MoveSeq = journalMoveSchemaVersion, 0
+				for i := range rec.Moves {
+					rec.Moves[i].ID = moveID{}
+				}
+			})
+			return j, func(t *testing.T) {
+				assertContent(t, a, "ORIGINAL\n")
+				assertGone(t, b)
+			}
+		},
+		journalDirSchemaVersion: func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			dir := filepath.Join(f.project, "made")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			return j, func(t *testing.T) { assertGone(t, dir) }
+		},
+		journalAnswerSchemaVersion: func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			a, b := f.seed(t, "a.txt", "ORIGINAL\n"), filepath.Join(f.project, "b.txt")
+			j := f.openMoves(t, nil, pairOf(a, b))
+			f.mustMove(t, j, a, b)
+			return j, func(t *testing.T) {
+				assertContent(t, a, "ORIGINAL\n")
+				assertGone(t, b)
+			}
+		},
+		6: func(t *testing.T, f *fixture) (*Journal, func(t *testing.T)) {
+			edited, outside := f.seed(t, "c.txt", "ORIGINAL\n"), f.seed(t, "o.txt", "ORIGINAL\n")
+			j := f.open(t, edited, outside)
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			replaceFile(t, outside, "OUTSIDE\n")
+			j.Finish(ReasonCompleted)
+			return j, func(t *testing.T) {
+				assertContent(t, edited, "CHILD\n")
+				assertContent(t, outside, "OUTSIDE\n")
+			}
+		},
+	}
+	for v := journalSchemaVersion; v <= 6; v++ {
+		build, ok := builders[v]
+		if !ok {
+			t.Fatalf("no journal staged for schema %d, which this reader accepts", v)
+		}
+		t.Run(fmt.Sprint(v), func(t *testing.T) {
+			f := newFixture(t)
+			j, check := build(t, f)
+			if got := onDiskRecord(t, j).SchemaVersion; got != v {
+				t.Fatalf("schema_version = %d, want %d", got, v)
+			}
+			orphan(t, j)
+
+			report := Recover(f.home, f.project, f.policy(), nil)
+
+			if v == 6 {
+				if len(report.Retained) != 1 || !report.Retained[0].Completed || len(report.CompletedRestored) != 0 || len(report.Restored) != 0 {
+					t.Fatalf("report = %+v, want the completed child's journal held for a question", report)
+				}
+				check(t)
+				assertRecordPresent(t, j)
+				return
+			}
+			if len(report.Retained) != 0 || len(report.LeftAlone) != 0 {
+				t.Fatalf("report = %+v, want a schema %d journal recovered", report, v)
+			}
+			check(t)
+			assertGone(t, j.Path())
+		})
+	}
+}
+
+func TestJournalSchema_RefusesAnswerStateBelowItsSchema(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, f *fixture) (*Journal, []string, func(*journalRecord))
+	}{
+		{"move identities", func(t *testing.T, f *fixture) (*Journal, []string, func(*journalRecord)) {
+			j, a, b := heldFileMove(t, f)
+			return j, []string{a, b}, func(*journalRecord) {}
+		}},
+		{"a recorded answer", func(t *testing.T, f *fixture) (*Journal, []string, func(*journalRecord)) {
+			j, a, b := heldFileMove(t, f)
+			return j, []string{a, b}, func(rec *journalRecord) {
+				rec.Answers = []groupAnswer{{Members: []moveID{rec.Moves[0].ID}, Endpoints: []string{a, b}, Choice: ChoiceKeep}}
+			}
+		}},
+		{"kept directory state", func(t *testing.T, f *fixture) (*Journal, []string, func(*journalRecord)) {
+			dir := filepath.Join(f.project, "made")
+			j := f.openConfig(t, JournalConfig{DeclaredDirs: []string{dir}})
+			mustSucceed(t, f.childMkdir(t, j, dir))
+			orphan(t, j)
+			return j, []string{dir}, func(rec *journalRecord) {
+				for i := range rec.Paths {
+					for k := range rec.Paths[i].Dirs {
+						rec.Paths[i].Dirs[k].KeptByUser = true
+					}
+				}
+			}
+		}},
+	} {
+		for v := journalSchemaVersion; v < journalAnswerSchemaVersion; v++ {
+			t.Run(fmt.Sprintf("%s/%d", tc.name, v), func(t *testing.T) {
+				f := newFixture(t)
+				j, watch, edit := tc.build(t, f)
+				rewriteRecord(t, j, func(rec *journalRecord) {
+					edit(rec)
+					rec.SchemaVersion = v
+				})
+				record := readBytes(t, recordPath(j))
+				before := captureEntries(t, watch...)
+
+				report := Recover(f.home, f.project, f.policy(), neverAsked(t))
+
+				assertEntriesUnchanged(t, before)
+				if got := readBytes(t, recordPath(j)); string(got) != string(record) {
+					t.Fatalf("record changed:\n%s\nwant\n%s", got, record)
+				}
+				want := fmt.Sprintf("a schema %d journal holds move identities or answers", v)
+				if len(report.Retained) != 1 || len(report.Restored) != 0 || !strings.Contains(strings.Join(report.Retained[0].Notes, "\n"), want) {
+					t.Fatalf("report = %+v, want the journal retained for %q", report, want)
+				}
+			})
+		}
+	}
+}
+
+func TestJournalAnswer_LegacyMovesTakeTheirIdentitiesInTheAnswersOwnWrite(t *testing.T) {
+	f := newFixture(t)
+	a := f.seed(t, "a.txt", "ORIGINAL\n")
+	b := filepath.Join(f.project, "b.txt")
+	edited := f.seed(t, "e.txt", "ORIGINAL\n")
+	j := f.openMoves(t, []string{edited}, pairOf(a, b))
+	f.mustMove(t, j, a, b)
+	f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+	replaceFile(t, b, "A THIRD WRITER\n")
+	replaceFile(t, edited, "A HAND EDIT\n")
+	orphan(t, j)
+	rewriteRecord(t, j, func(rec *journalRecord) {
+		rec.SchemaVersion, rec.MoveSeq = journalMoveSchemaVersion, 0
+		for i := range rec.Moves {
+			rec.Moves[i].ID = moveID{}
+		}
+	})
+	keepGroup := func(u Unresolved) Choice {
+		if len(u.Moves) > 0 {
+			return ChoiceKeep
+		}
+		return ChoiceDefer
+	}
+	assertLegacy := func(t *testing.T, rec journalRecord) {
+		t.Helper()
+		if rec.SchemaVersion != journalMoveSchemaVersion || rec.MoveSeq != 0 || len(rec.Answers) != 0 || len(rec.Moves) != 1 || rec.Moves[0].ID != (moveID{}) {
+			t.Fatalf("record = %+v, want the legacy move still without an identity", rec)
+		}
+	}
+
+	crashAt(t, "group_answered")
+	Recover(f.home, f.project, f.policy(), keepGroup)
+
+	assertLegacy(t, onDiskRecord(t, j))
+
+	var beforeAnswer, atAnswer journalRecord
+	beforeJournalStep = func(step string) error {
+		switch step {
+		case "group_answered":
+			beforeAnswer = recordIn(t, j.Path())
+		case "group_kept":
+			atAnswer = recordIn(t, j.Path())
+		}
+		return nil
+	}
+	t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+
+	Recover(f.home, f.project, f.policy(), keepGroup)
+
+	beforeJournalStep = func(string) error { return nil }
+	assertLegacy(t, beforeAnswer)
+	id := moveID{Invocation: atAnswer.Invocation, Seq: 1}
+	if atAnswer.SchemaVersion != journalAnswerSchemaVersion || atAnswer.MoveSeq != 1 || len(atAnswer.Moves) != 1 || atAnswer.Moves[0].ID != id ||
+		len(atAnswer.Answers) != 1 || !slices.Equal(atAnswer.Answers[0].Members, []moveID{id}) {
+		t.Fatalf("record at the answer = %+v, want the identity %+v and the answer naming it in one schema %d write", atAnswer, id, journalAnswerSchemaVersion)
+	}
+	for launch := 1; launch <= 2; launch++ {
+		Recover(f.home, f.project, f.policy(), func(u Unresolved) Choice {
+			if len(u.Moves) > 0 {
+				t.Errorf("launch %d asked about the kept group %+v", launch, u.Moves)
+			}
+			return ChoiceDefer
+		})
+
+		rec := onDiskRecord(t, j)
+		if rec.SchemaVersion != journalAnswerSchemaVersion || len(rec.Moves) != 1 || rec.Moves[0].ID != id || !reflect.DeepEqual(rec.Answers, atAnswer.Answers) {
+			t.Fatalf("launch %d record = %+v, want schema %d, the identity, and the answer unchanged", launch, rec, journalAnswerSchemaVersion)
+		}
+	}
+}
+
+func TestJournalAbsorb_CarriesIdentitiesAnswersAndKeptStateIntoTheParent(t *testing.T) {
+	f := newFixture(t)
+	a := f.seed(t, "a.txt", "ORIGINAL\n")
+	b := filepath.Join(f.project, "b.txt")
+	made := filepath.Join(f.project, "made")
+	parent := f.openConfig(t, JournalConfig{Declared: []string{a, b}, DeclaredDirs: []string{made}})
+	if got := onDiskRecord(t, parent).SchemaVersion; got != journalDirSchemaVersion {
+		t.Fatalf("parent schema_version = %d, want %d before it absorbs anything", got, journalDirSchemaVersion)
+	}
+	child := f.openConfig(t, JournalConfig{DeclaredMoves: []permissions.MovePair{pairOf(a, b)}, DeclaredDirs: []string{made}, Parent: parent})
+	f.mustMove(t, child, a, b)
+	mustSucceed(t, f.childMkdir(t, child, made))
+	child.rec.Answers = []groupAnswer{{Members: []moveID{child.rec.Moves[0].ID}, Endpoints: []string{a, b}, Choice: ChoiceKeep}}
+	for i := range child.rec.Paths {
+		pr := &child.rec.Paths[i]
+		pr.KeptByUser = pr.Path == a || pr.Path == b
+		for k := range pr.Dirs {
+			pr.Dirs[k].KeptByUser = true
+		}
+	}
+	if err := child.MarkTransferReady(); err != nil {
+		t.Fatalf("MarkTransferReady: %v", err)
+	}
+	want := onDiskRecord(t, child)
+
+	if err := parent.Absorb(child); err != nil {
+		t.Fatalf("Absorb: %v", err)
+	}
+
+	rec := onDiskRecord(t, parent)
+	if rec.SchemaVersion != journalAnswerSchemaVersion {
+		t.Fatalf("parent schema_version = %d, want %d once it holds answer state", rec.SchemaVersion, journalAnswerSchemaVersion)
+	}
+	if !slices.Equal(rec.Moves, want.Moves) || rec.Moves[0].ID.Invocation != want.Invocation || !reflect.DeepEqual(rec.Answers, want.Answers) {
+		t.Fatalf("parent moves %+v and answers %+v, want the child's %+v and %+v unchanged", rec.Moves, rec.Answers, want.Moves, want.Answers)
+	}
+	for _, path := range []string{a, b} {
+		if !pathIn(t, rec, path).KeptByUser {
+			t.Fatalf("parent record for %s = %+v, want it kept", path, pathIn(t, rec, path))
+		}
+	}
+	if !slices.ContainsFunc(pathIn(t, rec, made).Dirs, func(d dirRecord) bool { return d.KeptByUser }) {
+		t.Fatalf("parent directory records = %+v, want the kept directory carried over", pathIn(t, rec, made).Dirs)
+	}
+	assertGone(t, child.Path())
+}
+
+func TestJournalAbsorb_RetainsBothJournalsRatherThanLoseAnAnswerOrItsBinding(t *testing.T) {
+	answerKeep := func(child *Journal, a, b string) {
+		child.rec.Answers = []groupAnswer{{Members: []moveID{child.rec.Moves[0].ID}, Endpoints: []string{a, b}, Choice: ChoiceKeep}}
+	}
+	for _, tc := range []struct {
+		name     string
+		parentOf func(a, b string) []string
+		edit     func(parent, child *Journal, a, b string)
+		reason   string
+	}{
+		{"an answer naming a path the parent does not hold", func(a, _ string) []string { return []string{a} }, func(_, child *Journal, a, b string) {
+			answerKeep(child, a, b)
+		}, "answered for"},
+		{"a kept path the parent does not hold", func(a, _ string) []string { return []string{a} }, func(_, child *Journal, _, b string) {
+			child.record(b).KeptByUser = true
+		}, "kept"},
+		{"a move identity the parent already holds", func(a, b string) []string { return []string{a, b} }, func(parent, child *Journal, a, b string) {
+			answerKeep(child, a, b)
+			parent.rec.Moves = append(parent.rec.Moves, child.rec.Moves[0])
+		}, "an identity this journal already holds"},
+		{"a parent move linked to the answered group", func(a, b string) []string { return []string{a, b} }, func(parent, child *Journal, a, b string) {
+			answerKeep(child, a, b)
+			parent.rec.Moves = append(parent.rec.Moves, moveRecord{movePair: movePair{Source: b, Destination: a + ".elsewhere"}, State: moveCompleted, ID: parent.newMoveID()})
+		}, "leaves out the linked move"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			a := f.seed(t, "a.txt", "ORIGINAL\n")
+			b := filepath.Join(f.project, "b.txt")
+			parent := f.open(t, tc.parentOf(a, b)...)
+			child := f.openConfig(t, JournalConfig{DeclaredMoves: []permissions.MovePair{pairOf(a, b)}, Parent: parent})
+			f.mustMove(t, child, a, b)
+			tc.edit(parent, child, a, b)
+			if err := child.MarkTransferReady(); err != nil {
+				t.Fatalf("MarkTransferReady: %v", err)
+			}
+			parentRecord, childRecord := readBytes(t, recordPath(parent)), readBytes(t, recordPath(child))
+
+			err := parent.Absorb(child)
+
+			if err == nil || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("Absorb = %v, want a refusal naming %q", err, tc.reason)
+			}
+			if got := readBytes(t, recordPath(parent)); string(got) != string(parentRecord) {
+				t.Fatalf("parent record changed:\n%s\nwant\n%s", got, parentRecord)
+			}
+			if got := readBytes(t, recordPath(child)); string(got) != string(childRecord) {
+				t.Fatalf("child record changed:\n%s\nwant\n%s", got, childRecord)
+			}
+		})
+	}
+}
+
+func TestJournalFinish_RecordsTheCompletionMarkerBeforeAnyOtherTerminalStep(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, f *fixture, j *Journal, edited, outside string)
+	}{
+		{"a failed end-of-run check", func(t *testing.T, f *fixture, j *Journal, edited, outside string) {
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			replaceFile(t, outside, "OUTSIDE\n")
+		}},
+		{"a retained durability failure", func(t *testing.T, f *fixture, j *Journal, edited, _ string) {
+			failSyncOnce(t)
+			f.childEdit(t, j, edited, "ORIGINAL", "CHILD")
+			if len(onDiskRecord(t, j).Retained) == 0 {
+				t.Fatal("no durability failure was retained, so the early return is not exercised")
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			edited, outside := f.seed(t, "a.txt", "ORIGINAL\n"), f.seed(t, "b.txt", "ORIGINAL\n")
+			j := f.open(t, edited, outside)
+			tc.setup(t, f, j, edited, outside)
+
+			outcome := j.Finish(ReasonCompleted)
+
+			if outcome.JournalPath == "" {
+				t.Fatalf("outcome = %+v, want the journal retained", outcome)
+			}
+			rec := onDiskRecord(t, j)
+			if !rec.Completed || rec.SchemaVersion != 6 || rec.Lifecycle != lifecycleActive {
+				t.Fatalf("record completed=%v schema=%d lifecycle=%s, want the marker at schema 6 on an active record", rec.Completed, rec.SchemaVersion, rec.Lifecycle)
+			}
+			assertContent(t, edited, "CHILD\n")
+		})
+	}
+
+	t.Run("a nested child is not marked", func(t *testing.T) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		parent := f.open(t, target)
+		child := f.openNested(t, parent, target)
+		f.childEdit(t, child, target, "ORIGINAL", "CHILD")
+		crashAt(t, "transfer_ready")
+
+		if outcome := child.Finish(ReasonCompleted); outcome.JournalPath == "" {
+			t.Fatalf("outcome = %+v, want the nested journal retained", outcome)
+		}
+		if rec := onDiskRecord(t, child); rec.Completed || rec.SchemaVersion != 1 {
+			t.Fatalf("nested record completed=%v schema=%d, want no marker at schema 1", rec.Completed, rec.SchemaVersion)
+		}
+	})
+}
+
+func TestJournalFinish_AFailedCompletionMarkerRetainsTheWorkWithoutRollingBack(t *testing.T) {
+	setup := func(t *testing.T) (*fixture, *Journal, string) {
+		f := newFixture(t)
+		target := f.seed(t, "a.txt", "ORIGINAL\n")
+		j := f.open(t, target)
+		f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+		return f, j, target
+	}
+
+	t.Run("a recoverable failure persists the marker for a later headless recovery", func(t *testing.T) {
+		f, j, target := setup(t)
+		crashAt(t, "completed")
+
+		outcome := j.Finish(ReasonCompleted)
+
+		if outcome.JournalPath == "" || !strings.Contains(strings.Join(outcome.Unrecovered, "|"), "could not be recorded") {
+			t.Fatalf("outcome = %+v, want the journal retained with the failure reported", outcome)
+		}
+		assertContent(t, target, "CHILD\n")
+		rec := onDiskRecord(t, j)
+		if !rec.Completed || rec.SchemaVersion != 6 || rec.Lifecycle == lifecycleCommitted || len(rec.Retained) != 1 {
+			t.Fatalf("record = %+v, want the marker and one retained failure at schema 6, uncommitted", rec)
+		}
+
+		orphan(t, j)
+		report := Recover(f.home, f.project, f.policy(), nil)
+
+		assertContent(t, target, "CHILD\n")
+		assertRecordPresent(t, j)
+		if len(report.Retained) != 1 || !report.Retained[0].Completed {
+			t.Fatalf("report = %+v, want the completed journal held", report)
+		}
+	})
+
+	t.Run("storage refusing every write is reported as a limit", func(t *testing.T) {
+		_, j, target := setup(t)
+		before := readBytes(t, recordPath(j))
+		beforeJournalStep = func(step string) error {
+			if step == "completed" || step == "completion_retained" {
+				return errors.New("simulated storage refusal")
+			}
+			return nil
+		}
+		t.Cleanup(func() { beforeJournalStep = func(string) error { return nil } })
+
+		outcome := j.Finish(ReasonCompleted)
+
+		if outcome.JournalPath == "" || !strings.Contains(strings.Join(outcome.Unrecovered, "|"), "may treat this run as interrupted") {
+			t.Fatalf("outcome = %+v, want the missing completion signal reported", outcome)
+		}
+		assertContent(t, target, "CHILD\n")
+		if got := readBytes(t, recordPath(j)); string(got) != string(before) {
+			t.Fatalf("record = %s, want it unchanged (%s)", got, before)
+		}
+	})
+}
+
+func TestJournalSchema_PromotesTheCompletionMarkerAndNeverLowersIt(t *testing.T) {
+	f := newFixture(t)
+	target := f.seed(t, "a.txt", "ORIGINAL\n")
+	j := f.open(t, target)
+	if got := onDiskRecord(t, j).SchemaVersion; got != 1 {
+		t.Fatalf("schema_version = %d before completion, want 1", got)
+	}
+
+	j.mu.Lock()
+	j.rec.Completed = true
+	err := j.flush()
+	j.mu.Unlock()
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if rec := onDiskRecord(t, j); !rec.Completed || rec.SchemaVersion != 6 {
+		t.Fatalf("record completed=%v schema=%d, want the marker published only at schema 6", rec.Completed, rec.SchemaVersion)
+	}
+
+	f.childEdit(t, j, target, "ORIGINAL", "CHILD")
+	if got := onDiskRecord(t, j).SchemaVersion; got != 6 {
+		t.Fatalf("schema_version = %d after later flushes, want 6 kept", got)
+	}
 }

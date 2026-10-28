@@ -226,6 +226,14 @@ func EmptyStreamClassification() Classification {
 	}
 }
 
+func StreamNoOutputClassification() Classification {
+	return Classification{
+		Phase:       "stream_drop",
+		Reason:      "stream_no_output",
+		ErrorDetail: "codemeld cancelled the provider stream after it produced no assistant content or tool call within its no-output limit",
+	}
+}
+
 // HTTPBodyError reports a 2xx provider response whose body could not be consumed
 // as a usable completion: Truncated is false when a status line arrived but the
 // body was absent (http_no_body) and true when the body was cut off mid-transfer

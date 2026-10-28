@@ -1883,9 +1883,15 @@ func TestDispatchShell_LiteralSpecCarriesSharedClassifierAuthority(t *testing.T)
 		{input: `sh -c 'curl https://example.test'`, want: "network access"},
 		{input: `sh -c 'ls'`, want: ""},
 		{input: `sh -c 'if true; then curl x; fi'`, want: ""},
-		{input: `curl https://example.test > out`, want: ""},
-		{input: `sh -c 'curl https://example.test > out'`, want: ""},
+		{input: `curl https://example.test > out`, want: "network access"},
+		{input: `sh -c 'curl https://example.test > out'`, want: "network access"},
 		{input: `sh -c 'rm x && curl https://example.test'`, want: "network access"},
+		{input: `bash scripts/x.sh; echo "EXIT=$?"`, want: ""},
+		{input: `bash scripts/x.sh 2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"`, want: ""},
+		{input: `SHELL=/usr/bin/bash mise run x 2>&1 | tail -5`, want: ""},
+		{input: `X=1 rm f; ls`, want: "file deletion"},
+		{input: `GIT_DIR=x git push && ls`, want: "network access"},
+		{input: `bash scripts/x.sh; curl https://example.test`, want: "network access"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
@@ -3358,6 +3364,7 @@ func TestDispatchShell_AutoAllowedPSDropsTheInheritedEncoderPath(t *testing.T) {
 		{"null redirect", "ps --libxo=HTML 2>/dev/null", []bool{true}},
 		{"descriptor duplication", "ps --libxo=x 2>&1", []bool{true}},
 		{"wrapped compound", `sh -c "ps --libxo=x && ls"`, []bool{true}},
+		{"here-string", "ps aux <<< x", []bool{true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cwd := t.TempDir()
@@ -3450,6 +3457,7 @@ func TestDispatchShell_AutoAllowedHgRunsInTheOwnedEnvironment(t *testing.T) {
 		{"newly admitted pipeline route", "hg bookmarks --list | wc -l", []bool{true, false}},
 		{"newly admitted staged route", "hg branch && hg phase -r tip", []bool{true, true}},
 		{"newly admitted literal route", "hg phase -r tip 2>/dev/null", []bool{true}},
+		{"here-string literal route", "hg status <<< x", []bool{true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cwd := t.TempDir()
@@ -4129,10 +4137,18 @@ func TestDispatchShell_ClearEnvironmentStageRunsWithListedVariablesOnly(t *testi
 		t.Fatalf("DispatchShell: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(string(res.Stdout)), "\n")
-	slices.Sort(got)
+	listed := slices.DeleteFunc(slices.Clone(got), func(e string) bool { return strings.HasPrefix(e, "CODEMELD_RUN_ID=") })
+	wantMarkers := 0
+	if runtime.GOOS == "linux" {
+		wantMarkers = 1
+	}
+	if len(got)-len(listed) != wantMarkers {
+		t.Fatalf("child environment = %v, want the runner's run marker only on Linux, once", got)
+	}
+	slices.Sort(listed)
 	want := []string{"CODEMELD_TEST_CHILD=set", "PATH=" + binDir}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("child environment = %v, want exactly %v", got, want)
+	if !reflect.DeepEqual(listed, want) {
+		t.Fatalf("child environment = %v, want exactly %v besides the run marker", got, want)
 	}
 
 	if len(auth.requests) != 1 {
@@ -4866,6 +4882,158 @@ func TestDispatchShell_CancelledDuringAuthorizationRunsNothing(t *testing.T) {
 			}
 			if len(run.calls) != 0 {
 				t.Fatalf("runner calls = %d, want none after cancellation", len(run.calls))
+			}
+		})
+	}
+}
+
+type clockRunner struct {
+	fakeRunner
+	clockCalls   int
+	starts       int
+	budget       context.Context
+	expire       context.CancelFunc
+	expireOnExec int
+	onExec       func()
+}
+
+var _ ExecutionClock = (*clockRunner)(nil)
+
+func (c *clockRunner) ExecutionContext(ctx context.Context) context.Context {
+	c.clockCalls++
+	if c.budget == nil {
+		c.starts++
+		c.budget, c.expire = context.WithCancel(ctx)
+	}
+	return c.budget
+}
+
+func (c *clockRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
+	res, err := c.fakeRunner.Exec(ctx, spec)
+	if len(c.calls) == c.expireOnExec {
+		c.expire()
+	}
+	if c.onExec != nil {
+		c.onExec()
+	}
+	return res, err
+}
+
+func TestDispatchShell_ExpiredBudgetStopsBeforeTheNextStage(t *testing.T) {
+	magick := commandLookupPATH(t)
+	writeFixtureProgram(t, filepath.Dir(magick), "alpha", "exit 0")
+	writeFixtureProgram(t, filepath.Dir(magick), "beta", "exit 0")
+	for _, tc := range []struct{ name, input string }{
+		{"next group", "alpha ; beta"},
+		{"next group after a failure", "alpha || beta"},
+		{"sequential pipe stage", "alpha | beta"},
+		{"builtin group", "alpha ; command -v magick"},
+		{"builtin pipe stage", "alpha | command -v magick"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &clockRunner{
+				fakeRunner:   fakeRunner{results: []runner.RunResult{{Stdout: []byte("partial\n"), Stderr: []byte("err\n"), ExitCode: -1}}},
+				expireOnExec: 1,
+			}
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			auth.onAuthorize = func(permissions.MatchRequest) {
+				if run.clockCalls != 0 {
+					t.Error("the execution budget was touched before authorization finished")
+				}
+			}
+			res, err := DispatchShell(context.Background(), tc.input, t.TempDir(), t.TempDir(), auth, run)
+			if err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(run.calls) != 1 {
+				t.Fatalf("Exec calls = %d, want only the stage that ran before the budget expired", len(run.calls))
+			}
+			if string(res.Stdout) != "partial\n" || string(res.Stderr) != "err\n" || res.ExitCode != -1 {
+				t.Fatalf("result = %q/%q/%d, want the accumulated output and exit -1", res.Stdout, res.Stderr, res.ExitCode)
+			}
+			if strings.Contains(string(res.Stdout), magick) {
+				t.Fatal("a builtin stage was answered after the budget expired")
+			}
+			if run.starts != 1 || run.clockCalls < 2 {
+				t.Fatalf("budget starts/uses = %d/%d, want one budget reused across stages", run.starts, run.clockCalls)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_BuiltinOnlyStartsTheBudgetAfterAuthorization(t *testing.T) {
+	magick := commandLookupPATH(t)
+	run := &clockRunner{}
+	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+	auth.onAuthorize = func(permissions.MatchRequest) {
+		if run.clockCalls != 0 {
+			t.Error("the execution budget was touched before authorization finished")
+		}
+	}
+	res, err := DispatchShell(context.Background(), "command -v magick", t.TempDir(), t.TempDir(), auth, run)
+	if err != nil {
+		t.Fatalf("DispatchShell: %v", err)
+	}
+	if string(res.Stdout) != magick+"\n" || run.starts != 1 {
+		t.Fatalf("stdout = %q, budget starts = %d, want the lookup answered under a budget started once", res.Stdout, run.starts)
+	}
+}
+
+func TestDispatchShell_IncomingCancellationBetweenStagesIsAnError(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	run := &clockRunner{onExec: cancel}
+	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+	if _, err := DispatchShell(ctx, "alpha ; beta", t.TempDir(), t.TempDir(), auth, run); !errors.Is(err, context.Canceled) {
+		t.Fatalf("DispatchShell error = %v, want the incoming cancellation, not a result", err)
+	}
+	if len(run.calls) != 1 {
+		t.Fatalf("Exec calls = %d, want nothing run after the incoming cancellation", len(run.calls))
+	}
+}
+
+func TestDispatchShell_HereStringsAndQuotedEnvRunTheirTextUnderPlan(t *testing.T) {
+	prependFixturePrograms(t, "hg")
+	for _, input := range []string{
+		`jq -n 'input' <<< '1'`,
+		`jq . <<< a"b"`,
+		`jq . <<< a\b`,
+		`"env" ; printf x`,
+		"hg status <<< x",
+		"ps aux <<< x",
+	} {
+		t.Run(input, func(t *testing.T) {
+			cwd := t.TempDir()
+			run := &fakeRunner{}
+
+			if _, err := DispatchShell(context.Background(), input, t.TempDir(), cwd, modeAuthorizer{mode: "plan", root: cwd}, run); err != nil {
+				t.Fatalf("DispatchShell(%q): %v", input, err)
+			}
+			if len(run.calls) != 1 {
+				t.Fatalf("runner calls = %d, want 1", len(run.calls))
+			}
+			if argv := run.calls[0].Argv; len(argv) != 3 || argv[0] != "sh" || argv[1] != "-c" || argv[2] != input {
+				t.Fatalf("Argv = %q, want the original text under sh -c", argv)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_HereStringBehindABareLineBreakIsDenied(t *testing.T) {
+	cwd := t.TempDir()
+	writeFixtureProgram(t, cwd, "inproj", "exit 0")
+	for _, input := range []string{"ls\n<<< x ./inproj", "ls\r<<< x ./inproj", "ls\n<<< x ls"} {
+		t.Run(input, func(t *testing.T) {
+			run := &fakeRunner{}
+
+			_, err := DispatchShell(context.Background(), input, t.TempDir(), cwd, modeAuthorizer{mode: "plan", root: cwd}, run)
+
+			if err == nil || !strings.Contains(err.Error(), "newline") {
+				t.Fatalf("DispatchShell(%q) error = %v, want the newline refusal", input, err)
+			}
+			if len(run.calls) != 0 {
+				t.Fatalf("%q reached the runner: %+v", input, run.calls)
 			}
 		})
 	}

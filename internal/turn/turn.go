@@ -48,6 +48,15 @@ var idleTimer = func() (<-chan time.Time, func()) {
 	return t.C, func() { t.Stop() }
 }
 
+var noOutputLimit = 30 * time.Minute
+
+var noOutputTimer = func() (<-chan time.Time, func()) {
+	t := time.NewTimer(noOutputLimit)
+	return t.C, func() { t.Stop() }
+}
+
+var errStreamNoOutput = errors.New("turn: provider stream produced no assistant content or tool call before the no-output limit")
+
 // beforeIdleEmit is a test seam invoked in the idle branch immediately before the
 // synchronized cancellation recheck, so a test can inject a Runner.Cancel at the last
 // moment and prove the recheck still suppresses the diagnostic. No-op in production.
@@ -94,16 +103,18 @@ type FlushHook func() error
 type ToolCallHandoff struct {
 	AssistantText    string
 	ToolCallDeltas   [][]openai.ChatCompletionChunkChoiceDeltaToolCall
+	Reasoning        *sessions.Reasoning
 	Report           *RoundReport
 	UpstreamProvider string
 }
 
 type RoundReport struct {
-	Outcome         string
-	FailurePhase    string
-	FailedTool      string
-	FailureReason   string
-	DispatchStarted bool
+	Outcome          string
+	FailurePhase     string
+	FailedTool       string
+	FailureReason    string
+	DispatchStarted  bool
+	BlankSuggestOnly bool
 }
 
 func (h ToolCallHandoff) report() *RoundReport {
@@ -316,7 +327,7 @@ type Deps struct {
 
 	OnUserMessageAdded func(text string, parts []sessions.ContentPart)
 
-	finalAnswer func(ctx context.Context, text string) (intercepted bool, err error)
+	finalAnswer func(ctx context.Context, text string, reasoning *sessions.Reasoning) (intercepted bool, err error)
 	acct        *turnAccounting
 }
 
@@ -662,7 +673,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 			httpStatus := int64(httpErr.Status)
 			// Pre-stream HTTP-error round: record its timing before the failure event so
 			// both ride the EmitProviderRequestFailed flush, making the slow failure durable.
-			r.recordProviderRound(sel, roundID, roundStart, "")
+			r.recordProviderRound(sel, roundID, roundStart, "", 0, 0)
 			emit := func(onWriteFailure events.WriteFailureHandler, attempts int) {
 				r.deps.Notice(r.renderFailureNotice(friendly, phase, reason, httpErr.Status, attempts))
 				// error_detail receives Body, not Surface, so codemeld's synthetic prefix is
@@ -695,7 +706,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 			// client returns this directly; the streaming path surfaces the same shape
 			// from the stream-error branch below. Never retried: the status is the 2xx
 			// that arrived, outside the retry-status set.
-			r.recordProviderRound(sel, roundID, roundStart, "")
+			r.recordProviderRound(sel, roundID, roundStart, "", 0, 0)
 			phase := r.emitHTTPBodyFailure(ctx, sel, bodyErr)
 			return nil, errors.Join(err, r.recordTerminal(ctx, roundID, events.TurnOutcomeProviderFailed, phase, false))
 		}
@@ -708,7 +719,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 			// fall through unchanged. The event's flush routes write failures through
 			// OnFailureWrite; no model_response is emitted. Dial and recoverable
 			// TLS failures are retry candidates; a bad cert or decode error is not.
-			r.recordProviderRound(sel, roundID, roundStart, "")
+			r.recordProviderRound(sel, roundID, roundStart, "", 0, 0)
 			httpStatus := 0
 			if class.HTTPStatus != nil {
 				httpStatus = int(*class.HTTPStatus)
@@ -739,7 +750,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		// emits a model_response.
 		if resp.Completion != nil {
 			if class, ok := provider.ClassifyEmptyCompletion(resp.Completion); ok {
-				r.recordProviderRound(sel, roundID, roundStart, "")
+				r.recordProviderRound(sel, roundID, roundStart, "", 0, 0)
 				// Surface the one-line notice, like the streamed
 				// empty_response branch below; empty_response carries no hint.
 				surface := fmt.Sprintf("provider %s request to model %s failed (%s/%s): %s",
@@ -758,16 +769,21 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 				// error is nil (this path completes the turn without an error today).
 				return r.deferOrCommit(class, 0, false, 0, false, nil, commit), nil
 			}
-			r.recordProviderRound(sel, roundID, roundStart, "")
+			r.recordProviderRound(sel, roundID, roundStart, "", 0, 0)
 			return nil, errors.Join(errors.New("turn: provider returned a non-streamed completion for a streaming request"), r.recordTerminal(ctx, roundID, events.TurnOutcomeInvalidResponse, "", false))
 		}
-		r.recordProviderRound(sel, roundID, roundStart, "")
+		r.recordProviderRound(sel, roundID, roundStart, "", 0, 0)
 		return nil, errors.Join(errors.New("turn: provider returned no stream for a streaming request"), r.recordTerminal(ctx, roundID, events.TurnOutcomeInvalidResponse, "", false))
 	}
 
 	var reply strings.Builder
+	var reasoning reasoningAcc
 	var finishReason string
 	var toolCallDeltas [][]openai.ChatCompletionChunkChoiceDeltaToolCall
+	var chunks int64
+	recordStreamRound := func() {
+		r.recordProviderRound(sel, roundID, roundStart, upstream, chunks, int64(utf8.RuneCountInString(reasoning.text.String())))
+	}
 
 	// A small/open model can emit its whole reply as a text tool call — a bare JSON
 	// object or one fenced block — instead of a structured call. Hold streamed content back
@@ -795,7 +811,37 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 	lastActivity := now()
 	idleEmitted := false
 	idlePending := false
+	noOutputC, stopNoOutput := noOutputTimer()
+	defer stopNoOutput()
+	noOutputExpired, noOutputTripped := false, false
+	tripNoOutput := func(read <-chan bool) bool {
+		r.mu.Lock()
+		noOutputTripped = !r.cancelled && ctx.Err() == nil
+		r.mu.Unlock()
+		if !noOutputTripped {
+			return false
+		}
+		cancel()
+		if read != nil && <-read {
+			chunks++
+			if sel.Provider == "openrouter" {
+				for _, choice := range stream.Current().Choices {
+					reasoning.add(choice.Delta.JSON.ExtraFields)
+				}
+			}
+		}
+		return true
+	}
 	nextChunk := func() bool {
+		select {
+		case <-noOutputC:
+			noOutputC = nil
+			noOutputExpired = true
+		default:
+		}
+		if noOutputExpired && tripNoOutput(nil) {
+			return false
+		}
 		ch := make(chan bool, 1)
 		go func() { ch <- stream.Next() }()
 		idleC, stopIdle := idleTimer()
@@ -820,6 +866,13 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 				// Runner.Cancel raced the read: take the in-flight result via the
 				// normal cancellation path, never emit a false idle diagnostic.
 				return awaitRead()
+			case <-noOutputC:
+				noOutputC = nil
+				noOutputExpired = true
+				if len(ch) > 0 || !tripNoOutput(ch) {
+					return awaitRead()
+				}
+				return false
 			case <-idleC:
 				if idleEmitted {
 					continue
@@ -865,6 +918,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 	}
 
 	for nextChunk() {
+		chunks++
 		lastActivity = now()
 		chunk := stream.Current()
 		// include_usage streams the totals on a final chunk whose choices array is
@@ -878,6 +932,9 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 			upstream = upstreamProvider(chunk)
 		}
 		for _, choice := range chunk.Choices {
+			if sel.Provider == "openrouter" {
+				reasoning.add(choice.Delta.JSON.ExtraFields)
+			}
 			if delta := choice.Delta.Content; delta != "" {
 				reply.WriteString(delta)
 				r.mu.Lock()
@@ -899,10 +956,32 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 			if len(choice.Delta.ToolCalls) > 0 {
 				toolCallDeltas = append(toolCallDeltas, choice.Delta.ToolCalls)
 			}
+			if choice.Delta.Content != "" || len(choice.Delta.ToolCalls) > 0 {
+				stopNoOutput()
+				noOutputC = nil
+				noOutputExpired = false
+			}
 			if choice.FinishReason != "" {
 				finishReason = choice.FinishReason
 			}
 		}
+	}
+	if noOutputTripped {
+		class := provider.StreamNoOutputClassification()
+		recordStreamRound()
+		surface := fmt.Sprintf("provider %s request to model %s failed (%s/%s): %s",
+			sel.Provider, sel.ID, class.Phase, class.Reason, class.ErrorDetail)
+		emit := func(onWriteFailure events.WriteFailureHandler, attempts int) {
+			_ = events.EmitProviderRequestFailed(ctx, r.deps.Store, sel.Provider, sel.ID,
+				class.Phase, class.Reason, class.ErrorDetail, class.HTTPStatus, class.PartialResponseChars, onWriteFailure)
+			r.deps.Notice(r.renderFailureNotice(surface, class.Phase, class.Reason, 0, attempts))
+		}
+		if terminalErr := r.recordTerminal(ctx, roundID, events.TurnOutcomeProviderFailed, class.Phase, false); terminalErr != nil {
+			emit(nil, 0)
+			return nil, errors.Join(errStreamNoOutput, terminalErr)
+		}
+		commit := func(attempts int) { emit(r.deps.OnFailureWrite, attempts) }
+		return r.deferOrCommit(class, 0, false, 0, true, errStreamNoOutput, commit), errStreamNoOutput
 	}
 	if serr := stream.Err(); serr != nil {
 		if errors.Is(serr, context.Canceled) || errors.Is(serr, context.DeadlineExceeded) {
@@ -934,7 +1013,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 			// cut-off *after* partial content falls through to stream_drop below so the
 			// streamed characters are still counted. No model_response is emitted. Never
 			// retried (2xx status, outside the retry set).
-			r.recordProviderRound(sel, roundID, roundStart, upstream)
+			recordStreamRound()
 			phase := r.emitHTTPBodyFailure(ctx, sel, bodyErr)
 			return nil, errors.Join(serr, r.recordTerminal(ctx, roundID, events.TurnOutcomeProviderFailed, phase, false))
 		}
@@ -952,7 +1031,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		}
 		partialChars := utf8.RuneCountInString(reply.String())
 		class := provider.ClassifyStreamDrop(dropErr, int64(partialChars))
-		r.recordProviderRound(sel, roundID, roundStart, upstream)
+		recordStreamRound()
 		httpStatus := 0
 		if class.HTTPStatus != nil {
 			httpStatus = int(*class.HTTPStatus)
@@ -1012,11 +1091,12 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		// OnToolCalls), so a flush failure must not fail the turn: the error is ignored,
 		// matching recordProviderRound. An agentic turn still records exactly one
 		// provider_round_trip per provider round.
-		r.recordProviderRound(sel, roundID, roundStart, upstream)
+		recordStreamRound()
 		_ = r.deps.Flush()
-		return r.handOffToolCalls(ctx, roundID, ToolCallHandoff{
+		return r.handOffToolCalls(ctx, roundID, sel, ToolCallHandoff{
 			AssistantText:    reply.String(),
 			ToolCallDeltas:   toolCallDeltas,
+			Reasoning:        reasoning.record(sel),
 			UpstreamProvider: upstream,
 		})
 	}
@@ -1039,11 +1119,12 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		// outcome — time the round and flush it durable before handing off, like the
 		// structured branch, so a failing continuation cannot strand the timing event in
 		// memory. The flush error is ignored for the same reason (see that branch).
-		r.recordProviderRound(sel, roundID, roundStart, upstream)
+		recordStreamRound()
 		_ = r.deps.Flush()
-		return r.handOffToolCalls(ctx, roundID, ToolCallHandoff{
+		return r.handOffToolCalls(ctx, roundID, sel, ToolCallHandoff{
 			AssistantText:    "",
 			ToolCallDeltas:   deltas,
+			Reasoning:        reasoning.record(sel),
 			UpstreamProvider: upstream,
 		})
 	}
@@ -1054,7 +1135,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 	// so this is a no-op for the empty_response path below.
 	flushHeld()
 
-	if reply.Len() == 0 {
+	if strings.TrimSpace(reply.String()) == "" {
 		// a stream that closed cleanly with zero assistant-content
 		// deltas and no tool-call handoff is an empty_response failure. Emit the
 		// durable event and surface the one-line failure notice (like the
@@ -1064,7 +1145,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		// empty_response (no hint match). The event's flush routes write
 		// failures through OnFailureWrite.
 		class := provider.EmptyStreamClassification()
-		r.recordProviderRound(sel, roundID, roundStart, upstream)
+		recordStreamRound()
 		// empty_response is never an HTTP phase, so httpStatus is irrelevant here
 		// (ProviderHint returns no hint for empty_response regardless) — pass 0.
 		surface := fmt.Sprintf("provider %s request to model %s failed (%s/%s): %s",
@@ -1081,18 +1162,18 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		commit := func(attempts int) { emit(r.deps.OnFailureWrite, attempts) }
 		// A zero-delta empty response is a transient retry candidate; the
 		// returned error is nil (this path completes the turn without an error today).
-		return r.deferOrCommit(class, 0, false, 0, false, nil, commit), nil
+		return r.deferOrCommit(class, 0, false, r.retainedChars(), false, nil, commit), nil
 	}
 
 	completeRound()
 	if r.deps.finalAnswer != nil {
-		intercepted, err := r.deps.finalAnswer(ctx, reply.String())
+		intercepted, err := r.deps.finalAnswer(ctx, reply.String(), reasoning.record(sel))
 		if err != nil {
-			r.recordProviderRound(sel, roundID, roundStart, upstream)
+			recordStreamRound()
 			return nil, errors.Join(err, r.recordTerminal(ctx, roundID, events.TurnOutcomeContinuationFailed, "", false))
 		}
 		if intercepted {
-			r.recordProviderRound(sel, roundID, roundStart, upstream)
+			recordStreamRound()
 			appendSuggestFollowupDebug(r.deps, events.SuggestFollowupStageNoCall, nil, "", "")
 			return nil, r.recordTerminal(ctx, roundID, events.TurnOutcomeCompleted, "", false)
 		}
@@ -1102,6 +1183,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 		Role:      "assistant",
 		Content:   sessions.TextContent(reply.String()),
 		Timestamp: time.Now().UTC(),
+		Reasoning: reasoning.record(sel),
 	})
 	// The streaming request asks for include_usage, so a clean completion carries
 	// an exact final usage chunk; record those real token counts when present and
@@ -1113,15 +1195,17 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 	var inputTokens, outputTokens int64
 	var cachedInput *int64
 	var cachedPartial bool
+	var cost *float64
+	var costPartial bool
 	var anomalies []string
 	var hadUsage bool
 	if r.deps.UsageAcc != nil {
-		inputTokens, outputTokens, cachedInput, cachedPartial, anomalies, hadUsage = r.deps.UsageAcc.Totals()
+		inputTokens, outputTokens, cachedInput, cachedPartial, cost, costPartial, anomalies, hadUsage = r.deps.UsageAcc.Totals()
 	} else {
-		inputTokens, outputTokens, cachedInput, anomalies = model.UsageFromStreamUsage(usage, usageValid)
+		inputTokens, outputTokens, cachedInput, cost, anomalies = model.UsageFromStreamUsage(usage, usageValid)
 		hadUsage = usageValid
 	}
-	if err := model.EmitModelResponse(r.deps.Store, sel.Provider, sel.ID, inputTokens, outputTokens, cachedInput, cachedPartial, anomalies, upstream); err != nil {
+	if err := model.EmitModelResponse(r.deps.Store, sel.Provider, sel.ID, inputTokens, outputTokens, cachedInput, cachedPartial, cost, costPartial, anomalies, upstream); err != nil {
 		return nil, errors.Join(err, r.recordTerminal(ctx, roundID, events.TurnOutcomeContinuationFailed, "", false))
 	}
 	r.deps.acct.recorded = true
@@ -1140,7 +1224,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 	// final flush, so both are durable in the same write that persists model_response.
 	// turn_latency is recorded only here, on the final no-tool answer, so an agentic
 	// turn yields exactly one even though every round carries the same SubmitStart.
-	r.recordProviderRound(sel, roundID, roundStart, upstream)
+	recordStreamRound()
 	r.recordTurnLatency(sel)
 	// This round reached a final answer with no tool calls, so the model did not
 	// call suggest_followup — the most common "missing suggestion" case. Record it so a
@@ -1172,7 +1256,7 @@ func upstreamProvider(chunk openai.ChatCompletionChunk) string {
 	return *name
 }
 
-func (r *Runner) handOffToolCalls(ctx context.Context, roundID string, h ToolCallHandoff) (*retrySignal, error) {
+func (r *Runner) handOffToolCalls(ctx context.Context, roundID string, sel model.Selection, h ToolCallHandoff) (*retrySignal, error) {
 	report := &RoundReport{Outcome: events.TurnOutcomeCompleted}
 	h.Report = report
 	err := r.deps.OnToolCalls(ctx, h)
@@ -1184,11 +1268,29 @@ func (r *Runner) handOffToolCalls(ctx context.Context, roundID string, h ToolCal
 	if err != nil && report.Outcome == events.TurnOutcomeCompleted {
 		report.Outcome = events.TurnOutcomeContinuationFailed
 	}
+	var emitBlank func(onWriteFailure events.WriteFailureHandler, attempts int)
+	if err != nil && report.BlankSuggestOnly {
+		class := provider.EmptyStreamClassification()
+		surface := fmt.Sprintf("provider %s request to model %s failed (%s/%s): %s",
+			sel.Provider, sel.ID, class.Phase, class.Reason, class.ErrorDetail)
+		emitBlank = func(onWriteFailure events.WriteFailureHandler, attempts int) {
+			_ = events.EmitProviderRequestFailed(ctx, r.deps.Store, sel.Provider, sel.ID,
+				class.Phase, class.Reason, class.ErrorDetail, class.HTTPStatus, class.PartialResponseChars, onWriteFailure)
+			r.deps.Notice(r.renderFailureNotice(surface, class.Phase, class.Reason, 0, attempts))
+		}
+	}
 	if terminalErr := r.emitTerminal(ctx, roundID, *report); terminalErr != nil {
+		if emitBlank != nil {
+			emitBlank(nil, 0)
+		}
 		return nil, errors.Join(err, terminalErr)
 	}
 	if err == nil || report.DispatchStarted {
 		return nil, err
+	}
+	if emitBlank != nil {
+		commit := func(attempts int) { emitBlank(r.deps.OnFailureWrite, attempts) }
+		return r.deferOrCommit(provider.EmptyStreamClassification(), 0, false, r.retainedChars(), false, err, commit), err
 	}
 	reason, ok := handoffRetryReason(report.Outcome)
 	if !ok {
@@ -1282,7 +1384,7 @@ func (r *Runner) emitStreamIdleDurable(ctx context.Context, sel model.Selection,
 // backward clock adjustment cannot produce a payload the validator would reject.
 // An append error (only possible on a nil store/payload, neither of which occurs
 // here) is ignored: a missing observability event must not fail the turn.
-func (r *Runner) recordProviderRound(sel model.Selection, roundID string, start time.Time, upstream string) {
+func (r *Runner) recordProviderRound(sel model.Selection, roundID string, start time.Time, upstream string, chunks, reasoningChars int64) {
 	_, _ = events.Append(r.deps.Store, events.ProviderRoundTrip{
 		Provider:         sel.Provider,
 		ModelID:          sel.ID,
@@ -1290,6 +1392,8 @@ func (r *Runner) recordProviderRound(sel model.Selection, roundID string, start 
 		TurnID:           r.deps.TurnID,
 		RoundID:          roundID,
 		UpstreamProvider: upstream,
+		Chunks:           chunks,
+		ReasoningChars:   reasoningChars,
 	})
 }
 

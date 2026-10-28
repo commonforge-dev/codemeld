@@ -28,6 +28,7 @@ import (
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/skills"
 	"codemeld.dev/codemeld/internal/subagent"
 	"codemeld.dev/codemeld/internal/testsupport"
 	"codemeld.dev/codemeld/internal/trust"
@@ -52,7 +53,7 @@ func recordingSteps(order *[]string) FreshSteps {
 			return trust.Decision{Trusted: true, Reason: trust.ReasonTrusted, Root: "/proj"}
 		},
 		ScaffoldProjectIgnore: func(string) error { rec("2.5:ScaffoldProjectIgnore"); return nil },
-		RecoverJournals:       func(string, string) { rec("2.6:RecoverJournals") },
+		RecoverJournals:       func(string, string, map[string]any, trust.Decision) { rec("2.6:RecoverJournals") },
 		ComposeConfig: func(map[string]any, string) (ConfigComposition, error) {
 			rec("3:ComposeConfig")
 			return ConfigComposition{}, nil
@@ -78,7 +79,7 @@ func recordingSteps(order *[]string) FreshSteps {
 			rec("7b2:InitMode")
 			return nil, nil
 		},
-		LoadAgentInstructions: func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+		LoadAgentInstructions: func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 			rec("7c:LoadAgentInstructions")
 			return nil, nil
 		},
@@ -256,7 +257,7 @@ func TestRunFresh_ShortCircuitsOnStepError(t *testing.T) {
 			}
 		}, "7c:LoadAgentInstructions"},
 		{"step7c_LoadAgentInstructions", func(s *FreshSteps) {
-			s.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+			s.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 				return nil, sentinel
 			}
 		}, "8:StartTUI"},
@@ -718,7 +719,7 @@ func TestDefaultFreshSteps_LoadAgentInstructions_DurableAndLaunchAnchored(t *tes
 
 	composed := map[string]any{"agent_instructions": map[string]any{"max_file_bytes": maxFileBytes}}
 	step := DefaultFreshSteps(io.Discard, io.Discard).LoadAgentInstructions
-	entries, err := step(context.Background(), store, home, launchDir, composed, projectRoot, []string{SettingsPath(home)})
+	entries, err := step(context.Background(), store, home, launchDir, composed, projectRoot, []string{SettingsPath(home)}, agentinstr.Selection{})
 	if err != nil {
 		t.Fatalf("LoadAgentInstructions: %v", err)
 	}
@@ -772,7 +773,7 @@ func TestDefaultFreshSteps_LoadAgentInstructionsWriteFailureUsesCleanShutdownPro
 	}
 	os.Stderr = w
 
-	_, err = step(context.Background(), store, t.TempDir(), t.TempDir(), nil, "/proj", nil)
+	_, err = step(context.Background(), store, t.TempDir(), t.TempDir(), nil, "/proj", nil, agentinstr.Selection{})
 
 	_ = w.Close()
 	os.Stderr = oldStderr
@@ -786,6 +787,93 @@ func TestDefaultFreshSteps_LoadAgentInstructionsWriteFailureUsesCleanShutdownPro
 	}
 	if got := countEvents(store, events.KindSessionWriteFailed); got != 0 {
 		t.Fatalf("session_write_failed events = %d, want 0 for clean-shutdown protocol", got)
+	}
+}
+
+type selectionFixture struct {
+	home, launchDir, explicitPath, explicitContent string
+}
+
+func newSelectionFixture(t *testing.T) selectionFixture {
+	t.Helper()
+	home, launchDir := t.TempDir(), t.TempDir()
+	writeGlobalAgents(t, home, "# global\n")
+	writeAgentsFile(t, launchDir, "# launch\n")
+	const content = "# explicit\n"
+	return selectionFixture{
+		home:            home,
+		launchDir:       launchDir,
+		explicitPath:    writeAgentsFile(t, t.TempDir(), content),
+		explicitContent: content,
+	}
+}
+
+func (f selectionFixture) selections() map[string]agentinstr.Selection {
+	return map[string]agentinstr.Selection{
+		"discover none": {Mode: agentinstr.DiscoverNone},
+		"explicit file": {Mode: agentinstr.ExplicitFile, Path: f.explicitPath},
+	}
+}
+
+func (f selectionFixture) assertSelectionOutcome(t *testing.T, sel agentinstr.Selection, res *BootstrapResult, store *sessions.Store) {
+	t.Helper()
+	disk := diskAgentInstr(t, readSessionFile(t, store.Path()))
+	switch sel.Mode {
+	case agentinstr.DiscoverNone:
+		if len(res.AgentInstructions) != 0 || len(disk) != 0 {
+			t.Fatalf("entries = %+v, durable = %+v, want none", res.AgentInstructions, disk)
+		}
+		if got := agentinstr.SystemPrompt(res.AgentInstructions); got != "" {
+			t.Fatalf("SystemPrompt = %q, want empty", got)
+		}
+	case agentinstr.ExplicitFile:
+		if len(res.AgentInstructions) != 1 || len(disk) != 1 {
+			t.Fatalf("entries = %+v, durable = %+v, want exactly the explicit file", res.AgentInstructions, disk)
+		}
+		e, d := res.AgentInstructions[0], disk[0]
+		if e.Path != f.explicitPath || e.Layer != agentinstr.LayerWalked || e.LoadOrder != 2 || e.Skipped {
+			t.Fatalf("entry = %+v, want loaded walked/order-2 %s", e, f.explicitPath)
+		}
+		if d.Path != f.explicitPath || d.Layer != agentinstr.LayerWalked || d.LoadOrder != 2 {
+			t.Fatalf("durable record = %+v, want walked/order-2 %s", d, f.explicitPath)
+		}
+		if got := agentinstr.SystemPrompt(res.AgentInstructions); got != f.explicitContent {
+			t.Fatalf("SystemPrompt = %q, want %q", got, f.explicitContent)
+		}
+	default:
+		t.Fatalf("unexpected selection %+v", sel)
+	}
+}
+
+func TestRunFresh_AgentInstructionsSelectionReachesTheProductionAdapter(t *testing.T) {
+	if got := DefaultFreshSteps(io.Discard, io.Discard).AgentInstructionsSelection; got != (agentinstr.Selection{}) {
+		t.Fatalf("DefaultFreshSteps selection = %+v, want the zero value", got)
+	}
+	adapter := DefaultFreshSteps(io.Discard, io.Discard).LoadAgentInstructions
+	f := newSelectionFixture(t)
+	for name, sel := range f.selections() {
+		t.Run(name, func(t *testing.T) {
+			var order []string
+			steps := recordingSteps(&order)
+			steps.AgentInstructionsSelection = sel
+			steps.ResolveHome = func() (string, error) { return f.home, nil }
+			store := storeAt(t, filepath.Join(t.TempDir(), "session.json"), "01890000-0000-7000-8000-000000000422", f.launchDir)
+			steps.EnsureFreshSession = func(string, string) (*sessions.Store, error) { return store, nil }
+			var got agentinstr.Selection
+			steps.LoadAgentInstructions = func(ctx context.Context, s *sessions.Store, home, launchDir string, composed map[string]any, root string, layers []string, selection agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
+				got = selection
+				return adapter(ctx, s, home, launchDir, composed, root, layers, selection)
+			}
+
+			res, err := RunFresh(context.Background(), f.launchDir, steps)
+			if err != nil {
+				t.Fatalf("RunFresh: %v", err)
+			}
+			if got != sel {
+				t.Fatalf("step 7c selection = %+v, want %+v", got, sel)
+			}
+			f.assertSelectionOutcome(t, sel, res, store)
+		})
 	}
 }
 
@@ -836,7 +924,7 @@ func TestRunFresh_PostAcquireFailuresReleaseExactlyOnce(t *testing.T) {
 			}
 		}},
 		{"LoadAgentInstructions", func(s *FreshSteps) {
-			s.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string) ([]agentinstr.LoadEntry, error) {
+			s.LoadAgentInstructions = func(context.Context, *sessions.Store, string, string, map[string]any, string, []string, agentinstr.Selection) ([]agentinstr.LoadEntry, error) {
 				return nil, sentinel
 			}
 		}},
@@ -1346,7 +1434,7 @@ func TestDefaultFreshSteps_LoadAgentInstructions_UntrustedRepositoryFilesLoad(t 
 		"01890000-0000-7000-8000-000000002510", f.root)
 
 	step := DefaultFreshSteps(io.Discard, io.Discard).LoadAgentInstructions
-	entries, err := step(context.Background(), store, f.home, f.launch, nil, f.root, nil)
+	entries, err := step(context.Background(), store, f.home, f.launch, nil, f.root, nil, agentinstr.Selection{})
 	if err != nil {
 		t.Fatalf("LoadAgentInstructions: %v", err)
 	}
@@ -2020,6 +2108,7 @@ func killedChildJournal(t *testing.T, home, project, target string) string {
 // the file is read back from disk in its pre-run state, and the launch says so in plain terms.
 func TestDefaultFreshSteps_RecoverJournals_PutsBackAKilledChildsWrite(t *testing.T) {
 	home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
 	target := filepath.Join(project, "a.txt")
 	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -2027,7 +2116,7 @@ func TestDefaultFreshSteps_RecoverJournals_PutsBackAKilledChildsWrite(t *testing
 	journal := killedChildJournal(t, home, project, target)
 
 	var stderr strings.Builder
-	DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project)
+	DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project, nil, trust.Decision{})
 
 	if got, err := os.ReadFile(target); err != nil || string(got) != "ORIGINAL\n" {
 		t.Fatalf("%s = %q (err=%v), want its pre-run bytes", target, got, err)
@@ -2047,6 +2136,7 @@ func TestRecoverChildJournals_AsksOnlyWhenTheLaunchCanReachTheUser(t *testing.T)
 	changed := func(t *testing.T) (home, project, target string) {
 		t.Helper()
 		home, project = realPath(t, t.TempDir()), realPath(t, t.TempDir())
+		writeGlobalSettings(t, home, blockedYAML(), 0o600)
 		target = filepath.Join(project, "a.txt")
 		if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
 			t.Fatalf("seed: %v", err)
@@ -2062,7 +2152,7 @@ func TestRecoverChildJournals_AsksOnlyWhenTheLaunchCanReachTheUser(t *testing.T)
 		home, project, target := changed(t)
 
 		var stderr strings.Builder
-		recoverChildJournals(home, project, strings.NewReader("k\n"), &stderr, true)
+		recoverChildJournals(home, project, nil, trust.Decision{}, strings.NewReader("k\n"), &stderr, true)
 
 		if !strings.Contains(stderr.String(), "Keep, put back, or decide later?") {
 			t.Fatalf("stderr = %q, want the three answers offered", stderr.String())
@@ -2079,7 +2169,7 @@ func TestRecoverChildJournals_AsksOnlyWhenTheLaunchCanReachTheUser(t *testing.T)
 		home, project, target := changed(t)
 
 		var stderr strings.Builder
-		recoverChildJournals(home, project, strings.NewReader("k\n"), &stderr, false)
+		recoverChildJournals(home, project, nil, trust.Decision{}, strings.NewReader("k\n"), &stderr, false)
 
 		if strings.Contains(stderr.String(), "Keep, put back, or decide later?") {
 			t.Fatalf("stderr = %q, want no prompt with no one to answer it", stderr.String())
@@ -2100,7 +2190,7 @@ func TestReportJournalRecovery_PromisesAQuestionOnlyForOrdinaryUnresolvedPaths(t
 	const moveQuestion = "codemeld asks what to do with these moves the next time you start it here interactively"
 	render := func(retained subagent.RetainedJournal) string {
 		var stderr strings.Builder
-		reportJournalRecovery(&stderr, subagent.Report{Retained: []subagent.RetainedJournal{retained}})
+		reportJournalRecovery(&stderr, subagent.Report{Retained: []subagent.RetainedJournal{retained}}, false)
 		return stderr.String()
 	}
 
@@ -2246,7 +2336,7 @@ func TestJournalRecovery_EscapesTheValuesItPrints(t *testing.T) {
 						{Source: v, Destination: v, Reason: v, Resumes: true},
 					}},
 				},
-			})
+			}, false)
 			want := strings.Join([]string{
 				"codemeld: could not tell whether a child agent run recorded here has ended, so its files were left as they are.",
 				"  left alone: " + w + " (" + w + ")",
@@ -2311,7 +2401,7 @@ func TestDefaultFreshSteps_RecoverJournals_NamesAJournalItLeftAlone(t *testing.T
 			tc.lock(t, lock)
 
 			var stderr strings.Builder
-			DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project)
+			DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project, nil, trust.Decision{})
 
 			if !strings.HasPrefix(stderr.String(), "codemeld: could not tell whether a child agent run recorded here has ended, so its files were left as they are.\n") {
 				t.Fatalf("stderr = %q, want the could-not-tell header", stderr.String())
@@ -2362,7 +2452,7 @@ func TestDefaultFreshSteps_RecoverJournals_SaysNothingAboutARunningWriter(t *tes
 			}
 
 			var stderr strings.Builder
-			DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project)
+			DefaultFreshSteps(io.Discard, &stderr).RecoverJournals(home, project, nil, trust.Decision{})
 
 			if stderr.Len() != 0 {
 				t.Fatalf("stderr = %q, want nothing printed for a running writer", stderr.String())
@@ -2419,8 +2509,8 @@ func TestRecoverChildJournals_DoesNothingWithoutAProjectOrAJournal(t *testing.T)
 	home := realPath(t, t.TempDir())
 
 	var stderr strings.Builder
-	recoverChildJournals(home, "", strings.NewReader(""), &stderr, true)
-	recoverChildJournals(home, realPath(t, t.TempDir()), strings.NewReader(""), &stderr, true)
+	recoverChildJournals(home, "", nil, trust.Decision{}, strings.NewReader(""), &stderr, true)
+	recoverChildJournals(home, realPath(t, t.TempDir()), nil, trust.Decision{}, strings.NewReader(""), &stderr, true)
 
 	if stderr.String() != "" {
 		t.Fatalf("stderr = %q, want no report when there is no journal", stderr.String())
@@ -2977,4 +3067,706 @@ func TestRunResume_SuppliesTheSameSettingsLayersAsAFreshLaunch(t *testing.T) {
 	if !reflect.DeepEqual(resumed.SettingsLayers, fresh.SettingsLayers) {
 		t.Fatalf("resumed layers = %#v, want the fresh launch's %#v", resumed.SettingsLayers, fresh.SettingsLayers)
 	}
+}
+
+func TestRunFreshCore_RecoveryHonorsTheAdmittedBlockedPathsBeforeComposition(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trusted bool
+		block   func(t *testing.T, home, project, target string)
+		held    bool
+	}{
+		{"a global block", false, func(t *testing.T, home, _, target string) {
+			writeGlobalSettings(t, home, blockedYAML(target), 0o600)
+		}, true},
+		{"a local block in an approved project", true, func(t *testing.T, _, project, target string) {
+			writeLocalProjectSettings(t, project, blockedYAML(target))
+		}, true},
+		{"a shared block in an approved project", true, func(t *testing.T, _, project, target string) {
+			writeProjectSettings(t, project, blockedYAML(target))
+		}, true},
+		{"a block in an unapproved project", false, func(t *testing.T, _, project, target string) {
+			writeLocalProjectSettings(t, project, blockedYAML(target))
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+			writeGlobalSettings(t, home, blockedYAML(), 0o600)
+			target := filepath.Join(project, "a.txt")
+			if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			journal := killedChildJournal(t, home, project, target)
+			tc.block(t, home, project, target)
+
+			var stderr strings.Builder
+			var order []string
+			steps := recordingSteps(&order)
+			steps.ResolveHome = func() (string, error) { return home, nil }
+			steps.LoadGlobalSettings = defaultLoadGlobalSettings
+			steps.ResolveProjectRoot = func(string, map[string]any) (string, []string, error) { return project, nil, nil }
+			steps.GateTrust = func(string, string, string) trust.Decision {
+				return trust.Decision{Trusted: tc.trusted, Reason: trust.ReasonTrusted, Root: project}
+			}
+			production := DefaultFreshSteps(io.Discard, &stderr).RecoverJournals
+			steps.RecoverJournals = func(home, root string, global map[string]any, decision trust.Decision) {
+				if slices.Contains(order, "3:ComposeConfig") {
+					t.Errorf("order = %v, want recovery before composition", order)
+				}
+				production(home, root, global, decision)
+			}
+
+			if res, _, err := runFreshCore(context.Background(), project, steps); err != nil || res == nil {
+				t.Fatalf("runFreshCore = (%v, %v), want the launch to complete", res, err)
+			}
+
+			got, err := os.ReadFile(target)
+			if !tc.held {
+				if err != nil || string(got) != "ORIGINAL\n" {
+					t.Fatalf("%s = %q (err=%v), want an unapproved block ignored", target, got, err)
+				}
+				return
+			}
+			if err != nil || string(got) != "CHILD\n" {
+				t.Fatalf("%s = %q (err=%v), want the blocked file left alone", target, got, err)
+			}
+			if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
+				t.Fatalf("stat the journal record: %v, want it retained", err)
+			}
+			if want := "not put back: " + shown(target+": a blocked path is involved: "+target); !strings.Contains(stderr.String(), want) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+			}
+		})
+	}
+}
+
+type promptHook struct {
+	answer string
+	hook   func()
+}
+
+func (p *promptHook) Read(b []byte) (int, error) {
+	if p.hook != nil {
+		p.hook()
+		p.hook = nil
+	}
+	if p.answer == "" {
+		return 0, io.EOF
+	}
+	n := copy(b, p.answer)
+	p.answer = p.answer[n:]
+	return n, nil
+}
+
+func TestRecoverChildJournals_AGlobalBlockAddedWhileTheQuestionIsOpenStopsTheAnswer(t *testing.T) {
+	home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, blockedYAML(), 0o600)
+	target := filepath.Join(project, "a.txt")
+	if err := os.WriteFile(target, []byte("ORIGINAL\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	journal := killedChildJournal(t, home, project, target)
+	if err := os.WriteFile(target, []byte("A HAND EDIT\n"), 0o644); err != nil {
+		t.Fatalf("hand edit: %v", err)
+	}
+	stdin := &promptHook{answer: "r\n", hook: func() { writeGlobalSettings(t, home, blockedYAML(target), 0o600) }}
+
+	var stderr strings.Builder
+	recoverChildJournals(home, project, map[string]any{}, trust.Decision{}, stdin, &stderr, true)
+
+	if !strings.Contains(stderr.String(), "Keep, put back, or decide later?") {
+		t.Fatalf("stderr = %q, want the question asked before the block appeared", stderr.String())
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "A HAND EDIT\n" {
+		t.Fatalf("%s = %q (err=%v), want the answer refused under the new block", target, got, err)
+	}
+	if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
+		t.Fatalf("stat the journal record: %v, want it retained", err)
+	}
+	if !strings.Contains(stderr.String(), "a blocked path is involved: "+target) {
+		t.Fatalf("stderr = %q, want the blocked reason", stderr.String())
+	}
+}
+
+func TestReportJournalRecovery_PolicyHoldsPromiseARetryNotAQuestion(t *testing.T) {
+	const record = "journals/run"
+	const retry = "  codemeld tries these again the next time you start it here, once its settings can be read and no blocked path is involved"
+	const question = "codemeld asks what to do with these files the next time you start it here"
+	for _, tc := range []struct {
+		name     string
+		retained subagent.RetainedJournal
+		asks     bool
+	}{
+		{"a blocked group", subagent.RetainedJournal{Path: record, Notes: []string{"a -> b: a blocked path is involved: b/secret"}, PolicyNotes: 1}, false},
+		{"an unreadable list", subagent.RetainedJournal{Path: record, Notes: []string{"the blocked-path list cannot be read, so nothing was put back"}, PolicyNotes: 1}, false},
+		{"a blocked group beside an ordinary path", subagent.RetainedJournal{Path: record, Notes: []string{"a -> b: a blocked path is involved: b/secret", "c.txt: it was changed"}, PolicyNotes: 1}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr strings.Builder
+			reportJournalRecovery(&stderr, subagent.Report{Retained: []subagent.RetainedJournal{tc.retained}}, false)
+
+			got := stderr.String()
+			for _, note := range tc.retained.Notes {
+				if !strings.Contains(got, "  not put back: "+shown(note)+"\n") {
+					t.Fatalf("stderr = %q, want %q reported", got, note)
+				}
+			}
+			if !strings.Contains(got, retry+"\n") || !strings.Contains(got, record) {
+				t.Fatalf("stderr = %q, want the retry stated and the record named", got)
+			}
+			if strings.Contains(got, question) != tc.asks || strings.Contains(got, "moves the next time") {
+				t.Fatalf("stderr = %q, want a question promised = %v and no move question", got, tc.asks)
+			}
+		})
+	}
+}
+
+func orphanedMoveJournal(t *testing.T, home, project string, write []string, pairs ...permissions.MovePair) string {
+	t.Helper()
+	j, err := subagent.OpenJournal(subagent.JournalConfig{Home: home, ProjectRoot: project, Invocation: childJournalInvocation, Declared: write, DeclaredMoves: pairs})
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	defer j.Close()
+	ctx := filetools.WithWriteJournal(context.Background(), j)
+	for _, pair := range pairs {
+		res, err := filetools.NewMoveTool(home, project, project).InvokeWithResolvedMove(ctx, filetools.ResolvedMove{Source: pair.Source, Destination: pair.Destination})
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("child move %s -> %s = %+v, %v", pair.Source, pair.Destination, res, err)
+		}
+	}
+	for _, target := range write {
+		args := map[string]any{"path": target, "old_text": "ORIGINAL", "new_text": "CHILD"}
+		if _, err := filetools.NewEditTool(home, project, project).InvokeWithResolvedTarget(ctx, args, target); err != nil {
+			t.Fatalf("child edit: %v", err)
+		}
+	}
+	lock := filepath.Join(j.Path(), "journal.lock")
+	if err := os.Remove(lock); err != nil {
+		t.Fatalf("remove the writer's lock: %v", err)
+	}
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatalf("leave an unlocked lock: %v", err)
+	}
+	return j.Path()
+}
+
+type heldGroupPaths struct{ a, b, c, edited, journal string }
+
+func TestRecoverChildJournals_AsksAboutAHeldMoveGroupBeforeAnyPath(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stdin string
+		check func(t *testing.T, p heldGroupPaths, stderr string)
+	}{
+		{"keep", "k\nd\n", func(t *testing.T, p heldGroupPaths, stderr string) {
+			assertFileContent(t, p.a, "C ORIGINAL\n")
+			assertFileContent(t, p.b, "A THIRD WRITER\n")
+			assertFileContent(t, p.c, "")
+			for _, path := range []string{p.a, p.b, p.c} {
+				if !strings.Contains(stderr, "kept as it is now, as you asked: "+path+"\n") {
+					t.Fatalf("stderr = %q, want %s reported kept", stderr, path)
+				}
+			}
+		}},
+		{"restore", "r\nd\n", func(t *testing.T, p heldGroupPaths, stderr string) {
+			assertFileContent(t, p.a, "A ORIGINAL\n")
+			assertFileContent(t, p.b, "")
+			assertFileContent(t, p.c, "C ORIGINAL\n")
+			for _, path := range []string{p.a, p.b, p.c} {
+				if !strings.Contains(stderr, "put back: "+path+"\n") {
+					t.Fatalf("stderr = %q, want %s reported put back", stderr, path)
+				}
+			}
+		}},
+		{"defer", "d\nd\n", assertGroupDeferred},
+		{"end of input", "", assertGroupDeferred},
+		{"an unrecognized answer", "x\nd\n", assertGroupDeferred},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, project := realPath(t, t.TempDir()), realPath(t, t.TempDir())
+			writeGlobalSettings(t, home, blockedYAML(), 0o600)
+			p := heldGroupPaths{a: filepath.Join(project, "a.txt"), b: filepath.Join(project, "b.txt"), c: filepath.Join(project, "c.txt"), edited: filepath.Join(project, "e.txt")}
+			for path, content := range map[string]string{p.a: "A ORIGINAL\n", p.c: "C ORIGINAL\n", p.edited: "ORIGINAL\n"} {
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatalf("seed %s: %v", path, err)
+				}
+			}
+			p.journal = orphanedMoveJournal(t, home, project, []string{p.edited}, permissions.MovePair{Source: p.a, Destination: p.b}, permissions.MovePair{Source: p.c, Destination: p.a})
+			for path, content := range map[string]string{p.b: "A THIRD WRITER\n", p.edited: "A HAND EDIT\n"} {
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatalf("change %s: %v", path, err)
+				}
+			}
+
+			var stderr strings.Builder
+			recoverChildJournals(home, project, map[string]any{}, trust.Decision{}, strings.NewReader(tc.stdin), &stderr, true)
+
+			got := stderr.String()
+			group := strings.Index(got, "  move: "+p.a+" -> "+p.b+"\n  move: "+p.c+" -> "+p.a+"\n")
+			path := strings.Index(got, "codemeld: "+p.edited+" changed after")
+			if group < 0 || path < group || !strings.Contains(got[group:path], "Keep, put back, or decide later? [k/r/d] ") {
+				t.Fatalf("stderr = %q, want the group question naming both moves in order, before the path question", got)
+			}
+			assertFileContent(t, p.edited, "A HAND EDIT\n")
+			if _, err := os.Stat(filepath.Join(p.journal, "journal.json")); err != nil {
+				t.Fatalf("stat the journal record: %v, want it kept for the deferred path", err)
+			}
+			tc.check(t, p, got)
+		})
+	}
+}
+
+func assertGroupDeferred(t *testing.T, p heldGroupPaths, stderr string) {
+	t.Helper()
+	assertFileContent(t, p.a, "C ORIGINAL\n")
+	assertFileContent(t, p.b, "A THIRD WRITER\n")
+	assertFileContent(t, p.c, "")
+	if !strings.Contains(stderr, "move not undone: "+p.a+" -> "+p.b+" (") || !strings.Contains(stderr, "codemeld asks what to do with these moves the next time you start it here interactively") {
+		t.Fatalf("stderr = %q, want the deferred moves reported with the next interactive launch's question", stderr)
+	}
+}
+
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if want == "" {
+		if !os.IsNotExist(err) {
+			t.Fatalf("%s = %q (err=%v), want it absent", path, got, err)
+		}
+		return
+	}
+	if err != nil || string(got) != want {
+		t.Fatalf("%s = %q (err=%v), want %q", path, got, err, want)
+	}
+}
+
+func TestAskJournalChoice_DefersAGroupOnEndOfInputOrAnUnrecognizedAnswer(t *testing.T) {
+	group := subagent.Unresolved{Moves: []subagent.UnresolvedMove{{Source: "a", Destination: "b"}}, Choices: []subagent.Choice{subagent.ChoiceKeep, subagent.ChoiceRestore, subagent.ChoiceDefer}}
+	path := subagent.Unresolved{Path: "a"}
+	for _, tc := range []struct {
+		input       string
+		group, path subagent.Choice
+	}{
+		{"k\n", subagent.ChoiceKeep, subagent.ChoiceKeep},
+		{"KEEP\n", subagent.ChoiceKeep, subagent.ChoiceKeep},
+		{"r\n", subagent.ChoiceRestore, subagent.ChoiceRestore},
+		{"put back\n", subagent.ChoiceRestore, subagent.ChoiceRestore},
+		{"d\n", subagent.ChoiceDefer, subagent.ChoiceDefer},
+		{"\n", subagent.ChoiceDefer, subagent.ChoiceDefer},
+		{"x\n", subagent.ChoiceDefer, subagent.ChoiceDefer},
+		{"", subagent.ChoiceDefer, subagent.ChoiceDefer},
+		{"k", subagent.ChoiceDefer, subagent.ChoiceKeep},
+		{"r", subagent.ChoiceDefer, subagent.ChoiceRestore},
+	} {
+		for _, q := range []struct {
+			u    subagent.Unresolved
+			want subagent.Choice
+		}{{group, tc.group}, {path, tc.path}} {
+			if got := askJournalChoice(bufio.NewReader(strings.NewReader(tc.input)), io.Discard, q.u); got != q.want {
+				t.Fatalf("answer %q to %+v = %q, want %q", tc.input, q.u, got, q.want)
+			}
+		}
+	}
+}
+
+func TestSkillWarnings_CoverEveryLoaderReason(t *testing.T) {
+	const dir = "/home/u/.codemeld/skills/"
+	for _, tc := range []struct {
+		skipped skills.Skipped
+		want    string
+	}{
+		{skills.Skipped{Path: dir + "help", Reason: skills.BuiltinClash},
+			`skill "help" not loaded: /help is a built-in command; rename the skill folder and its name`},
+		{skills.Skipped{Path: dir + "mine", Reason: skills.NameMismatch},
+			`skill folder "/home/u/.codemeld/skills/mine" not loaded: declared name differs from folder name; rename the folder or the name so they match`},
+		{skills.Skipped{Path: dir + "deploy", Reason: skills.OverriddenByProject},
+			`your global skill "deploy" is not loaded in this project: the project has its own skill with that name. To use both, rename the folder ~/.codemeld/skills/deploy and its name line.`},
+		{skills.Skipped{Path: dir + "Bad", Reason: skills.BadName},
+			`skill folder "/home/u/.codemeld/skills/Bad" not loaded: name is not a valid skill name`},
+		{skills.Skipped{Path: dir + "a", Reason: skills.MissingDescription},
+			`skill folder "/home/u/.codemeld/skills/a" not loaded: description is missing or blank`},
+		{skills.Skipped{Path: dir + "a", Reason: skills.TooLarge},
+			`skill folder "/home/u/.codemeld/skills/a" not loaded: SKILL.md exceeds the configured byte limit`},
+		{skills.Skipped{Path: dir + "a", Reason: skills.Unreadable},
+			`skill folder "/home/u/.codemeld/skills/a" not loaded: SKILL.md could not be read`},
+		{skills.Skipped{Path: dir + "a", Reason: skills.BadFrontMatter},
+			`skill folder "/home/u/.codemeld/skills/a" not loaded: SKILL.md front matter is invalid`},
+		{skills.Skipped{Path: dir + "a", Reason: skills.OutsideFolder},
+			`skill folder "/home/u/.codemeld/skills/a" not loaded: skill folder or SKILL.md resolves outside its skills folder`},
+		{skills.Skipped{Path: dir + "tab\tand\x1b\nnewline", Reason: skills.NameMismatch},
+			`skill folder "/home/u/.codemeld/skills/tab and newline" not loaded: declared name differs from folder name; rename the folder or the name so they match`},
+	} {
+		got := skillWarnings([]skills.Skipped{tc.skipped}, "/home/u/.codemeld/skills", "/p/.codemeld/skills")
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("skillWarnings(%+v) = %q, want [%q]", tc.skipped, got, tc.want)
+		}
+	}
+}
+
+func TestSkillSkipReason_WarningsAndPanelShareWording(t *testing.T) {
+	const global, project = "/home/u/.codemeld/skills", "/work/p/.codemeld/skills"
+	unreadableRoot := "the skills folder could not be read"
+	rejectedRoot := "the skills folder was rejected because it resolves to a place skills cannot be loaded from"
+	for _, tc := range []struct {
+		skipped skills.Skipped
+		reason  string
+	}{
+		{skills.Skipped{Path: global + "/help", Reason: skills.BuiltinClash}, "/help is a built-in command; rename the skill folder and its name"},
+		{skills.Skipped{Path: project + "/mine", Reason: skills.NameMismatch}, "declared name differs from folder name; rename the folder or the name so they match"},
+		{skills.Skipped{Path: global + "/deploy", Reason: skills.OverriddenByProject}, "the project has its own skill with that name. To use both, rename the folder ~/.codemeld/skills/deploy and its name line."},
+		{skills.Skipped{Path: project + "/Bad", Reason: skills.BadName}, "name is not a valid skill name"},
+		{skills.Skipped{Path: project + "/a", Reason: skills.MissingDescription}, "description is missing or blank"},
+		{skills.Skipped{Path: project + "/a", Reason: skills.TooLarge}, "SKILL.md exceeds the configured byte limit"},
+		{skills.Skipped{Path: project + "/a", Reason: skills.Unreadable}, "SKILL.md could not be read"},
+		{skills.Skipped{Path: project + "/a", Reason: skills.BadFrontMatter}, "SKILL.md front matter is invalid"},
+		{skills.Skipped{Path: project + "/a", Reason: skills.OutsideFolder}, "skill folder or SKILL.md resolves outside its skills folder"},
+		{skills.Skipped{Path: global, Reason: skills.Unreadable}, unreadableRoot},
+		{skills.Skipped{Path: project, Reason: skills.Unreadable}, unreadableRoot},
+		{skills.Skipped{Path: global, Reason: skills.OutsideFolder}, rejectedRoot},
+		{skills.Skipped{Path: project, Reason: skills.OutsideFolder}, rejectedRoot},
+	} {
+		result := &BootstrapResult{Home: "/home/u", ProjectRoot: "/work/p", Skills: skills.Set{Skipped: []skills.Skipped{tc.skipped}}}
+		if got, want := skillsView(result).Skipped, []tui.SkippedSkill{{Path: tc.skipped.Path, Reason: tc.reason}}; !slices.Equal(got, want) {
+			t.Errorf("panel entry for %+v = %+v, want %+v", tc.skipped, got, want)
+		}
+		if got := skillWarnings(result.Skills.Skipped, global, project); len(got) != 1 || !strings.HasSuffix(got[0], ": "+tc.reason) {
+			t.Errorf("warning for %+v = %q, want it to end with %q", tc.skipped, got, tc.reason)
+		}
+	}
+
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codemeld"), 0o755); err != nil {
+		t.Fatalf("create state folder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codemeld", "skills"), nil, 0o644); err != nil {
+		t.Fatalf("write skills file: %v", err)
+	}
+	warnings := loadSkills(&BootstrapResult{Home: home, ProjectRoot: t.TempDir()}, 65536)
+	if want := []string{`skill folder "` + home + `/.codemeld/skills" not loaded: ` + unreadableRoot}; !slices.Equal(warnings, want) {
+		t.Fatalf("startup warnings = %q, want %q", warnings, want)
+	}
+}
+
+func TestSkillsView_CollapsesControlsWithoutExtraRows(t *testing.T) {
+	panel := func(result *BootstrapResult) string {
+		t.Helper()
+		host := &recordingHost{store: mkStore(t)}
+		tui.BuildRegistry(map[string]tui.HandlerFunc{"skills": tui.NewSkillsHandler(skillsView(result))}).DispatchSlashInput("/skills", host)
+		if len(host.panels) != 1 {
+			t.Fatalf("/skills opened %d panels, want 1", len(host.panels))
+		}
+		return host.panels[0]
+	}
+
+	loaded := &BootstrapResult{Home: "/h", ProjectRoot: "/p", Skills: skills.Set{
+		Loaded:  []skills.Skill{{Name: "tab\tname", Description: "line\none\x1b[31m red", Layer: skills.Global, Folder: "/h/.codemeld/skills/f\tx\ny", ModelInvocable: true}},
+		Skipped: []skills.Skipped{{Path: "/h/.codemeld/skills/bad\x1b\ndir", Reason: skills.BadName}},
+	}}
+	want := "Loaded\n" +
+		"  tab name (global)\n" +
+		"    line one [31m red\n" +
+		"    /h/.codemeld/skills/f x y/SKILL.md\n" +
+		"\nNot loaded\n" +
+		"  /h/.codemeld/skills/bad dir\n" +
+		"    name is not a valid skill name\n"
+	if got := panel(loaded); got != want {
+		t.Fatalf("panel =\n%q\nwant\n%q", got, want)
+	}
+
+	empty := &BootstrapResult{Home: "/h", ProjectRoot: "/p\n\x1bq", Skills: skills.Set{
+		Skipped: []skills.Skipped{{Path: "/p\n\x1bq/.codemeld/skills", Reason: skills.Unreadable}},
+	}}
+	want = "No skills are loaded. Skills live in ~/.codemeld/skills (every project) and .codemeld/skills (this project):\n" +
+		"  /h/.codemeld/skills\n" +
+		"  /p q/.codemeld/skills\n" +
+		"\nNot loaded\n" +
+		"  /p q/.codemeld/skills\n" +
+		"    the skills folder could not be read\n"
+	if got := panel(empty); got != want {
+		t.Fatalf("panel =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestLoadSkills_ReservesBuiltinNamesAndAliasesAndKeepsDigitLeadingNames(t *testing.T) {
+	home, project := t.TempDir(), t.TempDir()
+	global := filepath.Join(home, ".codemeld", "skills")
+	reserved := []string{"help", "quit", "new"}
+	for _, c := range tui.BuildRegistry(nil).Commands() {
+		reserved = append(reserved, c.Name)
+		reserved = append(reserved, c.Aliases...)
+	}
+	slices.Sort(reserved)
+	reserved = slices.Compact(reserved)
+	for _, name := range reserved {
+		writeSkill(t, global, name, "description: Clashes\n")
+	}
+	for _, name := range []string{"2fa", "9-lives", "deploy"} {
+		writeSkill(t, global, name, "description: Usable\n")
+	}
+
+	result := &BootstrapResult{Home: home, ProjectRoot: project}
+	warnings := loadSkills(result, 65536)
+
+	var loaded []string
+	for _, s := range result.Skills.Loaded {
+		loaded = append(loaded, s.Name)
+	}
+	if want := []string{"2fa", "9-lives", "deploy"}; !slices.Equal(loaded, want) {
+		t.Fatalf("loaded skills = %v, want %v", loaded, want)
+	}
+	var clashed []string
+	for _, s := range result.Skills.Skipped {
+		if s.Reason != skills.BuiltinClash {
+			t.Fatalf("skipped %+v, want only builtin_clash skips", s)
+		}
+		clashed = append(clashed, filepath.Base(s.Path))
+	}
+	if !slices.Equal(clashed, reserved) {
+		t.Fatalf("builtin_clash skips = %v, want every built-in name and alias %v", clashed, reserved)
+	}
+	if want := `skill "quit" not loaded: /quit is a built-in command; rename the skill folder and its name`; !slices.Contains(warnings, want) {
+		t.Fatalf("warnings = %q, want %q", warnings, want)
+	}
+}
+
+func writeSkill(t *testing.T, skillsDir, folder, header string) {
+	t.Helper()
+	dir := filepath.Join(skillsDir, folder)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create skill folder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\n"+header+"---\nSKILL-BODY-MARKER\n"), 0o644); err != nil {
+		t.Fatalf("write SKILL.md: %v", err)
+	}
+}
+
+func seedStartupSkills(t *testing.T, home, project string) []string {
+	t.Helper()
+	global := filepath.Join(home, ".codemeld", "skills")
+	writeSkill(t, global, "deploy", "description: Global deploy\n")
+	writeSkill(t, global, "help", "description: Clashes with a command\n")
+	writeSkill(t, global, "mismatch", "name: other\ndescription: Mismatched\n")
+	writeSkill(t, global, "nodesc", "description: \"  \"\n")
+	writeSkill(t, global, "bad[red]x", "description: Bad name\n")
+	writeSkill(t, global, "2fa", "description: \"Two factor\\n  codes\"\n")
+	writeSkill(t, global, "manual", "description: Manual only\ndisable-model-invocation: true\n")
+	writeSkill(t, filepath.Join(project, ".codemeld", "skills"), "deploy", "description: Project deploy\n")
+	return []string{
+		`skill folder "` + global + `/bad[red]x" not loaded: name is not a valid skill name`,
+		`skill "help" not loaded: /help is a built-in command; rename the skill folder and its name`,
+		`skill folder "` + global + `/mismatch" not loaded: declared name differs from folder name; rename the folder or the name so they match`,
+		`skill folder "` + global + `/nodesc" not loaded: description is missing or blank`,
+		`your global skill "deploy" is not loaded in this project: the project has its own skill with that name. To use both, rename the folder ~/.codemeld/skills/deploy and its name line.`,
+	}
+}
+
+func assertStartupSkillsPrompt(t *testing.T, system string) {
+	t.Helper()
+	for _, want := range []string{"- 2fa: Two factor codes", "- deploy: Project deploy"} {
+		if !strings.Contains(system, want) {
+			t.Fatalf("system prompt missing %q:\n%s", want, system)
+		}
+	}
+	for _, absent := range []string{"Global deploy", "SKILL-BODY-MARKER", "- help:", "Mismatched", "Bad name", "Manual only"} {
+		if strings.Contains(system, absent) {
+			t.Fatalf("system prompt contains %q:\n%s", absent, system)
+		}
+	}
+}
+
+const completedChildInvocation = "01890000-0000-7000-8000-00000000abce"
+
+func completedChildJournal(t *testing.T, home, project, edited, outside string) string {
+	t.Helper()
+	j, err := subagent.OpenJournal(subagent.JournalConfig{Home: home, ProjectRoot: project, Invocation: completedChildInvocation, Declared: []string{edited, outside}})
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	defer j.Close()
+	ctx := filetools.WithWriteJournal(context.Background(), j)
+	args := map[string]any{"path": edited, "old_text": "ORIGINAL", "new_text": "CHILD"}
+	if _, err := filetools.NewEditTool(home, project, project).InvokeWithResolvedTarget(ctx, args, edited); err != nil {
+		t.Fatalf("child edit: %v", err)
+	}
+	if err := os.WriteFile(outside, []byte("OUTSIDE\n"), 0o644); err != nil {
+		t.Fatalf("outside write: %v", err)
+	}
+	if outcome := j.Finish(subagent.ReasonCompleted); outcome.JournalPath == "" {
+		t.Fatalf("outcome = %+v, want the end-of-run check to keep the journal", outcome)
+	}
+	lock := filepath.Join(j.Path(), "journal.lock")
+	if err := os.Remove(lock); err != nil {
+		t.Fatalf("remove the writer's lock: %v", err)
+	}
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatalf("leave an unlocked lock: %v", err)
+	}
+	return j.Path()
+}
+
+func TestRecoverChildJournals_AsksBeforeUndoingACompletedChildsWork(t *testing.T) {
+	const intro = "codemeld: a child agent completed, but codemeld could not confirm all of its changes at the end of the run, so it kept its undo record."
+	const interruptedHeader = "codemeld: a previous session ended while a child agent was still writing files."
+	setup := func(t *testing.T) (home, project, edited, outside, journal string) {
+		t.Helper()
+		home, project = realPath(t, t.TempDir()), realPath(t, t.TempDir())
+		writeGlobalSettings(t, home, blockedYAML(), 0o600)
+		edited, outside = filepath.Join(project, "a.txt"), filepath.Join(project, "b.txt")
+		for _, path := range []string{edited, outside} {
+			if err := os.WriteFile(path, []byte("ORIGINAL\n"), 0o644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}
+		return home, project, edited, outside, completedChildJournal(t, home, project, edited, outside)
+	}
+
+	t.Run("a headless launch beside an interrupted journal keeps the completed work and says it will ask", func(t *testing.T) {
+		home, project, edited, outside, journal := setup(t)
+		interrupted := filepath.Join(project, "i.txt")
+		if err := os.WriteFile(interrupted, []byte("ORIGINAL\n"), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		killedChildJournal(t, home, project, interrupted)
+
+		var stderr strings.Builder
+		recoverChildJournals(home, project, map[string]any{}, trust.Decision{}, strings.NewReader("k\nk\n"), &stderr, false)
+
+		assertFileContent(t, interrupted, "ORIGINAL\n")
+		assertFileContent(t, edited, "CHILD\n")
+		assertFileContent(t, outside, "OUTSIDE\n")
+		if _, err := os.Stat(filepath.Join(journal, "journal.json")); err != nil {
+			t.Fatalf("stat the completed journal record: %v, want it kept", err)
+		}
+		got := stderr.String()
+		header, putBack, completed := strings.Index(got, interruptedHeader), strings.Index(got, "  put back: "+interrupted+"\n"), strings.Index(got, intro)
+		promise := strings.Index(got, "  codemeld asks what to do with these the next time you start it here interactively\n")
+		if header < 0 || putBack < header || completed < putBack || promise < completed || strings.Contains(got, "Keep, put back, or decide later?") {
+			t.Fatalf("stderr = %q, want the interrupted put back first, then the completed journal with a promise to ask interactively, and no prompt", got)
+		}
+		if !strings.Contains(got[completed:], `  not settled: "`+outside+`: it was changed outside`) || strings.Contains(got[completed:], "still writing") {
+			t.Fatalf("stderr = %q, want the outside change named under the completed journal", got)
+		}
+	})
+
+	t.Run("an interactive launch asks and keeps the completed work", func(t *testing.T) {
+		home, project, edited, outside, journal := setup(t)
+
+		var stderr strings.Builder
+		recoverChildJournals(home, project, map[string]any{}, trust.Decision{}, strings.NewReader("k\nk\n"), &stderr, true)
+
+		got := stderr.String()
+		if strings.Count(got, intro) != 3 || !strings.Contains(got, "  "+outside+": codemeld could not confirm this change: it was changed outside the child agent's journalled writes\n") || strings.Contains(got, interruptedHeader) {
+			t.Fatalf("stderr = %q, want both questions explained and the report under the completed heading", got)
+		}
+		assertFileContent(t, edited, "CHILD\n")
+		assertFileContent(t, outside, "OUTSIDE\n")
+		if _, err := os.Stat(journal); !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v, want the settled journal removed", journal, err)
+		}
+		if !strings.Contains(got, "  kept as it is now, as you asked: "+edited+"\n") || !strings.Contains(got, "  kept as it is now, as you asked: "+outside+"\n") {
+			t.Fatalf("stderr = %q, want both paths reported kept", got)
+		}
+	})
+}
+
+func TestAskJournalChoice_ExplainsACompletedChildsQuestion(t *testing.T) {
+	const intro = "codemeld: a child agent completed, but codemeld could not confirm all of its changes at the end of the run, so it kept its undo record.\n"
+	all := []subagent.Choice{subagent.ChoiceKeep, subagent.ChoiceRestore, subagent.ChoiceDefer}
+	limited := []subagent.Choice{subagent.ChoiceKeep, subagent.ChoiceDefer}
+	ask := func(u subagent.Unresolved) string {
+		var stderr strings.Builder
+		askJournalChoice(bufio.NewReader(strings.NewReader("d\n")), &stderr, u)
+		return stderr.String()
+	}
+	for _, tc := range []struct {
+		name string
+		u    subagent.Unresolved
+		want string
+	}{
+		{"a path with a reason", subagent.Unresolved{Path: "a.txt", Completed: true, Reason: "it was changed outside the child agent's journalled writes", Choices: all},
+			intro + "  a.txt: codemeld could not confirm this change: it was changed outside the child agent's journalled writes\n" +
+				"  [k] keep the file as it is now\n  [r] put back the version from before the child agent ran\n  [d] decide later (default)\nKeep, put back, or decide later? [k/r/d] "},
+		{"a path the check passed", subagent.Unresolved{Path: "a.txt", Completed: true, Choices: all},
+			intro + "  a.txt holds the child agent's change; codemeld found no problem with this file itself\n" +
+				"  [k] keep the file as it is now\n  [r] put back the version from before the child agent ran\n  [d] decide later (default)\nKeep, put back, or decide later? [k/r/d] "},
+		{"a path put back cannot reach", subagent.Unresolved{Path: "a.txt", Completed: true, Reason: "pending", Choices: limited, RestoreRefusal: "pending"},
+			intro + "  a.txt: codemeld could not confirm this change: pending\n" +
+				"  [k] keep the file as it is now\n  [d] decide later (default)\n  put back is not available: pending\nKeep or decide later? [k/d] "},
+		{"a move group put back cannot reach", subagent.Unresolved{Moves: []subagent.UnresolvedMove{{Source: "a", Destination: "b"}}, Completed: true, Reason: "changed", Choices: limited, RestoreRefusal: "unsafe"},
+			intro + "  It made these moves:\n  move: a -> b\n  codemeld could not confirm these moves: changed\n" +
+				"  [k] keep every path named above as it is now\n  [d] decide later (default)\n  put back is not available: unsafe\nKeep or decide later? [k/d] "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ask(tc.u); got != tc.want {
+				t.Fatalf("prompt = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReportJournalRecovery_ReportsCompletedAndInterruptedJournalsSeparately(t *testing.T) {
+	const interruptedHeader = "codemeld: a previous session ended while a child agent was still writing files."
+	const completedHeader = "codemeld: a child agent completed, but codemeld could not confirm all of its changes at the end of the run, so it kept its undo record."
+	render := func(report subagent.Report, interactive bool) string {
+		var stderr strings.Builder
+		reportJournalRecovery(&stderr, report, interactive)
+		return stderr.String()
+	}
+	both := subagent.Report{
+		Restored:          []string{"i.txt"},
+		Kept:              []string{"ik.txt"},
+		CompletedRestored: []string{"c.txt"},
+		CompletedKept:     []string{"ck.txt"},
+		Retained: []subagent.RetainedJournal{
+			{Path: "journals/completed", Notes: []string{"y.txt"}, Completed: true, Unanswered: 1},
+			{Path: "journals/interrupted", Notes: []string{"x.txt"}},
+		},
+	}
+
+	t.Run("a launch with both kinds", func(t *testing.T) {
+		got := render(both, false)
+
+		order := []string{
+			interruptedHeader, "  put back: i.txt\n", "  kept as it is now, as you asked: ik.txt\n", "  not put back: x.txt\n", "journals/interrupted\n",
+			completedHeader, "  put back, as you asked: c.txt\n", "  kept as it is now, as you asked: ck.txt\n", "  not settled: y.txt\n",
+			"  codemeld asks what to do with these the next time you start it here interactively\n", "  its record of the run is journals/completed\n",
+		}
+		at := 0
+		for _, want := range order {
+			i := strings.Index(got[at:], want)
+			if i < 0 {
+				t.Fatalf("stderr = %q, want %q after offset %d", got, want, at)
+			}
+			at += i + len(want)
+		}
+		if strings.Count(got, "still writing files") != 1 || strings.Contains(got, "not put back: y.txt") || strings.Contains(got, "put back: c.txt") {
+			t.Fatalf("stderr = %q, want each journal's paths under its own heading only", got)
+		}
+	})
+
+	t.Run("an interactive launch promises to ask again", func(t *testing.T) {
+		got := render(subagent.Report{Retained: both.Retained[:1]}, true)
+
+		if !strings.Contains(got, "  codemeld asks what to do with these again the next time you start it here\n") || strings.Contains(got, "interactively") || strings.Contains(got, "still writing files") {
+			t.Fatalf("stderr = %q, want the completed journal alone with a plain next-launch question", got)
+		}
+	})
+
+	t.Run("nothing answerable promises no question", func(t *testing.T) {
+		got := render(subagent.Report{Retained: []subagent.RetainedJournal{{Path: "journals/completed", Dirs: []string{"made"}, Notes: []string{"made: it was changed outside the child agent's journalled writes"}, Completed: true}}}, false)
+
+		if !strings.Contains(got, completedHeader) || !strings.Contains(got, "  directory not settled: made (") || strings.Contains(got, "asks what to do") || strings.Contains(got, "still writing files") {
+			t.Fatalf("stderr = %q, want the directory reported without a question", got)
+		}
+	})
+
+	t.Run("a completed journal whose cleanup failed", func(t *testing.T) {
+		got := render(subagent.Report{Retained: []subagent.RetainedJournal{{Path: "journals/completed", Notes: []string{"the committed journal could not be removed: permission denied"}, Completed: true, Committed: true}}}, false)
+
+		if !strings.Contains(got, committedJournalIntro) || strings.Contains(got, "could not confirm") || !strings.Contains(got, "  not settled: \"the committed journal could not be removed: permission denied\"\n") ||
+			strings.Contains(got, "asks what to do") || strings.Contains(got, "still writing files") {
+			t.Fatalf("stderr = %q, want the cleanup failure under the confirmed heading without a question", got)
+		}
+	})
 }

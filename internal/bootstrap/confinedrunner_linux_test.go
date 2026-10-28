@@ -11,7 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -100,7 +102,7 @@ func TestConfinedRunner_AutoProjectSymlinkExclusionsThroughTheRealHelper(t *test
 		t.Fatal(err)
 	}
 	conf := launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
-		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)})
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil)
 	forward := &helperForwardingRunner{bin: bin}
 	confined := &confinedRunner{inner: forward, conf: conf, cap: 4096}
 	write := func(t *testing.T, target string) runner.RunResult {
@@ -187,7 +189,20 @@ func TestConfinedRunner_AutoProjectSymlinkExclusionsThroughTheRealHelper(t *test
 	}
 }
 
-func TestConfinedRunner_AutoWritableFolderThroughTheRealHelper(t *testing.T) {
+func liveRealHelperConfinement(t *testing.T, home, project, tmpDir, yaml string) *confinement {
+	t.Helper()
+	writeProjectSettings(t, project, yaml)
+	cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project,
+		[]string{SettingsPath(home), projectSettingsPath(project)}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	return launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil)
+}
+
+func TestConfinedRunner_AutoWritableFolderFollowsTheLiveSettingsThroughTheRealHelper(t *testing.T) {
 	home, project, bin := realConfinementHost(t)
 	if _, err := runner.ResolveOnPath("sh", runner.FixedPATH); err != nil {
 		t.Fatalf("sh absent from %s: %v", runner.FixedPATH, err)
@@ -199,20 +214,14 @@ func TestConfinedRunner_AutoWritableFolderThroughTheRealHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cache, err := config.NewCache(map[string]any{
-		"confinement":      map[string]any{"program_lookup": "strict"},
-		"writable_folders": []any{writable},
-	}, project, nil, home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
-	conf := launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
-		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)})
+	conf := liveRealHelperConfinement(t, home, project, tmpDir, writableFoldersYAML(writable))
+	settings := projectSettingsPath(project)
 	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+	n := 0
 	write := func(t *testing.T, dir string) (runner.RunResult, string) {
 		t.Helper()
-		target := filepath.Join(dir, "f")
+		n++
+		target := filepath.Join(dir, "f"+strconv.Itoa(n))
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", "echo hi > " + target}, Cwd: project})
@@ -221,15 +230,104 @@ func TestConfinedRunner_AutoWritableFolderThroughTheRealHelper(t *testing.T) {
 		}
 		return res, target
 	}
-
-	if res, target := write(t, writable); res.ExitCode != 0 {
-		t.Fatalf("write into the writable folder: exit %d stderr %q, want 0", res.ExitCode, res.Stderr)
-	} else if b, err := os.ReadFile(target); err != nil || string(b) != "hi\n" {
-		t.Fatalf("%s = %q, %v; want the written line", target, b, err)
+	allowed := func(t *testing.T, label, dir string) {
+		t.Helper()
+		if res, target := write(t, dir); res.ExitCode != 0 {
+			t.Fatalf("%s: write into %s: exit %d stderr %q, want 0", label, dir, res.ExitCode, res.Stderr)
+		} else if b, err := os.ReadFile(target); err != nil || string(b) != "hi\n" {
+			t.Fatalf("%s: %s = %q, %v; want the written line", label, target, b, err)
+		}
 	}
-	res, target := write(t, sibling)
-	if _, err := os.Lstat(target); res.ExitCode == 0 || !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("write into the sibling: exit %d stderr %q, stat %v; want a failure leaving %s absent", res.ExitCode, res.Stderr, err, target)
+	denied := func(t *testing.T, label, dir string) {
+		t.Helper()
+		res, target := write(t, dir)
+		if _, err := os.Lstat(target); res.ExitCode == 0 || !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("%s: write into %s: exit %d stderr %q, stat %v; want a failure leaving %s absent", label, dir, res.ExitCode, res.Stderr, err, target)
+		}
+	}
+
+	allowed(t, "declared at launch", writable)
+	denied(t, "never declared", sibling)
+	rewriteSettings(t, settings, writableFoldersYAML(writable, sibling))
+	allowed(t, "added mid-session", sibling)
+	rewriteSettings(t, settings, writableFoldersYAML(sibling))
+	denied(t, "removed mid-session", writable)
+	allowed(t, "still declared", sibling)
+	rewriteSettings(t, settings, "writable_folders: [\n")
+	denied(t, "malformed settings", sibling)
+	rewriteSettings(t, settings, writableFoldersYAML(sibling))
+	allowed(t, "restored settings", sibling)
+	if err := os.Remove(settings); err != nil {
+		t.Fatal(err)
+	}
+	denied(t, "failed settings read", sibling)
+	writeProjectSettings(t, project, writableFoldersYAML(sibling))
+	allowed(t, "settings readable again", sibling)
+}
+
+func TestConfinedRunner_ARunningCommandKeepsItsPolicyThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if _, err := runner.ResolveOnPath("sh", runner.FixedPATH); err != nil {
+		t.Fatalf("sh absent from %s: %v", runner.FixedPATH, err)
+	}
+	base := filepath.Dir(project)
+	writable, tmpDir := filepath.Join(base, "writable"), filepath.Join(base, "tmp")
+	for _, dir := range []string{writable, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready, proceed := filepath.Join(tmpDir, "ready"), filepath.Join(tmpDir, "proceed")
+	for _, fifo := range []string{ready, proceed} {
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf := liveRealHelperConfinement(t, home, project, tmpDir, writableFoldersYAML(writable))
+	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	run := func(script string, args ...string) runner.RunResult {
+		res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: append([]string{"sh", "-c", script, "sh"}, args...), Cwd: project})
+		if err != nil || ctx.Err() != nil {
+			t.Errorf("confined %q %q: %v, %v; result %+v", script, args, err, ctx.Err(), res)
+		}
+		return res
+	}
+	early, late := filepath.Join(writable, "early"), filepath.Join(writable, "late")
+	running := make(chan runner.RunResult, 1)
+	go func() {
+		running <- run(`printf r > "$1" && read -r _ < "$2" && printf x > "$3"`, ready, proceed, early)
+	}()
+	signal := make(chan string, 1)
+	go func() {
+		b, _ := os.ReadFile(ready)
+		signal <- string(b)
+	}()
+	select {
+	case got := <-signal:
+		if got != "r" {
+			t.Fatalf("readiness signal = %q, want the running command's handshake", got)
+		}
+	case res := <-running:
+		t.Fatalf("the running command exited before its handshake: exit %d stderr %q", res.ExitCode, res.Stderr)
+	}
+
+	rewriteSettings(t, projectSettingsPath(project), writableFoldersYAML())
+	if res := run(`printf x > "$1"`, late); res.ExitCode == 0 {
+		t.Fatalf("a command started after the removal wrote %s: exit 0, want a failure", late)
+	}
+	if err := os.WriteFile(proceed, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := <-running; res.ExitCode != 0 {
+		t.Fatalf("the command running before the removal: exit %d stderr %q, want its original policy to allow the write", res.ExitCode, res.Stderr)
+	}
+	if b, err := os.ReadFile(early); err != nil || string(b) != "x" {
+		t.Fatalf("%s = %q, %v; want the running command's write", early, b, err)
+	}
+	if _, err := os.Lstat(late); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat %s = %v, want it absent", late, err)
 	}
 }
 
@@ -264,14 +362,7 @@ func TestConfinedRunner_AutoNestedWriteRootsThroughTheRealHelper(t *testing.T) {
 	if filepath.Dir(private) != shared {
 		t.Fatalf("private temp folder %q, want it stored resolved inside %q", private, shared)
 	}
-	cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project, nil, home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
-	conf := launchConfinement(resolution, private, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
-		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)})
-	conf.writeRoots = []string{declared, inShared, shared}
+	conf := liveRealHelperConfinement(t, home, project, private, writableFoldersYAML(declared, inShared, shared))
 	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
 	run := func(t *testing.T, script string, args ...string) runner.RunResult {
 		t.Helper()
@@ -374,5 +465,61 @@ func TestConfinedRunner_SavedAllowLaunchWritesOnlyThePrivateTempFolderThroughThe
 	})
 	if !inspected {
 		t.Fatal("the launch confinement was never inspected")
+	}
+}
+
+func TestConfinedRunner_GitRunsWithABlockedGlobalConfigThroughTheRealHelper(t *testing.T) {
+	if _, err := runner.ResolveOnPath("git", runner.FixedPATH); err != nil {
+		t.Skipf("git absent from %s: %v", runner.FixedPATH, err)
+	}
+	home, project, bin := realConfinementHost(t)
+	gitconfig := filepath.Join(home, ".gitconfig")
+	const fixture = "[user]\n\tname = codemeld fixture\n"
+	if err := os.WriteFile(gitconfig, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(gitconfig); err != nil || string(b) != fixture {
+		t.Fatalf("unconfined read of %s = %q, %v; want the fixture", gitconfig, b, err)
+	}
+	repo, tmpDir := filepath.Join(project, "repo"), filepath.Join(filepath.Dir(project), "tmp")
+	for _, dir := range []string{repo, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var entries []permissions.BlockedEntry
+	for _, raw := range []string{"~/.gitconfig", "~/.config/git/config"} {
+		path, err := permissions.ExpandBlockedEntry(home, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, permissions.BlockedEntry{Path: path, Source: SettingsPath(home)})
+	}
+	cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
+		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, entries)}, nil)
+	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+	run := func(script string) runner.RunResult {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", script}, Cwd: repo})
+		if err != nil || ctx.Err() != nil {
+			t.Fatalf("confined %q: %v, %v; result %+v", script, err, ctx.Err(), res)
+		}
+		return res
+	}
+
+	if res := run(`cat "$HOME/.gitconfig"`); res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "Permission denied") {
+		t.Fatalf("confined read of the fixture: exit %d stdout %q stderr %q; want a denial", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if res := run(`git init -q && git status`); res.ExitCode != 0 {
+		t.Fatalf("confined git init and status: exit %d stderr %q; want 0", res.ExitCode, res.Stderr)
+	}
+	if res := run(`unset GIT_CONFIG_GLOBAL; git status`); res.ExitCode == 0 || !strings.Contains(string(res.Stderr), gitconfig) {
+		t.Fatalf("confined git status without the override: exit %d stderr %q; want a failure reading %s", res.ExitCode, res.Stderr, gitconfig)
 	}
 }

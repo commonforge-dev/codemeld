@@ -1025,6 +1025,7 @@ func TestApp_StatusCopyControlHitTestFollowsWrappedText(t *testing.T) {
 			a.ShowStatus(RenderStatus(BuildStatusSnapshot(state)))
 			screen := drawPrimitive(t, a.status, width, height)
 			cells, _, _ := screen.GetContents()
+			a.afterFunc = func(time.Duration, func()) {}
 
 			var hits strings.Builder
 			for y := 0; y < height; y++ {
@@ -1167,6 +1168,7 @@ func TestApp_StatusCopyControlClickCopiesSessionIDThroughDispatch(t *testing.T) 
 	state := fixtureState()
 	var captured []string
 	h.runDraw(func() {
+		h.a.afterFunc = func(time.Duration, func()) {}
 		h.a.input.osc52 = func(seq string) error { captured = append(captured, seq); return nil }
 		h.a.SetActiveStore(escTestStore())
 		h.a.SetStatusLineState(state)

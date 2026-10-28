@@ -606,7 +606,7 @@ func TestAppStreamSurface_BoundariesShowBufferedReply(t *testing.T) {
 		{
 			name:     "tool activity",
 			boundary: func(a *App) { a.AppendToolActivity([]string{"Run: go build"}) },
-			want:     "buffered" + visibleResponseLine + "\n\nRun: go build",
+			want:     "buffered" + visibleResponseLine + "\n\n▸ Run: go build",
 		},
 		{
 			name:     "edit patch",
@@ -846,13 +846,62 @@ func TestAppAppendToolActivity_FinalizesThenAppendsEscapedBlock(t *testing.T) {
 	}
 	// Pre-tool text commits above the activity; the two lines render as one block (one
 	// blank-gap below the reply, none between the two lines); "[x]" stays literal.
-	want := "> prompt\n\nabout to edit" + visibleResponseLine + "\n\nEdit pkg/[x].go\nRun: go build ./..."
+	want := "> prompt\n\nabout to edit" + visibleResponseLine + "\n\n▸ Edit pkg/[x].go\n▸ Run: go build ./..."
 	if got := a.transcript.view.GetText(true); got != want {
 		t.Fatalf("rendered = %q, want %q", got, want)
 	}
 	// One transcript entry for the whole round (prompt, finalized reply, activity block).
 	if len(a.transcript.lines) != 3 {
 		t.Fatalf("committed lines = %v, want 3 (prompt, reply, one activity block)", a.transcript.lines)
+	}
+}
+
+func TestAppAppendToolActivity_MarkedDimmedLiteralAndReset(t *testing.T) {
+	a := New(nil)
+	a.AppendToolActivity([]string{"Run: echo [red]x", "Read b.go"})
+	a.AppendStreamDelta("the answer")
+
+	wantMarkup := "[#6b7480]▸ Run: echo [red[]x[-:-:-]\n[#6b7480]▸ Read b.go[-:-:-]"
+	if got := a.transcript.lines[0]; got != wantMarkup {
+		t.Fatalf("activity markup = %q, want %q", got, wantMarkup)
+	}
+
+	screen := drawPrimitive(t, a.transcript.view, 40, 8)
+	cells, width, height := screen.GetContents()
+	dim := tcell.GetColor("#6b7480")
+	rows := map[string]bool{}
+	for y := 0; y < height; y++ {
+		var text strings.Builder
+		var fgs []tcell.Color
+		for x := 0; x < width; x++ {
+			c := cells[y*width+x]
+			if len(c.Runes) == 0 || c.Runes[0] == ' ' {
+				continue
+			}
+			fg, _, _ := c.Style.Decompose()
+			text.WriteString(string(c.Runes))
+			fgs = append(fgs, fg)
+		}
+		row := text.String()
+		want := tcell.ColorDefault
+		switch row {
+		case "▸Run:echo[red]x", "▸Readb.go":
+			want = dim
+		case "theanswer":
+		default:
+			continue
+		}
+		rows[row] = true
+		for i, fg := range fgs {
+			if fg != want {
+				t.Errorf("row %q glyph %d foreground = %v, want %v", row, i, fg, want)
+			}
+		}
+	}
+	for _, row := range []string{"▸Run:echo[red]x", "▸Readb.go", "theanswer"} {
+		if !rows[row] {
+			t.Errorf("row %q not rendered; screen = %q", row, screenText(screen))
+		}
 	}
 }
 
@@ -866,7 +915,7 @@ func TestAppAppendToolActivity_NoReplyAndEmptyRound(t *testing.T) {
 		t.Fatalf("committed lines = %v, want only the prompt (empty round appends nothing)", a.transcript.lines)
 	}
 	a.AppendToolActivity([]string{"Read server.go"})
-	if got := a.transcript.view.GetText(true); got != "> prompt\n\nRead server.go" {
+	if got := a.transcript.view.GetText(true); got != "> prompt\n\n▸ Read server.go" {
 		t.Fatalf("rendered = %q, want the activity directly after the prompt", got)
 	}
 }
@@ -882,7 +931,7 @@ func TestAppAppendToolActivity_OffLoopMarshalsThroughQueue(t *testing.T) {
 	a.AppendToolActivity([]string{"Run: go build ./...", "Edit pkg/[x].go"})
 
 	got := transcriptText(t, a)
-	want := "Run: go build ./...\nEdit pkg/[x].go"
+	want := "▸ Run: go build ./...\n▸ Edit pkg/[x].go"
 	if got != want {
 		a.app.Stop()
 		t.Fatalf("rendered transcript = %q, want %q", got, want)
