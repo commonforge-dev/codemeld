@@ -91,7 +91,7 @@ func TestCommands_ReturnsSourceOrder(t *testing.T) {
 	for i, c := range got {
 		names[i] = c.Name
 	}
-	want := []string{"help", "clear", "connect", "status", "context", "effort", "model", "mode", "resume", "settings", "blocked", "exit", "rename", "color", "fork", "compact", "systemone", "skills"}
+	want := []string{"help", "clear", "connect", "status", "context", "effort", "model", "mode", "resume", "settings", "openrouter", "blocked", "exit", "rename", "color", "fork", "compact", "systemone", "skills"}
 	if !equalStrings(names, want) {
 		t.Fatalf("Commands() names = %v, want %v", names, want)
 	}
@@ -122,6 +122,12 @@ func TestRegistry_SkillsIsANoArgumentPhaseOneBuiltin(t *testing.T) {
 	clash, _ := SkillCommands([]skills.Skill{{Name: "skills", Description: "Mine", Body: "b"}}, SkillDeps{})
 	if _, err := NewRegistry(append(r.Commands(), clash...)); err == nil {
 		t.Fatal("a skill named skills joined the built-in registry, want a clash")
+	}
+}
+
+func TestRenderHelp_ListsOpenRouter(t *testing.T) {
+	if out := RenderHelp(BuildRegistry(nil)); !strings.Contains(out, "/openrouter") || !strings.Contains(out, "Open the OpenRouter routing settings") {
+		t.Fatalf("help output = %q, want /openrouter with its description", out)
 	}
 }
 

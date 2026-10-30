@@ -523,3 +523,74 @@ func TestConfinedRunner_GitRunsWithABlockedGlobalConfigThroughTheRealHelper(t *t
 		t.Fatalf("confined git status without the override: exit %d stderr %q; want a failure reading %s", res.ExitCode, res.Stderr, gitconfig)
 	}
 }
+
+func TestConfinedRunner_HelperNeverRunsAnInfocmpPlantedOnTheFriendlyLookupPath(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	base := filepath.Dir(project)
+	tools, tmpDir := filepath.Join(project, "tools"), filepath.Join(base, "tmp")
+	for _, dir := range []string{tools, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marker := filepath.Join(base, "infocmp-ran")
+	stub := filepath.Join(tools, "infocmp")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf ran > '"+marker+"'\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command(stub, "-1", "dumb").Run(); err == nil {
+		t.Fatal("unconfined stub exited 0, want its non-zero exit")
+	}
+	if b, err := os.ReadFile(marker); err != nil || string(b) != "ran" {
+		t.Fatalf("unconfined stub marker = %q, %v; want the fixture to write it", b, err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tools+string(os.PathListSeparator)+runner.FixedPATH)
+	cache, err := config.NewCache(map[string]any{}, project, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		mode   mode.Mode
+		tmpDir string
+	}{{mode.Plan, ""}, {mode.AutoEdits, tmpDir}} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			conf := launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tc.tmpDir,
+				mode.NewActiveState(tc.mode, mode.SourceDefault), cache, home, securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil)
+			if first, _, _ := strings.Cut(conf.lookupPath, string(os.PathListSeparator)); first != tools {
+				t.Fatalf("lookup path = %q, want %s first", conf.lookupPath, tools)
+			}
+			confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+			run := func(argv ...string) runner.RunResult {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: argv, Cwd: project})
+				if err != nil || ctx.Err() != nil {
+					t.Fatalf("confined %q: %v, %v; result %+v", argv, err, ctx.Err(), res)
+				}
+				return res
+			}
+
+			if res := run("sh", "-c", `printf %s "$TERM"`); res.ExitCode != 0 || string(res.Stdout) != "dumb" {
+				t.Fatalf("confined TERM print: exit %d stdout %q stderr %q; want 0 and dumb", res.ExitCode, res.Stdout, res.Stderr)
+			}
+			res := run("env")
+			var terms []string
+			for line := range strings.Lines(string(res.Stdout)) {
+				if strings.HasPrefix(line, "TERM=") {
+					terms = append(terms, line)
+				}
+			}
+			if res.ExitCode != 0 || !slices.Equal(terms, []string{"TERM=dumb\n"}) {
+				t.Fatalf("confined env: exit %d TERM entries %q stderr %q; want exactly TERM=dumb", res.ExitCode, terms, res.Stderr)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("stat %s = %v; want the planted infocmp never run", marker, err)
+			}
+		})
+	}
+}

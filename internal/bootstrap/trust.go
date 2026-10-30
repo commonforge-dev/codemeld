@@ -13,6 +13,7 @@ import (
 	"golang.org/x/term"
 
 	"codemeld.dev/codemeld/internal/config"
+	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/trust"
 )
@@ -54,7 +55,7 @@ func gateTrust(home, projectRoot, launchDir string, stdin io.Reader, stderr io.W
 		if err == nil {
 			return trust.Decision{Trusted: true, Reason: trust.ReasonTrusted, Root: decision.Root}
 		}
-		_, _ = fmt.Fprintf(stderr, "codemeld: could not record approval of %s, project stays unapproved: %v\n", projectRoot, err)
+		_, _ = fmt.Fprintf(stderr, "codemeld: could not record approval of %s, project stays unapproved: %s\n", permissions.SingleLineControlEscape(projectRoot), permissions.SingleLineControlEscape(err.Error()))
 	}
 
 	noticeUntrustedProject(stderr, projectRoot, withheldInputs(projectRoot, false))
@@ -122,7 +123,7 @@ func trustPrompt(projectRoot string, present []string) string {
 	case vcs:
 		body = "has its own codemeld settings and version-control commands, which can let commands run and files be changed without asking you.\nIf you say no, codemeld still runs but ignores those settings and commands."
 	}
-	return fmt.Sprintf("Do you trust %s?\nThis folder %s\nTrust this folder? [y/N] ", projectRoot, body)
+	return fmt.Sprintf("Do you trust %s?\nThis folder %s\nTrust this folder? [y/N] ", permissions.SingleLineControlEscape(projectRoot), body)
 }
 
 // withheldInputs is the run-fixed record of what a degraded launch did not load. Both the
@@ -153,9 +154,9 @@ func noticeUntrustedProject(stderr io.Writer, projectRoot string, withheld []Wit
 	}
 	parts := make([]string, 0, len(withheld))
 	for _, input := range withheld {
-		parts = append(parts, withheldLabel(input.Category)+" "+input.Path)
+		parts = append(parts, withheldLabel(input.Category)+" "+permissions.SingleLineControlEscape(input.Path))
 	}
-	_, _ = fmt.Fprintf(stderr, "codemeld: unapproved project %s: ignoring %s\n", projectRoot, strings.Join(parts, " and "))
+	_, _ = fmt.Fprintf(stderr, "codemeld: unapproved project %s: ignoring %s\n", permissions.SingleLineControlEscape(projectRoot), strings.Join(parts, " and "))
 }
 
 func withheldLabel(category WithheldCategory) string {

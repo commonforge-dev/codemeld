@@ -1283,6 +1283,10 @@ func findEscalation(p events.PermissionPromptShown, prior []storedGrant) *scopeE
 	if !ok {
 		return nil
 	}
+	requestSubject := p.Subject
+	if p.SubjectKind == subjectKindDirect {
+		requestSubject = p.DirectRequestSubject
+	}
 	var narrowest *storedGrant
 	for i := range prior {
 		g := prior[i]
@@ -1292,7 +1296,7 @@ func findEscalation(p events.PermissionPromptShown, prior []storedGrant) *scopeE
 		if g.pathScope == p.PathScope || !permissions.IsDescendantOrEqual(g.pathScope, p.PathScope) {
 			continue
 		}
-		if !permissions.AuditSubjectMatches(p.SubjectKind, p.Subject, tokens, assignments, clearEnvironment, g.subject) {
+		if !permissions.AuditSubjectMatches(p.SubjectKind, requestSubject, tokens, assignments, clearEnvironment, g.subject) {
 			continue
 		}
 		if narrowest == nil || permissions.IsDeeperScope(g.pathScope, narrowest.pathScope) {

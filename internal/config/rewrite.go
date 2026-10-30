@@ -53,6 +53,7 @@ const (
 	KeyOpenRouterRoutingDataCollection = "provider.openrouter.routing.data_collection"
 	KeyOpenRouterRoutingSort           = "provider.openrouter.routing.sort"
 	KeyOpenRouterRoutingMaxPrice       = "provider.openrouter.routing.max_price"
+	KeyOpenRouterRoutingQuantizations  = "provider.openrouter.routing.quantizations"
 )
 
 const (
@@ -60,11 +61,18 @@ const (
 	routingKey           = "routing"
 	routingSortDefault   = "default"
 	maxPriceKey          = "max_price"
+	quantizationsKey     = "quantizations"
 )
 
 type OpenRouterMaxPrice struct {
 	Model string
 	Price provider.MaxPrice
+}
+
+type OpenRouterQuantization struct {
+	Model        string
+	Quantization provider.Quantization
+	Delete       bool
 }
 
 var errNoOpenRouterEntry = errors.New("config.RewriteKey: the settings file has no provider.openrouter entry")
@@ -255,6 +263,12 @@ func rewriteKey(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWrit
 			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires an OpenRouterMaxPrice payload with a model id, got %T", key, newValue)
 		}
 		return setOpenRouterMaxPrice(r, v.Model, v.Price)
+	case KeyOpenRouterRoutingQuantizations:
+		v, ok := newValue.(OpenRouterQuantization)
+		if !ok || v.Model == "" {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires an OpenRouterQuantization payload with a model id, got %T", key, newValue)
+		}
+		return setOpenRouterQuantization(r, v)
 	default:
 		if name, ok := strings.CutPrefix(key, KeyProviderPrefix); ok && name != "" {
 			return setProviderEntry(r, name, newValue)
@@ -2272,6 +2286,197 @@ func setOpenRouterMaxPrice(r *settingsRewrite, model string, p provider.MaxPrice
 	return validateAndPublish(r, body)
 }
 
+func setOpenRouterQuantization(r *settingsRewrite, v OpenRouterQuantization) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	data, entry, step, cat, err := readOpenRouterEntry(r)
+	if err != nil {
+		return step, cat, err
+	}
+	var routing, quants yamlMapping
+	var quantsMV, modelMV *ast.MappingValueNode
+	routingMV := findMV(entry.values, routingKey)
+	if routingMV != nil {
+		var ok bool
+		if routing, ok = childMapping(entry, routingMV); !ok {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: provider.openrouter.routing is not a mapping (got %T)", routingMV.Value)
+		}
+		quantsMV = findMV(routing.values, quantizationsKey)
+	}
+	if quantsMV != nil {
+		var ok bool
+		if quants, ok = childMapping(routing, quantsMV); !ok {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: provider.openrouter.routing.quantizations is not a mapping (got %T)", quantsMV.Value)
+		}
+		modelMV = findMV(quants.values, v.Model)
+	}
+
+	levels := "[" + strings.Join(v.Quantization.Levels, ", ") + "]"
+	line := strconv.Quote(v.Model) + ": {levels: " + levels + ", mode: " + v.Quantization.Mode + "}"
+	var body []byte
+	switch {
+	case modelMV == nil && v.Delete:
+		return "", "", nil
+	case routingMV == nil:
+		body, err = insertMappingEntry(data, entry, []string{routingKey + ":", "  " + quantizationsKey + ":", "    " + line}, routingKey+": {"+quantizationsKey+": {"+line+"}}")
+	case quantsMV == nil:
+		body, err = insertMappingEntry(data, routing, []string{quantizationsKey + ":", "  " + line}, quantizationsKey+": {"+line+"}")
+	case modelMV == nil:
+		body, err = insertMappingEntry(data, quants, []string{line}, line)
+	case !v.Delete:
+		body, err = setQuantizationFields(data, v.Model, v.Quantization.Mode, levels, v.Quantization.Levels)
+	case len(quants.values) > 1:
+		body, err = removeMappingEntry(data, quants, modelMV)
+	case len(routing.values) > 1:
+		body, err = removeEmptyMappingEntry(data, routing, quantsMV, routingKey)
+	default:
+		body, err = removeEmptyMappingEntry(data, entry, routingMV)
+	}
+	if err != nil {
+		return fsutil.LoadStep, "", err
+	}
+	return validateAndPublish(r, body)
+}
+
+func setQuantizationFields(data []byte, model, mode, flowLevels string, levels []string) ([]byte, error) {
+	m, err := findOpenRouterMapping(data, routingKey, quantizationsKey, model)
+	if err != nil {
+		return nil, err
+	}
+	if mv := findMV(m.values, "mode"); mv != nil && mv.Value.Type() == ast.LiteralType {
+		data = replaceBlockScalar(data, mv, mode)
+	} else if data, err = setMappingScalar(data, m, "mode", mode); err != nil {
+		return nil, err
+	}
+	if m, err = findOpenRouterMapping(data, routingKey, quantizationsKey, model); err != nil {
+		return nil, err
+	}
+	mv := findMV(m.values, "levels")
+	var seq *ast.SequenceNode
+	if mv != nil {
+		seq, _ = yamlNodeValue(mv.Value).(*ast.SequenceNode)
+	}
+	switch {
+	case seq == nil:
+		return setMappingScalar(data, m, "levels", flowLevels)
+	case seq.IsFlowStyle:
+		return spliceBytes(data, tokenOffset(data, seq.Start), tokenOffset(data, seq.End)+len("]"), flowLevelsKeepingComments(data, seq, levels)), nil
+	}
+	dash := dashColumnFromSource(data, seq)
+	if dash < 0 {
+		return nil, errors.New("config.RewriteKey: quantizations levels sequence has no '-' entry")
+	}
+	indent := strings.Repeat(" ", dash)
+	start := lineEndAfter(data, tokenOffset(data, mv.Key.GetToken()))
+	end := lineEndAfter(data, subtreeEnd(data, mv))
+	entries := make([]string, len(seq.Values))
+	for i := range seq.Values {
+		from, to := start, end
+		if i > 0 {
+			from = seqEntryLeadingEdge(data, seq, i)
+		}
+		if i+1 < len(seq.Values) {
+			to = seqEntryLeadingEdge(data, seq, i+1)
+		}
+		entries[i] = string(data[from:to])
+		if !strings.HasSuffix(entries[i], "\n") {
+			entries[i] += "\n"
+		}
+	}
+	used := make([]bool, len(seq.Values))
+	var b strings.Builder
+	for _, l := range levels {
+		if i := unusedLevel(seq, used, l); i >= 0 {
+			b.WriteString(entries[i])
+			continue
+		}
+		b.WriteString(indent + "- " + l + "\n")
+	}
+	var kept strings.Builder
+	for i, entry := range entries {
+		if used[i] {
+			continue
+		}
+		for _, c := range mappingComments([]byte(entry)) {
+			kept.WriteString(indent + strings.TrimSpace(c.text) + "\n")
+		}
+	}
+	rep := kept.String() + b.String()
+	if data[end-1] != '\n' {
+		rep = strings.TrimSuffix(rep, "\n")
+	}
+	return spliceBytes(data, start, end, rep), nil
+}
+
+func unusedLevel(seq *ast.SequenceNode, used []bool, level string) int {
+	for i, v := range seq.Values {
+		value := ""
+		switch n := yamlNodeValue(v).(type) {
+		case *ast.LiteralNode:
+			if n.Value != nil {
+				value = n.Value.Value
+			}
+		default:
+			if tok := n.GetToken(); tok != nil {
+				value = tok.Value
+			}
+		}
+		if !used[i] && value == level {
+			used[i] = true
+			return i
+		}
+	}
+	return -1
+}
+
+func flowLevelsKeepingComments(data []byte, seq *ast.SequenceNode, levels []string) string {
+	open, closing := tokenOffset(data, seq.Start), tokenOffset(data, seq.End)
+	starts := make([]int, len(seq.Values)+1)
+	indent := strings.Repeat(" ", open-startOfLine(data, open)+1)
+	for i, v := range seq.Values {
+		starts[i] = tokenOffset(data, yamlNodeValue(v).GetToken())
+		if lead := data[startOfLine(data, starts[i]):starts[i]]; len(bytes.TrimLeft(lead, " ")) == 0 {
+			indent = string(lead)
+		}
+	}
+	starts[len(seq.Values)] = closing
+	head := mappingComments(data[open+1 : starts[0]])
+	used := make([]bool, len(seq.Values))
+	trailing := make([][]mappingComment, len(levels))
+	for j, l := range levels {
+		if i := unusedLevel(seq, used, l); i >= 0 {
+			trailing[j] = mappingComments(data[starts[i]:starts[i+1]])
+		}
+	}
+	for i := range seq.Values {
+		if !used[i] {
+			head = append(head, mappingComments(data[starts[i]:starts[i+1]])...)
+		}
+	}
+	var b strings.Builder
+	writeComments := func(comments []mappingComment) {
+		if len(comments) == 0 {
+			return
+		}
+		b.WriteByte(' ')
+		for _, c := range comments {
+			b.WriteString(strings.TrimSpace(c.text) + "\n" + indent)
+		}
+	}
+	b.WriteByte('[')
+	writeComments(head)
+	for j, l := range levels {
+		b.WriteString(l)
+		if j < len(levels)-1 {
+			b.WriteByte(',')
+			if len(trailing[j]) == 0 {
+				b.WriteByte(' ')
+			}
+		}
+		writeComments(trailing[j])
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
 func maxPriceFields(p provider.MaxPrice) []string {
 	var fields []string
 	if p.HasPrompt {
@@ -2685,15 +2890,23 @@ func subtreeEnd(data []byte, n ast.Node) int {
 		if v.IsFlowStyle || len(v.Values) == 0 {
 			return tokenOffset(data, v.End)
 		}
-		return subtreeEnd(data, v.Values[len(v.Values)-1])
+		last := v.Values[len(v.Values)-1]
+		if lit, ok := yamlNodeValue(last).(*ast.LiteralNode); ok {
+			dash := tokenOffset(data, v.Start)
+			return blockScalarContentEnd(data, tokenOffset(data, lit.Start), dash-startOfLine(data, dash))
+		}
+		return subtreeEnd(data, last)
 	default:
 		return tokenOffset(data, n.GetToken())
 	}
 }
 
 func blockScalarLastLine(data []byte, mv *ast.MappingValueNode) int {
-	header := tokenOffset(data, mv.Value.GetToken())
-	parent := tokenOffset(data, mv.Key.GetToken()) - startOfLine(data, tokenOffset(data, mv.Key.GetToken()))
+	key := tokenOffset(data, mv.Key.GetToken())
+	return blockScalarContentEnd(data, tokenOffset(data, mv.Value.GetToken()), key-startOfLine(data, key))
+}
+
+func blockScalarContentEnd(data []byte, header, parent int) int {
 	content := -1
 	for i := header + 1; i < len(data) && i <= header+2; i++ {
 		if c := data[i]; c >= '1' && c <= '9' {

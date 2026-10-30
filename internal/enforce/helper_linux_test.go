@@ -37,6 +37,7 @@ func captureStderr(t *testing.T) func() string {
 
 func recordSteps(t *testing.T, failing string, override map[string]func(*helperState) error) *[]string {
 	t.Helper()
+	t.Setenv("TERM", os.Getenv("TERM"))
 	var calls []string
 	oldSteps, oldExec := helperSteps, execStep
 	t.Cleanup(func() { helperSteps, execStep = oldSteps, oldExec })
@@ -105,6 +106,40 @@ func TestRunHelperRunsStepsInOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(execArgs, []string{"/bin/true", "-h"}) {
 		t.Errorf("exec args = %v", execArgs)
+	}
+}
+
+func TestRunHelperRestoresTERMBeforeStepsProbesAndExec(t *testing.T) {
+	for _, args := range [][]string{
+		{"/bin/true"},
+		{ProbeArg, "write-tmp", filepath.Join(t.TempDir(), "probe")},
+		{ControlArg, "write-tmp", filepath.Join(t.TempDir(), "control")},
+	} {
+		t.Setenv("TERM", "")
+		seen := map[string][]string{}
+		override := map[string]func(*helperState) error{}
+		for _, name := range []string{"lock thread", "policy frame", "rlimits", "no_new_privs", "landlock", "seccomp", "exec"} {
+			override[name] = func(*helperState) error {
+				for _, e := range os.Environ() {
+					if strings.HasPrefix(e, "TERM=") {
+						seen[name] = append(seen[name], e)
+					}
+				}
+				return nil
+			}
+		}
+		calls := recordSteps(t, "", override)
+		if code := RunHelper(args); code != 0 {
+			t.Fatalf("%v: exit %d", args, code)
+		}
+		if len(*calls) == 0 {
+			t.Fatalf("%v: no step ran", args)
+		}
+		for _, name := range *calls {
+			if !slices.Equal(seen[name], []string{"TERM=dumb"}) {
+				t.Errorf("%v: TERM entries at %s = %q, want exactly TERM=dumb", args, name, seen[name])
+			}
+		}
 	}
 }
 
@@ -247,6 +282,7 @@ func TestRunHelperLocksThreadFirst(t *testing.T) {
 }
 
 func TestNoNewPrivsUsesAllThreadsCall(t *testing.T) {
+	t.Setenv("TERM", os.Getenv("TERM"))
 	old := allThreadsSyscall
 	t.Cleanup(func() { allThreadsSyscall = old })
 	var got []uintptr

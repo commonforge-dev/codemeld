@@ -1,6 +1,6 @@
 # Development setup
 
-_Last updated: 2026-10-21_
+_Last updated: 2026-10-29_
 
 This page is the whole "get building" story: the toolchain, the commands, and how to run the
 binary. The dependency list itself is [`go.mod`](../go.mod).
@@ -56,8 +56,7 @@ Run **`mise run fmt`** and then **`mise run check`** before proposing a change, 
 the two slow gates, so they are worth one deliberate run rather than one per edit. The
 wiring-stub check runs a real check only in the maintainers' development tree; in the public
 repository it does nothing and always passes. The shipping-set reference check runs in both, so
-a banned reference fails the everyday gate rather than waiting for release; see
-[workflow.md](workflow.md) for what it scans.
+a banned reference fails the everyday gate rather than waiting for release.
 
 `mise run test-fast` runs the **entire** suite. To iterate on one package, call `go test`
 directly — `go test ./internal/permissions` — but run the gate before you propose the change.
@@ -67,14 +66,17 @@ directly — `go test ./internal/permissions` — but run the gate before you pr
 Three checks refuse to pass until you take one deliberate step. Never silence them by deleting a
 test or blindly accepting new output.
 
-- **System-prompt snapshots** (`internal/agentinstr/snapshot_test.go`, six saved copies in
+- **System-prompt snapshots** (`internal/agentinstr/snapshot_test.go`, seven saved copies in
   `internal/agentinstr/testdata/snapshots/`) fail when the assembled **normal-turn** system
-  message stops matching the committed copies. They cover all four assembly sections: the five
-  embedded Markdown files under `internal/agentinstr/baseprompts/`, the generated environment block
-  in `internal/agentinstr/envblock.go`, and — via `base_env_only.txt` and `with_agents.txt` — how an
-  empty and a populated `AGENTS.md` are assembled in. Of those, the first two are the
-  product-authored prompt text this gate covers; the guided maintainer editor offers exactly the
-  five Markdown files and never edits a project's `AGENTS.md` content. To accept an intended wording
+  message stops matching the committed copies. They cover all five assembly sections: the base
+  prompt and — via `special_latex.txt` — the model special instructions, both from the five
+  embedded Markdown files under `internal/agentinstr/baseprompts/`; the generated environment block
+  in `internal/agentinstr/envblock.go`; the model-invocable loaded skills, via `with_skills.txt`;
+  and — via `base_env_only.txt` and `with_agents.txt` — how an empty and a populated `AGENTS.md`
+  are assembled in. The product-authored text covered here comes from the five embedded
+  Markdown files, the generated environment block, and the skills-list heading and instructions.
+  The fixtures also pin how a project's AGENTS.md content is assembled, but that content belongs to
+  the project, not the product. To accept an intended wording
   change, rewrite the copies and then assert against them:
 
   ```sh
@@ -95,8 +97,7 @@ test or blindly accepting new output.
   `TestBuildCompactionSummaryRequest_ExactShape` pin those two instructions, and
   `internal/provider/tooldefs_test.go` pins the three product-authored tool definitions. Registry
   metadata coverage varies by tool, with no shared exact-description test; review a registry
-  description with its package tests, not `snapshot-update`. See
-  [`learning/system-prompts.md`](learning/system-prompts.md) for the full inventory.
+  description with its package tests, not `snapshot-update`.
 
 - **First-run snapshots** (`internal/bootstrap/firstrun_snapshot_test.go`,
   `firstrun_settings_test.go`) cover the first-run message and the starter
@@ -125,13 +126,19 @@ differently and neither overrides the other):
 
 - **`openai-chatgpt` (ChatGPT subscription):** from an interactive shell, run
   `./codemeld auth login openai-chatgpt` to sign in through your browser — no API key required.
-- **`openai` (Platform API key):** set `OPENAI_API_KEY`, or edit
-  `~/.codemeld/global/settings.yaml` and add an OpenAI Platform key under `provider:`. This is the
-  path for CI, servers, and other non-interactive setups.
+- **`openai` (Platform API key):** in the app, type `/connect`, pick the OpenAI Platform and paste
+  the key; this saves the `provider.openai` entry (`base_url` and `api_key`) in
+  `~/.codemeld/global/settings.yaml` and the models it found in `~/.codemeld/global/models.yaml`.
+  A headless run (`./codemeld run`, for CI or servers) never loads a model list, so it needs both
+  from the app: run `/connect` once on that host, or copy there the `provider.openai` entry into
+  its `settings.yaml` and a `models.yaml` the app wrote.
+  Then pick a listed model with `./codemeld run --model openai/<id>`; a model missing from
+  `models.yaml` is rejected. In a headless run a set `OPENAI_API_KEY` takes precedence over the
+  entry's `api_key`, which may then be empty; it does not create the entry or the model list.
 
 Run `./codemeld auth status` to see which providers are authenticated (it prints no secrets), then
-run `./codemeld` inside any project folder. See the top-level [`README.md`](../README.md) "Quick
-start" for the full first-run flow,
+run `./codemeld` inside any project folder. See the top-level [`README.md`](../README.md) "First
+run" for the full first-run flow,
 [`docs/architecture.md`](../docs/architecture.md#openai-authentication-two-separate-providers) →
 "OpenAI authentication: two separate providers" for how the two providers differ, and that page's
 [Overview](../docs/architecture.md#overview) for what startup sets up.
@@ -145,21 +152,22 @@ commits), and `local` (`.codemeld/settings.local.yaml`, this machine's own setti
 over the other two). The command checks them like this:
 
 - **No argument:** it checks the global file, then the project's shared `.codemeld/settings.yaml`,
-  found the way `discovery.boundary` says. It does not yet validate `.codemeld/settings.local.yaml`.
+  then the project's `.codemeld/settings.local.yaml`, both in the project root found the way
+  `discovery.boundary` says. It parses the two project files only in a project you have approved.
 - **A path argument** (`./codemeld config check .codemeld/settings.yaml`): it checks only that
   file and does no project discovery. The global settings path is checked under the global
-  layer's rules; any other path — including a `settings.local.yaml` — is checked under the project
-  layer's rules, which do not apply the local file's narrower list of accepted keys. A relative
-  path is reported as an absolute one.
+  layer's rules; a `settings.local.yaml` directly inside a `.codemeld` folder is checked under the
+  local layer's rules, which apply the local file's narrower list of accepted keys; any other path
+  is checked under the project layer's rules. A relative path is reported as an absolute one.
 
 It prints one line per layer, `<path> (<rules>): <state>`, where `<rules>` is
-`global layer rules` or `project layer rules`:
+`global layer rules`, `project layer rules` or `local layer rules`:
 
 | State | Meaning |
 |-------|---------|
 | `ok` | The file loads under those rules. |
 | `not present` | There is no file at that path. This is not a failure: most projects have no settings file, and a missing global file is reported, not generated. |
-| `present, not approved` | The shared project settings file exists in a project you have not approved yet, so it was not parsed. Until you approve the project, a launch ignores both of its project-scope files — `.codemeld/settings.yaml` and `.codemeld/settings.local.yaml` — though this line names only the shared one. The lines that follow say how to approve the project and give the command that checks the file directly. |
+| `present, not approved` | The shared or local project settings file exists in a project you have not approved yet, so it was not parsed. Until you approve the project, a launch ignores both of its project-scope files — `.codemeld/settings.yaml` and `.codemeld/settings.local.yaml`. The lines that follow say how to approve the project and give the command that checks the file directly. |
 | `failed to load` | Followed by the same what happened / to fix message a launch prints, stating that codemeld would not start with this file in place. |
 
 The command exits `1` when any checked layer fails to load — `not present` and

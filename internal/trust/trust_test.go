@@ -532,3 +532,104 @@ func TestStore_LegacyTrustFileIsNeitherReadNorModified(t *testing.T) {
 		t.Fatalf("stored projects = %v, want only [%s]", got, other)
 	}
 }
+
+func mkdirRoot(t *testing.T, parent, name string) string {
+	t.Helper()
+	dir := filepath.Join(parent, name)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %q: %v", dir, err)
+	}
+	return dir
+}
+
+func TestRecord_RootsWithControlsOrInvalidUTF8ReadBackExactly(t *testing.T) {
+	home, ordinary, parent := t.TempDir(), canonical(t, t.TempDir()), canonical(t, t.TempDir())
+	mustRecord(t, home, ordinary)
+
+	names := []string{
+		"esc\x1b",
+		"csi\x1b[2J",
+		"cr\r",
+		"lf\n",
+		"c1\xc2\x9b",
+		"invalid\xff\xfe",
+		"alias\x9b",
+		"alias\xc2\x9b",
+		"combined\x1b[31m\r\n\xc2\x9b\x9b\xff",
+	}
+	want := []string{ordinary}
+	for _, name := range names {
+		root := mkdirRoot(t, parent, name)
+		mustRecord(t, home, root)
+		want = append(want, root)
+	}
+	unapproved := mkdirRoot(t, parent, "alias\xef\xbf\xbd")
+
+	for _, root := range want {
+		assertLookup(t, home, root, Decision{Trusted: true, Reason: ReasonTrusted, Root: root})
+	}
+	assertLookup(t, home, unapproved, Decision{Reason: ReasonNoRecord, Root: unapproved})
+	if got := readStoreFile(t, home).Projects; !slices.Equal(got, want) {
+		t.Fatalf("stored projects = %q, want %q", got, want)
+	}
+	if raw := mustRead(t, StorePath(home)); !strings.HasPrefix(raw, "version: 1\nprojects:\n- "+ordinary+"\n") {
+		t.Fatalf("store = %q, want the ordinary root written as before", raw)
+	}
+}
+
+func TestRecord_OrdinaryRootsAreWrittenAsV047Wrote(t *testing.T) {
+	home, old, added := t.TempDir(), canonical(t, t.TempDir()), canonical(t, t.TempDir())
+	seedStoreBytes(t, home, "version: 1\nprojects:\n- "+old+"\n")
+	assertLookup(t, home, old, Decision{Trusted: true, Reason: ReasonTrusted, Root: old})
+
+	mustRecord(t, home, added)
+
+	if got, want := mustRead(t, StorePath(home)), "version: 1\nprojects:\n- "+old+"\n- "+added+"\n"; got != want {
+		t.Fatalf("store = %q, want %q", got, want)
+	}
+}
+
+func TestRecord_EncodedStoreThatDoesNotReadBackIsNeverWritten(t *testing.T) {
+	cases := []struct {
+		name   string
+		encode func(Store) ([]byte, error)
+	}{
+		{"malformed yaml", func(Store) ([]byte, error) { return []byte("version: [1\nprojects: {\n"), nil }},
+		{"wrong version", func(s Store) ([]byte, error) { return []byte(storeText(Version+1, s.Projects...)), nil }},
+		{"duplicate root", func(s Store) ([]byte, error) {
+			return []byte(storeText(Version, append(s.Projects, s.Projects[0])...)), nil
+		}},
+		{"relative root", func(s Store) ([]byte, error) {
+			return []byte(storeText(Version, append(s.Projects, "relative/root")...)), nil
+		}},
+		{"reordered roots", func(s Store) ([]byte, error) {
+			reversed := slices.Clone(s.Projects)
+			slices.Reverse(reversed)
+			return []byte(storeText(Version, reversed...)), nil
+		}},
+		{"new root missing", func(s Store) ([]byte, error) {
+			return []byte(storeText(Version, s.Projects[:len(s.Projects)-1]...)), nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home, earlier, root := t.TempDir(), canonical(t, t.TempDir()), canonical(t, t.TempDir())
+			mustRecord(t, home, earlier)
+			before := mustRead(t, StorePath(home))
+
+			original := encodeStore
+			encodeStore = tc.encode
+			t.Cleanup(func() { encodeStore = original })
+
+			err := Record(home, root)
+			if err == nil || !strings.Contains(err.Error(), "write store (load)") {
+				t.Fatalf("Record error = %v, want a write store (load) failure", err)
+			}
+			if after := mustRead(t, StorePath(home)); after != before {
+				t.Fatalf("store bytes changed:\n got=%q\nwant=%q", after, before)
+			}
+			assertLookup(t, home, earlier, Decision{Trusted: true, Reason: ReasonTrusted, Root: earlier})
+			assertLookup(t, home, root, Decision{Reason: ReasonNoRecord, Root: root})
+		})
+	}
+}

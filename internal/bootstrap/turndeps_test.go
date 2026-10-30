@@ -847,6 +847,106 @@ func TestBuildTurnClient_OpenRouterBestValueSendsPickedEndpoint(t *testing.T) {
 	}
 }
 
+func TestBuildTurnClient_OpenRouterQuantizationReachesRequests(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	const exhausted = `{"error":{"message":"No endpoints found","code":404,"metadata":{"failed_routing_step":"Filter by Quantization"}}}`
+	var endpointHits atomic.Int32
+	var chatBodies [][]byte
+	var mu sync.Mutex
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/models/" + model + "/endpoints":
+			endpointHits.Add(1)
+			_, _ = io.WriteString(w, `{"data":{"endpoints":[
+				{"provider_name":"a","tag":"a/fp8","quantization":"fp8","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":90}},
+				{"provider_name":"b","tag":"b/bf16","quantization":"bf16","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":200}},
+				{"provider_name":"d","tag":"d/fp4/us","quantization":"nvfp4","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":55.5}},
+				{"provider_name":"e","tag":"e/fp8","quantization":"fp8","pricing":{"prompt":"0.0000001","completion":"0.0000002"},"throughput_last_30m":{"p50":10}}
+			]}}`)
+		case "/api/v1/chat/completions":
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			chatBodies = append(chatBodies, raw)
+			first := len(chatBodies) == 1
+			mu.Unlock()
+			if first {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, exhausted)
+				return
+			}
+			_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	global := []byte(fmt.Sprintf(`provider:
+  openrouter:
+    base_url: %s/api/v1
+    api_key: or-key
+    routing:
+      sort: best_value
+      quantizations:
+        %s: { levels: [fp4, fp8], mode: required }
+`, srv.URL, model))
+	raw, _, err := config.ValidateGlobalSettingsBytes(global, "settings.yaml")
+	if err != nil {
+		t.Fatalf("ValidateGlobalSettingsBytes: %v", err)
+	}
+	composed, err := config.Compose(raw, nil)
+	if err != nil {
+		t.Fatalf("config.Compose: %v", err)
+	}
+	cache, err := config.NewCache(composed, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+
+	prevStore := openRouterEndpoints
+	openRouterEndpoints = &provider.OpenRouterEndpointStore{HTTPClient: srv.Client()}
+	t.Cleanup(func() { openRouterEndpoints = prevStore })
+	defer swapTurnProviderClient(func(cfg provider.ClientConfig) provider.Client {
+		cfg.HTTPClient = srv.Client()
+		return provider.NewClient(cfg)
+	})()
+
+	client, ok := buildTurnClient("openrouter", provider.AuthKindConfigured, cache, nil, "")
+	if !ok {
+		t.Fatalf("buildTurnClient(openrouter) ok = false, want a client")
+	}
+	if _, err := client.ChatCompletion(context.Background(), provider.Request{
+		Model:    model,
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("ChatCompletion() error = %v, want nil", err)
+	}
+	if got := endpointHits.Load(); got != 1 {
+		t.Fatalf("endpoint requests = %d, want 1", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	wants := []map[string]any{
+		{"order": []any{"d/fp4/us"}, "quantizations": []any{"fp4"}},
+		{"order": []any{"a/fp8"}, "quantizations": []any{"fp8"}},
+	}
+	if len(chatBodies) != len(wants) {
+		t.Fatalf("chat requests = %d, want %d", len(chatBodies), len(wants))
+	}
+	for i, b := range chatBodies {
+		var body struct {
+			Provider map[string]any `json:"provider"`
+		}
+		if err := json.Unmarshal(b, &body); err != nil {
+			t.Fatalf("decode request body %d: %v\nbody = %s", i, err, b)
+		}
+		if !reflect.DeepEqual(body.Provider, wants[i]) {
+			t.Fatalf("attempt %d provider object = %#v, want %#v", i+1, body.Provider, wants[i])
+		}
+	}
+}
+
 // The production turn wiring threads the provider.retry policy and the partial
 // rollback seam onto the turn's Deps: a partial stream drop on the
 // first round is auto-retried, the second round succeeds, the wired

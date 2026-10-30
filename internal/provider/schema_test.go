@@ -4,6 +4,7 @@ package provider
 import (
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -207,6 +208,47 @@ func TestParseProviders_Entries(t *testing.T) {
 				AuthHeader: &AuthHeader{Name: "Authorization", Value: "Bearer {api_key}"},
 			},
 		},
+		{
+			name: "openrouter routing quantizations keep level order and mode",
+			composed: map[string]any{"provider": map[string]any{
+				"openrouter": map[string]any{
+					"base_url": "https://openrouter.ai/api/v1",
+					"api_key":  "or-key",
+					"routing": map[string]any{
+						"quantizations": map[string]any{
+							"z-ai/glm-5.3":       map[string]any{"levels": []any{"fp8", "fp4"}, "mode": "required"},
+							"moonshotai/kimi-k2": map[string]any{"levels": []any{"unknown", "bf16"}, "mode": "preferred"},
+						},
+					},
+				},
+			}},
+			wantKey: "openrouter",
+			want: ProviderEntry{
+				BaseURL:    "https://openrouter.ai/api/v1",
+				APIKey:     "or-key",
+				AuthHeader: &AuthHeader{Name: "Authorization", Value: "Bearer {api_key}"},
+				Routing: Routing{Quantizations: map[string]Quantization{
+					"z-ai/glm-5.3":       {Levels: []string{"fp8", "fp4"}, Mode: "required"},
+					"moonshotai/kimi-k2": {Levels: []string{"unknown", "bf16"}, Mode: "preferred"},
+				}},
+			},
+		},
+		{
+			name: "openrouter routing empty quantizations",
+			composed: map[string]any{"provider": map[string]any{
+				"openrouter": map[string]any{
+					"base_url": "https://openrouter.ai/api/v1",
+					"api_key":  "or-key",
+					"routing":  map[string]any{"quantizations": map[string]any{}},
+				},
+			}},
+			wantKey: "openrouter",
+			want: ProviderEntry{
+				BaseURL:    "https://openrouter.ai/api/v1",
+				APIKey:     "or-key",
+				AuthHeader: &AuthHeader{Name: "Authorization", Value: "Bearer {api_key}"},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -227,13 +269,18 @@ func TestParseProviders_Entries(t *testing.T) {
 
 func TestParseProviders_RoutingTypeMismatch(t *testing.T) {
 	for name, routing := range map[string]any{
-		"routing not object":          "fast",
-		"sort not string":             map[string]any{"sort": 1},
-		"data_collection not string":  map[string]any{"data_collection": true},
-		"require_parameters not bool": map[string]any{"require_parameters": "yes"},
-		"max_price not object":        map[string]any{"max_price": 1},
-		"max_price entry not object":  map[string]any{"max_price": map[string]any{"m": 1}},
-		"max_price prompt not number": map[string]any{"max_price": map[string]any{"m": map[string]any{"prompt": "1"}}},
+		"routing not object":             "fast",
+		"sort not string":                map[string]any{"sort": 1},
+		"data_collection not string":     map[string]any{"data_collection": true},
+		"require_parameters not bool":    map[string]any{"require_parameters": "yes"},
+		"max_price not object":           map[string]any{"max_price": 1},
+		"max_price entry not object":     map[string]any{"max_price": map[string]any{"m": 1}},
+		"max_price prompt not number":    map[string]any{"max_price": map[string]any{"m": map[string]any{"prompt": "1"}}},
+		"quantizations not object":       map[string]any{"quantizations": 1},
+		"quantizations entry not object": map[string]any{"quantizations": map[string]any{"m": "fp8"}},
+		"quantizations levels not list":  map[string]any{"quantizations": map[string]any{"m": map[string]any{"levels": "fp8", "mode": "required"}}},
+		"quantizations level not string": map[string]any{"quantizations": map[string]any{"m": map[string]any{"levels": []any{8}, "mode": "required"}}},
+		"quantizations mode not string":  map[string]any{"quantizations": map[string]any{"m": map[string]any{"levels": []any{"fp8"}, "mode": true}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := ParseProviders(map[string]any{"provider": map[string]any{
@@ -241,6 +288,65 @@ func TestParseProviders_RoutingTypeMismatch(t *testing.T) {
 			}})
 			if err == nil {
 				t.Fatalf("ParseProviders() error = nil, want a type error")
+			}
+		})
+	}
+}
+
+func TestParseProviders_RejectsInvalidQuantizations(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	tests := []struct {
+		name    string
+		entry   map[string]any
+		wantBad string
+	}{
+		{"unknown level", map[string]any{"levels": []any{"fp8", "q4"}, "mode": "required"}, `"q4"`},
+		{"empty list", map[string]any{"levels": []any{}, "mode": "required"}, "levels"},
+		{"duplicate level", map[string]any{"levels": []any{"fp8", "fp4", "fp8"}, "mode": "required"}, `duplicate level "fp8"`},
+		{"missing mode", map[string]any{"levels": []any{"fp8"}}, `got ""`},
+		{"unknown mode", map[string]any{"levels": []any{"fp8"}, "mode": "strict"}, `"strict"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseProviders(map[string]any{"provider": map[string]any{
+				"openrouter": map[string]any{"base_url": "u", "api_key": "k", "routing": map[string]any{
+					"quantizations": map[string]any{model: tt.entry},
+				}},
+			}})
+			if err == nil {
+				t.Fatalf("ParseProviders() error = nil, want an invalid quantizations error")
+			}
+			if !strings.Contains(err.Error(), "quantizations."+model) || !strings.Contains(err.Error(), tt.wantBad) {
+				t.Fatalf("error %q, want it to name %q and %q", err.Error(), "quantizations."+model, tt.wantBad)
+			}
+		})
+	}
+}
+
+func TestValidateQuantizationLevels(t *testing.T) {
+	if err := ValidateQuantizationLevels([]string{"fp8", "fp4"}); err != nil {
+		t.Fatalf("ValidateQuantizationLevels([fp8 fp4]) = %v, want nil", err)
+	}
+	all := []string{"int4", "int8", "fp4", "mxfp4", "nvfp4", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"}
+	if err := ValidateQuantizationLevels(all); err != nil {
+		t.Fatalf("ValidateQuantizationLevels(every OpenRouter level) = %v, want nil", err)
+	}
+	for name, tt := range map[string]struct {
+		levels  []string
+		wantBad string
+	}{
+		"nil list":        {nil, "at least one"},
+		"empty list":      {[]string{}, "at least one"},
+		"unknown level":   {[]string{"fp8", "FP4"}, `"FP4"`},
+		"duplicate level": {[]string{"fp4", "fp8", "fp4"}, `duplicate level "fp4"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateQuantizationLevels(tt.levels)
+			if err == nil {
+				t.Fatalf("ValidateQuantizationLevels(%q) = nil, want error", tt.levels)
+			}
+			if !strings.Contains(err.Error(), tt.wantBad) {
+				t.Fatalf("error %q, want it to contain %q", err.Error(), tt.wantBad)
 			}
 		})
 	}

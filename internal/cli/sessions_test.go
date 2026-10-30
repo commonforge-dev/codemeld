@@ -6,6 +6,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"go/ast"
@@ -4856,6 +4857,205 @@ func TestSessionsPermissions_DirectV2NeverEscalatesAV1OrLegacyGrant(t *testing.T
 			records := append(append([]sessions.Record{}, tt.priorSet...),
 				clearEnvPromptEvent(t, assignments, auditProj, "hg", "log"))
 			out := runPermissions(t, writeSession(t, "direct-v2-escalation", records))
+			if got := strings.Contains(out, "escalates_grant_scope="); got != tt.wantEsc {
+				t.Fatalf("escalation reported = %v, want %v:\n%s", got, tt.wantEsc, out)
+			}
+		})
+	}
+}
+
+var homeTargetTokens = []string{"mv", "x", "~/target"}
+
+const homeTargetCommand = "mv x '~/target'"
+
+func homeStateEnvelope(t *testing.T, scope string, expanding, literal []int) string {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		Subject   string `json:"subject"`
+		Expanding []int  `json:"expanding"`
+		Literal   []int  `json:"literal"`
+	}{scope, expanding, literal})
+	if err != nil {
+		t.Fatalf("marshal direct-home payload: %v", err)
+	}
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func stageIdentity(t *testing.T, assignments []string, clearEnvironment bool, expands ...bool) string {
+	t.Helper()
+	subject, err := permissions.DirectStageRequestSubject(homeTargetTokens, assignments, clearEnvironment, expands)
+	if err != nil {
+		t.Fatalf("DirectStageRequestSubject(%v, %v, %v): %v", assignments, clearEnvironment, expands, err)
+	}
+	return subject
+}
+
+func identityPromptEvent(requestSubject, pathScope string) sessions.Event {
+	return eventRecord(events.KindPermissionPromptShown, events.PermissionPromptShown{
+		SubjectKind: "direct", Subject: strings.Join(homeTargetTokens, " "), PathScope: pathScope,
+		DirectTokens:         directTokens(homeTargetTokens...),
+		DirectCommandSubject: homeTargetCommand, DirectRequestSubject: requestSubject,
+	})
+}
+
+func identityDecisionEvent(requestSubject, pathScope, outcome, grantSubject string) sessions.Event {
+	p := events.PermissionDecision{
+		SubjectKind: "direct", Subject: strings.Join(homeTargetTokens, " "), PathScope: pathScope, Outcome: outcome,
+		DirectCommandSubject: homeTargetCommand, DirectRequestSubject: requestSubject,
+	}
+	if grantSubject != "" {
+		p.GrantKind, p.GrantPathScope, p.GrantSubject = "folder", pathScope, grantSubject
+	}
+	return eventRecord(events.KindPermissionDecision, p)
+}
+
+func TestSessionsPermissions_HomeStateVariantsPairWithTheirOwnDecisions(t *testing.T) {
+	tests := []struct {
+		name        string
+		assignments []string
+		clear       bool
+	}{
+		{name: "inherited environment"},
+		{name: "assigned and cleared environment", assignments: []string{"PATH=/usr/bin"}, clear: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expanding := stageIdentity(t, tt.assignments, tt.clear, false, false, true)
+			literal := stageIdentity(t, tt.assignments, tt.clear, false, false, false)
+			records := []sessions.Record{
+				identityPromptEvent(expanding, auditProj),
+				identityPromptEvent(literal, auditProj),
+				identityDecisionEvent(literal, auditProj, "denied", ""),
+				identityDecisionEvent(expanding, auditProj, "granted", expanding),
+			}
+			out := runPermissions(t, writeSession(t, "home-state-pairing", records))
+			if !strings.Contains(out, "1. [granted] direct  mv x ~/target") {
+				t.Fatalf("the expanding prompt did not take its own granted decision:\n%s", out)
+			}
+			if !strings.Contains(out, "2. [denied] direct  mv x ~/target") {
+				t.Fatalf("the literal prompt did not take its own denied decision:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestSessionsPermissions_HomeStateRecordsWithoutValidStateDoNotPair(t *testing.T) {
+	tests := []struct {
+		name             string
+		prompt, decision string
+	}{
+		{
+			name:     "a token-only identity does not take a literal decision",
+			prompt:   homeTargetCommand,
+			decision: homeStateEnvelope(t, homeTargetCommand, []int{}, []int{2}),
+		},
+		{
+			name:     "a token-only identity does not take an expanding decision",
+			prompt:   homeTargetCommand,
+			decision: homeStateEnvelope(t, homeTargetCommand, []int{2}, []int{}),
+		},
+		{
+			name:     "two malformed home identities do not pair",
+			prompt:   "'direct-home/v1 !!not-base64",
+			decision: "'direct-home/v1 !!not-base64",
+		},
+		{
+			name:     "two home identities missing the pinned position's state do not pair",
+			prompt:   homeStateEnvelope(t, homeTargetCommand, []int{}, []int{}),
+			decision: homeStateEnvelope(t, homeTargetCommand, []int{}, []int{}),
+		},
+		{
+			name:     "two home identities naming another command do not pair",
+			prompt:   homeStateEnvelope(t, "mv x '~/other'", []int{2}, []int{}),
+			decision: homeStateEnvelope(t, "mv x '~/other'", []int{2}, []int{}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := []sessions.Record{
+				identityPromptEvent(tt.prompt, auditProj),
+				identityDecisionEvent(tt.decision, auditProj, "granted", ""),
+			}
+			out := runPermissions(t, writeSession(t, "home-state-unpaired", records))
+			if !strings.Contains(out, "1. [pending] direct  mv x ~/target") {
+				t.Fatalf("a prompt without matching valid home state took a decision:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestSessionsPermissions_HomeStateEscalationReplay(t *testing.T) {
+	envAssignments := []string{"PATH=/usr/bin"}
+	expandingGrant := homeStateEnvelope(t, homeTargetCommand, []int{2}, []int{})
+	literalGrant := homeStateEnvelope(t, homeTargetCommand, []int{}, []int{2})
+	clearExpandingGrant, err := permissions.EncodeDirectEnvSubject(envAssignments, true, expandingGrant)
+	if err != nil {
+		t.Fatalf("EncodeDirectEnvSubject: %v", err)
+	}
+	expanding := stageIdentity(t, nil, false, false, false, true)
+	literal := stageIdentity(t, nil, false, false, false, false)
+	clearExpanding := stageIdentity(t, envAssignments, true, false, false, true)
+	clearLiteral := stageIdentity(t, envAssignments, true, false, false, false)
+	envExpanding := stageIdentity(t, envAssignments, false, false, false, true)
+	tests := []struct {
+		name                 string
+		priorIdentity, grant string
+		later                sessions.Event
+		wantEsc              bool
+	}{
+		{
+			name: "an expanding grant escalates an expanding prompt", priorIdentity: expanding, grant: expandingGrant,
+			later: identityPromptEvent(expanding, auditProj), wantEsc: true,
+		},
+		{
+			name: "an expanding grant does not escalate a literal prompt", priorIdentity: expanding, grant: expandingGrant,
+			later: identityPromptEvent(literal, auditProj),
+		},
+		{
+			name: "a literal grant escalates a literal prompt", priorIdentity: literal, grant: literalGrant,
+			later: identityPromptEvent(literal, auditProj), wantEsc: true,
+		},
+		{
+			name: "a literal grant does not escalate an expanding prompt", priorIdentity: literal, grant: literalGrant,
+			later: identityPromptEvent(expanding, auditProj),
+		},
+		{
+			name: "a cleared assigned expanding grant escalates the same request", priorIdentity: clearExpanding, grant: clearExpandingGrant,
+			later: identityPromptEvent(clearExpanding, auditProj), wantEsc: true,
+		},
+		{
+			name: "a cleared assigned expanding grant does not escalate its literal request", priorIdentity: clearExpanding, grant: clearExpandingGrant,
+			later: identityPromptEvent(clearLiteral, auditProj),
+		},
+		{
+			name: "a cleared assigned expanding grant does not escalate an inherited-environment request", priorIdentity: clearExpanding, grant: clearExpandingGrant,
+			later: identityPromptEvent(envExpanding, auditProj),
+		},
+		{
+			name: "a token-only identity gets no state invented against an expanding grant", priorIdentity: expanding, grant: expandingGrant,
+			later: identityPromptEvent(homeTargetCommand, auditProj),
+		},
+		{
+			name: "a token-only identity gets no state invented against a literal grant", priorIdentity: literal, grant: literalGrant,
+			later: identityPromptEvent(homeTargetCommand, auditProj),
+		},
+		{
+			name: "a malformed home identity is omitted", priorIdentity: expanding, grant: expandingGrant,
+			later: identityPromptEvent("'direct-home/v1 !!not-base64", auditProj),
+		},
+		{
+			name: "an identity-less legacy record is omitted", priorIdentity: expanding, grant: expandingGrant,
+			later: legacyDirectPrompt("mv x ~/target", auditProj, homeTargetTokens...),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := []sessions.Record{
+				identityPromptEvent(tt.priorIdentity, auditSub),
+				identityDecisionEvent(tt.priorIdentity, auditSub, "granted", tt.grant),
+				tt.later,
+			}
+			out := runPermissions(t, writeSession(t, "home-state-escalation", records))
 			if got := strings.Contains(out, "escalates_grant_scope="); got != tt.wantEsc {
 				t.Fatalf("escalation reported = %v, want %v:\n%s", got, tt.wantEsc, out)
 			}

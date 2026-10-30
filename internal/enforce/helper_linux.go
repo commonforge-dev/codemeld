@@ -55,6 +55,9 @@ func RunHelper(args []string) int {
 		args = args[1:]
 		steps = slices.DeleteFunc(slices.Clone(helperSteps), func(st helperStep) bool { return st.name != "policy frame" })
 	}
+	if err := os.Setenv("TERM", "dumb"); err != nil {
+		return helperFailure("environment", err)
+	}
 	s := &helperState{args: args}
 	for _, step := range steps {
 		if err := step.run(s); err != nil {

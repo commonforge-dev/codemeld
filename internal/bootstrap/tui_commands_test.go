@@ -321,6 +321,43 @@ func TestF600_PermissionsCommand_OpensOverlayWithComposedCacheGrants(t *testing.
 	}
 }
 
+func TestOpenRouterCommand_OpensSettingsOnOpenRouterTabThroughProductionWiring(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	cfg := map[string]any{
+		"permissions": []any{
+			map[string]any{"kind": "direct", "subject": "ls", "path_scope": "*", "grant_kind": "global"},
+		},
+	}
+	result := &BootstrapResult{
+		Home:           home,
+		LaunchDir:      "/launch",
+		Config:         cfg,
+		SettingsLayers: []securitystate.LayerSnapshot{{Kind: securitystate.LayerGlobal, Path: SettingsPath(home), Present: true, Raw: cfg}},
+		Session:        mkStore(t),
+	}
+	app, restore := startCaptured(t, ctx, result, io.Discard)
+	defer restore()
+
+	if !app.SubmitInput("/openrouter") {
+		t.Fatalf("/openrouter rejected; notice %q", app.NoticeText())
+	}
+	if app.SettingsOverlayText() == "" || app.SortRowForTest() == "" {
+		t.Fatalf("/openrouter overlay %q sort row %q, want the overlay open on the OpenRouter tab", app.SettingsOverlayText(), app.SortRowForTest())
+	}
+	app.HandleEsc()
+	if app.SettingsOverlayText() != "" {
+		t.Fatal("ESC left the /openrouter overlay open")
+	}
+
+	if !app.SubmitInput("/settings") {
+		t.Fatalf("/settings rejected; notice %q", app.NoticeText())
+	}
+	if !strings.Contains(app.SettingsOverlayText(), "run ls") || app.SortRowForTest() != "" {
+		t.Fatalf("/settings overlay %q sort row %q, want the overlay open on its first tab", app.SettingsOverlayText(), app.SortRowForTest())
+	}
+}
+
 // TestF1210_PermissionsSettingsTab_TogglesAttributionThroughRealWiring drives the settings
 // tab's toggle through the genuine StartTUI wiring — the real cache-backed callbacks, no
 // fake — and proves the write lands in the global settings file (byte-preserving) and in
@@ -787,8 +824,22 @@ func startPermissionsSettingsTUI(t *testing.T, seed string) (*tui.App, *config.C
 
 func startPermissionsSettingsTUIWithModel(t *testing.T, seed string, sel *model.Selection) (*tui.App, *config.Cache, string) {
 	t.Helper()
+	return startPermissionsSettingsTUIWithDiscovered(t, seed, sel, nil)
+}
+
+func startPermissionsSettingsTUIWithDiscovered(t *testing.T, seed string, sel *model.Selection, openRouterIDs []string) (*tui.App, *config.Cache, string) {
+	t.Helper()
 	home := t.TempDir()
 	global := writeGlobalSettings(t, home, seed, 0o600)
+	if len(openRouterIDs) > 0 {
+		var discovered []config.DiscoveredModel
+		for _, id := range openRouterIDs {
+			discovered = append(discovered, config.DiscoveredModel{ID: id})
+		}
+		if err := config.UpdateDiscoveredModelsProvider(config.DiscoveredModelsPath(global), "openrouter", config.DiscoveredProvider{Models: discovered}); err != nil {
+			t.Fatalf("seed discovered openrouter models: %v", err)
+		}
+	}
 	_, raw, _, err := config.LoadYAML(global)
 	if err != nil {
 		t.Fatalf("load seeded settings: %v", err)
@@ -818,6 +869,7 @@ func startPermissionsSettingsTUIWithModel(t *testing.T, seed string, sel *model.
 	if cache == nil {
 		t.Fatal("StartTUI built no config cache through the permissions-deps seam")
 	}
+	settleOpenRouterEndpoints(t, cache, openRouterIDs...)
 	if !app.SubmitInput("/settings") {
 		t.Fatal("/settings rejected; the production registry did not bind the handler")
 	}
@@ -1012,42 +1064,203 @@ func (refusingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errors.New("no network in this test")
 }
 
-func settleOpenRouterEndpoints(t *testing.T, cache *config.Cache, model string) {
+func settleOpenRouterEndpoints(t *testing.T, cache *config.Cache, models ...string) {
 	t.Helper()
 	prev := openRouterEndpoints
 	openRouterEndpoints = &provider.OpenRouterEndpointStore{HTTPClient: &http.Client{Transport: refusingTransport{}}}
 	t.Cleanup(func() { openRouterEndpoints = prev })
 	entry, _ := cache.Provider("openrouter")
 	name, value := entry.ResolveAuthHeader()
-	openRouterEndpoints.BestValueTag(context.Background(), entry, name, value, model, nil)
+	for _, model := range models {
+		openRouterEndpoints.BestValueTag(context.Background(), entry, name, value, model, "", nil)
+	}
 }
 
+const openRouterModelsHeader = "model | input $/M | output $/M | quantizations"
+
 func TestF1630_PermissionsSettingsTab_MaxPriceReachesNextTurnClientConfig(t *testing.T) {
-	app, cache, global := startPermissionsSettingsTUIWithModel(t, openRouterSettingsSeed, &model.Selection{Provider: "openrouter", ID: "m", Effort: model.EffortDefault})
+	app, cache, global := startPermissionsSettingsTUIWithDiscovered(t, openRouterSettingsSeed, &model.Selection{Provider: "openrouter", ID: "m", Effort: model.EffortDefault}, []string{"other/model", "m"})
 	settleOpenRouterEndpoints(t, cache, "m")
 
-	if row := app.SetMaxPriceForTest("0.5", "2"); row != "max price (m)   input $0.5 / output $2 per M tokens" {
-		t.Fatalf("max price row = %q", row)
+	if rows := app.OpenRouterModelsForTest(); !slices.Equal(rows, []string{openRouterModelsHeader, "(no models configured)"}) {
+		t.Fatalf("table rows before any cap = %q", rows)
+	}
+	for _, step := range []struct {
+		prompt, completion string
+		rows               []string
+		persisted          map[string]any
+		request            map[string]any
+	}{
+		{
+			"0.5", "2", []string{openRouterModelsHeader, "m | $0.5 | $2 | none"},
+			map[string]any{"prompt": 0.5, "completion": uint64(2)}, map[string]any{"prompt": 0.5, "completion": 2.0},
+		},
+		{
+			"1", "", []string{openRouterModelsHeader, "m | $1 | none | none"},
+			map[string]any{"prompt": uint64(1)}, map[string]any{"prompt": 1.0},
+		},
+	} {
+		if !app.SaveOpenRouterModelCapsForTest("m", step.prompt, step.completion) {
+			t.Fatalf("saving %s/%s did not reach the price editor", step.prompt, step.completion)
+		}
+		if notice := app.NoticeText(); notice != "" {
+			t.Fatalf("notice = %q, want none", notice)
+		}
+		if rows := app.OpenRouterModelsForTest(); !slices.Equal(rows, step.rows) {
+			t.Fatalf("table rows = %q, want %q", rows, step.rows)
+		}
+		if row := app.OpenRouterModelsCountRowForTest(); row != "models: 1 configured" {
+			t.Fatalf("models row = %q", row)
+		}
+		wantPersisted := map[string]any{"max_price": map[string]any{"m": step.persisted}}
+		if got := persistedProviderEntry(t, global, "openrouter")["routing"]; !reflect.DeepEqual(got, wantPersisted) {
+			t.Fatalf("persisted routing = %#v, want %#v", got, wantPersisted)
+		}
+		if got := openRouterRequestProviderObject(t, cache)["max_price"]; !reflect.DeepEqual(got, step.request) {
+			t.Fatalf("next request max_price = %#v, want %#v", got, step.request)
+		}
+	}
+
+	if !app.RemoveOpenRouterModelForTest("m") {
+		t.Fatal("removing m did not reach the confirmation")
+	}
+	if rows := app.OpenRouterModelsForTest(); !slices.Equal(rows, []string{openRouterModelsHeader, "(no models configured)"}) {
+		t.Fatalf("table rows after removal = %q", rows)
+	}
+	if row := app.OpenRouterModelsCountRowForTest(); row != "models: 0 configured" {
+		t.Fatalf("models row after removal = %q", row)
+	}
+	if _, ok := persistedProviderEntry(t, global, "openrouter")["routing"]; ok {
+		t.Fatal("removing the only cap left a routing entry on disk")
+	}
+	if got, ok := openRouterRequestProviderObject(t, cache)["max_price"]; ok {
+		t.Fatalf("next request max_price after removal = %#v, want none", got)
+	}
+}
+
+func TestF1930_OpenRouterModelsDialog_QuantizationsPersistThroughProductionDeps(t *testing.T) {
+	const seed = openRouterSettingsSeed + "    routing:\n      # keep me\n      max_price:\n        keep/caps: {prompt: 7}\n      quantizations:\n        keep/quant: {levels: [int8], mode: preferred}\n"
+	app, cache, global := startPermissionsSettingsTUIWithDiscovered(t, seed, nil, []string{"m"})
+	keepCaps := map[string]any{"keep/caps": map[string]any{"prompt": uint64(7)}}
+	keepQuant := map[string]any{"levels": []any{"int8"}, "mode": "preferred"}
+	routing := func() map[string]any {
+		t.Helper()
+		r, _ := persistedProviderEntry(t, global, "openrouter")["routing"].(map[string]any)
+		return r
+	}
+
+	if !app.SaveOpenRouterModelForTest("m", "", "", "fp8 fp4", true) {
+		t.Fatal("adding m did not reach the dialog")
 	}
 	if notice := app.NoticeText(); notice != "" {
 		t.Fatalf("notice = %q, want none", notice)
 	}
-	wantPersisted := map[string]any{"max_price": map[string]any{"m": map[string]any{"prompt": 0.5, "completion": uint64(2)}}}
-	if got := persistedProviderEntry(t, global, "openrouter")["routing"]; !reflect.DeepEqual(got, wantPersisted) {
-		t.Fatalf("persisted routing = %#v, want %#v", got, wantPersisted)
+	want := map[string]any{
+		"max_price":     keepCaps,
+		"quantizations": map[string]any{"keep/quant": keepQuant, "m": map[string]any{"levels": []any{"fp8", "fp4"}, "mode": "required"}},
 	}
-	if got := openRouterRequestProviderObject(t, cache)["max_price"]; !reflect.DeepEqual(got, map[string]any{"prompt": 0.5, "completion": 2.0}) {
-		t.Fatalf("next request max_price = %#v, want prompt 0.5 and completion 2", got)
+	if got := routing(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted routing = %#v, want %#v", got, want)
+	}
+	wantCache := []config.OpenRouterQuantization{
+		{Model: "keep/quant", Quantization: provider.Quantization{Levels: []string{"int8"}, Mode: "preferred"}},
+		{Model: "m", Quantization: provider.Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}},
+	}
+	if got := cache.OpenRouterQuantizations(); !reflect.DeepEqual(got, wantCache) {
+		t.Fatalf("cached quantizations = %+v, want %+v", got, wantCache)
+	}
+	rows := []string{openRouterModelsHeader, "keep/caps | $7 | none | none", "keep/quant | none | none | int8 (preferred)", "m | none | none | fp8 fp4 (required)"}
+	if got := app.OpenRouterModelsForTest(); !slices.Equal(got, rows) {
+		t.Fatalf("table rows = %q, want %q", got, rows)
+	}
+	if row := app.OpenRouterModelsCountRowForTest(); row != "models: 3 configured" {
+		t.Fatalf("models row = %q", row)
 	}
 
-	if row := app.SetMaxPriceForTest("", ""); row != "max price (m)   none" {
-		t.Fatalf("max price row after clearing = %q", row)
+	if !app.SaveOpenRouterModelForTest("m", "1", "", "", false) {
+		t.Fatal("editing m did not reach the dialog")
 	}
-	if _, ok := persistedProviderEntry(t, global, "openrouter")["routing"]; ok {
-		t.Fatal("clearing the only cap left a routing entry on disk")
+	want = map[string]any{
+		"max_price":     map[string]any{"keep/caps": map[string]any{"prompt": uint64(7)}, "m": map[string]any{"prompt": uint64(1)}},
+		"quantizations": map[string]any{"keep/quant": keepQuant},
 	}
-	if got, ok := openRouterRequestProviderObject(t, cache)["max_price"]; ok {
-		t.Fatalf("next request max_price after clearing = %#v, want none", got)
+	if got := routing(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted routing after clearing the levels = %#v, want %#v", got, want)
+	}
+	if data, _ := os.ReadFile(global); !strings.Contains(string(data), "# keep me") {
+		t.Fatalf("saving dropped a routing comment:\n%s", data)
+	}
+
+	if !app.SaveOpenRouterModelForTest("m", "1", "", "bf16", false) {
+		t.Fatal("re-editing m did not reach the dialog")
+	}
+	if !app.RemoveOpenRouterModelForTest("m") {
+		t.Fatal("removing m did not reach the confirmation")
+	}
+	want = map[string]any{"max_price": keepCaps, "quantizations": map[string]any{"keep/quant": keepQuant}}
+	if got := routing(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted routing after remove = %#v, want %#v", got, want)
+	}
+	if got := cache.OpenRouterQuantizations(); !reflect.DeepEqual(got, wantCache[:1]) {
+		t.Fatalf("cached quantizations after remove = %+v", got)
+	}
+}
+
+func TestF1930_OpenRouterModelsDialog_ExternalQuantizationsSurviveButStayOutOfTheSession(t *testing.T) {
+	const seed = openRouterSettingsSeed + "    routing:\n      quantizations:\n        a/one: {levels: [fp8], mode: preferred}\n"
+	app, cache, global := startPermissionsSettingsTUIWithDiscovered(t, seed, nil, []string{"m"})
+	if err := os.WriteFile(global, []byte(seed+"        b/two: {levels: [fp4, unknown], mode: required}\n"), 0o600); err != nil {
+		t.Fatalf("external settings edit: %v", err)
+	}
+
+	if !app.SaveOpenRouterModelForTest("m", "", "", "bf16", false) {
+		t.Fatal("adding m did not reach the dialog")
+	}
+	want := map[string]any{
+		"a/one": map[string]any{"levels": []any{"fp8"}, "mode": "preferred"},
+		"b/two": map[string]any{"levels": []any{"fp4", "unknown"}, "mode": "required"},
+		"m":     map[string]any{"levels": []any{"bf16"}, "mode": "preferred"},
+	}
+	routing, _ := persistedProviderEntry(t, global, "openrouter")["routing"].(map[string]any)
+	if got := routing["quantizations"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted quantizations = %#v, want %#v", got, want)
+	}
+	for _, q := range cache.OpenRouterQuantizations() {
+		if q.Model == "b/two" {
+			t.Fatal("the external entry reached the session cache")
+		}
+	}
+	rows := []string{openRouterModelsHeader, "a/one | none | none | fp8 (preferred)", "m | none | none | bf16 (preferred)"}
+	if got := app.OpenRouterModelsForTest(); !slices.Equal(got, rows) {
+		t.Fatalf("table rows = %q, want %q", got, rows)
+	}
+	if row := app.OpenRouterModelsCountRowForTest(); row != "models: 2 configured" {
+		t.Fatalf("models row = %q", row)
+	}
+}
+
+func TestF1920_OpenRouterModelsTable_ListsLaunchCapsAndIgnoresExternalEdits(t *testing.T) {
+	const capsSeed = openRouterSettingsSeed + "    routing:\n      max_price:\n        a/one:\n          prompt: 1\n"
+	app, _, global := startPermissionsSettingsTUIWithDiscovered(t, capsSeed, nil, []string{"m"})
+
+	if rows := app.OpenRouterModelsForTest(); !slices.Equal(rows, []string{openRouterModelsHeader, "a/one | $1 | none | none"}) {
+		t.Fatalf("table rows at launch = %q", rows)
+	}
+	external := capsSeed + "        b/two:\n          completion: 5\n"
+	if err := os.WriteFile(global, []byte(external), 0o600); err != nil {
+		t.Fatalf("external settings edit: %v", err)
+	}
+	if !app.SaveOpenRouterModelCapsForTest("m", "2", "") {
+		t.Fatal("adding m did not reach the price editor")
+	}
+	if notice := app.NoticeText(); notice != "" {
+		t.Fatalf("notice = %q, want none", notice)
+	}
+	if rows := app.OpenRouterModelsForTest(); !slices.Equal(rows, []string{openRouterModelsHeader, "a/one | $1 | none | none", "m | $2 | none | none"}) {
+		t.Fatalf("table rows after an external edit and an in-process add = %q", rows)
+	}
+	if row := app.OpenRouterModelsCountRowForTest(); row != "models: 2 configured" {
+		t.Fatalf("models row = %q", row)
 	}
 }
 
@@ -3594,7 +3807,7 @@ type estimateServer struct {
 	release chan struct{}
 }
 
-func newEstimateServer(t *testing.T, prices map[string][2]string) *estimateServer {
+func newEndpointsBodyServer(t *testing.T, body func(model string) (string, bool)) *estimateServer {
 	t.Helper()
 	s := &estimateServer{}
 	s.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3606,13 +3819,12 @@ func newEstimateServer(t *testing.T, prices map[string][2]string) *estimateServe
 			entered <- struct{}{}
 			<-release
 		}
-		model := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/models/"), "/endpoints")
-		p, ok := prices[model]
+		b, ok := body(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/models/"), "/endpoints"))
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"data":{"endpoints":[{"provider_name":"a","pricing":{"prompt":%q,"completion":%q},"throughput_last_30m":{"p50":20}}]}}`, p[0], p[1])
+		_, _ = io.WriteString(w, b)
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
@@ -3653,10 +3865,9 @@ type estimateTUI struct {
 	app    *tui.App
 	screen tcell.SimulationScreen
 	cache  *config.Cache
-	active *model.ActiveState
 }
 
-func startEstimateTUI(t *testing.T, baseURL string, sel *model.Selection, store *provider.OpenRouterEndpointStore, routing map[string]any) *estimateTUI {
+func startEstimateTUI(t *testing.T, baseURL string, sel *model.Selection, store *provider.OpenRouterEndpointStore, routing map[string]any, layers ...string) *estimateTUI {
 	t.Helper()
 	prevStore := openRouterEndpoints
 	openRouterEndpoints = store
@@ -3664,7 +3875,7 @@ func startEstimateTUI(t *testing.T, baseURL string, sel *model.Selection, store 
 	h := &estimateTUI{t: t}
 	production := newSettingsDeps
 	newSettingsDeps = func(app *tui.App, c *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
-		h.cache, h.active = c, active
+		h.cache = c
 		return production(app, c, active, authorizer)
 	}
 	t.Cleanup(func() { newSettingsDeps = production })
@@ -3673,10 +3884,11 @@ func startEstimateTUI(t *testing.T, baseURL string, sel *model.Selection, store 
 		openrouter["routing"] = routing
 	}
 	h.app, h.screen = startRunningOnScreen(t, &BootstrapResult{
-		Home:      t.TempDir(),
-		LaunchDir: "/launch",
-		Session:   mkStore(t),
-		Model:     model.NewActiveState(sel, model.SourceProject),
+		Home:             t.TempDir(),
+		LaunchDir:        "/launch",
+		ConfigLayerPaths: layers,
+		Session:          mkStore(t),
+		Model:            model.NewActiveState(sel, model.SourceProject),
 		Config: map[string]any{"provider": map[string]any{
 			"openrouter": openrouter,
 			"openai":     map[string]any{"base_url": baseURL, "api_key": "sk-test", "models": []string{"gpt-5.5"}},
@@ -3737,136 +3949,56 @@ func (h *estimateTUI) awaitSortRow(want string) {
 	}
 }
 
-func (h *estimateTUI) awaitStored(model string) {
-	entry, _ := h.cache.Provider("openrouter")
-	name, value := entry.ResolveAuthHeader()
-	openRouterEndpoints.BestValueTag(context.Background(), entry, name, value, model, nil)
-}
-
-func (h *estimateTUI) switchModel(sel model.Selection) {
-	h.onLoop(func() { h.active.ApplyUserSelection(sel, false) })
-}
-
 func openRouterModel(id string) *model.Selection {
 	return &model.Selection{Provider: "openrouter", ID: id, Effort: model.EffortDefault}
 }
 
-func TestF1660_SettingsTabEstimate_BackgroundFetchReachesOnlyConfiguredOpenRouter(t *testing.T) {
-	srv := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}})
+func TestF1950_OpenRouterTabAndModelsTableMakeNoEndpointsRequest(t *testing.T) {
+	srv := newEndpointsBodyServer(t, func(string) (string, bool) { return `{"data":{"endpoints":[]}}`, true })
 	client, rejected := guardedEstimateClient(srv)
-	h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
-	if got := srv.requests(); len(got) != 0 {
-		t.Fatalf("endpoint requests at startup and on the grants tab = %v, want none", got)
+	h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, map[string]any{
+		"sort":      "best_value",
+		"max_price": map[string]any{"q/one": map[string]any{"prompt": 1}},
+	})
+	expectNone := func(when string) {
+		t.Helper()
+		time.Sleep(50 * time.Millisecond)
+		if got := srv.requests(); len(got) != 0 || rejected.Load() != 0 {
+			t.Fatalf("endpoint requests %s = %v, rejected dials = %d; want none", when, got, rejected.Load())
+		}
 	}
+	expectNone("at startup")
 
-	srv.block()
-	if row := h.showSettings(); row != "sort   default" {
-		t.Fatalf("sort row while the fetch is blocked = %q, want the mode alone", row)
+	if row := h.showSettings(); row != "sort   best value" {
+		t.Fatalf("sort row = %q, want the mode alone", row)
 	}
-	<-srv.entered
-	if row := h.showSettings(); row != "sort   default" {
-		t.Fatalf("sort row on a second open while the fetch is blocked = %q", row)
-	}
-	close(srv.release)
-	h.awaitSortRow("sort   default (about $0.1 / $0.2 per M)")
+	expectNone("after opening the OpenRouter tab")
 
-	if got, want := srv.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key"}; !slices.Equal(got, want) {
-		t.Fatalf("endpoint requests = %v, want %v", got, want)
-	}
-	if n := rejected.Load(); n != 0 {
-		t.Fatalf("rejected dials = %d, want none", n)
-	}
-}
-
-func TestF1660_SettingsTabEstimate_ReopenedOverlayRedrawsWhenTheFetchFinishes(t *testing.T) {
-	srv := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}, "n": {"0.000001", "0.000002"}})
-	client, _ := guardedEstimateClient(srv)
-	h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
-
-	srv.block()
-	h.showSettings()
-	<-srv.entered
 	h.screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
 	h.awaitSortRow("")
 	h.reopen()
-	if row := h.showSettings(); row != "sort   default" {
-		t.Fatalf("sort row on the reopened overlay while the fetch is blocked = %q", row)
+	if row := h.showSettings(); row != "sort   best value" {
+		t.Fatalf("sort row on the reopened tab = %q, want the mode alone", row)
 	}
-	close(srv.release)
-	h.awaitSortRow("sort   default (about $0.1 / $0.2 per M)")
-	if got, want := srv.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key"}; !slices.Equal(got, want) {
-		t.Fatalf("endpoint requests = %v, want %v", got, want)
-	}
+	expectNone("after reopening the OpenRouter tab")
 
-	srv.block()
-	h.reopen()
-	h.switchModel(*openRouterModel("n"))
-	h.showSettings()
-	<-srv.entered
-	h.reopen()
-	h.showSettings()
-	h.switchModel(*openRouterModel("m"))
-	close(srv.release)
-	h.awaitStored("n")
-	time.Sleep(50 * time.Millisecond)
-	var row string
-	h.onLoop(func() { row = h.app.SortRowForTest() })
-	if row != "sort   default" {
-		t.Fatalf("sort row after the model switched back during the fetch = %q, want the mode alone until the next render", row)
+	var rows []string
+	h.onLoop(func() { rows = h.app.OpenRouterModelsForTest() })
+	if len(rows) != 2 {
+		t.Fatalf("table rows = %q, want the header and q/one", rows)
 	}
-}
-
-func TestF1660_SettingsTabEstimate_NoEstimateCases(t *testing.T) {
-	t.Run("another provider makes no request", func(t *testing.T) {
-		srv := newEstimateServer(t, map[string][2]string{"gpt-5.5": {"0.000001", "0.000002"}})
-		client, rejected := guardedEstimateClient(srv)
-		h := startEstimateTUI(t, srv.srv.URL+"/api/v1", &model.Selection{Provider: "openai", ID: "gpt-5.5", Effort: model.EffortDefault}, &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
-		if row := h.showSettings(); row != "sort   default" {
-			t.Fatalf("sort row = %q, want the mode alone", row)
-		}
-		h.reopen()
-		if got := srv.requests(); len(got) != 0 || rejected.Load() != 0 {
-			t.Fatalf("endpoint requests = %v, rejected dials = %d; want none", got, rejected.Load())
-		}
-	})
-	t.Run("retention-only settings tab makes no request", func(t *testing.T) {
-		srv := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}})
-		client, rejected := guardedEstimateClient(srv)
-		h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
-		var row string
-		h.onLoop(func() {
-			if !h.app.ShowSettingsTabForTest() {
-				t.Error("permissions overlay is not open")
-			}
-			row = h.app.SortRowForTest()
-		})
-		if row != "" {
-			t.Fatalf("sort row on the settings tab = %q, want none", row)
-		}
-		time.Sleep(50 * time.Millisecond)
-		if got := srv.requests(); len(got) != 0 || rejected.Load() != 0 {
-			t.Fatalf("endpoint requests = %v, rejected dials = %d; want none", got, rejected.Load())
-		}
-	})
-	t.Run("hand-set latency shows the mode alone", func(t *testing.T) {
-		srv := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}})
-		client, _ := guardedEstimateClient(srv)
-		h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, map[string]any{"sort": "latency"})
-		h.showSettings()
-		h.awaitStored("m")
-		if row := h.showSettings(); row != "sort   latency" {
-			t.Fatalf("sort row with stored prices = %q, want the mode alone", row)
-		}
-	})
+	expectNone("after opening the models table")
 }
 
 func TestSettingsTabEstimate_BestValueRequestPickHonorsIgnoredProviders(t *testing.T) {
 	var mu sync.Mutex
 	var chatBody []byte
+	var endpointRequests atomic.Int64
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/models/m/endpoints":
+			endpointRequests.Add(1)
 			_, _ = io.WriteString(w, `{"data":{"endpoints":[
 				{"provider_name":"Slow","tag":"slow","pricing":{"prompt":"0.0000001","completion":"0.0000001"},"throughput_last_30m":{"p50":20}},
 				{"provider_name":"Wafer","tag":"wafer/nvfp4","pricing":{"prompt":"0.00000028","completion":"0.00000028"},"throughput_last_30m":{"p50":90}},
@@ -3884,8 +4016,13 @@ func TestSettingsTabEstimate_BestValueRequestPickHonorsIgnoredProviders(t *testi
 	}))
 	t.Cleanup(srv.Close)
 	h := startEstimateTUI(t, srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: srv.Client()}, map[string]any{"sort": "best_value"})
-	h.showSettings()
-	h.awaitSortRow("sort   best value (about $0.28 / $0.28 per M)")
+	if row := h.showSettings(); row != "sort   best value" {
+		t.Fatalf("sort row = %q, want the mode alone", row)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := endpointRequests.Load(); n != 0 {
+		t.Fatalf("endpoint requests before the chat request = %d, want none", n)
+	}
 
 	defer swapTurnProviderClient(func(cfg provider.ClientConfig) provider.Client {
 		cfg.HTTPClient = srv.Client()
@@ -3913,76 +4050,114 @@ func TestSettingsTabEstimate_BestValueRequestPickHonorsIgnoredProviders(t *testi
 	if want := map[string]any{"order": []any{"relace"}, "ignore": []any{"wafer"}}; !reflect.DeepEqual(body.Provider, want) {
 		t.Fatalf("request provider object = %#v, want %#v", body.Provider, want)
 	}
-	h.awaitSortRow("sort   best value (about $0.28 / $0.28 per M)")
+	if n := endpointRequests.Load(); n != 1 {
+		t.Fatalf("endpoint requests after the chat request = %d, want 1", n)
+	}
 }
 
-func TestF1660_SettingsTabEstimate_ReconnectUsesTheNewEntryAndKey(t *testing.T) {
-	first := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}})
-	second := newEstimateServer(t, map[string][2]string{"m": {"0.000003", "0.000004"}})
-	client, rejected := guardedEstimateClient(first, second)
-	h := startEstimateTUI(t, first.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, nil)
-	h.showSettings()
-	h.awaitSortRow("sort   default (about $0.1 / $0.2 per M)")
-
-	h.onLoop(func() { h.cache.SetOpenRouterConnection(second.srv.URL+"/api/v1", "or-key-2") })
-	h.reopen()
-	h.showSettings()
-	h.awaitSortRow("sort   default (about $3 / $4 per M)")
-
-	if got, want := first.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key"}; !slices.Equal(got, want) {
-		t.Fatalf("first provider requests = %v, want %v", got, want)
+func (h *estimateTUI) awaitOfferedLevels(want string) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var got string
+		h.onLoop(func() { got = h.app.OpenRouterOfferedLevelsForTest() })
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("offered line = %q, want %q", got, want)
+		}
 	}
-	if got, want := second.requests(), []string{"/api/v1/models/m/endpoints Bearer or-key-2"}; !slices.Equal(got, want) {
-		t.Fatalf("reconnected provider requests = %v, want %v", got, want)
+}
+
+func TestF1940_OpenRouterModelsDialog_OfferedLevelsThroughProductionDepsAndStore(t *testing.T) {
+	const hosts = `{"data":{"endpoints":[
+		{"provider_name":"a","quantization":"fp8","pricing":{"prompt":"0.0000001","completion":"0.0000002"}},
+		{"provider_name":"b","quantization":"fp8","pricing":{"prompt":"n/a","completion":"0.0000002"}},
+		{"provider_name":"c","quantization":"nvfp4","pricing":{"prompt":"0.0000003","completion":"0.0000004"}},
+		{"provider_name":"d","pricing":{"prompt":"0.0000003","completion":"0.0000004"}}
+	]}}`
+	srv := newEndpointsBodyServer(t, func(model string) (string, bool) {
+		return hosts, model == "q/one" || model == "q/three"
+	})
+	client, rejected := guardedEstimateClient(srv)
+	global := writeGlobalSettings(t, t.TempDir(), "provider:\n  openrouter:\n    base_url: "+srv.srv.URL+"/api/v1\n    api_key: or-key\n", 0o600)
+	h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), &provider.OpenRouterEndpointStore{HTTPClient: client}, map[string]any{
+		"max_price": map[string]any{
+			"q/one":   map[string]any{"prompt": 1},
+			"q/two":   map[string]any{"prompt": 2},
+			"q/three": map[string]any{"prompt": 3},
+		},
+	}, global)
+	expectRequests := func(when string, want ...string) {
+		t.Helper()
+		var models []string
+		for _, r := range srv.requests() {
+			models = append(models, strings.TrimSuffix(strings.TrimPrefix(r, "/api/v1/models/"), "/endpoints Bearer or-key"))
+		}
+		if !slices.Equal(models, want) {
+			t.Fatalf("endpoint requests %s = %v, want %v", when, models, want)
+		}
 	}
+
+	if row := h.showSettings(); row != "sort   default" {
+		t.Fatalf("sort row = %q, want the mode alone", row)
+	}
+	var rows []string
+	h.onLoop(func() { rows = h.app.OpenRouterModelsForTest() })
+	if len(rows) != 4 {
+		t.Fatalf("table rows = %q, want the three configured models", rows)
+	}
+	time.Sleep(50 * time.Millisecond)
+	expectRequests("after opening the tab and the table")
+
+	edit := func(model string) {
+		t.Helper()
+		var opened bool
+		h.onLoop(func() { opened = h.app.EditOpenRouterModelForTest(model) })
+		if !opened {
+			t.Fatalf("%s dialog did not open", model)
+		}
+		h.awaitOfferedLevels("  checking providers\u2026")
+	}
+
+	srv.block()
+	edit("q/one")
+	<-srv.entered
+	close(srv.release)
+	h.awaitOfferedLevels("  providers per level: fp8 2, nvfp4 1, unspecified 1")
+	expectRequests("after editing q/one", "q/one")
+
+	srv.block()
+	edit("q/two")
+	<-srv.entered
+	var drafted bool
+	h.onLoop(func() { drafted = h.app.DraftOpenRouterModelCapsForTest("q/two", "5", "") })
+	if !drafted {
+		t.Fatal("drafting q/two caps did not reach the open dialog")
+	}
+	close(srv.release)
+	h.awaitOfferedLevels("  provider list unavailable")
+	expectRequests("after the failed lookup", "q/one", "q/two")
+
+	var saved bool
+	h.onLoop(func() { saved = h.app.SubmitOpenRouterModelEditorForTest("q/two") })
+	if !saved {
+		t.Fatal("the q/two dialog that received the failed lookup was no longer open to save")
+	}
+	var notice string
+	h.onLoop(func() { notice = h.app.NoticeText() })
+	if notice != "" {
+		t.Fatalf("notice after saving with no host list = %q, want none", notice)
+	}
+	if got, _ := h.cache.OpenRouterMaxPrice("q/two"); got != (provider.MaxPrice{Prompt: 5, HasPrompt: true}) {
+		t.Fatalf("q/two caps after saving = %+v, want prompt 5", got)
+	}
+	if got, want := persistedProviderEntry(t, global, "openrouter")["routing"], map[string]any{"max_price": map[string]any{"q/two": map[string]any{"prompt": uint64(5)}}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted routing = %#v, want %#v", got, want)
+	}
+	expectRequests("after the failed lookup and the save", "q/one", "q/two")
 	if n := rejected.Load(); n != 0 {
 		t.Fatalf("rejected dials = %d, want none", n)
 	}
-}
-
-func TestF1660_SettingsTabEstimate_ModelSwitchFetchesOnlyOnOpen(t *testing.T) {
-	srv := newEstimateServer(t, map[string][2]string{"m": {"0.0000001", "0.0000002"}, "n": {"0.000001", "0.000002"}})
-	client, _ := guardedEstimateClient(srv)
-	var offset atomic.Int64
-	start := time.Unix(1_700_000_000, 0)
-	store := &provider.OpenRouterEndpointStore{HTTPClient: client, Now: func() time.Time { return start.Add(time.Duration(offset.Load())) }}
-	h := startEstimateTUI(t, srv.srv.URL+"/api/v1", openRouterModel("m"), store, nil)
-	const priceM, priceN = "sort   default (about $0.1 / $0.2 per M)", "sort   default (about $1 / $2 per M)"
-	expectRequests := func(want ...string) {
-		t.Helper()
-		var paths []string
-		for _, r := range srv.requests() {
-			paths = append(paths, strings.TrimSuffix(strings.TrimPrefix(r, "/api/v1/models/"), "/endpoints Bearer or-key"))
-		}
-		if !slices.Equal(paths, want) {
-			t.Fatalf("endpoint requests = %v, want %v", paths, want)
-		}
-	}
-
-	h.showSettings()
-	h.awaitSortRow(priceM)
-	expectRequests("m")
-
-	h.reopen()
-	h.switchModel(*openRouterModel("n"))
-	time.Sleep(50 * time.Millisecond)
-	expectRequests("m")
-
-	h.showSettings()
-	h.awaitSortRow(priceN)
-	expectRequests("m", "n")
-
-	h.reopen()
-	h.switchModel(*openRouterModel("m"))
-	offset.Store(int64(12*time.Hour - time.Second))
-	if row := h.showSettings(); row != priceM {
-		t.Fatalf("sort row after switching back = %q, want the cached %q", row, priceM)
-	}
-	expectRequests("m", "n")
-
-	offset.Store(int64(12 * time.Hour))
-	h.reopen()
-	h.showSettings()
-	h.awaitStored("m")
-	expectRequests("m", "n", "m")
 }

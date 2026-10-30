@@ -228,3 +228,61 @@ func TestMatchesDeclaredCommand_NoEntriesNeverMatches(t *testing.T) {
 		t.Fatalf("expected no match with an empty declared list")
 	}
 }
+
+func TestMatchesDeclaredCommand_PinnedHomeFormRefusesBothSpellings(t *testing.T) {
+	tests := []struct {
+		declaration string
+		stages      []string
+	}{
+		{"cat ~/x", []string{`cat ~/x`, `cat '~/x'`, `cat ~/x -n`, `cat \~/x -n`}},
+		{"cat '~/x'", []string{`cat ~/x`, `cat '~/x'`}},
+		{"ls $HOME", []string{`ls $HOME`, `ls "$HOME"`, `ls $HOME -l`}},
+		{"ls -l ~", []string{`ls -l ~`, `ls -l '~'`}},
+		{"cp $HOME/a", []string{`cp $HOME/a b`, `cp '$HOME/a' b`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.declaration, func(t *testing.T) {
+			entries, _, err := ParseDeclaredCommands([]any{tt.declaration})
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("ParseDeclaredCommands(%q) = %v, %v; want one entry", tt.declaration, entries, err)
+			}
+			for _, stage := range tt.stages {
+				norm, err := NormalizeDirectStage(stage, StageSolo)
+				if err != nil || norm.Route != RouteDirect {
+					t.Fatalf("NormalizeDirectStage(%q) = route %v, error %v; want a direct stage", stage, norm.Route, err)
+				}
+				if MatchesDeclaredCommand(norm.Tokens, norm.Assignments, norm.ClearEnvironment, entries) {
+					t.Fatalf("declaration %q authorized %q, want a pinned home form refused", tt.declaration, stage)
+				}
+			}
+		})
+	}
+}
+
+func TestMatchesDeclaredCommand_UnpinnedHomeFormsKeepMatching(t *testing.T) {
+	tests := []struct {
+		declaration string
+		stages      []string
+	}{
+		{"cat -n", []string{`cat -n ~/x`, `cat -n '~/x'`, `cat -n $HOME`, `cat -n "$HOME"/x`, `cat -n ~`}},
+		{"cat ~alice/x", []string{`cat ~alice/x`, `cat '~alice/x' -n`}},
+		{"echo $HOMEDIR", []string{`echo '$HOMEDIR'`, `echo '$HOMEDIR' ~`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.declaration, func(t *testing.T) {
+			entries, _, err := ParseDeclaredCommands([]any{tt.declaration})
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("ParseDeclaredCommands(%q) = %v, %v; want one entry", tt.declaration, entries, err)
+			}
+			for _, stage := range tt.stages {
+				norm, err := NormalizeDirectStage(stage, StageSolo)
+				if err != nil || norm.Route != RouteDirect {
+					t.Fatalf("NormalizeDirectStage(%q) = route %v, error %v; want a direct stage", stage, norm.Route, err)
+				}
+				if !MatchesDeclaredCommand(norm.Tokens, norm.Assignments, norm.ClearEnvironment, entries) {
+					t.Fatalf("declaration %q stopped authorizing %q", tt.declaration, stage)
+				}
+			}
+		})
+	}
+}

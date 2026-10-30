@@ -55,8 +55,7 @@ representing the project include using an official email address, posting via an
 official social media account, or acting as an appointed representative at an
 online or offline event.
 
-For contribution setup and workflow, see [CONTRIBUTING.md](CONTRIBUTING.md) and
-the [contributing/](contributing/README.md) guide.
+For how to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Enforcement
 

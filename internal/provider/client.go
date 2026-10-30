@@ -150,13 +150,13 @@ type ClientConfig struct {
 	Attribution  bool
 	Routing      Routing
 	HTTPClient   *http.Client
-	BestValueTag func(ctx context.Context, model string, ignored []string) string
+	BestValueTag func(ctx context.Context, model, level string, ignored []string) string
 }
 
 type openAIClient struct {
 	name         string
 	routing      Routing
-	bestValueTag func(ctx context.Context, model string, ignored []string) string
+	bestValueTag func(ctx context.Context, model, level string, ignored []string) string
 	svc          openai.ChatCompletionService
 }
 
@@ -219,41 +219,6 @@ func (c *openAIClient) ChatCompletion(ctx context.Context, req Request) (Respons
 			params.ReasoningEffort = shared.ReasoningEffort(req.Effort)
 		}
 	}
-	if c.name == openRouterProviderID {
-		if len(req.IgnoredProviders) > 0 {
-			extraOpts = append(extraOpts, option.WithJSONSet("provider.ignore", req.IgnoredProviders))
-		}
-		switch {
-		case c.routing.Sort == openRouterSortBestValue:
-			tag := ""
-			if c.bestValueTag != nil {
-				tag = c.bestValueTag(ctx, req.Model, req.IgnoredProviders)
-			}
-			if tag != "" {
-				extraOpts = append(extraOpts, option.WithJSONSet("provider.order", []string{tag}))
-			} else {
-				extraOpts = append(extraOpts, option.WithJSONSet("provider.sort", "price"))
-			}
-		case c.routing.Sort != "":
-			extraOpts = append(extraOpts, option.WithJSONSet("provider.sort", c.routing.Sort))
-		}
-		if c.routing.DataCollection != "" {
-			extraOpts = append(extraOpts, option.WithJSONSet("provider.data_collection", c.routing.DataCollection))
-		}
-		if c.routing.RequireParameters {
-			extraOpts = append(extraOpts, option.WithJSONSet("provider.require_parameters", true))
-		}
-		if p, ok := c.routing.MaxPrice[req.Model]; ok {
-			price := map[string]float64{}
-			if p.HasPrompt {
-				price["prompt"] = p.Prompt
-			}
-			if p.HasCompletion {
-				price["completion"] = p.Completion
-			}
-			extraOpts = append(extraOpts, option.WithJSONSet("provider.max_price", price))
-		}
-	}
 	if len(req.Tools) > 0 {
 		// advertise the turn's mode-filtered tool set with automatic tool
 		// choice. An empty set leaves both fields omitted (omitzero), so a zero-tool
@@ -270,27 +235,109 @@ func (c *openAIClient) ChatCompletion(ctx context.Context, req Request) (Respons
 		// indicator. The chunk may be absent if the stream is
 		// interrupted, which the runner tolerates.
 		params.StreamOptions = openai.ChatCompletionStreamOptionsParam{IncludeUsage: openai.Bool(true)}
+	}
+	q := c.routing.Quantizations[req.Model]
+	levels := []string{""}
+	if c.name == openRouterProviderID && len(q.Levels) > 0 {
+		levels = q.Levels
+		if q.Mode == "preferred" {
+			levels = append(slices.Clip(levels), "")
+		}
+	}
+	var err error
+	sent := Quantization{Mode: q.Mode}
+	for i, level := range levels {
+		if i > 0 && ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
+		if level == "" {
+			sent = Quantization{}
+		} else {
+			sent.Levels = append(sent.Levels, level)
+		}
+		var resp Response
+		resp, err = c.send(ctx, params, req.Stream, slices.Concat(extraOpts, c.openRouterOpts(ctx, req, level)))
+		if err == nil {
+			return resp, nil
+		}
+		err = c.routingExhaustion(err, req, sent)
+		var exhausted *RoutingExhaustionError
+		if !errors.As(err, &exhausted) {
+			break
+		}
+	}
+	return Response{}, err
+}
+
+func (c *openAIClient) send(ctx context.Context, params openai.ChatCompletionNewParams, stream bool, opts []option.RequestOption) (Response, error) {
+	if stream {
 		// The streaming call uses a body-failure detector that does not buffer the
 		// SSE body: it wraps the response body so a missing/truncated 2xx body
 		// surfaces from the incremental read as a status-carrying *HTTPBodyError
 		// (the non-streaming detectHTTPBodyFailure buffers and cannot be reused
 		// here)..
-		stream := c.svc.NewStreaming(ctx, params, append(extraOpts, option.WithMiddleware(detectStreamingBodyFailure))...)
-		if err := stream.Err(); err != nil {
-			return Response{}, c.routingExhaustion(c.surfaceHTTPError(err), req)
+		s := c.svc.NewStreaming(ctx, params, append(opts, option.WithMiddleware(detectStreamingBodyFailure))...)
+		if err := s.Err(); err != nil {
+			err = c.surfaceHTTPError(err)
+			_ = s.Close()
+			return Response{}, err
 		}
-		return Response{Stream: stream}, nil
+		return Response{Stream: s}, nil
 	}
 	// The non-streaming detector buffers the response body to tell a
 	// missing/truncated 2xx body apart, which is safe only off the streaming path
-	completion, err := c.svc.New(ctx, params, append(extraOpts, option.WithMiddleware(detectHTTPBodyFailure))...)
+	completion, err := c.svc.New(ctx, params, append(opts, option.WithMiddleware(detectHTTPBodyFailure))...)
 	if err != nil {
-		return Response{}, c.routingExhaustion(c.surfaceHTTPError(err), req)
+		return Response{}, c.surfaceHTTPError(err)
 	}
 	return Response{Completion: completion}, nil
 }
 
-func (c *openAIClient) routingExhaustion(err error, req Request) error {
+func (c *openAIClient) openRouterOpts(ctx context.Context, req Request, level string) []option.RequestOption {
+	if c.name != openRouterProviderID {
+		return nil
+	}
+	var opts []option.RequestOption
+	if len(req.IgnoredProviders) > 0 {
+		opts = append(opts, option.WithJSONSet("provider.ignore", req.IgnoredProviders))
+	}
+	switch {
+	case c.routing.Sort == openRouterSortBestValue:
+		tag := ""
+		if c.bestValueTag != nil {
+			tag = c.bestValueTag(ctx, req.Model, level, req.IgnoredProviders)
+		}
+		if tag != "" {
+			opts = append(opts, option.WithJSONSet("provider.order", []string{tag}))
+		} else {
+			opts = append(opts, option.WithJSONSet("provider.sort", "price"))
+		}
+	case c.routing.Sort != "":
+		opts = append(opts, option.WithJSONSet("provider.sort", c.routing.Sort))
+	}
+	if c.routing.DataCollection != "" {
+		opts = append(opts, option.WithJSONSet("provider.data_collection", c.routing.DataCollection))
+	}
+	if c.routing.RequireParameters {
+		opts = append(opts, option.WithJSONSet("provider.require_parameters", true))
+	}
+	if p, ok := c.routing.MaxPrice[req.Model]; ok {
+		price := map[string]float64{}
+		if p.HasPrompt {
+			price["prompt"] = p.Prompt
+		}
+		if p.HasCompletion {
+			price["completion"] = p.Completion
+		}
+		opts = append(opts, option.WithJSONSet("provider.max_price", price))
+	}
+	if level != "" {
+		opts = append(opts, option.WithJSONSet("provider.quantizations", []string{level}))
+	}
+	return opts
+}
+
+func (c *openAIClient) routingExhaustion(err error, req Request, sent Quantization) error {
 	var httpErr *HTTPError
 	if c.name != openRouterProviderID || !errors.As(err, &httpErr) || !isRoutingFilterExhaustion(httpErr) {
 		return err
@@ -301,6 +348,7 @@ func (c *openAIClient) routingExhaustion(err error, req Request) error {
 		DataCollectionDeny: c.routing.DataCollection == "deny",
 		RequireParameters:  c.routing.RequireParameters,
 		Ignore:             slices.Clone(req.IgnoredProviders),
+		Quantization:       sent,
 		HTTP:               httpErr,
 	}
 }

@@ -536,8 +536,8 @@ func buildTurnClient(providerID string, kind provider.AuthKind, cache *config.Ca
 	}
 	if providerID == "openrouter" {
 		store := openRouterEndpoints
-		cfg.BestValueTag = func(ctx context.Context, model string, ignored []string) string {
-			return store.BestValueTag(ctx, entry, authHeader, authValue, model, ignored)
+		cfg.BestValueTag = func(ctx context.Context, model, level string, ignored []string) string {
+			return store.BestValueTag(ctx, entry, authHeader, authValue, model, level, ignored)
 		}
 	}
 	return newTurnProviderClient(cfg), true
@@ -636,10 +636,6 @@ func (c *turnController) dispatch(store *sessions.Store, submitStart time.Time) 
 		c.armTUIDebug(sel.Provider, sel.ID, modeName)
 	}
 
-	// Publish this turn for any child a general_agent call in it starts. It happens here, on the
-	// event-loop goroutine before the turn goroutine exists, so the tool-dispatch goroutine
-	// never reads the run-scoped active states and a /model or /mode change landing mid-turn
-	// reaches the next turn's children, not this turn's.
 	if c.generalAgentParent != nil {
 		c.generalAgentParent.publish(sel, source, modeName, systemPrompt)
 	}

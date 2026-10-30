@@ -2,6 +2,7 @@
 package config_test
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -116,6 +117,29 @@ func TestValidate_Accepts(t *testing.T) {
     api_key: or-key
     routing:
       max_price: {}
+`,
+		},
+		{
+			"openrouter routing with per-model quantizations",
+			`provider:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: or-key
+    routing:
+      quantizations:
+        z-ai/glm-5.3:
+          levels: [fp8, fp4]
+          mode: required
+`,
+		},
+		{
+			"openrouter routing with empty quantizations",
+			`provider:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: or-key
+    routing:
+      quantizations: {}
 `,
 		},
 		{
@@ -1205,6 +1229,65 @@ func TestValidate_RejectsInvalidMaxPriceAtExactKeys(t *testing.T) {
 			}
 			if keys, _, _ := strings.Cut(rest, ": "); keys != tt.wantKey {
 				t.Fatalf("offending keys = %q, want exactly %q\nerror = %s", keys, tt.wantKey, err.Error())
+			}
+		})
+	}
+}
+
+func quantizationsSettings(entry string) []byte {
+	return []byte("provider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: or-key\n    routing:\n      quantizations:\n        z-ai/glm-5.3:\n" + entry)
+}
+
+func TestLoadYAMLBytes_QuantizationsReachCacheInFileOrder(t *testing.T) {
+	_, raw, cat, err := config.LoadYAMLBytes(quantizationsSettings("          levels: [fp8, fp4]\n          mode: required\n"), "settings.yaml")
+	if cat != config.LoadOK || err != nil {
+		t.Fatalf("LoadYAMLBytes() = (%q, %v), want success", cat, err)
+	}
+	c, err := config.NewCache(raw, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewCache() error = %v", err)
+	}
+	entry, _ := c.Provider("openrouter")
+	want := map[string]provider.Quantization{"z-ai/glm-5.3": {Levels: []string{"fp8", "fp4"}, Mode: "required"}}
+	if !reflect.DeepEqual(entry.Routing.Quantizations, want) {
+		t.Fatalf("Routing.Quantizations = %+v, want %+v", entry.Routing.Quantizations, want)
+	}
+}
+
+func TestValidate_RejectsInvalidQuantizations(t *testing.T) {
+	const model = "provider.openrouter.routing.quantizations.z-ai/glm-5.3"
+	tests := []struct {
+		name    string
+		entry   string
+		wantKey string
+	}{
+		{"unknown level", "          levels: [fp8, q4]\n          mode: required\n", model + ".levels.1"},
+		{"empty list", "          levels: []\n          mode: required\n", model + ".levels"},
+		{"duplicate level", "          levels: [fp8, fp4, fp8]\n          mode: required\n", model + ".levels"},
+		{"missing mode", "          levels: [fp8]\n", model},
+		{"unknown mode", "          levels: [fp8]\n          mode: strict\n", model + ".mode"},
+		{"unknown entry key", "          levels: [fp8]\n          mode: required\n          fallback: true\n", model},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := quantizationsSettings(tt.entry)
+			err := config.Validate(src, "settings.yaml")
+			if err == nil {
+				t.Fatalf("Validate() = nil, want error")
+			}
+			_, rest, ok := strings.Cut(err.Error(), "schema validation failed at ")
+			if !ok {
+				t.Fatalf("error %q lacks the schema validation key list", err.Error())
+			}
+			if keys, _, _ := strings.Cut(rest, ": "); keys != tt.wantKey {
+				t.Fatalf("offending keys = %q, want exactly %q\nerror = %s", keys, tt.wantKey, err.Error())
+			}
+			_, raw, cat, err := config.LoadYAMLBytes(src, "settings.yaml")
+			if cat != config.SchemaValidationError || raw != nil {
+				t.Fatalf("LoadYAMLBytes() category = %q, raw = %v, want %q and no decoded settings", cat, raw, config.SchemaValidationError)
+			}
+			if !strings.Contains(err.Error(), "z-ai/glm-5.3") {
+				t.Fatalf("LoadYAMLBytes() error %q does not name the model id", err.Error())
 			}
 		})
 	}

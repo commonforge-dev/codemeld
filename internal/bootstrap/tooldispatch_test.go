@@ -6033,7 +6033,7 @@ func TestGeneralAgentBinding_SnapshotCarriesTheRealizedRegistry(t *testing.T) {
 	reg := generalAgentVCSRegistry(t, cache, home, project, active, modeActive, store, project, "irrelevant")
 	deps := generalAgentTestBinding(active, modeActive).deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
-	snap, ok := deps.Snapshot()
+	snap, ok := deps.Snapshot(t.Context())
 	if !ok {
 		t.Fatal("Snapshot reported no resolvable parent, want the seeded openai selection")
 	}
@@ -6281,7 +6281,7 @@ type generalAgentProbe struct {
 	declared []map[string]bool
 }
 
-func (p *generalAgentProbe) snapshot() (subagenttool.Snapshot, bool) {
+func (p *generalAgentProbe) snapshot(context.Context) (subagenttool.Snapshot, bool) {
 	p.mu.Lock()
 	p.starts++
 	p.mu.Unlock()
@@ -6719,10 +6719,6 @@ func TestProductionDispatcher_DeleteDeclarationsOrderGeneralAgents(t *testing.T)
 	}
 }
 
-// TestGeneralAgentBinding_SnapshotsThePublishedParentTurn proves a child inherits the turn that
-// emitted its call: the binding reports no parent before any turn publishes, then stays frozen
-// on the published model, source, mode, and prompt while a /model or /mode change moves the
-// run-scoped state on, and follows only the next publication.
 func TestGeneralAgentBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
 	cache, home, project, active, modeActive := generalAgentFixture(t)
 	reg := generalAgentRegistry(t, cache, home, project, active, modeActive)
@@ -6733,7 +6729,7 @@ func TestGeneralAgentBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
 	if _, ok := parent.current(); ok {
 		t.Fatal("an unread holder reported a parent, want the zero value withheld")
 	}
-	if _, ok := deps.Snapshot(); ok {
+	if _, ok := deps.Snapshot(t.Context()); ok {
 		t.Fatal("Snapshot resolved a parent before any turn published one, want no child started")
 	}
 
@@ -6741,7 +6737,7 @@ func TestGeneralAgentBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
 	active.ApplyUserSelection(model.Selection{Provider: "openai", ID: "gpt-6", Effort: "xhigh"}, false)
 	modeActive.ApplyUserCommand(mode.AutoEdits)
 
-	frozen, ok := deps.Snapshot()
+	frozen, ok := deps.Snapshot(t.Context())
 	if !ok {
 		t.Fatal("Snapshot reported no resolvable parent after a turn published one")
 	}
@@ -6764,8 +6760,19 @@ func TestGeneralAgentBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
 		t.Fatalf("snapshot tools = %v, want the parent's advertised surface", toolNames(frozen.Tools))
 	}
 
+	pinned, ok := deps.Snapshot(vcs.WithConfinementMode(t.Context(), string(mode.Plan)))
+	if !ok {
+		t.Fatal("Snapshot reported no resolvable parent for a pinned call")
+	}
+	if pinned.Mode != string(mode.Plan) || slices.Contains(toolNames(pinned.Tools), filetools.CreateToolName) {
+		t.Fatalf("pinned snapshot mode = %q, tools %v; want the call's plan pin and its read-only surface", pinned.Mode, toolNames(pinned.Tools))
+	}
+	if pinned.Model != frozen.Model || pinned.ModelSource != frozen.ModelSource || pinned.SystemPrompt != frozen.SystemPrompt {
+		t.Fatalf("pinned snapshot = %+v, want the published turn's model, source and prompt", pinned)
+	}
+
 	publishParentTurn(parent, active, modeActive)
-	next, ok := deps.Snapshot()
+	next, ok := deps.Snapshot(t.Context())
 	if !ok {
 		t.Fatal("Snapshot reported no resolvable parent after the next turn published")
 	}
@@ -6780,10 +6787,6 @@ func TestGeneralAgentBinding_SnapshotsThePublishedParentTurn(t *testing.T) {
 	}
 }
 
-// TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent proves the TUI path publishes
-// the dispatched turn into the same holder the registry's delegate binding reads, and that a
-// /model or /mode change landing after dispatch does not move what a child started in that
-// turn inherits.
 func TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent(t *testing.T) {
 	var turns sync.WaitGroup
 	defer swapGoTurn(waitableGoTurn(&turns))()
@@ -6799,7 +6802,7 @@ func TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent(t *testing
 	parent := &parentTurnHolder{}
 	deps := generalAgentBinding{parent: parent, notices: &recordingNotices{}}.deps(reg, cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
 
-	if _, ok := deps.Snapshot(); ok {
+	if _, ok := deps.Snapshot(t.Context()); ok {
 		t.Fatal("a delegate call before the first dispatch resolved a parent, want none")
 	}
 
@@ -6821,7 +6824,7 @@ func TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent(t *testing
 	active.ApplyUserSelection(model.Selection{Provider: "openai", ID: "gpt-6", Effort: "xhigh"}, false)
 	modeActive.ApplyUserCommand(mode.AutoEdits)
 
-	snap, ok := deps.Snapshot()
+	snap, ok := deps.Snapshot(t.Context())
 	if !ok {
 		t.Fatal("a delegate call in the dispatched turn resolved no parent, want the dispatched turn")
 	}
@@ -6833,6 +6836,14 @@ func TestTurnController_DispatchPublishesTheParentTurnForGeneralAgent(t *testing
 	}
 	if snap.SystemPrompt != "prompt for build/gpt-5.5" {
 		t.Fatalf("child prompt = %q, want the prompt the dispatched turn assembled", snap.SystemPrompt)
+	}
+
+	pinned, ok := deps.Snapshot(vcs.WithConfinementMode(t.Context(), string(mode.AutoEdits)))
+	if !ok {
+		t.Fatal("a pinned delegate call in the dispatched turn resolved no parent")
+	}
+	if pinned.Mode != string(mode.AutoEdits) || pinned.Model != snap.Model || pinned.SystemPrompt != snap.SystemPrompt {
+		t.Fatalf("pinned child = mode %q, model %+v, prompt %q; want the call's pin with the dispatched turn's model and prompt", pinned.Mode, pinned.Model, pinned.SystemPrompt)
 	}
 }
 
@@ -8506,7 +8517,7 @@ func TestProductionDispatcher_ConfinedVCSSharesTheRealizedConfinement(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got.Env, want) {
+	if !slices.Equal(got.Env, helperLaunchEnv(t, want)) {
 		t.Fatalf("vcs env = %v, want the fixed environment %v", got.Env, want)
 	}
 	wantHelperArgv(t, got.Argv, filepath.Join(conf.lookupPath, "git"), "status", "--short")
@@ -8567,6 +8578,318 @@ func TestGeneralAgentBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 	wantHelperArgv(t, childInner.bounded[0].Argv, filepath.Join(lookup, "ls"))
 	if policy, _ := decodeFrame(t, childInner.bounded[0].Stdin); policy.Mode != string(mode.Plan) {
 		t.Fatalf("child policy = %+v, want the frozen plan mode", policy)
+	}
+}
+
+func TestGeneralAgentBinding_AChildWithoutConfinementKeepsItsOwnMode(t *testing.T) {
+	cache, home, project, active, modeActive := generalAgentFixture(t)
+	store := mkStore(t)
+	deps := generalAgentTestBinding(active, modeActive).deps(tools.NewRegistry(), cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	child, ok := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.Plan), ChildAgent: true}).(*productionToolDispatcher)
+	if !ok || child.confinement != nil {
+		t.Fatalf("NewDispatcher = %+v, want an unconfined production dispatcher", child)
+	}
+	ctx := vcs.WithConfinementMode(context.Background(), string(mode.Build))
+	if got, ok := vcs.ConfinementMode(child.pinMode(ctx)); !ok || got != string(mode.Plan) {
+		t.Fatalf("child call mode = %q (pinned %v), want its inherited plan over the caller's build", got, ok)
+	}
+}
+
+type childModeRound struct {
+	before func()
+	chunks [][]byte
+}
+
+type childModeHarness struct {
+	d          *productionToolDispatcher
+	modeActive *mode.ActiveState
+	cache      *config.Cache
+	home       string
+	store      *sessions.Store
+	script     []childModeRound
+	advertised [][]string
+	ran        []string
+}
+
+func newChildModeHarness(t *testing.T, published mode.Mode, wiring string) *childModeHarness {
+	t.Helper()
+	cache, home, project, active, _ := generalAgentFixture(t)
+	h := &childModeHarness{modeActive: mode.NewActiveState(published, mode.SourceUserCommand), cache: cache, home: home, store: mkStore(t)}
+	turnStore := func() *sessions.Store { return h.store }
+	inner := &confineInner{
+		onBounded: func(spec cmdrunner.RunSpec) {
+			policy, _ := decodeFrame(t, spec.Stdin)
+			h.ran = append(h.ran, policy.Mode)
+		},
+		onExec: func(cmdrunner.RunSpec) { h.ran = append(h.ran, "unconfined") },
+	}
+	prevVCS := newVCSActionRunner
+	newVCSActionRunner = func() cmdrunner.Runner { return inner }
+	t.Cleanup(func() { newVCSActionRunner = prevVCS })
+	client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+		h.advertised = append(h.advertised, toolNames(req.Tools))
+		next := childModeRound{chunks: [][]byte{contentChunk("done"), finishChunk("stop")}}
+		if len(h.script) > 0 {
+			next, h.script = h.script[0], h.script[1:]
+		}
+		if next.before != nil {
+			next.before()
+		}
+		return provider.Response{Stream: newStream(next.chunks...)}, nil
+	}}
+	t.Cleanup(swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client }))
+
+	var top, bound *confinement
+	live := func() *confinement {
+		return &confinement{constrained: true, mode: liveMode(h.modeActive), lookupPath: programDir(t, "git"), blocked: testBlocked(t), tmpDir: t.TempDir(), projectRoot: project}
+	}
+	switch wiring {
+	case "shared":
+		top = live()
+		bound = top
+	case "unbound":
+		top = live()
+	case "readerless":
+		top = &confinement{constrained: true, blocked: testBlocked(t)}
+		bound = top
+	case "none":
+	default:
+		t.Fatalf("unknown wiring %q", wiring)
+	}
+	parent := &parentTurnHolder{}
+	publishParentTurn(parent, active, h.modeActive)
+	guard := mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil)
+	factory := &toolRegistryFactory{active: &ActiveVCS{Template: productVettedGitTemplate(t), RepoRoot: project}}
+	reg, err := realizeToolRegistry(factory, cache, turnStore, home, project, guard, generalAgentBinding{parent: parent, notices: &recordingNotices{}, confinement: bound})
+	if err != nil {
+		t.Fatalf("realizeToolRegistry: %v", err)
+	}
+	auth := newHeadlessAuthorizer(cache, turnStore, h.modeActive, nil, &recordingNotices{})
+	auth.executionConstrained = top != nil
+	auth.blocked = guard.Blocked
+	h.d = newProductionToolDispatcher(reg, &fakeDispatchRunner{}, auth, home, project, turnStore, cache.MaxToolOutputBytes(), guard)
+	h.d.confinement = top
+	return h
+}
+
+func (h *childModeHarness) saveBuildGrant(t *testing.T) {
+	t.Helper()
+	entry := permissions.PermissionEntry{Kind: "tool", Subject: filetools.CreateToolName, PathScope: h.cache.ProjectRoot(), GrantKind: "folder"}
+	seedGrantFile(t, SettingsPath(h.home), entry)
+	h.cache.AppendPermission(entry)
+}
+
+func (h *childModeHarness) call(t *testing.T, scheduled bool, call turn.AssembledToolCall, from, to mode.Mode) turn.ToolResult {
+	t.Helper()
+	h.modeActive.ApplyUserCommand(from)
+	run := func(ctx context.Context) (turn.ToolResult, error) { return h.d.Dispatch(ctx, call) }
+	if scheduled {
+		unit := h.d.Plan([]turn.AssembledToolCall{call}, 1).Units[0]
+		if slices.Equal(unit.Targets, []string{productionToolDispatchTarget}) {
+			t.Fatal("the general_agent call was planned as a serial barrier, want a prepared general_agent unit")
+		}
+		run = func(ctx context.Context) (turn.ToolResult, error) {
+			if err := unit.PreRun(ctx); err != nil {
+				return turn.ToolResult{}, err
+			}
+			return unit.Run(ctx)
+		}
+	}
+	h.modeActive.ApplyUserCommand(to)
+	res, err := run(context.Background())
+	if err != nil {
+		t.Fatalf("general_agent call error = %v", err)
+	}
+	return res
+}
+
+func (h *childModeHarness) childStarts(t *testing.T) int {
+	t.Helper()
+	return len(decodeStoreEvents[events.ChildAgentStart](t, h.store, events.KindChildAgentStart))
+}
+
+func (h *childModeHarness) nestedDenialSources(t *testing.T) []string {
+	t.Helper()
+	var sources []string
+	for _, m := range decodePermissionMatched(t, h.store) {
+		if m.Subject == subagenttool.ToolName && m.ChildInvocationID != "" && m.Outcome == "deny" {
+			sources = append(sources, m.OutcomeSource)
+		}
+	}
+	return sources
+}
+
+func childVCSRound() childModeRound {
+	return childModeRound{chunks: [][]byte{toolCallsChunk(toolFrag(0, "v1", "vcs_status", `{}`))}}
+}
+
+func nestedWriterRound() childModeRound {
+	return childModeRound{chunks: [][]byte{toolCallsChunk(toolFrag(0, "n1", subagenttool.ToolName, `{"instructions":"write","files":["nested.txt"]}`))}}
+}
+
+func nestedReaderRound(before func()) childModeRound {
+	return childModeRound{before: before, chunks: [][]byte{toolCallsChunk(toolFrag(0, "n2", subagenttool.ToolName, `{"instructions":"look deeper"}`))}}
+}
+
+func nestedDenialSource(m mode.Mode) string {
+	if m == mode.Plan {
+		return "mode_auto"
+	}
+	return "declared_scope"
+}
+
+func readOnlyGeneralAgentCall(id string) turn.AssembledToolCall {
+	return structuredCall(id, subagenttool.ToolName, map[string]any{"instructions": "look"})
+}
+
+func TestGeneralAgentBinding_ChildRunsUnderTheModeItsCallWasPinnedTo(t *testing.T) {
+	for _, tc := range []struct{ from, to mode.Mode }{
+		{mode.Build, mode.Plan},
+		{mode.Plan, mode.Build},
+		{mode.Build, mode.AutoEdits},
+		{mode.Build, mode.Build},
+		{mode.Plan, mode.Plan},
+	} {
+		for _, scheduled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_to_%s/scheduled=%v", tc.from, tc.to, scheduled), func(t *testing.T) {
+				h := newChildModeHarness(t, tc.from, "shared")
+				h.saveBuildGrant(t)
+
+				h.script = []childModeRound{childVCSRound(), nestedWriterRound()}
+				if res := h.call(t, scheduled, readOnlyGeneralAgentCall("g1"), tc.from, tc.to); res.Denied {
+					t.Fatalf("read-only general_agent = %+v, want a started child", res)
+				}
+				if h.childStarts(t) != 1 {
+					t.Fatalf("children started = %d, want 1", h.childStarts(t))
+				}
+				if want := []string{ranAs(tc.to)}; !slices.Equal(h.ran, want) {
+					t.Fatalf("child vcs runs = %v, want %v", h.ran, want)
+				}
+				if got, want := h.nestedDenialSources(t), []string{nestedDenialSource(tc.to)}; !slices.Equal(got, want) {
+					t.Fatalf("child authorizer denial sources = %v, want %v", got, want)
+				}
+				if len(h.advertised) == 0 || slices.Contains(h.advertised[0], filetools.CreateToolName) || !slices.Contains(h.advertised[0], "vcs_status") {
+					t.Fatalf("read-only child advertised %v, want vcs_status and no create", h.advertised)
+				}
+
+				h.advertised = nil
+				res := h.call(t, scheduled, structuredCall("g2", subagenttool.ToolName, map[string]any{"instructions": "write it", "files": []any{"out.txt"}}), tc.from, tc.to)
+				if tc.to == mode.Plan {
+					if !res.Denied || h.childStarts(t) != 1 || len(h.advertised) != 0 {
+						t.Fatalf("mutating general_agent under plan = %+v, children %d, provider rounds %d; want a refusal before any child starts", res, h.childStarts(t), len(h.advertised))
+					}
+					return
+				}
+				if res.Denied || h.childStarts(t) != 2 {
+					t.Fatalf("mutating general_agent under %s = %+v, children %d; want the saved grant to start a child", tc.to, res, h.childStarts(t))
+				}
+				if len(h.advertised) != 1 || !slices.Contains(h.advertised[0], filetools.CreateToolName) {
+					t.Fatalf("writing child advertised %v, want create offered under %s", h.advertised, tc.to)
+				}
+			})
+		}
+	}
+}
+
+type switchAfterAuthorizer struct {
+	dispatch.Authorizer
+	after func()
+}
+
+func (a switchAfterAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, disp dispatch.PromptDisplay, modeCtx permissions.ModeContext) (permissions.Decision, error) {
+	dec, err := a.Authorizer.Authorize(ctx, req, disp, modeCtx)
+	a.after()
+	return dec, err
+}
+
+func TestGeneralAgentBinding_ASwitchAfterThePinDoesNotMoveTheChild(t *testing.T) {
+	for _, tc := range []struct{ pinned, later mode.Mode }{
+		{mode.Plan, mode.Build},
+		{mode.Build, mode.Plan},
+	} {
+		for _, scheduled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_then_%s/scheduled=%v", tc.pinned, tc.later, scheduled), func(t *testing.T) {
+				h := newChildModeHarness(t, tc.later, "shared")
+				h.d.authorizer = switchAfterAuthorizer{Authorizer: h.d.authorizer, after: func() { h.modeActive.ApplyUserCommand(tc.later) }}
+
+				h.script = []childModeRound{childVCSRound(), nestedWriterRound()}
+				if res := h.call(t, scheduled, readOnlyGeneralAgentCall("g1"), tc.later, tc.pinned); res.Denied {
+					t.Fatalf("general_agent = %+v, want a started child", res)
+				}
+				if want := []string{ranAs(tc.pinned)}; !slices.Equal(h.ran, want) {
+					t.Fatalf("child vcs runs = %v, want %v", h.ran, want)
+				}
+				if got, want := h.nestedDenialSources(t), []string{nestedDenialSource(tc.pinned)}; !slices.Equal(got, want) {
+					t.Fatalf("child authorizer denial sources = %v, want %v", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestGeneralAgentBinding_APlanChildAndItsGrandchildStayPlan(t *testing.T) {
+	for _, wiring := range []string{"shared", "unbound"} {
+		for _, scheduled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/scheduled=%v", wiring, scheduled), func(t *testing.T) {
+				h := newChildModeHarness(t, mode.Build, wiring)
+				toBuild := func() { h.modeActive.ApplyUserCommand(mode.Build) }
+				done := childModeRound{chunks: [][]byte{contentChunk("done"), finishChunk("stop")}}
+				if wiring == "shared" {
+					h.script = []childModeRound{childVCSRound(), nestedReaderRound(toBuild), childVCSRound(), nestedWriterRound(), done, nestedWriterRound()}
+				} else {
+					h.script = []childModeRound{nestedReaderRound(toBuild), nestedWriterRound(), done, nestedWriterRound()}
+				}
+
+				if res := h.call(t, scheduled, readOnlyGeneralAgentCall("g1"), mode.Build, mode.Plan); res.Denied {
+					t.Fatalf("general_agent = %+v, want a started child", res)
+				}
+				if m, _ := h.modeActive.Current(); m != mode.Build {
+					t.Fatalf("top-level mode = %s, want the switch back to build to have happened mid-child", m)
+				}
+				if h.childStarts(t) != 2 {
+					t.Fatalf("children started = %d, want the child and its grandchild", h.childStarts(t))
+				}
+				if got := h.nestedDenialSources(t); !slices.Equal(got, []string{"mode_auto", "mode_auto"}) {
+					t.Fatalf("child and grandchild denial sources = %v, want both under plan", got)
+				}
+				for i, names := range h.advertised {
+					if slices.Contains(names, filetools.CreateToolName) || !slices.Contains(names, subagenttool.ToolName) {
+						t.Fatalf("round %d advertised %v, want the read-only plan surface", i, names)
+					}
+				}
+				if wiring == "shared" && !slices.Equal(h.ran, []string{"plan", "plan"}) {
+					t.Fatalf("child and grandchild vcs runs = %v, want both confined under plan", h.ran)
+				}
+			})
+		}
+	}
+}
+
+func TestGeneralAgentBinding_AnUnpinnedCallFallsBackToThePublishedMode(t *testing.T) {
+	for _, wiring := range []string{"none", "readerless"} {
+		for _, scheduled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/scheduled=%v", wiring, scheduled), func(t *testing.T) {
+				h := newChildModeHarness(t, mode.Build, wiring)
+				h.modeActive.ApplyUserCommand(mode.Plan)
+				if pinned, ok := vcs.ConfinementMode(h.d.pinMode(context.Background())); ok {
+					t.Fatalf("pinMode invented mode %q with no mode reader", pinned)
+				}
+
+				h.script = []childModeRound{childVCSRound(), nestedWriterRound()}
+				if res := h.call(t, scheduled, readOnlyGeneralAgentCall("g1"), mode.Build, mode.Plan); res.Denied {
+					t.Fatalf("general_agent = %+v, want a started child", res)
+				}
+				if h.childStarts(t) != 1 {
+					t.Fatalf("children started = %d, want 1", h.childStarts(t))
+				}
+				if !slices.Equal(h.ran, []string{"unconfined"}) {
+					t.Fatalf("child vcs runs = %v, want the read-only action auto-allowed and run unconfined under build", h.ran)
+				}
+				if got := h.nestedDenialSources(t); !slices.Equal(got, []string{"declared_scope"}) {
+					t.Fatalf("child authorizer denial sources = %v, want the published build mode", got)
+				}
+			})
+		}
 	}
 }
 

@@ -239,6 +239,22 @@ func TestRenderStatusLine_EscapesBracketDirInDynamicColorView(t *testing.T) {
 	}
 }
 
+func TestRenderStatusLine_EscapesControlCharactersInLaunchDir(t *testing.T) {
+	state := &statusStateFake{provider: "openai", modelID: "gpt-5", effort: "medium", launchDir: "/w/x\x1b\x1b[2Jy\rz\nq\u009b"}
+	escaped := `/w/x\x1B\x1B[2Jy\x0Dz\x0Aq\u009B`
+
+	raw := RenderStatusLine(state)
+	if !strings.Contains(raw, escaped) {
+		t.Errorf("status bar = %q, want the launch dir escaped as %q", raw, escaped)
+	}
+	if strings.ContainsAny(raw, "\x1b\r\n\u009b") {
+		t.Errorf("status bar carries a raw control from the launch dir: %q", raw)
+	}
+	if got := visibleStatusLine(state); !strings.Contains(got, escaped) {
+		t.Errorf("visible status bar = %q, want it to contain %q", got, escaped)
+	}
+}
+
 func TestStatusLine_RefreshReflectsInstalledState(t *testing.T) {
 	a := New(nil)
 	state := &statusStateFake{provider: "openai", modelID: "gpt-5", effort: "medium", launchDir: "/work"}

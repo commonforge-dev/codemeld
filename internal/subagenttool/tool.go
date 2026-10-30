@@ -59,7 +59,7 @@ type Deps struct {
 	Home          string
 	LaunchDir     string
 	ProjectRoot   string
-	Snapshot      func() (Snapshot, bool)
+	Snapshot      func(context.Context) (Snapshot, bool)
 	NewDispatcher func(permissions.ModeContext) turn.ToolDispatcher
 	// Store is the parent's session store: a child records into it rather than one of its own.
 	Store func() *sessions.Store
@@ -211,7 +211,7 @@ func (t *Tool) prepare(args map[string]any) (string, map[string]bool, map[string
 }
 
 func (t *Tool) InvokeWithPreparedGeneralAgent(ctx context.Context, instruction string, write, remove map[string]bool, moves map[permissions.MovePair]bool, dirs map[string]bool) (tools.Result, error) {
-	snap, ok := t.deps.Snapshot()
+	snap, ok := t.deps.Snapshot(ctx)
 	if !ok {
 		return failResult("no model is resolvable, so no child agent can start"), nil
 	}

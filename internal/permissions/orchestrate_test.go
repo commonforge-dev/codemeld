@@ -2,6 +2,7 @@ package permissions
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -7408,4 +7409,417 @@ func TestPromptWait_NoEventWithoutAPrompt(t *testing.T) {
 			t.Fatalf("waits = %+v, want none when no stage prompted", *waits)
 		}
 	})
+}
+
+func homeShellReq(t *testing.T, input string) MatchRequest {
+	t.Helper()
+	split, err := SplitCommand(input)
+	if err != nil {
+		t.Fatalf("SplitCommand(%q): %v", input, err)
+	}
+	if split.LiteralRoute || len(split.Stages) != 1 {
+		t.Fatalf("SplitCommand(%q) = %+v, want one direct stage", input, split)
+	}
+	stage := split.Stages[0]
+	expands := make([]bool, len(stage.Tokens))
+	for i := range expands {
+		expands[i] = stage.ExecForms[i].Expand
+	}
+	subject, err := DirectStageRequestSubject(stage.Tokens, stage.Assignments, stage.ClearEnvironment, expands)
+	if err != nil {
+		t.Fatalf("DirectStageRequestSubject(%q): %v", input, err)
+	}
+	return MatchRequest{
+		Kind: subjectKindDirect, Subject: subject, SubjectTokens: stage.Tokens,
+		Assignments: stage.Assignments, ClearEnvironment: stage.ClearEnvironment, PathScope: scopeProj,
+	}
+}
+
+func promptSequence(outcomes ...PromptOutcome) func(context.Context, ScopeEscalation) (PromptOutcome, error) {
+	next := 0
+	return func(context.Context, ScopeEscalation) (PromptOutcome, error) {
+		if next >= len(outcomes) {
+			return PromptOutcome{}, errors.New("unexpected prompt")
+		}
+		next++
+		return outcomes[next-1], nil
+	}
+}
+
+func rawHomeSubject(payload string) string {
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString([]byte(payload))
+}
+
+func TestAuthorize_HomeStateGrantDoesNotAuthorizeTheOtherSpelling(t *testing.T) {
+	pairs := [][2]string{
+		{`mv x '~/target'`, `mv x ~/target`},
+		{`mv x ~/target`, `mv x '~/target'`},
+		{`mv x "$HOME"/target`, `mv x $HOME/target`},
+		{`mv x $HOME/target`, `mv x "$HOME"/target`},
+	}
+	choices := []struct {
+		name       string
+		choice     PromptChoice
+		persistErr error
+	}{
+		{"session", PromptAllowSession, nil},
+		{"folder", PromptAllowFolder, nil},
+		{"folder persist failure", PromptAllowFolder, errors.New("disk full")},
+	}
+	for _, pair := range pairs {
+		for _, c := range choices {
+			t.Run(pair[0]+" then "+pair[1]+" "+c.name, func(t *testing.T) {
+				approved, other := homeShellReq(t, pair[0]), homeShellReq(t, pair[1])
+				if !slices.Equal(approved.SubjectTokens, other.SubjectTokens) || approved.Subject == other.Subject {
+					t.Fatalf("requests %+v and %+v must share tokens but not identity", approved, other)
+				}
+				f := newFixture(promptSequence(PromptOutcome{Choice: c.choice}, PromptOutcome{Choice: PromptDeny}), c.persistErr)
+
+				mustAuthorize(t, approved, f.deps)
+				if len(f.cap.appends) != 1 || f.cap.appends[0].Subject != approved.Subject {
+					t.Fatalf("appended = %+v, want one grant storing %q", f.cap.appends, approved.Subject)
+				}
+				if d := mustAuthorize(t, approved, f.deps); f.cap.prompts != 1 || d.Grant == nil {
+					t.Fatalf("same spelling: prompts = %d, decision = %+v, want the stored grant to match", f.cap.prompts, d)
+				}
+
+				d := mustAuthorize(t, other, f.deps)
+				if f.cap.prompts != 2 {
+					t.Fatalf("prompts = %d, want the other spelling to ask again", f.cap.prompts)
+				}
+				if d.Outcome != outcomeDeny || d.DenyEnvelope == "" {
+					t.Fatalf("decision = %+v, want the denial returned", d)
+				}
+				if len(f.cap.appends) != 1 {
+					t.Fatalf("appended = %+v, want only the first grant", f.cap.appends)
+				}
+			})
+		}
+	}
+}
+
+func TestAuthorize_HomeStateAllowOnceIsNotReusedAcrossSpellings(t *testing.T) {
+	for _, pair := range [][2]string{{`mv x '~/target'`, `mv x ~/target`}, {`mv x ~/target`, `mv x '~/target'`}} {
+		t.Run(pair[0], func(t *testing.T) {
+			first, second := homeShellReq(t, pair[0]), homeShellReq(t, pair[1])
+			f := newFixture(promptSequence(PromptOutcome{Choice: PromptAllowOnce}, PromptOutcome{Choice: PromptDeny}), nil)
+			f.deps.Cache = NewTurnCache()
+
+			steps := []struct {
+				req         MatchRequest
+				wantOutcome string
+				wantPrompts int
+			}{
+				{first, outcomeOnce, 1},
+				{first, outcomeOnce, 1},
+				{second, outcomeDeny, 2},
+				{second, outcomeDeny, 2},
+				{first, outcomeOnce, 2},
+			}
+			for i, s := range steps {
+				d := mustAuthorize(t, s.req, f.deps)
+				if d.Outcome != s.wantOutcome || f.cap.prompts != s.wantPrompts {
+					t.Fatalf("step %d: outcome = %q, prompts = %d, want %q after %d prompts", i, d.Outcome, f.cap.prompts, s.wantOutcome, s.wantPrompts)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthorize_ChooserScopeCarriesTheRequestHomeState(t *testing.T) {
+	exactMv := ExactSubject("mv", []string{"x", "~/target"})
+	prefixCp := PrefixSubject("cp", []string{"~/a"})
+	exactCp := ExactSubject("cp", []string{"~/a", "$HOME/b"})
+	tests := []struct {
+		name    string
+		input   string
+		scope   string
+		want    string
+		match   []string
+		noMatch []string
+	}{
+		{"exact expanding", `mv x ~/target`, exactMv, testHomeSubject(exactMv, []int{2}, nil),
+			[]string{`mv x ~/target`}, []string{`mv x '~/target'`, `mv x \~/target`}},
+		{"exact literal", `mv x '~/target'`, exactMv, testHomeSubject(exactMv, nil, []int{2}),
+			[]string{`mv x '~/target'`, `mv x \~/target`, `mv x ~'/target'`}, []string{`mv x ~/target`}},
+		{"exact mixed positions", `cp ~/a '$HOME/b'`, exactCp, testHomeSubject(exactCp, []int{1}, []int{2}),
+			[]string{`cp ~/a '$HOME/b'`}, []string{`cp '~/a' $HOME/b`, `cp ~/a $HOME/b`, `cp '~/a' '$HOME/b'`}},
+		{"prefix expanding", `cp ~/a b`, prefixCp, testHomeSubject(prefixCp, []int{1}, nil),
+			[]string{`cp ~/a b`, `cp ~/a c '~/d'`}, []string{`cp '~/a' b`, `cp \~/a c`}},
+		{"prefix literal", `cp '~/a' b`, prefixCp, testHomeSubject(prefixCp, nil, []int{1}),
+			[]string{`cp '~/a' c`, `cp \~/a b`}, []string{`cp ~/a b`}},
+		{"prefix with home only in the tail", `mv x ~/target`, PrefixSubject("mv", []string{"x"}), PrefixSubject("mv", []string{"x"}),
+			[]string{`mv x ~/target`, `mv x '~/target'`, `mv x $HOME/y`}, nil},
+		{"program", `mv x ~/target`, ProgramSubject("mv"), ProgramSubject("mv"),
+			[]string{`mv x ~/target`, `mv x '~/target'`, `mv '~' $HOME`}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(func(context.Context, ScopeEscalation) (PromptOutcome, error) {
+				return PromptOutcome{Choice: PromptAllowFolder, StoredSubject: tc.scope}, nil
+			}, nil)
+
+			mustAuthorize(t, homeShellReq(t, tc.input), f.deps)
+
+			if len(f.cap.appends) != 1 || f.cap.appends[0].Subject != tc.want {
+				t.Fatalf("appended = %+v, want one grant storing %q", f.cap.appends, tc.want)
+			}
+			for _, in := range tc.match {
+				if !Match(homeShellReq(t, in), f.cap.appends).Matched {
+					t.Errorf("grant %q does not authorize %s", tc.want, in)
+				}
+			}
+			for _, in := range tc.noMatch {
+				if Match(homeShellReq(t, in), f.cap.appends).Matched {
+					t.Errorf("grant %q authorizes %s", tc.want, in)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthorize_ContainmentChoicePinsTheFixedHomeArgumentState(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, sibling := filepath.Join(home, "proj", "dst"), filepath.Join(home, "proj", "other")
+	for _, dir := range []string{dst, sibling} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		spelling, other    string
+		expanding, literal []int
+	}{
+		{`$HOME`, `'$HOME'`, []int{1}, nil},
+		{`'$HOME'`, `$HOME`, nil, []int{1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.spelling, func(t *testing.T) {
+			req := homeShellReq(t, "mv "+tc.spelling+" "+ShellQuote(dst))
+			model, ok := NewDirectScopeModel(req.SubjectTokens, home)
+			if !ok || model.PathRow() < 0 {
+				t.Fatalf("NewDirectScopeModel(%v) offers no containment row", req.SubjectTokens)
+			}
+			scope := model.Choices[model.PathRow()].Subject
+			if !isDirectUnderSubject(scope) {
+				t.Fatalf("containment row subject = %q, want a direct-under subject", scope)
+			}
+			f := newFixture(func(context.Context, ScopeEscalation) (PromptOutcome, error) {
+				return PromptOutcome{Choice: PromptAllowFolder, StoredSubject: scope}, nil
+			}, nil)
+
+			mustAuthorize(t, req, f.deps)
+
+			want := testHomeSubject(scope, tc.expanding, tc.literal)
+			if len(f.cap.appends) != 1 || f.cap.appends[0].Subject != want {
+				t.Fatalf("appended = %+v, want one grant storing %q", f.cap.appends, want)
+			}
+			for _, path := range []string{dst, sibling} {
+				if !Match(homeShellReq(t, "mv "+tc.spelling+" "+ShellQuote(path)), f.cap.appends).Matched {
+					t.Errorf("grant does not authorize the same spelling on %s", path)
+				}
+			}
+			if Match(homeShellReq(t, "mv "+tc.other+" "+ShellQuote(dst)), f.cap.appends).Matched {
+				t.Errorf("grant for %s authorizes %s", tc.spelling, tc.other)
+			}
+		})
+	}
+}
+
+func TestAuthorize_HomeStateNestsInsideTheEnvironmentWrapper(t *testing.T) {
+	exact := ExactSubject("mv", []string{"x", "~/target"})
+	tests := []struct {
+		input   string
+		noMatch []string
+	}{
+		{`PATH=/usr/bin:/bin FOO=bar mv x ~/target`, []string{
+			`PATH=/usr/bin:/bin FOO=bar mv x '~/target'`, `mv x ~/target`, `PATH=/usr/bin:/bin FOO=baz mv x ~/target`,
+			`FOO=bar PATH=/usr/bin:/bin mv x ~/target`, `env -i PATH=/usr/bin:/bin FOO=bar mv x ~/target`,
+		}},
+		{`env -i PATH=/usr/bin:/bin FOO=bar mv x ~/target`, []string{
+			`env -i PATH=/usr/bin:/bin FOO=bar mv x '~/target'`, `PATH=/usr/bin:/bin FOO=bar mv x ~/target`,
+			`env -i PATH=/usr/bin:/bin mv x ~/target`, `mv x ~/target`,
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			req := homeShellReq(t, tc.input)
+			f := newFixture(func(context.Context, ScopeEscalation) (PromptOutcome, error) {
+				return PromptOutcome{Choice: PromptAllowFolder, StoredSubject: exact}, nil
+			}, nil)
+
+			mustAuthorize(t, req, f.deps)
+
+			want, err := EncodeDirectEnvSubject(req.Assignments, req.ClearEnvironment, testHomeSubject(exact, []int{2}, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(f.cap.appends) != 1 || f.cap.appends[0].Subject != want {
+				t.Fatalf("appended = %+v, want one grant storing %q", f.cap.appends, want)
+			}
+			if !Match(req, f.cap.appends).Matched {
+				t.Fatal("the stored grant does not authorize the request that created it")
+			}
+			for _, in := range tc.noMatch {
+				if Match(homeShellReq(t, in), f.cap.appends).Matched {
+					t.Errorf("grant %q authorizes %s", want, in)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthorize_LegacyHomePinnedGrantsFailClosedForBothSpellings(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(home, "proj", "dst")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exact := ExactSubject("mv", []string{"x", "~/target"})
+	envWrapped, err := EncodeDirectEnvSubject([]string{"FOO=bar"}, false, exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	under, err := EncodeDirectUnderSubject([]string{"mv", "$HOME", dst}, 2, filepath.Dir(dst), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		grant  string
+		inputs []string
+	}{
+		{"plain exact", exact, []string{`mv x ~/target`, `mv x '~/target'`}},
+		{"plain prefix", PrefixSubject("cp", []string{"~/a"}), []string{`cp ~/a b`, `cp '~/a' b`}},
+		{"direct-env", envWrapped, []string{`FOO=bar mv x ~/target`, `FOO=bar mv x '~/target'`}},
+		{"direct-under fixed $HOME", under, []string{"mv $HOME " + ShellQuote(dst), "mv '$HOME' " + ShellQuote(dst)}},
+	}
+	for _, tc := range tests {
+		for _, in := range tc.inputs {
+			t.Run(tc.name+" "+in, func(t *testing.T) {
+				f := newFixture(choose(PromptDeny), nil)
+				f.grants.entries = []PermissionEntry{directGrant(tc.grant, scopeProj, grantKindFolder)}
+
+				d := mustAuthorize(t, homeShellReq(t, in), f.deps)
+
+				if f.cap.prompts != 1 || d.Outcome != outcomeDeny {
+					t.Fatalf("prompts = %d, outcome = %q, want the legacy grant ignored and the denial returned", f.cap.prompts, d.Outcome)
+				}
+			})
+		}
+	}
+}
+
+func TestAuthorize_RejectsMalformedOrContradictoryHomeIdentity(t *testing.T) {
+	valid := homeShellReq(t, `FOO=bar mv x ~/target`)
+	plainValid := homeShellReq(t, `mv x ~/target`)
+	sibling := homeShellReq(t, `mv y ~/z`)
+	scopeJSON, err := json.Marshal(ExactSubject("mv", []string{"x", "~/target"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformed := func(payload string) MatchRequest {
+		r := plainValid
+		r.Subject = rawHomeSubject(fmt.Sprintf(payload, scopeJSON))
+		return r
+	}
+	with := func(r MatchRequest, edit func(*MatchRequest)) MatchRequest {
+		edit(&r)
+		return r
+	}
+	tests := []struct {
+		name string
+		req  MatchRequest
+	}{
+		{"contradictory tokens", with(valid, func(r *MatchRequest) { r.SubjectTokens = []string{"mv", "x", "~/other"} })},
+		{"contradictory assignments", with(valid, func(r *MatchRequest) { r.Assignments = []string{"FOO=baz"} })},
+		{"dropped assignments", with(valid, func(r *MatchRequest) { r.Assignments = nil })},
+		{"contradictory clear environment", with(valid, func(r *MatchRequest) { r.ClearEnvironment = true })},
+		{"assignments without env wrapper", with(plainValid, func(r *MatchRequest) { r.Assignments = []string{"FOO=bar"} })},
+		{"duplicate field", malformed(`{"subject":%s,"expanding":[2],"literal":[],"literal":[]}`)},
+		{"missing literal", malformed(`{"subject":%s,"expanding":[2]}`)},
+		{"unknown field", malformed(`{"subject":%s,"expanding":[2],"literal":[],"home":"/h"}`)},
+		{"non-home position", malformed(`{"subject":%s,"expanding":[1],"literal":[]}`)},
+	}
+	cleared := homeShellReq(t, `env -i PATH=/usr/bin:/bin FOO=bar mv x ~/target`)
+	for _, base := range []MatchRequest{valid, cleared} {
+		env, err := decodeDirectEnvSubject(base.Subject)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, mutations := directEnvOuterMutations(t, base.Assignments, base.ClearEnvironment, env.Subject)
+		for _, m := range mutations {
+			tests = append(tests, struct {
+				name string
+				req  MatchRequest
+			}{fmt.Sprintf("env wrapper %s (clear %v)", m.name, base.ClearEnvironment), with(base, func(r *MatchRequest) { r.Subject = m.encoded })})
+		}
+	}
+
+	control := newFixture(neverPrompt, nil)
+	control.cache.hits[turnCacheKeyOf(valid)] = outcomeOnce
+	if d := mustAuthorize(t, valid, control.deps); d.Outcome != outcomeOnce {
+		t.Fatalf("control decision = %+v, want the seeded allow-once reused", d)
+	}
+
+	for _, tc := range tests {
+		for _, path := range authorizePaths {
+			t.Run(tc.name+" "+path, func(t *testing.T) {
+				f := newFixture(neverPrompt, nil)
+				f.cache.hits[turnCacheKeyOf(valid)] = outcomeOnce
+				f.cache.hits[turnCacheKeyOf(tc.req)] = outcomeOnce
+				f.grants.entries = []PermissionEntry{directGrant(valid.Subject, scopeProj, grantKindFolder)}
+				calls := 0
+				f.deps.PromptBatch = chooseBatch(&calls, PromptAllowFolder)
+				f.deps.PromptIndependent = fixedIndependentPrompt(&calls, PromptAllowFolder, PromptAllowFolder)
+				members := []BatchRequest{{Req: sibling}, {Req: tc.req}}
+
+				var err error
+				switch path {
+				case "single":
+					_, err = Authorize(context.Background(), tc.req, ModeContext{}, f.deps)
+				case "batch":
+					_, err = AuthorizeBatch(context.Background(), members, f.deps)
+				case "independent":
+					_, err = AuthorizeIndependent(context.Background(), members, f.deps)
+				}
+
+				if err == nil {
+					t.Fatal("authorization accepted a malformed or contradictory request identity")
+				}
+				if f.cap.prompts != 0 || calls != 0 || len(f.cap.events) != 0 {
+					t.Fatalf("prompts = %d, batch prompts = %d, events = %+v, want nothing before the rejection", f.cap.prompts, calls, f.cap.events)
+				}
+				if len(f.cap.appends) != 0 || len(f.cap.persists) != 0 || len(f.cap.records) != 0 {
+					t.Fatalf("appends = %+v, persists = %+v, records = %+v, want none", f.cap.appends, f.cap.persists, f.cap.records)
+				}
+			})
+		}
+	}
+}
+
+func TestAuthorize_NonHomeChooserSubjectKeepsItsBytes(t *testing.T) {
+	req := homeShellReq(t, `mv a b`)
+	if req.Subject != "mv a b" {
+		t.Fatalf("request subject = %q, want the unchanged token-only identity", req.Subject)
+	}
+	for _, scope := range []string{"mv a b", "mv a :*", "mv :*"} {
+		t.Run(scope, func(t *testing.T) {
+			f := newFixture(func(context.Context, ScopeEscalation) (PromptOutcome, error) {
+				return PromptOutcome{Choice: PromptAllowFolder, StoredSubject: scope}, nil
+			}, nil)
+
+			mustAuthorize(t, req, f.deps)
+
+			if len(f.cap.appends) != 1 || f.cap.appends[0].Subject != scope {
+				t.Fatalf("appended = %+v, want one grant storing %q", f.cap.appends, scope)
+			}
+		})
+	}
 }

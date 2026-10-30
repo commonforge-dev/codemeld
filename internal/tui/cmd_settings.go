@@ -52,6 +52,7 @@ type SettingsDeps struct {
 	Share    func(PermissionRow) ShareResult
 	Approved bool
 	Boundary string
+	tab      int
 }
 
 // NewSettingsHandler returns the /settings handler bound to deps. It records the
@@ -74,6 +75,11 @@ func NewSettingsHandler(deps SettingsDeps) HandlerFunc {
 		deps.Picker.Present(rows, deps)
 		return nil
 	}
+}
+
+func NewOpenRouterHandler(deps SettingsDeps) HandlerFunc {
+	deps.tab = permTabIndexOpenRouter
+	return NewSettingsHandler(deps)
 }
 
 func unlayeredPermissionRows(entries []permissions.PermissionEntry) []PermissionRow {

@@ -1,8 +1,11 @@
 package tui
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -166,6 +169,91 @@ func TestRenderPermissionEntry(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := renderPermissionEntry(tc.e); got != tc.want {
 				t.Errorf("renderPermissionEntry() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func homeStateEnvelope(t *testing.T, scope string, expanding, literal []int) string {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		Subject   string `json:"subject"`
+		Expanding []int  `json:"expanding"`
+		Literal   []int  `json:"literal"`
+	}{scope, expanding, literal})
+	if err != nil {
+		t.Fatalf("marshal direct-home payload: %v", err)
+	}
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func TestRenderPermissionEntry_HomeStateDirectGrants(t *testing.T) {
+	envWrap := func(assignments []string, clear bool, subject string) string {
+		t.Helper()
+		encoded, err := permissions.EncodeDirectEnvSubject(assignments, clear, subject)
+		if err != nil {
+			t.Fatalf("EncodeDirectEnvSubject: %v", err)
+		}
+		return encoded
+	}
+	underScope := func(tokens []string, boundary string, tail bool) string {
+		t.Helper()
+		encoded, err := permissions.EncodeDirectUnderSubject(tokens, 2, boundary, tail)
+		if err != nil {
+			t.Fatalf("EncodeDirectUnderSubject: %v", err)
+		}
+		return encoded
+	}
+	const exact = "mv x '~/target'"
+	malformed := "'direct-home/v1 !!not-base64"
+	uncovered := homeStateEnvelope(t, exact, []int{}, []int{})
+	missingLiteral := "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString([]byte(`{"subject":"mv x '~/target'","expanding":[2]}`))
+	legacyEnv := envWrap([]string{"FOO=a"}, false, exact)
+	cases := []struct {
+		name, subject, want string
+	}{
+		{name: "expanding exact", subject: homeStateEnvelope(t, exact, []int{2}, []int{}), want: "run mv x ~/target"},
+		{name: "literal exact", subject: homeStateEnvelope(t, exact, []int{}, []int{2}), want: "run mv x '~/target'"},
+		{
+			name:    "mixed states with a quoted remainder",
+			subject: homeStateEnvelope(t, "cp '~' '$HOME/a b' '$HOME'", []int{2, 3}, []int{1}),
+			want:    "run cp '~' $HOME/'a b' $HOME",
+		},
+		{name: "expanding home folder with a trailing slash", subject: homeStateEnvelope(t, "ls '~/'", []int{1}, []int{}), want: "run ls ~/"},
+		{
+			name:    "assignments wrap the home state",
+			subject: envWrap([]string{"FOO=a b", "BAR=2"}, false, homeStateEnvelope(t, exact, []int{2}, []int{})),
+			want:    "run FOO='a b' BAR=2 mv x ~/target",
+		},
+		{
+			name:    "a cleared environment wraps the home state",
+			subject: envWrap([]string{"PATH=/usr/bin"}, true, homeStateEnvelope(t, exact, []int{}, []int{2})),
+			want:    "run env -i PATH=/usr/bin mv x '~/target'",
+		},
+		{name: "expanding prefix", subject: homeStateEnvelope(t, "mv x '~/target' :*", []int{2}, []int{}), want: "run mv x ~/target :*"},
+		{name: "literal prefix", subject: homeStateEnvelope(t, "mv x '~/target' :*", []int{}, []int{2}), want: "run mv x '~/target' :*"},
+		{
+			name:    "expanding containment fixed argument",
+			subject: homeStateEnvelope(t, underScope([]string{"mv", "$HOME", "/srv/data/f"}, "/srv/data", false), []int{1}, []int{}),
+			want:    "run mv $HOME :under=/srv/data",
+		},
+		{
+			name: "literal containment fixed argument with a tail wildcard under a cleared environment",
+			subject: envWrap([]string{"PATH=/usr/bin"}, true,
+				homeStateEnvelope(t, underScope([]string{"mv", "$HOME", "/srv/data/f", "y"}, "/srv/data", true), []int{}, []int{1})),
+			want: "run env -i PATH=/usr/bin mv '$HOME' :under=/srv/data :*",
+		},
+		{name: "malformed envelope", subject: malformed, want: "run " + malformed},
+		{name: "envelope missing a pinned position's state", subject: uncovered, want: "run " + uncovered},
+		{name: "envelope missing its literal field", subject: missingLiteral, want: "run " + missingLiteral},
+		{name: "legacy plain subject", subject: exact, want: "run " + exact},
+		{name: "legacy env-wrapped subject", subject: legacyEnv, want: "run " + legacyEnv},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := permissions.PermissionEntry{Kind: "direct", Subject: tc.subject, PathScope: "/srv/app", GrantKind: "folder"}
+			if got, want := renderPermissionEntry(e), tc.want+" — in /srv/app"; got != want {
+				t.Errorf("renderPermissionEntry() = %q, want %q", got, want)
 			}
 		})
 	}
@@ -584,7 +672,7 @@ func TestSettingsPicker_TabKeysNavigateBothDirections(t *testing.T) {
 		}
 		switch tc.want {
 		case permTabIndexOpenRouter:
-			assertRows(t, a, tc.want, []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow})
+			assertRows(t, a, tc.want, []string{"attribution   on", "data collection   allow", "sort   default", modelsEmptyRow})
 			continue
 		case permTabIndexSettings:
 			assertRows(t, a, tc.want, []string{retentionDefaultRow})
@@ -592,6 +680,46 @@ func TestSettingsPicker_TabKeysNavigateBothDirections(t *testing.T) {
 		}
 		assertRows(t, a, tc.want, wantUnorderedRowsByTab()[tc.want])
 	}
+}
+
+func TestOpenRouterAndSettingsCommands_OpenTheRealPickerOnTheirTab(t *testing.T) {
+	a := New(nil)
+	picker := NewSettingsPicker(a, (&fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"}).seam(), (&fakeRetention{days: 30}).seam())
+	grants := permissionsUnorderedFixture()
+	reg := newSettingsAndOpenRouterRegistry(SettingsDeps{Lister: &fakePermissionLister{entries: grants}, Picker: picker})
+	openRouterRows := []string{"attribution   on", "data collection   allow", "sort   default", modelsEmptyRow}
+	dispatch := func(input string) {
+		t.Helper()
+		if res := reg.DispatchSlashInput(input, newFakeHost()); res.Status != StatusHandled || res.Err != nil {
+			t.Fatalf("dispatch %s = %+v, want Handled/nil-err", input, res)
+		}
+		if !a.settingsPickerOpen {
+			t.Fatalf("%s did not open the settings overlay", input)
+		}
+	}
+
+	dispatch("/openrouter")
+	if got := a.settingsPicker.activeTab; got != permTabIndexOpenRouter {
+		t.Fatalf("/openrouter activeTab = %d, want %d", got, permTabIndexOpenRouter)
+	}
+	assertRows(t, a, permTabIndexOpenRouter, openRouterRows)
+	if got := a.settingsPicker.list.GetCurrentItem(); got != 0 {
+		t.Fatalf("/openrouter selected row %d, want 0", got)
+	}
+	a.dismissSettingsPicker()
+
+	dispatch("/settings")
+	if got := a.settingsPicker.activeTab; got != 0 {
+		t.Fatalf("/settings after /openrouter activeTab = %d, want 0", got)
+	}
+	assertRows(t, a, 0, wantUnorderedRowsByTab()[0])
+	for range permTabIndexOpenRouter {
+		a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	if got := a.settingsPicker.activeTab; got != permTabIndexOpenRouter {
+		t.Fatalf("Tab from /settings reached tab %d, want %d", got, permTabIndexOpenRouter)
+	}
+	assertRows(t, a, permTabIndexOpenRouter, openRouterRows)
 }
 
 func TestSettingsPicker_RevokeKeepsNearestSelection(t *testing.T) {
@@ -1228,18 +1356,28 @@ type fakeOpenRouterSettings struct {
 	dc, sort                    string
 	activeProvider, activeModel string
 	prices                      map[string]provider.MaxPrice
+	quants                      map[string]provider.Quantization
+	models                      []string
 	err                         error
+	quantErr                    error
 	wrote                       []string
-	estimate                    func(model, sortMode string, fetched func()) (provider.OpenRouterEstimate, bool)
 }
 
 const (
-	maxPriceDisabledRow = "max price   active model is not an OpenRouter model"
+	modelsEmptyRow      = "models: 0 configured"
 	retentionDefaultRow = "session retention (days)   default"
 )
 
 func maxPriceWrite(model string, p provider.MaxPrice) string {
 	return fmt.Sprintf("max_price[%s]=%+v", model, p)
+}
+
+func quantWrite(model string, q provider.Quantization) string {
+	return fmt.Sprintf("quantizations[%s]=%+v", model, q)
+}
+
+func quantClear(model string) string {
+	return "quantizations[" + model + "] cleared"
 }
 
 func (f *fakeOpenRouterSettings) record(write string, apply func()) error {
@@ -1249,6 +1387,14 @@ func (f *fakeOpenRouterSettings) record(write string, apply func()) error {
 	}
 	apply()
 	return nil
+}
+
+func (f *fakeOpenRouterSettings) recordQuant(write string, apply func()) error {
+	if f.quantErr != nil {
+		f.wrote = append(f.wrote, write)
+		return f.quantErr
+	}
+	return f.record(write, apply)
 }
 
 func (f *fakeOpenRouterSettings) seam() OpenRouterSettings {
@@ -1269,6 +1415,8 @@ func (f *fakeOpenRouterSettings) seam() OpenRouterSettings {
 			p, ok := f.prices[model]
 			return p, ok
 		},
+		MaxPrices: func() map[string]provider.MaxPrice { return maps.Clone(f.prices) },
+		Models:    func() []string { return f.models },
 		SetMaxPrice: func(model string, p provider.MaxPrice) error {
 			return f.record(maxPriceWrite(model, p), func() {
 				if !p.HasPrompt && !p.HasCompletion {
@@ -1281,8 +1429,19 @@ func (f *fakeOpenRouterSettings) seam() OpenRouterSettings {
 				f.prices[model] = p
 			})
 		},
-		ActiveModel:  func() (string, string) { return f.activeProvider, f.activeModel },
-		SortEstimate: f.estimate,
+		Quantizations: func() map[string]provider.Quantization { return maps.Clone(f.quants) },
+		SetQuantization: func(model string, q provider.Quantization) error {
+			return f.recordQuant(quantWrite(model, q), func() {
+				if f.quants == nil {
+					f.quants = map[string]provider.Quantization{}
+				}
+				f.quants[model] = q
+			})
+		},
+		ClearQuantization: func(model string) error {
+			return f.recordQuant(quantClear(model), func() { delete(f.quants, model) })
+		},
+		ActiveModel: func() (string, string) { return f.activeProvider, f.activeModel },
 	}
 }
 
@@ -1318,11 +1477,11 @@ func TestSettingsPicker_SettingsTabShowsLiveValues(t *testing.T) {
 	}{
 		{
 			fake: fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"},
-			want: []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow},
+			want: []string{"attribution   on", "data collection   allow", "sort   default", modelsEmptyRow},
 		},
 		{
 			fake: fakeOpenRouterSettings{on: false, dc: "deny", sort: "latency"},
-			want: []string{"attribution   off", "data collection   deny", "sort   latency", maxPriceDisabledRow},
+			want: []string{"attribution   off", "data collection   deny", "sort   latency", modelsEmptyRow},
 		},
 	} {
 		a := New(nil)
@@ -1334,7 +1493,7 @@ func TestSettingsPicker_SettingsTabShowsLiveValues(t *testing.T) {
 func TestSettingsPicker_SettingsTabWithoutSeamShowsDefaultsAndIsInert(t *testing.T) {
 	a := New(nil)
 	openSettingsTab(a, nil)
-	want := []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow}
+	want := []string{"attribution   on", "data collection   allow", "sort   default", modelsEmptyRow}
 	assertRows(t, a, permTabIndexOpenRouter, want)
 
 	for row := range want {
@@ -1409,7 +1568,7 @@ func TestSettingsPicker_DataCollectionFlipsAndWritesExplicitAllow(t *testing.T) 
 
 func TestSettingsPicker_SortCyclesBackToDefault(t *testing.T) {
 	a := New(nil)
-	f := &fakeOpenRouterSettings{on: true, dc: "allow", sort: "default"}
+	f := &fakeOpenRouterSettings{on: true, dc: "allow", sort: "default", activeProvider: "openrouter", activeModel: maxPriceModelID}
 	openSettingsTab(a, f)
 
 	for _, want := range []struct{ row, help string }{
@@ -1449,7 +1608,7 @@ func TestSettingsPicker_SortRowShowsEachModeWithItsHelp(t *testing.T) {
 		{"latency", "latency", sortHelpOther},
 	} {
 		a := New(nil)
-		openSettingsTab(a, &fakeOpenRouterSettings{on: true, dc: "allow", sort: tc.stored})
+		openSettingsTab(a, &fakeOpenRouterSettings{on: true, dc: "allow", sort: tc.stored, activeProvider: "openrouter", activeModel: maxPriceModelID})
 		a.settingsPicker.list.SetCurrentItem(settingsRowSort)
 		if rows := permissionsRowsOnTab(a); rows[settingsRowSort] != "sort   "+tc.row {
 			t.Errorf("stored %s: sort row = %q, want %q", tc.stored, rows[settingsRowSort], tc.row)
@@ -1517,7 +1676,7 @@ func TestSettingsPicker_HelpOnlyOnTheOpenRouterAndSettingsTabs(t *testing.T) {
 const (
 	helpAttribution    = "Identify codemeld to OpenRouter on chat requests (app URL, name, categories)"
 	helpDataCollection = "allow: may use providers that store or train on prompts; deny: avoid them"
-	helpMaxPrice       = "Input/output price caps per M tokens for OpenRouter models; empty: no cap"
+	helpModels         = "Price caps and quantizations, per OpenRouter model; Enter edits them"
 	helpRetention      = "Idle days before auto-deletion; pruning runs at a fresh launch, not on resume"
 )
 
@@ -1526,7 +1685,7 @@ func rowHelpWant(id int, sortText string) string {
 		settingsRowAttribution:    helpAttribution,
 		settingsRowDataCollection: helpDataCollection,
 		settingsRowSort:           sortText,
-		settingsRowMaxPrice:       helpMaxPrice,
+		settingsRowModels:         helpModels,
 		settingsRowRetention:      helpRetention,
 	}[id]
 }
@@ -1573,7 +1732,7 @@ func TestSettingsPicker_RowHelpWording(t *testing.T) {
 	cases := []helpCase{
 		{"default", place{permTabIndexOpenRouter, 0}, helpAttribution},
 		{"default", place{permTabIndexOpenRouter, 1}, helpDataCollection},
-		{"default", place{permTabIndexOpenRouter, 3}, helpMaxPrice},
+		{"default", place{permTabIndexOpenRouter, 3}, helpModels},
 		{"default", place{permTabIndexSettings, 0}, helpRetention},
 	}
 	for _, v := range sortHelpVariants {
@@ -1596,7 +1755,7 @@ func TestSettingsPicker_RowHelpWording(t *testing.T) {
 	}
 }
 
-func TestSettingsPicker_MaxPriceHelpIsTheSameWithOrWithoutAnOpenRouterModel(t *testing.T) {
+func TestSettingsPicker_ModelsHelpIsTheSameWithOrWithoutAnOpenRouterModel(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		setup func(*App)
@@ -1620,11 +1779,11 @@ func TestSettingsPicker_MaxPriceHelpIsTheSameWithOrWithoutAnOpenRouterModel(t *t
 		openEntryPicker(a, permissionsFixture(), nil, nil)
 		a.settingsPicker.activeTab = permTabIndexOpenRouter
 		a.renderSettingsTab()
-		_, i := settingsRowPlace(settingsRowMaxPrice)
+		_, i := settingsRowPlace(settingsRowModels)
 		a.settingsPicker.list.SetCurrentItem(i)
 		a.updateRowHelp(i)
-		if got := permissionsHelp(a); got != helpMaxPrice {
-			t.Errorf("%s: max price help = %q, want %q", tc.name, got, helpMaxPrice)
+		if got := permissionsHelp(a); got != helpModels {
+			t.Errorf("%s: models help = %q, want %q", tc.name, got, helpModels)
 		}
 	}
 }
@@ -1651,7 +1810,7 @@ func TestSettingsPicker_RowHelpFitsTheHelpRowOfAnEightyColumnOverlay(t *testing.
 			t.Errorf("sort %s, row %d: help row = %q, want the whole help %q", sort, id, string(help), want)
 		}
 	}
-	for _, id := range []int{settingsRowAttribution, settingsRowDataCollection, settingsRowMaxPrice, settingsRowRetention} {
+	for _, id := range []int{settingsRowAttribution, settingsRowDataCollection, settingsRowModels, settingsRowRetention} {
 		check("default", id, rowHelpWant(id, ""))
 	}
 	for _, v := range sortHelpVariants {
@@ -1660,7 +1819,7 @@ func TestSettingsPicker_RowHelpFitsTheHelpRowOfAnEightyColumnOverlay(t *testing.
 }
 
 func TestSettingsPicker_FailedSettingWriteKeepsRowsAndNotifies(t *testing.T) {
-	stored := []string{"attribution   on", "data collection   allow", "sort   default", maxPriceDisabledRow}
+	stored := []string{"attribution   on", "data collection   allow", "sort   default", modelsEmptyRow}
 	for row, label := range []string{"attribution", "data collection", "sort"} {
 		a := New(nil)
 		f := &fakeOpenRouterSettings{on: true, dc: "allow", sort: "default", err: errors.New("write_error: no\nspace left")}
@@ -1712,243 +1871,167 @@ func maxPriceSettings(prices map[string]provider.MaxPrice) *fakeOpenRouterSettin
 	return &fakeOpenRouterSettings{on: true, dc: "allow", sort: "default", activeProvider: "openrouter", activeModel: maxPriceModelID, prices: prices}
 }
 
-func openMaxPriceEditor(t *testing.T, a *App) *maxPriceEditor {
-	t.Helper()
-	pressEnterOnRow(t, a, settingsRowMaxPrice)
-	if !a.pages.HasPage(settingsDeletePage) || a.settingsPicker.maxPrice == nil {
-		t.Fatal("Enter on the max price row opened no editor")
+func TestSettingsPicker_ModelsRowCountsTheCapsAndQuantizationsUnion(t *testing.T) {
+	capA := provider.MaxPrice{Prompt: 1, HasPrompt: true}
+	quant := provider.Quantization{Levels: []string{"fp8"}, Mode: "preferred"}
+	for _, tc := range []struct {
+		prices map[string]provider.MaxPrice
+		quants map[string]provider.Quantization
+		want   string
+	}{
+		{nil, nil, "models: 0 configured"},
+		{map[string]provider.MaxPrice{"a/x": capA}, nil, "models: 1 configured"},
+		{nil, map[string]provider.Quantization{"hand/edited": quant}, "models: 1 configured"},
+		{map[string]provider.MaxPrice{"a/x": capA, "b/y": capA}, map[string]provider.Quantization{"a/x": quant, "c/z": quant}, "models: 3 configured"},
+	} {
+		a := New(nil)
+		f := maxPriceSettings(tc.prices)
+		f.quants = tc.quants
+		openSettingsTab(a, f)
+		if got := permissionsRowsOnTab(a)[settingsRowModels]; got != tc.want {
+			t.Errorf("models row = %q, want %q", got, tc.want)
+		}
 	}
-	return a.settingsPicker.maxPrice
+}
+
+func modelDialogText(t *testing.T, a *App, width, height int) (string, []string) {
+	t.Helper()
+	ed := a.settingsPicker.maxPrice
+	screen := drawPrimitive(t, a.pages, width, height)
+	x, y, w, h := ed.form.GetRect()
+	if x < 0 || y < 0 || x+w > width || y+h > height {
+		t.Fatalf("dialog rect %d,%d %dx%d leaves the %dx%d screen", x, y, w, h, width, height)
+	}
+	cells, sw, _ := screen.GetContents()
+	var lines []string
+	for row := y + 1; row < y+h-1; row++ {
+		var b strings.Builder
+		for col := x + 1; col < x+w-1; col++ {
+			if r := cells[row*sw+col].Runes; len(r) > 0 {
+				b.WriteString(string(r))
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		lines = append(lines, strings.TrimRight(b.String(), " "))
+	}
+	return strings.Join(strings.Fields(strings.Join(lines, " ")), " "), lines
+}
+
+func TestSettingsPicker_ModelDialogFitsEightyColumnsWithNoteAndError(t *testing.T) {
+	const levelsHelp = "Quantizations to try, first to last; codemeld moves on when no provider serves one. Blank: any."
+	const modeHelp = "If no provider serves selected levels: Preferred accepts any quantization, Required stops with an error."
+	const msg = `levels: unknown level "fp9", expected one of int4, int8, fp4, mxfp4, nvfp4, fp6, fp8, mxfp8, fp16, bf16, fp32, unknown`
+	a := New(nil)
+	f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, HasPrompt: true}})
+	openSettingsTab(a, f)
+	pressEnterOnRow(t, a, settingsRowModels)
+	tableKey(a, keyEv(tcell.KeyEnter))
+	ed := a.settingsPicker.maxPrice
+	if ed == nil {
+		t.Fatal("Enter on the table opened no dialog")
+	}
+
+	text, lines := modelDialogText(t, a, 80, 24)
+	if !strings.Contains(text, levelsHelp) || !strings.Contains(text, modeHelp) {
+		t.Fatalf("dialog does not show both help lines in full:\n%s", strings.Join(lines, "\n"))
+	}
+	for i, prefix := range []string{"Input per million  $ 1", "Output per million $", "", "Quantization levels", "  Quantizations to try"} {
+		if !strings.HasPrefix(lines[i], prefix) {
+			t.Errorf("dialog line %d = %q, want it to start with %q", i, lines[i], prefix)
+		}
+	}
+
+	ed.levels.SetText("fp9")
+	sendFieldKey(a, ed.levels, tcell.KeyEnter)
+	if len(f.wrote) != 0 || !a.pages.HasPage(openRouterModelsEditPage) {
+		t.Fatalf("invalid levels wrote %v or closed the dialog", f.wrote)
+	}
+	text, lines = modelDialogText(t, a, 80, 24)
+	if !strings.Contains(text, modeHelp+" "+msg) {
+		t.Fatalf("dialog does not show the mode help and the whole error:\n%s", strings.Join(lines, "\n"))
+	}
+	if last := lines[len(lines)-1]; !strings.HasPrefix(last, "save enter") {
+		t.Errorf("last dialog line = %q, want the key footer still visible", last)
+	}
+}
+
+func TestSettingsPicker_ModelDialogLayout(t *testing.T) {
+	const model = "deepseek/deepseek-v4.1-flash-1017"
+	want := []string{
+		"Input per million  $ 0.3",
+		"Output per million $ 1",
+		"",
+		"Quantization levels  fp8 fp4 mxfp4",
+		"  Quantizations to try, first to last; codemeld moves on when no provider serves one. Blank: any.",
+		"  providers per level: fp4 4, fp8 16, mxfp4 2, unknown 17",
+		"",
+		"Quantization mode    Preferred",
+		"  If no provider serves selected levels: Preferred accepts any quantization, Required stops with an",
+		"  error.",
+		"",
+		"save enter   next field tab   mode \u2190/\u2192   esc back",
+	}
+	a := New(nil)
+	f := maxPriceSettings(map[string]provider.MaxPrice{model: {Prompt: 0.3, HasPrompt: true, Completion: 1, HasCompletion: true}})
+	f.quants = map[string]provider.Quantization{model: {Levels: []string{"fp8", "fp4", "mxfp4"}, Mode: "preferred"}}
+	openSettingsTab(a, f)
+	q := &fakeHostQuantizations{counts: map[string]int{"fp4": 4, "fp8": 16, "mxfp4": 2, "unknown": 17}, state: provider.OpenRouterHostsReady}
+	a.openRouterSettings.HostQuantizations = q.query
+	pressEnterOnRow(t, a, settingsRowModels)
+	ed := openEditor(t, a, model)
+
+	_, lines := modelDialogText(t, a, 103, 30)
+	if !slices.Equal(lines, want) {
+		t.Fatalf("dialog lines:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+
+	screen := drawPrimitive(t, a.pages, 103, 30)
+	cells, sw, _ := screen.GetContents()
+	x, y, _, _ := ed.form.GetRect()
+	for i, line := range want {
+		_, _, attrs := cells[(y+1+i)*sw+x+3].Style.Decompose()
+		if dim := attrs&tcell.AttrDim != 0; dim != strings.HasPrefix(line, "  ") {
+			t.Errorf("dialog line %d %q drawn dim = %v", i, line, dim)
+		}
+	}
+}
+
+func TestSettingsPicker_ModelDialogTakesTheScreenWidth(t *testing.T) {
+	for _, width := range []int{80, 160} {
+		a := New(nil)
+		openSettingsTab(a, maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, HasPrompt: true}}))
+		pressEnterOnRow(t, a, settingsRowModels)
+		tableKey(a, keyEv(tcell.KeyEnter))
+		ed := a.settingsPicker.maxPrice
+		if ed == nil {
+			t.Fatal("Enter on the table opened no dialog")
+		}
+		drawPrimitive(t, a.pages, width, 24)
+		if _, _, w, _ := ed.form.GetRect(); w != width {
+			t.Errorf("dialog width = %d on a %d-column screen, want %d", w, width, width)
+		}
+	}
 }
 
 func sendFieldKey(a *App, field *tview.InputField, key tcell.Key) {
 	field.InputHandler()(tcell.NewEventKey(key, 0, tcell.ModNone), func(p tview.Primitive) { a.app.SetFocus(p) })
 }
 
-func maxPriceRow(t *testing.T, a *App) string {
+func settingsEditorTitle(t *testing.T, a *App, page string) string {
 	t.Helper()
-	return permissionsRowsOnTab(a)[settingsRowMaxPrice]
-}
-
-func TestSettingsPicker_MaxPriceRowShowsActiveModelCaps(t *testing.T) {
-	const label = "max price (" + maxPriceModelID + ")   "
-	for _, tc := range []struct {
-		name   string
-		prices map[string]provider.MaxPrice
-		want   string
-	}{
-		{"both caps", map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1.5, Completion: 2, HasPrompt: true, HasCompletion: true}}, label + "input $1.5 / output $2 per M tokens"},
-		{"prompt cap only", map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 0.25, HasPrompt: true}}, label + "input $0.25 / output none per M tokens"},
-		{"completion cap only", map[string]provider.MaxPrice{maxPriceModelID: {Completion: 0.0000001, HasCompletion: true}}, label + "input none / output $0.0000001 per M tokens"},
-		{"no caps", map[string]provider.MaxPrice{"openai/gpt-4.1": {Prompt: 1, HasPrompt: true}}, label + "none"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := New(nil)
-			openSettingsTab(a, maxPriceSettings(tc.prices))
-			if got := maxPriceRow(t, a); got != tc.want {
-				t.Errorf("max price row = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestSettingsPicker_MaxPriceRowIsInertWithoutAnOpenRouterModel(t *testing.T) {
-	for _, tc := range []struct {
-		name, provider, model string
-	}{
-		{"another provider", "venice", "llama-3.3-70b"},
-		{"no selection", "", ""},
-		{"empty provider id", "", maxPriceModelID},
-		{"empty model id", "openrouter", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := New(nil)
-			f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, HasPrompt: true}})
-			f.activeProvider, f.activeModel = tc.provider, tc.model
-			openSettingsTab(a, f)
-			if got := maxPriceRow(t, a); got != maxPriceDisabledRow {
-				t.Errorf("max price row = %q, want %q", got, maxPriceDisabledRow)
-			}
-			pressEnterOnRow(t, a, settingsRowMaxPrice)
-			if a.pages.HasPage(settingsDeletePage) {
-				t.Error("Enter opened the max price editor for a non-OpenRouter model")
-			}
-			if len(f.wrote) != 0 {
-				t.Errorf("writes = %v, want none", f.wrote)
-			}
-		})
-	}
-}
-
-func TestSettingsPicker_MaxPriceEditorSubmitWritesParsedValues(t *testing.T) {
-	a := New(nil)
-	f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, HasPrompt: true}})
-	openSettingsTab(a, f)
-
-	ed := openMaxPriceEditor(t, a)
-	if ed.prompt.GetLabel() != "input  $ " || ed.completion.GetLabel() != "output $ " {
-		t.Fatalf("editor labels = %q/%q, want %q/%q", ed.prompt.GetLabel(), ed.completion.GetLabel(), "input  $ ", "output $ ")
-	}
-	if ed.prompt.GetText() != "1" || ed.completion.GetText() != "" {
-		t.Fatalf("editor fields = %q/%q, want the current values 1 and empty", ed.prompt.GetText(), ed.completion.GetText())
-	}
-	if a.app.GetFocus() != ed.prompt {
-		t.Fatalf("focus = %T, want the prompt field", a.app.GetFocus())
-	}
-	for _, step := range []struct {
-		key  tcell.Key
-		from *tview.InputField
-		want *tview.InputField
-	}{
-		{tcell.KeyTab, ed.prompt, ed.completion},
-		{tcell.KeyUp, ed.completion, ed.prompt},
-		{tcell.KeyDown, ed.prompt, ed.completion},
-	} {
-		sendFieldKey(a, step.from, step.key)
-		if a.app.GetFocus() != step.want {
-			t.Fatalf("focus after key %v = %T, want the other field", step.key, a.app.GetFocus())
-		}
-	}
-
-	ed.prompt.SetText(" 0.5 ")
-	ed.completion.SetText("2")
-	sendFieldKey(a, ed.completion, tcell.KeyEnter)
-
-	want := provider.MaxPrice{Prompt: 0.5, Completion: 2, HasPrompt: true, HasCompletion: true}
-	if !slices.Equal(f.wrote, []string{maxPriceWrite(maxPriceModelID, want)}) {
-		t.Fatalf("writes = %v, want one write of %+v", f.wrote, want)
-	}
-	if a.pages.HasPage(settingsDeletePage) || !a.pages.HasPage(settingsPickerPage) {
-		t.Fatal("submit did not close only the editor")
-	}
-	if a.app.GetFocus() != a.settingsPicker.list || a.settingsPicker.list.GetCurrentItem() != settingsRowMaxPrice {
-		t.Fatal("submit did not return focus to the max price row")
-	}
-	if got, wantRow := maxPriceRow(t, a), "max price ("+maxPriceModelID+")   input $0.5 / output $2 per M tokens"; got != wantRow {
-		t.Errorf("max price row = %q, want %q", got, wantRow)
-	}
-	if a.NoticeText() != "" {
-		t.Errorf("notice = %q, want none on a successful write", a.NoticeText())
-	}
-}
-
-func TestSettingsPicker_MaxPriceEditorBothEmptyRemovesTheCap(t *testing.T) {
-	a := New(nil)
-	f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, Completion: 2, HasPrompt: true, HasCompletion: true}})
-	openSettingsTab(a, f)
-
-	ed := openMaxPriceEditor(t, a)
-	ed.prompt.SetText("")
-	ed.completion.SetText("  ")
-	sendFieldKey(a, ed.prompt, tcell.KeyEnter)
-
-	if !slices.Equal(f.wrote, []string{maxPriceWrite(maxPriceModelID, provider.MaxPrice{})}) {
-		t.Fatalf("writes = %v, want one removal", f.wrote)
-	}
-	if got, want := maxPriceRow(t, a), "max price ("+maxPriceModelID+")   none"; got != want {
-		t.Errorf("max price row = %q, want %q", got, want)
-	}
-}
-
-func TestSettingsPicker_MaxPriceEditorRejectsInvalidInput(t *testing.T) {
-	stored := "max price (" + maxPriceModelID + ")   input $1 / output none per M tokens"
-	for _, tc := range []struct{ prompt, completion, notice string }{
-		{"abc", "", `couldn't change the openrouter max price setting: input "abc" is not a number of at least 0`},
-		{"1", "-0.5", `couldn't change the openrouter max price setting: output "-0.5" is not a number of at least 0`},
-		{"NaN", "", `couldn't change the openrouter max price setting: input "NaN" is not a number of at least 0`},
-		{"1", "+Inf", `couldn't change the openrouter max price setting: output "+Inf" is not a number of at least 0`},
-	} {
-		a := New(nil)
-		f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, HasPrompt: true}})
-		openSettingsTab(a, f)
-
-		ed := openMaxPriceEditor(t, a)
-		ed.prompt.SetText(tc.prompt)
-		ed.completion.SetText(tc.completion)
-		sendFieldKey(a, ed.prompt, tcell.KeyEnter)
-
-		if len(f.wrote) != 0 {
-			t.Errorf("%q/%q writes = %v, want none", tc.prompt, tc.completion, f.wrote)
-		}
-		if a.NoticeText() != tc.notice {
-			t.Errorf("notice = %q, want %q", a.NoticeText(), tc.notice)
-		}
-		if got := maxPriceRow(t, a); got != stored {
-			t.Errorf("max price row = %q, want the stored %q", got, stored)
-		}
-	}
-}
-
-func TestSettingsPicker_MaxPriceFailedWriteKeepsStoredRowAndNotifies(t *testing.T) {
-	a := New(nil)
-	f := maxPriceSettings(nil)
-	f.err = errors.New("write_error: no\nspace left")
-	openSettingsTab(a, f)
-
-	ed := openMaxPriceEditor(t, a)
-	ed.prompt.SetText("3")
-	sendFieldKey(a, ed.prompt, tcell.KeyEnter)
-
-	if len(f.wrote) != 1 {
-		t.Fatalf("writes = %v, want exactly one attempt", f.wrote)
-	}
-	if got, want := maxPriceRow(t, a), "max price ("+maxPriceModelID+")   none"; got != want {
-		t.Errorf("max price row = %q, want the stored %q", got, want)
-	}
-	if want := "couldn't change the openrouter max price setting: write_error: no space left"; a.NoticeText() != want {
-		t.Errorf("notice = %q, want %q", a.NoticeText(), want)
-	}
-}
-
-func TestSettingsPicker_EscClosesOnlyTheMaxPriceEditor(t *testing.T) {
-	a := New(nil)
-	f := maxPriceSettings(nil)
-	openSettingsTab(a, f)
-
-	ed := openMaxPriceEditor(t, a)
-	ed.prompt.SetText("9")
-	if ev := a.handleGlobalKey(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone)); ev != nil {
-		t.Fatal("ESC was not consumed by the global key handler")
-	}
-
-	if a.pages.HasPage(settingsDeletePage) {
-		t.Fatal("ESC left the max price editor open")
-	}
-	if !a.settingsPickerOpen || !a.pages.HasPage(settingsPickerPage) {
-		t.Fatal("ESC closed the permissions picker, want only the editor closed")
-	}
-	if a.app.GetFocus() != a.settingsPicker.list {
-		t.Errorf("focus = %T, want the settings list", a.app.GetFocus())
-	}
-	if len(f.wrote) != 0 {
-		t.Errorf("writes = %v, want none after ESC", f.wrote)
-	}
-	if got := maxPriceRow(t, a); got != "max price ("+maxPriceModelID+")   none" {
-		t.Errorf("max price row = %q, want it unchanged", got)
-	}
-}
-
-func settingsEditorTitle(t *testing.T, a *App) string {
-	t.Helper()
-	page, ok := a.pages.GetPage(settingsDeletePage).(*tview.Flex)
+	flex, ok := a.pages.GetPage(page).(*tview.Flex)
 	if !ok {
 		t.Fatal("no editor open")
 	}
-	return page.GetItem(1).(*tview.Flex).GetItem(1).(*tview.Flex).GetTitle()
+	return flex.GetItem(1).(*tview.Flex).GetItem(1).(*tview.Flex).GetTitle()
 }
 
-func TestSettingsPicker_ShortRowLabelsKeepEditorTitles(t *testing.T) {
-	a := New(nil)
-	openSettingsTab(a, maxPriceSettings(nil))
-	openMaxPriceEditor(t, a)
-	if got, want := settingsEditorTitle(t, a), " openrouter max price per M tokens ("+maxPriceModelID+") "; got != want {
-		t.Errorf("max price editor title = %q, want %q", got, want)
-	}
-
+func TestSettingsPicker_RetentionEditorKeepsItsTitle(t *testing.T) {
 	b := New(nil)
 	openRetentionTab(t, b, &fakeRetention{days: 30})
 	pressEnterOnRow(t, b, 0)
-	if got, want := settingsEditorTitle(t, b), " session retention (days) "; got != want {
+	if got, want := settingsEditorTitle(t, b, settingsDeletePage), " session retention (days) "; got != want {
 		t.Errorf("retention editor title = %q, want %q", got, want)
 	}
 }
@@ -2650,196 +2733,4 @@ func TestSettingsPicker_ProjectRowRevokeCancelKeepsFileAndRow(t *testing.T) {
 		t.Fatalf("revoked %+v, want the project row", revoked)
 	}
 	assertRows(t, a, permTabIndexFolders, []string{read + " — " + shareLocalPath + " [local]"})
-}
-
-type fakeSortEstimates struct {
-	ready   map[string]provider.OpenRouterEstimate
-	calls   []string
-	fetched []func()
-}
-
-func (f *fakeSortEstimates) estimate(model, sortMode string, fetched func()) (provider.OpenRouterEstimate, bool) {
-	f.calls = append(f.calls, model+" "+sortMode)
-	est, ok := f.ready[model+" "+sortMode]
-	if !ok {
-		f.fetched = append(f.fetched, fetched)
-	}
-	return est, ok
-}
-
-func estimateSettings(sortMode string, est *fakeSortEstimates) *fakeOpenRouterSettings {
-	f := maxPriceSettings(nil)
-	f.sort = sortMode
-	f.estimate = est.estimate
-	return f
-}
-
-func sortRow(a *App) string {
-	return permissionsRowsOnTab(a)[settingsRowSort]
-}
-
-func TestSettingsPicker_SortRowShowsEstimateForEachMode(t *testing.T) {
-	for _, tc := range []struct {
-		stored string
-		est    provider.OpenRouterEstimate
-		want   string
-	}{
-		{"default", provider.OpenRouterEstimate{PromptPerM: 0.04, CompletionPerM: 0.15, Discount: 0.8}, "sort   default (about $0.04 / $0.15 per M, 80% off)"},
-		{"throughput", provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2.5}, "sort   throughput (about $1 / $2.5 per M)"},
-		{"best_value", provider.OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.32}, "sort   best value (about $0.1 / $0.32 per M)"},
-	} {
-		est := &fakeSortEstimates{ready: map[string]provider.OpenRouterEstimate{maxPriceModelID + " " + tc.stored: tc.est}}
-		a := New(nil)
-		openSettingsTab(a, estimateSettings(tc.stored, est))
-		if got := sortRow(a); got != tc.want {
-			t.Errorf("stored %s: sort row = %q, want %q", tc.stored, got, tc.want)
-		}
-	}
-}
-
-func TestRenderSortEstimate(t *testing.T) {
-	for _, tc := range []struct {
-		est  provider.OpenRouterEstimate
-		want string
-	}{
-		{provider.OpenRouterEstimate{PromptPerM: 0.1, CompletionPerM: 0.12345}, "about $0.1 / $0.1235 per M"},
-		{provider.OpenRouterEstimate{PromptPerM: 1.5, CompletionPerM: 20}, "about $1.5 / $20 per M"},
-		{provider.OpenRouterEstimate{PromptPerM: 0.00004, CompletionPerM: 0.10001}, "about $0 / $0.1 per M"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.8}, "about $1 / $2 per M, 80% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.125}, "about $1 / $2 per M, 13% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.3333}, "about $1 / $2 per M, 33% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.005}, "about $1 / $2 per M, 1% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.004}, "about $1 / $2 per M, 0% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.145}, "about $1 / $2 per M, 15% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.14499}, "about $1 / $2 per M, 14% off"},
-		{provider.OpenRouterEstimate{PromptPerM: 1, CompletionPerM: 2, Discount: 0.14501}, "about $1 / $2 per M, 15% off"},
-	} {
-		if got := renderSortEstimate(tc.est); got != tc.want {
-			t.Errorf("renderSortEstimate(%+v) = %q, want %q", tc.est, got, tc.want)
-		}
-	}
-}
-
-func TestSettingsPicker_SortRowWithoutEstimateShowsModeAlone(t *testing.T) {
-	ready := map[string]provider.OpenRouterEstimate{maxPriceModelID + " default": {PromptPerM: 1, CompletionPerM: 2}}
-	for _, tc := range []struct {
-		name, provider, model string
-		wantCalls             int
-	}{
-		{"another provider", "venice", maxPriceModelID, 0},
-		{"no selection", "", "", 0},
-		{"missing data", "openrouter", "other/model", 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			est := &fakeSortEstimates{ready: ready}
-			f := estimateSettings("default", est)
-			f.activeProvider, f.activeModel = tc.provider, tc.model
-			a := New(nil)
-			openSettingsTab(a, f)
-			if got := sortRow(a); got != "sort   default" {
-				t.Errorf("sort row = %q, want the mode alone", got)
-			}
-			if len(est.calls) != tc.wantCalls {
-				t.Errorf("estimate calls = %v, want %d", est.calls, tc.wantCalls)
-			}
-		})
-	}
-}
-
-func TestSettingsPicker_FetchedEstimateRedrawsTheOpenSettingsTab(t *testing.T) {
-	est := &fakeSortEstimates{}
-	a := New(nil)
-	openSettingsTab(a, estimateSettings("best_value", est))
-	a.settingsPicker.list.SetCurrentItem(settingsRowMaxPrice)
-	if got := sortRow(a); got != "sort   best value" {
-		t.Fatalf("sort row before the fetch = %q", got)
-	}
-	if len(est.fetched) != 1 {
-		t.Fatalf("estimate requests with a pending fetch = %d, want 1", len(est.fetched))
-	}
-
-	est.ready = map[string]provider.OpenRouterEstimate{maxPriceModelID + " best_value": {PromptPerM: 0.1, CompletionPerM: 0.32}}
-	est.fetched[0]()
-	if got := sortRow(a); got != "sort   best value (about $0.1 / $0.32 per M)" {
-		t.Fatalf("sort row after the fetch = %q", got)
-	}
-	if got := a.settingsPicker.list.GetCurrentItem(); got != settingsRowMaxPrice {
-		t.Errorf("cursor after the redraw = %d, want it unchanged", got)
-	}
-}
-
-func TestSettingsPicker_FetchedEstimateIgnoresASwitchedModel(t *testing.T) {
-	est := &fakeSortEstimates{}
-	f := estimateSettings("default", est)
-	a := New(nil)
-	openSettingsTab(a, f)
-
-	f.activeModel = "other/model"
-	est.ready = map[string]provider.OpenRouterEstimate{
-		maxPriceModelID + " default": {PromptPerM: 9, CompletionPerM: 9},
-		"other/model default":        {PromptPerM: 1, CompletionPerM: 1},
-	}
-	calls := len(est.calls)
-	est.fetched[0]()
-	if got := sortRow(a); got != "sort   default" {
-		t.Errorf("sort row after the previous model's fetch = %q, want the mode alone", got)
-	}
-	if len(est.calls) != calls {
-		t.Errorf("estimate calls after a switched-model completion = %v, want none added", est.calls[calls:])
-	}
-}
-
-func TestSettingsPicker_FetchedEstimateAfterCloseOrTabChangeIsInert(t *testing.T) {
-	for name, leave := range map[string]func(a *App){
-		"closed":    func(a *App) { a.dismissSettingsPicker() },
-		"other tab": func(a *App) { a.stepSettingsTab(1) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			est := &fakeSortEstimates{}
-			a := New(nil)
-			openSettingsTab(a, estimateSettings("default", est))
-			leave(a)
-			est.ready = map[string]provider.OpenRouterEstimate{maxPriceModelID + " default": {PromptPerM: 1, CompletionPerM: 1}}
-			calls := len(est.calls)
-			est.fetched[0]()
-			if len(est.calls) != calls {
-				t.Errorf("estimate calls after leaving the tab = %v, want none added", est.calls[calls:])
-			}
-			if a.settingsPicker != nil {
-				assertRows(t, a, permTabIndexSettings, []string{retentionDefaultRow})
-			}
-		})
-	}
-}
-
-func TestSettingsPicker_SettingsTabBuildsNoEstimate(t *testing.T) {
-	est := &fakeSortEstimates{}
-	a := New(nil)
-	a.openRouterSettings = estimateSettings("default", est).seam()
-	openEntryPicker(a, permissionsFixture(), nil, nil)
-	a.settingsPicker.activeTab = permTabIndexSettings
-	a.renderSettingsTab()
-	if len(est.calls) != 0 {
-		t.Errorf("estimate calls rendering the settings tab = %v, want none", est.calls)
-	}
-}
-
-func TestSettingsPicker_EnterOnSortRowChangesTheEstimate(t *testing.T) {
-	est := &fakeSortEstimates{ready: map[string]provider.OpenRouterEstimate{
-		maxPriceModelID + " default":    {PromptPerM: 0.1, CompletionPerM: 0.2},
-		maxPriceModelID + " throughput": {PromptPerM: 3, CompletionPerM: 4},
-		maxPriceModelID + " best_value": {PromptPerM: 0.5, CompletionPerM: 0.6, Discount: 0.1},
-	}}
-	a := New(nil)
-	openSettingsTab(a, estimateSettings("default", est))
-	for _, want := range []string{
-		"throughput (about $3 / $4 per M)",
-		"best value (about $0.5 / $0.6 per M, 10% off)",
-		"default (about $0.1 / $0.2 per M)",
-	} {
-		pressEnterOnRow(t, a, settingsRowSort)
-		if got := sortRow(a); got != "sort   "+want {
-			t.Errorf("sort row = %q, want %q", got, "sort   "+want)
-		}
-	}
 }

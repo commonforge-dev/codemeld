@@ -9,9 +9,12 @@
 ## Ongoing
 
 ## Completed
+- **0.4.8 Beta — October 2026:**
+  - Fixes for the v0.4.7 known issues
+  - OpenRouter: per-model quantization preference or requirement, and one table for every model's price caps
 - **0.4.7 Alpha October 2026:**
   - Cost of each session as reported by the provider
-  - Declare a model's context window: codemeld shows how full it is and warns at 90%
+  - Declare a model's context window: codemeld shows the session's input and output tokens against it and warns when a turn's input, added up over its rounds, reaches 90% of it
   - Explanation line for each OpenRouter and general setting
   - Fewer permission prompts: a read-only shell command can run once without asking, after codemeld's structural checks and a SYSTEMONE read-only judgement
   - Fewer prompts in sandboxed Auto edits: any shell command runs, and files in allowed folders can be deleted, without asking; network access and history rewrites still ask

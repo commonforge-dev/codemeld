@@ -52,6 +52,13 @@ func FriendlyRoutingExhaustionMessage(name string, e *RoutingExhaustionError) st
 	if e.RequireParameters {
 		filters = append(filters, "require_parameters true")
 	}
+	if len(e.Quantization.Levels) > 0 {
+		levels := make([]string, len(e.Quantization.Levels))
+		for i, level := range e.Quantization.Levels {
+			levels[i] = collapseLine(level)
+		}
+		filters = append(filters, "quantizations "+collapseLine(e.Quantization.Mode)+" ["+strings.Join(levels, " ")+"] (each tried in order)")
+	}
 	if len(filters) > 0 {
 		remedies = append(remedies, "Change provider.openrouter.routing to let a provider through.")
 	}

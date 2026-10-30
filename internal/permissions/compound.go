@@ -79,23 +79,16 @@ func RecognizeSimpleCompoundForGrant(canonical string) (SimpleCompound, bool) {
 	if !ok {
 		return SimpleCompound{}, false
 	}
-	if !removed {
-		return RecognizeSimpleCompound(canonical)
-	}
-	wrapped, norms, operators, ok := SimpleCompoundStages(stripped)
+	wrapped, norms, _, ok := SimpleCompoundStages(stripped)
 	if !ok {
 		return SimpleCompound{}, false
 	}
-	// The stripped text is not what runs: `sh -c` re-parses the original, so a token that can expand
-	// would authorize stages the chooser never saw.
-	if !stagesExpansionFree(norms) {
+	// Both shapes run through `sh -c`, which expands what the recorded tokens hold literally, so a
+	// token that can expand would authorize stages the chooser never saw.
+	if (wrapped || removed) && !stagesExpansionFree(norms) {
 		return SimpleCompound{}, false
 	}
-	stages := make([][]string, len(norms))
-	for i, n := range norms {
-		stages[i] = n.Tokens
-	}
-	return SimpleCompound{Wrapped: wrapped, Stages: stages, Operators: operators}, true
+	return RecognizeSimpleCompound(stripped)
 }
 
 // An ineligible redirect is left in place rather than rejected here, so the caller's decomposition

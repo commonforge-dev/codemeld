@@ -18,8 +18,10 @@ codemeld is a terminal coding assistant shipped as one static Go binary. Its mai
   version-control, web and child-agent tools the model can call.
 - **Permissions** (`permissions`, `trust`, `securitystate`): decide whether a tool call runs, asks,
   or is refused; project approval; protection of codemeld's own settings files.
-- **Commands and sandbox** (`runner`, `enforce`): `runner` runs every command; `enforce` holds the
-  Linux sandbox helper and the startup self-test.
+- **Commands and sandbox** (`runner`, `enforce`): `runner` runs every command except two: the
+  clipboard image helper (`runClipboardHelper` in `tui`) and the processes the startup self-test
+  starts (`startHelperProcess` in `enforce`); `enforce` holds the Linux sandbox helper and the
+  startup self-test.
 - **Sessions and settings** (`sessions`, `config`): the per-session log and the YAML settings files.
 
 ## Platform Support
@@ -61,20 +63,30 @@ is `refused`, and it returns when the file is fixed. There is no toggle and no n
 
 A sandboxed command starts as codemeld's own binary running a hidden helper. The helper reads its
 policy from its stdin (never the command line, which other processes can read), sets resource
-limits and `no_new_privs`, applies a Landlock ruleset and a seccomp filter, then becomes the
-command. Everything the command starts inherits the restrictions, and none can be removed. The
-command sees codemeld's launch environment minus withheld-authority names, secret-looking names
-and values carrying a URL credential (`runner.InheritedEnvironment`), then the fixed table's
-`PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` and `LC_ALL`, then the
-command's own assignments (`confinement.prepare`).
+limits and `no_new_privs`, applies a Landlock ruleset (Landlock ABI 3 or newer) and a seccomp
+filter, then becomes the command. Everything the command starts inherits the restrictions, and
+none can be removed. The command sees codemeld's launch environment minus withheld-authority
+names, secret-looking names and values carrying a URL credential (`runner.InheritedEnvironment`),
+then the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` and
+`LC_ALL`, then the command's own assignments (`confinement.prepare`).
 
 - **Files.** Reads are allowed everywhere except the blocked paths, which always include
-  `~/.codemeld`. Plan may write only `/dev/null`. Auto edits may write each top-level entry of the
+  `~/.codemeld`; the one exception is `~/.codemeld/skills`, readable under the conditions in
+  [Global skills and the sandbox](skills.md#global-skills-and-the-sandbox)
+  (`skillsReadRoots`). Plan may write only `/dev/null`. Auto edits may write each top-level entry of the
   project except `.codemeld` (skipping an entry that resolves outside the project, to the project
   itself, into `.codemeld`, or nowhere), the session's private temp folder (given to the command
   as `TMPDIR` and removed when the session ends), and declared `writable_folders`. Blocked
-  paths, the `.codemeld` folders and `/dev/shm` are carved out of every write root, and `/tmp` is
-  writable only through one of those roots.
+  paths and the `.codemeld` folders are carved out of every write root, and `/dev/shm` itself is
+  never writable. codemeld adds no other temporary write grant: `/tmp` and the `$TMPDIR` codemeld
+  was launched with are writable only when an effective declared `writable_folders` entry covers
+  where they resolve, or when they resolve inside a granted top-level project entry.
+- **Nested write roots.** A write root that another write root's grant already covers (for
+  example, a private temp folder inside a declared writable folder) is never granted on its own,
+  so replacing it with a symlink gives commands no access to the symlink's target. A declared
+  folder under `/dev/shm` is not covered by `/dev` or `/dev/shm`, since `/dev/shm` is carved out
+  of them, so it keeps its own grant; its parent stays unwritable (`outerRoots` in
+  `internal/enforce/landlock_linux.go`).
 - **Network.** A sandboxed command cannot create a socket that reaches another process. The one
   socket it may create is a Unix stream or seqpacket socket pair, whose ends connect only to each
   other; datagram pairs are denied, with the same pair rule in every seccomp filter
@@ -164,7 +176,8 @@ sandbox exists.
 codemeld's own file and version-control tools refuse to change the settings files, the project
 approval list, or their `.lock` files, including through a symlink or by moving a folder that
 holds one; the version-control tools also refuse a hardlink to one. Only codemeld's dedicated
-writers change them: saving approvals, `/settings`, `/blocked`, `/model`, `/effort`, favorites,
+writers change them: saving approvals, `/settings`, `/blocked`, `/systemone`, `/openrouter`,
+`/model`, `/effort`, favorites,
 `/connect`, login, logout and token refresh, the project-approval prompt, and first-run setup. A
 sandboxed command cannot write them either; an unsandboxed one can, as the same user.
 

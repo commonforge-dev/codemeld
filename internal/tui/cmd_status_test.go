@@ -328,6 +328,47 @@ func TestRenderStatus_EscapesBracketDataInDynamicColorView(t *testing.T) {
 	}
 }
 
+func TestRenderStatus_EscapesControlCharactersInRuntimePaths(t *testing.T) {
+	render := func(name string) string {
+		state := fixtureState()
+		state.launchDir = "/l/" + name
+		state.projectRoot = "/r/" + name
+		state.approval = ApprovalDisclosure{Reason: trust.ReasonNoRecord, Withheld: []string{
+			"project settings /r/" + name + "/.codemeld/settings.yaml",
+		}}
+		return RenderStatus(BuildStatusSnapshot(state))
+	}
+	raw := render("x\x1b\x1b[2Jy\rz\nProject approval: approved\u009b")
+	escaped := `x\x1B\x1B[2Jy\x0Dz\x0AProject approval: approved\u009B`
+
+	for _, line := range []string{
+		"\nLaunch dir: /l/" + escaped + "\n",
+		"\nProject root: /r/" + escaped + "\n",
+		"\nProject approval: not approved — ignoring project settings /r/" + escaped + "/.codemeld/settings.yaml\n",
+	} {
+		if !strings.Contains(raw, line) {
+			t.Errorf("status render missing %q:\n%s", line, raw)
+		}
+	}
+	if strings.ContainsAny(raw, "\x1b\r\u009b") {
+		t.Errorf("status render carries a raw control from a runtime value: %q", raw)
+	}
+	if got, want := strings.Count(raw, "\n"), strings.Count(render("plain"), "\n"); got != want {
+		t.Errorf("status render has %d lines, want %d as for an ordinary folder name:\n%s", got, want, raw)
+	}
+
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetText(raw)
+	visible := tv.GetText(true)
+	if n := strings.Count("\n"+visible, "\nProject approval:"); n != 1 {
+		t.Errorf("visible status shows %d approval rows, want 1:\n%s", n, visible)
+	}
+	if !strings.Contains(visible, "Launch dir: /l/"+escaped+"\n") {
+		t.Errorf("visible status lost the escaped launch dir:\n%s", visible)
+	}
+}
+
 func TestRenderStatus_WebResearchLineReflectsInMemoryState(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

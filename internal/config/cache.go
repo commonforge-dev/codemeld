@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 
 	"codemeld.dev/codemeld/internal/fserrors"
@@ -432,6 +433,47 @@ func (c *Cache) SetOpenRouterMaxPrice(model string, p provider.MaxPrice) (Persis
 	})
 }
 
+func (c *Cache) OpenRouterQuantizations() []OpenRouterQuantization {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	quants := c.providers[openRouterProviderID].Routing.Quantizations
+	out := make([]OpenRouterQuantization, 0, len(quants))
+	for model, q := range quants {
+		q.Levels = slices.Clone(q.Levels)
+		out = append(out, OpenRouterQuantization{Model: model, Quantization: q})
+	}
+	slices.SortFunc(out, func(x, y OpenRouterQuantization) int { return strings.Compare(x.Model, y.Model) })
+	return out
+}
+
+func (c *Cache) SetOpenRouterQuantization(model string, q provider.Quantization) (PersistReason, fserrors.Category, error) {
+	if model == "" {
+		return ReasonRereadParseError, "", fmt.Errorf("config.SetOpenRouterQuantization: empty model id")
+	}
+	if err := provider.ValidateQuantizationLevels(q.Levels); err != nil {
+		return ReasonRereadParseError, "", fmt.Errorf("config.SetOpenRouterQuantization: %w", err)
+	}
+	if q.Mode != "preferred" && q.Mode != "required" {
+		return ReasonRereadParseError, "", fmt.Errorf("config.SetOpenRouterQuantization: mode %q is not preferred or required", q.Mode)
+	}
+	q.Levels = slices.Clone(q.Levels)
+	return c.setOpenRouterRouting(KeyOpenRouterRoutingQuantizations, OpenRouterQuantization{Model: model, Quantization: q}, func(r *provider.Routing) {
+		if r.Quantizations == nil {
+			r.Quantizations = map[string]provider.Quantization{}
+		}
+		r.Quantizations[model] = q
+	})
+}
+
+func (c *Cache) DeleteOpenRouterQuantization(model string) (PersistReason, fserrors.Category, error) {
+	if model == "" {
+		return ReasonRereadParseError, "", fmt.Errorf("config.DeleteOpenRouterQuantization: empty model id")
+	}
+	return c.setOpenRouterRouting(KeyOpenRouterRoutingQuantizations, OpenRouterQuantization{Model: model, Delete: true}, func(r *provider.Routing) {
+		delete(r.Quantizations, model)
+	})
+}
+
 func validMaxPrice(v float64) bool {
 	return v >= 0 && !math.IsInf(v, 1)
 }
@@ -753,6 +795,13 @@ func copyProviderEntry(e provider.ProviderEntry) provider.ProviderEntry {
 		cp.AuthHeader = &h
 	}
 	cp.Routing.MaxPrice = maps.Clone(e.Routing.MaxPrice)
+	if e.Routing.Quantizations != nil {
+		cp.Routing.Quantizations = make(map[string]provider.Quantization, len(e.Routing.Quantizations))
+		for model, q := range e.Routing.Quantizations {
+			q.Levels = slices.Clone(q.Levels)
+			cp.Routing.Quantizations[model] = q
+		}
+	}
 	cp.ContextWindows = maps.Clone(e.ContextWindows)
 	return cp
 }

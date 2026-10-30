@@ -331,7 +331,7 @@ func refuseReadOnlyStages(stages []permissions.StageNormalization, scope string,
 	}
 	readOnlyArgv := make([][]string, len(stages))
 	for i, stage := range stages {
-		req, err := stageRequest(stage, scope, modeCtx, "")
+		req, err := stageRequest(stage, scope, home, modeCtx, "")
 		if err != nil {
 			return nil, err
 		}
@@ -456,7 +456,7 @@ func dispatchDirect(ctx context.Context, stages []permissions.StageNormalization
 	}
 
 	// Pass 1: authorize every stage before any runs. A denied stage denies the whole pipeline.
-	auto, err := authorizeStages(ctx, stages, scope, batch, modeCtx, pipeline, asks)
+	auto, err := authorizeStages(ctx, stages, scope, home, batch, modeCtx, pipeline, asks)
 	if err != nil {
 		return tools.Result{}, err
 	}
@@ -471,10 +471,10 @@ func dispatchDirect(ctx context.Context, stages []permissions.StageNormalization
 
 // authorizeStages returns, per stage, whether the active mode allowed it because it classified
 // read-only.
-func authorizeStages(ctx context.Context, stages []permissions.StageNormalization, scope string, batch BatchAuthorizer, modeCtx permissions.ModeContext, pipeline string, asks []bool) ([]bool, error) {
+func authorizeStages(ctx context.Context, stages []permissions.StageNormalization, scope string, home string, batch BatchAuthorizer, modeCtx permissions.ModeContext, pipeline string, asks []bool) ([]bool, error) {
 	reqs := make([]BatchAuthRequest, len(stages))
 	for i, stage := range stages {
-		req, err := stageRequest(stage, scope, modeCtx, pipeline)
+		req, err := stageRequest(stage, scope, home, modeCtx, pipeline)
 		if err != nil {
 			return nil, err
 		}
@@ -500,8 +500,12 @@ func authorizeStages(ctx context.Context, stages []permissions.StageNormalizatio
 	return auto, nil
 }
 
-func stageRequest(stage permissions.StageNormalization, scope string, modeCtx permissions.ModeContext, pipeline string) (BatchAuthRequest, error) {
-	subject, err := permissions.DirectRequestSubject(stage.Tokens, stage.Assignments, stage.ClearEnvironment)
+func stageRequest(stage permissions.StageNormalization, scope string, home string, modeCtx permissions.ModeContext, pipeline string) (BatchAuthRequest, error) {
+	expands := make([]bool, len(stage.Tokens))
+	for i := range expands {
+		expands[i] = home != "" && i < len(stage.ExecForms) && stage.ExecForms[i].Expand
+	}
+	subject, err := permissions.DirectStageRequestSubject(stage.Tokens, stage.Assignments, stage.ClearEnvironment, expands)
 	if err != nil {
 		return BatchAuthRequest{}, err
 	}
@@ -530,7 +534,7 @@ func dispatchStaged(ctx context.Context, stages []permissions.StageNormalization
 	if err != nil {
 		return tools.Result{}, err
 	}
-	auto, err := authorizeStages(ctx, stages, scope, batch, modeCtx, "", asks)
+	auto, err := authorizeStages(ctx, stages, scope, home, batch, modeCtx, "", asks)
 	if err != nil {
 		return tools.Result{}, err
 	}

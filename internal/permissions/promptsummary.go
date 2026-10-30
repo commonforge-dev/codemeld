@@ -115,15 +115,15 @@ func (s PromptSummaryResult) shapeLine() string {
 }
 
 // BoundPromptFact renders one variable authorization fact for a fixed prompt block: every
-// ASCII control byte becomes a visible \xHH escape kept whole, and the result is cut on a
+// ASCII or C1 control becomes a visible escape kept whole, and the result is cut on a
 // rune and escape boundary at 120 code points with an ellipsis.
 func BoundPromptFact(value string) string {
 	var b strings.Builder
 	count := 0
 	for _, r := range value {
 		unit := string(r)
-		if r < 0x20 || r == 0x7f {
-			unit = fmt.Sprintf("\\x%02X", r)
+		if promptControl(r) {
+			unit = promptControlEscape(r)
 		}
 		n := utf8.RuneCountInString(unit)
 		if count+n > promptFactRuneCap {
@@ -137,20 +137,39 @@ func BoundPromptFact(value string) string {
 }
 
 // VisibleControlEscape renders untrusted request text for a terminal that has no scrollback
-// discipline of its own: every ASCII control byte other than a line feed or tab becomes a
-// visible \xHH escape, so a request cannot conceal, clear, or reposition what the prompt
+// discipline of its own: every ASCII or C1 control other than a line feed or tab becomes a
+// visible escape, so a request cannot conceal, clear, or reposition what the prompt
 // prints after it. Nothing is dropped or shortened, so the complete request stays inspectable.
 func VisibleControlEscape(value string) string {
+	return escapePromptControls(value, true)
+}
+
+func SingleLineControlEscape(value string) string {
+	return escapePromptControls(value, false)
+}
+
+func escapePromptControls(value string, keepLayout bool) string {
 	var b strings.Builder
 	b.Grow(len(value))
 	for _, r := range value {
-		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f {
-			fmt.Fprintf(&b, "\\x%02X", r)
+		if promptControl(r) && (!keepLayout || (r != '\n' && r != '\t')) {
+			b.WriteString(promptControlEscape(r))
 			continue
 		}
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+func promptControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+func promptControlEscape(r rune) string {
+	if r >= 0x80 {
+		return fmt.Sprintf("\\u%04X", r)
+	}
+	return fmt.Sprintf("\\x%02X", r)
 }
 
 func promptUnknownEffect(s PromptSummaryResult) PromptSummaryResult {

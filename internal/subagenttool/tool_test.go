@@ -190,7 +190,7 @@ func newHarness(t *testing.T, rounds ...func() (provider.Response, error)) *harn
 			}
 			return h.store
 		},
-		Snapshot: func() (Snapshot, bool) {
+		Snapshot: func(context.Context) (Snapshot, bool) {
 			h.snapshotted++
 			if !h.snapshotOK {
 				return Snapshot{}, false
@@ -1026,6 +1026,32 @@ func TestGeneralAgent_CarriesInheritedModeAndDeclaredWriteIntoAuthorization(t *t
 	}
 	if len(mc.GeneralAgentWrite) != 0 {
 		t.Fatalf("GeneralAgentWrite = %v, want empty — the child has made no delegate call of its own", mc.GeneralAgentWrite)
+	}
+}
+
+type invocationModeKey struct{}
+
+func TestGeneralAgent_SnapshotReceivesTheInvocationContext(t *testing.T) {
+	h := newHarness(t, streamRound(contentChunk("done"), finishChunk()))
+	parent := h.deps.Snapshot
+	var seen []string
+	h.deps.Snapshot = func(ctx context.Context) (Snapshot, bool) {
+		snap, ok := parent(ctx)
+		m, _ := ctx.Value(invocationModeKey{}).(string)
+		seen = append(seen, m)
+		snap.Mode = m
+		return snap, ok
+	}
+
+	ctx := context.WithValue(t.Context(), invocationModeKey{}, "plan")
+	if res, err := h.tool().Invoke(ctx, map[string]any{instructionsArg: "look"}); err != nil || res.ExitCode != 0 {
+		t.Fatalf("Invoke = %+v, %v, want a completed child", res, err)
+	}
+	if !slices.Equal(seen, []string{"plan"}) {
+		t.Fatalf("Snapshot saw modes %q, want the invocation context's plan once", seen)
+	}
+	if len(h.modeCtxs) != 1 || h.modeCtxs[0].Mode != "plan" {
+		t.Fatalf("child mode contexts = %+v, want one carrying the snapshot's plan", h.modeCtxs)
 	}
 }
 
@@ -3032,8 +3058,8 @@ func TestGeneralAgent_APathFreeCallStartsAReadOnlyChildInEveryMode(t *testing.T)
 			t.Run(mode+"/"+name, func(t *testing.T) {
 				h := newHarness(t, streamRound(contentChunk("12 files"), finishChunk()))
 				parent := h.deps.Snapshot
-				h.deps.Snapshot = func() (Snapshot, bool) {
-					snap, ok := parent()
+				h.deps.Snapshot = func(ctx context.Context) (Snapshot, bool) {
+					snap, ok := parent(ctx)
 					snap.Mode = mode
 					return snap, ok
 				}

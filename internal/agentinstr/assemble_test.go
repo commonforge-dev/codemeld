@@ -383,12 +383,18 @@ func TestBasePrompt_AutoEditsProjectTreeContract(t *testing.T) {
 		"**both** its source and its destination resolve inside the project",
 		"if either end is outside, the whole move pauses for permission",
 		"Auto edits is not blanket approval",
-		"Version-control actions, any target outside the project apart from the deletes described below, and other out-of-scope or risky actions still pause for permission",
+		"On a host where codemeld's sandbox self-test passed, while the settings files are valid and the project's settings layer was admitted by project approval at launch, structured `edit`, `create` and `mkdir` calls whose resolved target is a folder listed in `writable_folders` or a descendant of it also run without pausing",
+		"For these three tools that includes the listed folder itself, unlike `delete`",
+		"A `move` gets no authority from `writable_folders`: it is covered only when both its source and its destination resolve inside the project",
+		"Version-control actions, any other file-tool target outside the project apart from the deletes described below, and other out-of-scope or risky actions still pause for permission",
+		"When your run is limited to declared files or operations, including a child agent's declaration, that limit resolves before every file-tool rule in this mode: a call it does not cover is refused rather than auto-approved or offered for permission, even when its target is inside the project or inside a folder listed in `writable_folders`",
 		"they are not auto-approved",
 		"Inside codemeld's sandbox, while the settings files are valid, a shell command runs without pausing unless codemeld recognizes network access or a version-control history rewrite in it",
 		"delete only what the user's request calls for",
 		"a `delete` call whose target is inside the project or inside a folder listed in `writable_folders`, but not that folder itself; a `delete` anywhere else still pauses",
-		"On a host without the sandbox, or while a settings file is broken, shell commands and `delete` pause for permission exactly as in Build mode",
+		"Automatic delete approval never covers the project root or any declared writable-folder root, even when another declared folder contains it",
+		"On a host without the sandbox, shell commands and `delete` pause for permission exactly as in Build mode",
+		"On a host where the sandbox self-test passed, while a settings file is broken, every shell command, read-only ones included, pauses for permission unless you already denied it this turn, and commands still run inside codemeld's sandbox; a `delete` call pauses for permission too, unless the declared file limit above resolves it first",
 	} {
 		if !strings.Contains(auto, want) {
 			t.Errorf("Auto edits base prompt missing project-tree contract wording %q\n--- got ---\n%s", want, auto)

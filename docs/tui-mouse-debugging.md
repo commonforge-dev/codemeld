@@ -55,8 +55,10 @@ in `docs/environment-variables.md` and the `/help` panel). It logs:
   `tview.MouseAction` (`0`=Move `1`=LeftDown `2`=LeftUp `3`=LeftClick `13`=WheelUp), `event.Position()`,
   `event.Buttons()`, the `inputSelecting` / `transcript.isSelecting()` states, and the input/transcript
   rects.
-- In `scrollDrag` / `scrollDragScroll`, the scroll decision: `y`, inner `iy`/`ih`, `bottom`, current offset
-  → next offset, `maxOffset`, and whether it scrolled.
+- In `scrollDrag` / `scrollDragScroll`, the position and scroll decision: `y`, inner `iy`/`ih`, `bottom`,
+  then for the input current offset → next offset, `maxOffset` and `scrolled`; for a transcript edge
+  attempt current offset → next offset and `scrolled`, without `maxOffset`; and for a transcript drag
+  inside the edges only the current offset, marked `(interior, no scroll)`.
 - In the drag-scroll timer ticks, each fire (generation, selecting state, held `y`).
 
 Reading the capture: **compare the press coordinates to each pane's rect.** In that report the press was at
@@ -126,9 +128,12 @@ evidence here.
 ### When a gesture misbehaves
 
 Read the capture with the questions from the section above: where were the press coordinates relative
-to each pane's rect, and did the event class arrive at all. A gesture that produces no log line for
-its own action is an arrival problem (mouse mode, focus reporting, bracketed paste), not a routing
-one, and the fix is at the screen boundary rather than in the overlay.
+to each pane's rect, and did the event class arrive at all. A missing line says nothing when the
+logger is off, or for an event it never logs: it logs only the mouse, drag-scroll and timer-tick
+lines listed above, never focus changes or pastes (`mouseDebugf` in `internal/tui/mousedebug.go`).
+With the logger on, a mouse gesture that produces no log line for its own action is an arrival
+problem (mouse mode), not a routing one, and the fix is at the screen boundary rather than in the
+overlay.
 
 Fix it in the primitive the capture implicates, confirm the same gesture in the same terminal, and
 then add the part of it the SimulationScreen can hold — a click map, a scroll offset, a focus target,
@@ -161,6 +166,3 @@ Both panes share an edge-hold drag auto-scroll, kept deliberately parallel:
 - Both `offsetAt` mappers clamp the column to the row end when the pointer is held **below the last
   visible row** (`y > iy+ih-1`): dragging past the bottom rule means "take the whole line"; to keep only
   part of the bottom line the user drags back up onto it.
-
-The behavior (not the debugging process) is also described in the human onboarding curriculum at
-`contributing/learning/module-10-tui.md`.

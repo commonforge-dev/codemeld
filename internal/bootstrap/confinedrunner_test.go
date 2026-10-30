@@ -307,7 +307,7 @@ func TestConfinedRunner_ConfinedModesApplyTheFixedEnvironment(t *testing.T) {
 					t.Fatalf("%s: exec/bounded = %d/%d, want only ExecBounded", name, len(inner.execs), len(inner.bounded))
 				}
 				got := inner.bounded[0]
-				if !slices.Equal(got.Env, wantEnv) {
+				if !slices.Equal(got.Env, helperLaunchEnv(t, wantEnv)) {
 					t.Fatalf("%s: env = %v, want %v", name, got.Env, wantEnv)
 				}
 				wantHelperArgv(t, got.Argv, filepath.Join(lookup, "ls"), "-la")
@@ -523,6 +523,16 @@ func TestConfinedRunner_ParallelPreparationsKeepTheLaunchSnapshot(t *testing.T) 
 
 const wantGitNeutralizer = "GIT_CONFIG_GLOBAL=/dev/null"
 
+func helperLaunchEnv(t *testing.T, target []string) []string {
+	t.Helper()
+	if got := envNamed(target, "TERM"); !slices.Equal(got, []string{"TERM=dumb"}) {
+		t.Fatalf("target env TERM entries = %q, want exactly TERM=dumb", got)
+	}
+	launch := slices.Clone(target)
+	launch[slices.Index(launch, "TERM=dumb")] = "TERM="
+	return launch
+}
+
 func blockedEntries(t *testing.T, home string, raws ...string) []permissions.BlockedEntry {
 	t.Helper()
 	var entries []permissions.BlockedEntry
@@ -593,7 +603,7 @@ func TestConfinedRunner_BlockedGitConfigNeutralizesTheGlobalConfig(t *testing.T)
 				spec := confinedSpec(cwd, "git", "status")
 				spec.Assignments = []string{"FOO=bar"}
 				spec.Env = []string{"GIT_CONFIG_GLOBAL=/elsewhere/gitconfig"}
-				if env := confinedExecEnv(t, conf, spec); !slices.Equal(env, want) {
+				if env := confinedExecEnv(t, conf, spec); !slices.Equal(env, helperLaunchEnv(t, want)) {
 					t.Fatalf("env = %q, want %q", env, want)
 				}
 			})
@@ -1752,6 +1762,8 @@ func skillsPolicy(t *testing.T, conf *confinement, f skillsFixture) enforce.Poli
 }
 
 func TestConfinedRunner_SkillsFolderReadRoot(t *testing.T) {
+	skillsDir := func(f skillsFixture) []string { return []string{f.skills} }
+	extDir := func(f skillsFixture) []string { return []string{f.ext} }
 	cases := []struct {
 		name     string
 		setup    func(t *testing.T, f skillsFixture)
@@ -1759,29 +1771,34 @@ func TestConfinedRunner_SkillsFolderReadRoot(t *testing.T) {
 		confHome func(f skillsFixture) string
 		degraded bool
 		want     func(f skillsFixture) []string
+		noWrite  func(f skillsFixture) []string
 	}{
-		{name: "real skills folder", want: func(f skillsFixture) []string { return []string{f.skills} }},
+		{name: "real skills folder", want: skillsDir, noWrite: skillsDir},
 		{name: "empty home falls back to the blocked home", confHome: func(skillsFixture) string { return "" },
-			want: func(f skillsFixture) []string { return []string{f.skills} }},
-		{name: "relative home", setup: func(t *testing.T, f skillsFixture) { t.Chdir(f.home) },
-			confHome: func(skillsFixture) string { return "." }},
+			want: skillsDir, noWrite: skillsDir},
+		{name: "relative home", setup: func(t *testing.T, f skillsFixture) {
+			if err := os.MkdirAll(filepath.Join(f.project, ".codemeld", "skills"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(f.project)
+		}, confHome: func(skillsFixture) string { return "." }},
 		{name: "unrelated configured entry", blocked: func(f skillsFixture) []string { return []string{"~/.ssh"} },
-			want: func(f skillsFixture) []string { return []string{f.skills} }},
-		{name: "configured entry is skills", blocked: func(skillsFixture) []string { return []string{"~/.codemeld/skills"} }},
-		{name: "configured missing entry inside skills", blocked: func(skillsFixture) []string { return []string{"~/.codemeld/skills/pdf/missing"} }},
-		{name: "configured entry covers skills", blocked: func(f skillsFixture) []string { return []string{f.home} }},
+			want: skillsDir, noWrite: skillsDir},
+		{name: "configured entry is skills", blocked: func(skillsFixture) []string { return []string{"~/.codemeld/skills"} }, noWrite: skillsDir},
+		{name: "configured missing entry inside skills", blocked: func(skillsFixture) []string { return []string{"~/.codemeld/skills/pdf/missing"} }, noWrite: skillsDir},
+		{name: "configured entry covers skills", blocked: func(f skillsFixture) []string { return []string{f.home} }, noWrite: skillsDir},
 		{name: "configured entry reaches skills through a symlink",
 			setup:   func(t *testing.T, f skillsFixture) { mustSymlink(t, f.skills, filepath.Join(f.home, "alias")) },
-			blocked: func(skillsFixture) []string { return []string{"~/alias"} }},
+			blocked: func(skillsFixture) []string { return []string{"~/alias"} }, noWrite: skillsDir},
 		{name: "configured missing entry below a symlink to skills",
 			setup:   func(t *testing.T, f skillsFixture) { mustSymlink(t, f.skills, filepath.Join(f.home, "alias")) },
-			blocked: func(skillsFixture) []string { return []string{"~/alias/pdf/missing"} }},
+			blocked: func(skillsFixture) []string { return []string{"~/alias/pdf/missing"} }, noWrite: skillsDir},
 		{name: "configured entry at the resolved skills location",
 			setup:   func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.ext, f.skills) },
-			blocked: func(f skillsFixture) []string { return []string{f.ext} }},
+			blocked: func(f skillsFixture) []string { return []string{f.ext} }, noWrite: extDir},
 		{name: "configured missing entry below the resolved skills location",
 			setup:   func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.ext, f.skills) },
-			blocked: func(f skillsFixture) []string { return []string{filepath.Join(f.ext, "pdf", "missing")} }},
+			blocked: func(f skillsFixture) []string { return []string{filepath.Join(f.ext, "pdf", "missing")} }, noWrite: extDir},
 		{name: "skills missing", setup: func(t *testing.T, f skillsFixture) {
 			if err := os.Remove(f.skills); err != nil {
 				t.Fatal(err)
@@ -1809,13 +1826,15 @@ func TestConfinedRunner_SkillsFolderReadRoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			replaceWithSymlink(t, sessions, f.skills)
-		}},
-		{name: "skills redirected to the codemeld folder", setup: func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.codemeld, f.skills) }},
-		{name: "skills redirected to home", setup: func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.home, f.skills) }},
+		}, noWrite: func(f skillsFixture) []string { return []string{filepath.Join(f.codemeld, "sessions")} }},
+		{name: "skills redirected to the codemeld folder", setup: func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.codemeld, f.skills) },
+			noWrite: func(f skillsFixture) []string { return []string{f.codemeld} }},
+		{name: "skills redirected to home", setup: func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.home, f.skills) },
+			noWrite: func(f skillsFixture) []string { return []string{f.home} }},
 		{name: "skills redirected to a safe external folder",
 			setup: func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.ext, f.skills) },
-			want:  func(f skillsFixture) []string { return []string{f.ext} }},
-		{name: "degraded blocked list", degraded: true},
+			want:  extDir, noWrite: extDir},
+		{name: "degraded blocked list", degraded: true, noWrite: skillsDir},
 	}
 	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
 		for _, tc := range cases {
@@ -1849,11 +1868,15 @@ func TestConfinedRunner_SkillsFolderReadRoot(t *testing.T) {
 				if !slices.Equal(policy.ReadRoots, want) {
 					t.Errorf("read roots = %q, want %q", policy.ReadRoots, want)
 				}
+				var wantNoWrite []string
 				if m == mode.AutoEdits {
-					wantNoWrite := append([]string{filepath.Join(f.project, ".codemeld")}, want...)
-					if !slices.Equal(policy.NoWritePaths, wantNoWrite) {
-						t.Errorf("no-write paths = %q, want %q", policy.NoWritePaths, wantNoWrite)
+					wantNoWrite = []string{filepath.Join(f.project, ".codemeld")}
+					if tc.noWrite != nil {
+						wantNoWrite = append(wantNoWrite, tc.noWrite(f)...)
 					}
+				}
+				if !slices.Equal(policy.NoWritePaths, wantNoWrite) {
+					t.Errorf("no-write paths = %q, want %q", policy.NoWritePaths, wantNoWrite)
 				}
 				if !slices.Contains(policy.BlockedPaths, f.codemeld) {
 					t.Errorf("blocked paths %q lost the floor %s", policy.BlockedPaths, f.codemeld)
@@ -1884,5 +1907,144 @@ func TestConfinedRunner_UninspectableSkillsFolderStartsNothing(t *testing.T) {
 				t.Fatalf("inner runner called %d times", inner.calls())
 			}
 		})
+	}
+}
+
+func TestConfinedRunner_UninspectableSkillsFolderStopsAutoOnReadRefusalPaths(t *testing.T) {
+	breaks := []struct {
+		name     string
+		apply    func(t *testing.T, f skillsFixture)
+		checkErr func(t *testing.T, err error)
+	}{
+		{name: "symlink loop", apply: func(t *testing.T, f skillsFixture) { replaceWithSymlink(t, f.skills, f.skills) },
+			checkErr: func(t *testing.T, err error) {
+				if err == nil || !strings.Contains(err.Error(), "too many links") {
+					t.Fatalf("Exec error = %v, want a symlink-loop error", err)
+				}
+			}},
+		{name: "unreadable codemeld folder", apply: func(t *testing.T, f skillsFixture) {
+			if os.Geteuid() == 0 {
+				t.Skip("root ignores folder permissions")
+			}
+			if err := os.Chmod(f.codemeld, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(f.codemeld, 0o755) })
+		}, checkErr: func(t *testing.T, err error) {
+			if !errors.Is(err, fs.ErrPermission) {
+				t.Fatalf("Exec error = %v, want a permission error", err)
+			}
+		}},
+	}
+	refusals := []struct {
+		name     string
+		blocked  []string
+		degraded bool
+	}{
+		{name: "ordinary"},
+		{name: "degraded", degraded: true},
+		{name: "blocked entry refuses the read grant", blocked: []string{"~/.codemeld/skills"}},
+	}
+	blockedFor := func(t *testing.T, f skillsFixture, raws []string, degraded bool) *permissions.BlockedPaths {
+		entries := blockedEntries(t, f.home, raws...)
+		if !degraded {
+			return permissions.NewBlockedPaths(f.home, entries)
+		}
+		return permissions.NewLiveBlockedPaths(f.home, f.project, entries, func() permissions.BlockedReload {
+			return permissions.BlockedReload{Problems: map[string]string{filepath.Join(f.home, "settings.yaml"): "can't be parsed"}}
+		})
+	}
+	for _, b := range breaks {
+		for _, r := range refusals {
+			t.Run(b.name+"/auto_edits/"+r.name, func(t *testing.T) {
+				f := newSkillsFixture(t)
+				blocked := blockedFor(t, f, r.blocked, r.degraded)
+				b.apply(t, f)
+				conf := &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), home: f.home, lookupPath: programDir(t, "ls"),
+					tmpDir: t.TempDir(), projectRoot: f.project, blocked: blocked}
+				inner := &confineInner{}
+				_, err := shellAdapter(conf, inner).Exec(context.Background(), confinedSpec(f.project, "ls"))
+				b.checkErr(t, err)
+				if inner.calls() != 0 {
+					t.Fatalf("inner runner called %d times", inner.calls())
+				}
+			})
+		}
+		t.Run(b.name+"/plan/degraded", func(t *testing.T) {
+			f := newSkillsFixture(t)
+			blocked := blockedFor(t, f, nil, true)
+			b.apply(t, f)
+			conf := &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), home: f.home, lookupPath: programDir(t, "ls"),
+				tmpDir: t.TempDir(), projectRoot: f.project, blocked: blocked}
+			policy := skillsPolicy(t, conf, f)
+			if len(policy.ReadRoots) != 0 || len(policy.NoWritePaths) != 0 {
+				t.Fatalf("degraded plan policy read roots %q, no-write %q; want neither", policy.ReadRoots, policy.NoWritePaths)
+			}
+		})
+	}
+}
+
+func TestConfinedRunner_SkillsLinkedIntoTheProjectStayUnwritableThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if _, err := cmdrunner.ResolveOnPath("sh", cmdrunner.FixedPATH); err != nil {
+		t.Skipf("sh absent from %s: %v", cmdrunner.FixedPATH, err)
+	}
+	project, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, other, tmpDir := filepath.Join(project, "x"), filepath.Join(project, "other"), filepath.Join(filepath.Dir(project), "tmp")
+	for _, dir := range []string{filepath.Join(x, "sub"), other, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sibling := filepath.Join(x, "skill.md")
+	if err := os.WriteFile(sibling, []byte("orig\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	skills := filepath.Join(home, ".codemeld", "skills")
+	replaceWithSymlink(t, x, skills)
+	cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project,
+		[]string{SettingsPath(home)}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, blockedEntries(t, home, filepath.Join(x, "sub")))}
+	conf := launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
+		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, guard, nil)
+
+	inner := &confineInner{}
+	if _, err := shellAdapter(conf, inner).Exec(context.Background(), confinedSpec(project, "sh")); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	policy, _ := decodeFrame(t, inner.bounded[0].Stdin)
+	if len(policy.ReadRoots) != 0 || !slices.Contains(policy.NoWritePaths, x) {
+		t.Fatalf("policy read roots %q, no-write %q; want no read root and %s unwritable", policy.ReadRoots, policy.NoWritePaths, x)
+	}
+
+	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+	write := func(t *testing.T, target string) cmdrunner.RunResult {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := confined.Exec(ctx, cmdrunner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", `echo hi > "$1"`, "sh", target}, Cwd: project})
+		if err != nil || ctx.Err() != nil {
+			t.Fatalf("confined write to %s: %v, %v; result %+v", target, err, ctx.Err(), res)
+		}
+		return res
+	}
+	for _, target := range []string{filepath.Join(skills, "skill.md"), sibling} {
+		res := write(t, target)
+		if b, err := os.ReadFile(sibling); res.ExitCode == 0 || err != nil || string(b) != "orig\n" {
+			t.Fatalf("write to %s: exit %d stderr %q, %s = %q, %v; want a failure leaving it unchanged", target, res.ExitCode, res.Stderr, sibling, b, err)
+		}
+	}
+	unrelated := filepath.Join(other, "f")
+	if res := write(t, unrelated); res.ExitCode != 0 {
+		t.Fatalf("write to %s: exit %d stderr %q, want 0", unrelated, res.ExitCode, res.Stderr)
+	}
+	if b, err := os.ReadFile(unrelated); err != nil || string(b) != "hi\n" {
+		t.Fatalf("%s = %q, %v; want the written line", unrelated, b, err)
 	}
 }

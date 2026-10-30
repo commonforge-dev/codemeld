@@ -612,15 +612,11 @@ func TestStripNullRedirectsForGrant(t *testing.T) {
 	}
 }
 
-// The inputs carry expandable tokens deliberately: the expansion gate must not reach a command from
-// which no redirect was removed.
-func TestRecognizeSimpleCompoundForGrant_RedirectFreeUnchanged(t *testing.T) {
+func TestRecognizeSimpleCompoundForGrant_BareRedirectFreeUnchanged(t *testing.T) {
 	for _, input := range []string{
 		"a $X && b | c",
 		"a *.go && b | c",
 		"a ~/x && b | c",
-		`sh -c 'a $X && b'`,
-		`sh -c 'a *.go && b'`,
 		"gofmt -w a.go && go build ./...",
 	} {
 		t.Run(input, func(t *testing.T) {
@@ -636,6 +632,132 @@ func TestRecognizeSimpleCompoundForGrant_RedirectFreeUnchanged(t *testing.T) {
 			if got.Wrapped != want.Wrapped || !equalStageTokens(got.Stages, want.Stages) ||
 				strings.Join(got.Operators, ",") != strings.Join(want.Operators, ",") {
 				t.Fatalf("grant recognition %+v differs from existing recognition %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestRecognizeSimpleCompoundForGrant_WrappedRedirectFreeExpansionRefused(t *testing.T) {
+	for _, input := range []string{
+		`sh -c 'a $X && b'`,
+		`sh -c 'a *.go && b'`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			c := canon(t, input)
+			if _, ok := RecognizeSimpleCompoundForGrant(c); ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = simple, want refusal (sh -c expands the token)", input)
+			}
+			if _, ok := RecognizeSimpleCompound(c); !ok {
+				t.Fatalf("RecognizeSimpleCompound(%q) = not simple, want execution recognition unchanged", input)
+			}
+		})
+	}
+}
+
+func exactCompoundGrant(t *testing.T, sc SimpleCompound) string {
+	t.Helper()
+	stageSubjects := make([]string, len(sc.Stages))
+	for i, stage := range sc.Stages {
+		stageSubjects[i] = ExactSubject(stage[0], stage[1:])
+	}
+	grant, err := EncodeCompoundSubject(sc.Wrapped, stageSubjects, sc.Operators)
+	if err != nil {
+		t.Fatalf("EncodeCompoundSubject error: %v", err)
+	}
+	return grant
+}
+
+func TestMatchesCompoundSubject_WrappedQuotedGrantDoesNotCoverExpansion(t *testing.T) {
+	source := canon(t, `sh -c "mv '*.txt' d && true"`)
+	request := canon(t, `sh -c 'mv *.txt d && true'`)
+
+	sc, ok := RecognizeSimpleCompoundForGrant(source)
+	if !ok {
+		t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = not simple, want the inert source recognized", source)
+	}
+	grant := exactCompoundGrant(t, sc)
+	if want := "compound/v1 W mv '*.txt' d && true"; grant != want {
+		t.Fatalf("grant = %q, want %q", grant, want)
+	}
+	if !matchesCompoundSubject(source, grant) {
+		t.Fatalf("matchesCompoundSubject(%q, %q) = false, want the grant to cover its own source", source, grant)
+	}
+	if matchesCompoundSubject(request, grant) {
+		t.Fatalf("matchesCompoundSubject(%q, %q) = true, want the expanding glob to re-prompt", request, grant)
+	}
+}
+
+func TestMatchesCompoundSubject_StoredWrappedGrantDoesNotCoverExpansion(t *testing.T) {
+	const stored = "compound/v1 W mv '*.txt' d && true"
+	if !matchesCompoundSubject(canon(t, `sh -c "mv '*.txt' d && true"`), stored) {
+		t.Fatalf("stored grant %q does not match its inert source, want a decodable grant", stored)
+	}
+	if matchesCompoundSubject(canon(t, `sh -c 'mv *.txt d && true'`), stored) {
+		t.Fatalf("stored grant %q matched the expanding request, want re-prompt", stored)
+	}
+}
+
+func TestRecognizeSimpleCompoundForGrant_WrappedExpansionTable(t *testing.T) {
+	cases := []struct {
+		name      string
+		inert     string
+		expanding string
+		homePin   bool
+	}{
+		{"star", "ls '*.txt' && true", "ls *.txt && true", false},
+		{"question mark", "ls 'a?.txt' && true", "ls a?.txt && true", false},
+		{"bracket class", "ls '[ab].txt' && true", "ls [ab].txt && true", false},
+		{"tilde", "cat '~/x' && true", "cat ~/x && true", true},
+		{"home variable", "cat '$HOME' && true", "cat $HOME && true", true},
+		{"double-quoted home variable", "cat '$HOME' && true", `cat "$HOME" && true`, true},
+		{"brace list", "ls '{a,b}' && true", "ls {a,b} && true", false},
+	}
+	variants := []struct {
+		name     string
+		redirect string
+	}{
+		{"redirect-free", ""},
+		{"stderr to null", " 2>/dev/null"},
+	}
+	for _, tt := range cases {
+		for _, v := range variants {
+			t.Run(tt.name+"/"+v.name, func(t *testing.T) {
+				withRedirect := func(body string) string {
+					stage, rest, _ := strings.Cut(body, " && ")
+					return "sh -c " + ShellQuote(stage+v.redirect+" && "+rest)
+				}
+				source := canon(t, withRedirect(tt.inert))
+				request := canon(t, withRedirect(tt.expanding))
+
+				sc, ok := RecognizeSimpleCompoundForGrant(source)
+				if !ok || !sc.Wrapped {
+					t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = (%+v, %v), want the inert wrapped source", source, sc, ok)
+				}
+				grant := exactCompoundGrant(t, sc)
+				if got := matchesCompoundSubject(source, grant); got == tt.homePin {
+					t.Fatalf("matchesCompoundSubject(%q, %q) = %v, want %v (a pinned home form cannot prove its expansion)", source, grant, got, !tt.homePin)
+				}
+				if _, ok := RecognizeSimpleCompoundForGrant(request); ok {
+					t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = simple, want refusal", request)
+				}
+				if matchesCompoundSubject(request, grant) {
+					t.Fatalf("matchesCompoundSubject(%q, %q) = true, want the expanding spelling to re-prompt", request, grant)
+				}
+			})
+		}
+	}
+}
+
+func TestRecognizeSimpleCompoundForGrant_BashWrapperStaysByteExact(t *testing.T) {
+	for _, input := range []string{
+		`bash -c "mv '*.txt' d && true"`,
+		`bash -c 'mv *.txt d && true'`,
+		`bash -c "mv '*.txt' d 2>/dev/null && true"`,
+		`bash -c 'mv *.txt d 2>/dev/null && true'`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			if _, ok := RecognizeSimpleCompoundForGrant(canon(t, input)); ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = simple, want bash -c to stay byte-exact", input)
 			}
 		})
 	}
@@ -792,5 +914,61 @@ func TestMatchesCompoundSubject_StagesStayAssignmentFreeAndInheriting(t *testing
 		if matchesCompoundSubject(c, inner) {
 			t.Fatalf("an environment-bearing stage matched the assignment-free compound grant: %q", held)
 		}
+	}
+}
+
+func TestMatchesCompoundSubject_PinnedHomeStageFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		stage    string
+		requests []string
+	}{
+		{"exact tilde path", ExactSubject("cat", []string{"~/x"}), []string{"cat '~/x' && true", "cat \\~/x && true", "cat ~/x && true"}},
+		{"exact home variable", ExactSubject("cat", []string{"$HOME"}), []string{"cat '$HOME' && true", `cat "$HOME" && true`, "cat $HOME && true"}},
+		{"exact lone tilde", ExactSubject("cat", []string{"-n", "~"}), []string{"cat -n '~' && true", "cat -n ~ && true"}},
+		{"prefix pinning a home form", PrefixSubject("cat", []string{"~/x"}), []string{"cat '~/x' -n && true", "cat ~/x -n && true"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			grant, err := EncodeCompoundSubject(false, []string{tt.stage, "true"}, []string{"&&"})
+			if err != nil {
+				t.Fatalf("EncodeCompoundSubject(%q): %v", tt.stage, err)
+			}
+			source := canon(t, tt.requests[0])
+			if _, ok := RecognizeSimpleCompoundForGrant(source); !ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = not simple, want the grant's own source recognized", source)
+			}
+			for _, request := range tt.requests {
+				if matchesCompoundSubject(canon(t, request), grant) {
+					t.Fatalf("matchesCompoundSubject(%q, %q) = true, want a pinned home form refused", request, grant)
+				}
+			}
+		})
+	}
+}
+
+func TestMatchesCompoundSubject_UnpinnedHomeFormsKeepMatching(t *testing.T) {
+	tests := []struct {
+		name    string
+		stage   string
+		request string
+	}{
+		{"program scope over a tilde path", ProgramSubject("cat"), "cat '~/x' && true"},
+		{"prefix scope over a home variable tail", PrefixSubject("cat", []string{"-n"}), "cat -n '$HOME' && true"},
+		{"prefix scope over a lone tilde tail", PrefixSubject("cat", []string{"-n"}), "cat -n '~' && true"},
+		{"exact tilde-user pin", ExactSubject("cat", []string{"~alice/x"}), "cat '~alice/x' && true"},
+		{"exact longer variable pin", ExactSubject("cat", []string{"$HOMEDIR"}), "cat '$HOMEDIR' && true"},
+		{"exact embedded home variable pin", ExactSubject("cat", []string{"a/$HOME"}), "cat 'a/$HOME' && true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			grant, err := EncodeCompoundSubject(false, []string{tt.stage, "true"}, []string{"&&"})
+			if err != nil {
+				t.Fatalf("EncodeCompoundSubject(%q): %v", tt.stage, err)
+			}
+			if !matchesCompoundSubject(canon(t, tt.request), grant) {
+				t.Fatalf("matchesCompoundSubject(%q, %q) = false, want the unpinned argument covered", tt.request, grant)
+			}
+		})
 	}
 }

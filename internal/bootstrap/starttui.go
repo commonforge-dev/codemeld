@@ -58,7 +58,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Alpha 0.4.7"
+var codemeldVersion = "Beta 0.4.8"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -362,21 +362,23 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 		}
 		return entry(input, imageParts...)
 	})
+	settingsDeps := newSettingsDeps(app, cache, active, authorizer)
 	reg := tui.MustNewRegistry(append(tui.BuildRegistry(map[string]tui.HandlerFunc{
-		"status":   tui.NewStatusHandler(status),
-		"context":  tui.NewContextHandler(contextSt),
-		"effort":   tui.NewEffortHandler(effortDeps),
-		"model":    tui.NewModelHandler(modelDeps),
-		"mode":     tui.NewModeHandler(modeDeps),
-		"exit":     tui.NewExitHandler(exit),
-		"clear":    tui.NewClearHandler(clearDeps),
-		"resume":   tui.NewResumeHandler(resumeDeps),
-		"rename":   renameHandler,
-		"color":    tui.NewColorHandler(tui.ColorDeps{Apply: app.ApplyInputAccent}),
-		"fork":     tui.NewForkHandler(newForkDeps(ctx, app, result.Home, resumeLock, turnCtl, status, recorder, conf)),
-		"compact":  tui.NewCompactHandler(newCompactDeps(ctx, app, cache, active, result.Home, resumeLock, turnCtl, status, compact, recorder, conf)),
-		"connect":  tui.NewConnectHandler(newConnectDeps(app, result.Home, cache)),
-		"settings": tui.NewSettingsHandler(newSettingsDeps(app, cache, active, authorizer)),
+		"status":     tui.NewStatusHandler(status),
+		"context":    tui.NewContextHandler(contextSt),
+		"effort":     tui.NewEffortHandler(effortDeps),
+		"model":      tui.NewModelHandler(modelDeps),
+		"mode":       tui.NewModeHandler(modeDeps),
+		"exit":       tui.NewExitHandler(exit),
+		"clear":      tui.NewClearHandler(clearDeps),
+		"resume":     tui.NewResumeHandler(resumeDeps),
+		"rename":     renameHandler,
+		"color":      tui.NewColorHandler(tui.ColorDeps{Apply: app.ApplyInputAccent}),
+		"fork":       tui.NewForkHandler(newForkDeps(ctx, app, result.Home, resumeLock, turnCtl, status, recorder, conf)),
+		"compact":    tui.NewCompactHandler(newCompactDeps(ctx, app, cache, active, result.Home, resumeLock, turnCtl, status, compact, recorder, conf)),
+		"connect":    tui.NewConnectHandler(newConnectDeps(app, result.Home, cache)),
+		"settings":   tui.NewSettingsHandler(settingsDeps),
+		"openrouter": tui.NewOpenRouterHandler(settingsDeps),
 		"blocked": tui.NewBlockedHandler(tui.BlockedDeps{
 			Rows:   func() []tui.BlockedRow { return blockedRows(guard.Blocked, result.Home, SettingsPath(result.Home)) },
 			Picker: tui.NewBlockedPicker(app),
@@ -642,18 +644,41 @@ var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.Acti
 				return err
 			},
 			MaxPrice: cache.OpenRouterMaxPrice,
+			MaxPrices: func() map[string]provider.MaxPrice {
+				entry, _ := cache.Provider("openrouter")
+				return entry.Routing.MaxPrice
+			},
+			Models: func() []string {
+				entry, _ := cache.SelectableCatalog().Entry("openrouter")
+				return entry.Models
+			},
 			SetMaxPrice: func(model string, p provider.MaxPrice) error {
 				_, _, err := cache.SetOpenRouterMaxPrice(model, p)
 				return err
 			},
+			Quantizations: func() map[string]provider.Quantization {
+				out := map[string]provider.Quantization{}
+				for _, q := range cache.OpenRouterQuantizations() {
+					out[q.Model] = q.Quantization
+				}
+				return out
+			},
+			SetQuantization: func(model string, q provider.Quantization) error {
+				_, _, err := cache.SetOpenRouterQuantization(model, q)
+				return err
+			},
+			ClearQuantization: func(model string) error {
+				_, _, err := cache.DeleteOpenRouterQuantization(model)
+				return err
+			},
 			ActiveModel: func() (string, string) { return activeModelIDs(active) },
-			SortEstimate: func(model, sortMode string, fetched func()) (provider.OpenRouterEstimate, bool) {
+			HostQuantizations: func(model string, fetched func()) (map[string]int, provider.OpenRouterHostsState) {
 				entry, ok := cache.Provider("openrouter")
 				if !ok {
-					return provider.OpenRouterEstimate{}, false
+					return nil, provider.OpenRouterHostsFailed
 				}
 				authName, authValue := entry.ResolveAuthHeader()
-				return openRouterEndpoints.Estimate(entry, authName, authValue, model, sortMode, fetched)
+				return openRouterEndpoints.QuantizationCounts(entry, authName, authValue, model, fetched)
 			},
 		}, tui.SessionSettings{
 			RetentionDays: cache.RetentionDays,

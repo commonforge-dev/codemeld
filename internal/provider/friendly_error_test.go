@@ -137,3 +137,49 @@ func TestFriendlyRoutingExhaustionMessage(t *testing.T) {
 		})
 	}
 }
+
+func TestFriendlyRoutingExhaustionMessage_Quantizations(t *testing.T) {
+	const friendly = "provider openrouter returned HTTP 404: No endpoints found that satisfy the max price for this request"
+	const routingRemedy = "Change provider.openrouter.routing to let a provider through."
+	const ignoreRemedy = "The ignore list is session-only; start a new session to clear it."
+	for _, tc := range []struct {
+		name string
+		err  RoutingExhaustionError
+		want string
+	}{
+		{
+			name: "beside the other filters",
+			err: RoutingExhaustionError{
+				Model:              "z-ai/glm-5.3",
+				MaxPrice:           MaxPrice{Prompt: 1, HasPrompt: true},
+				DataCollectionDeny: true,
+				RequireParameters:  true,
+				Ignore:             []string{"together"},
+				Quantization:       Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"},
+			},
+			want: friendly + " (model z-ai/glm-5.3; filters sent: max_price prompt 1, data_collection deny, require_parameters true, quantizations required [fp8 fp4] (each tried in order), ignore [together]). " + routingRemedy + " " + ignoreRemedy,
+		},
+		{
+			name: "alone",
+			err:  RoutingExhaustionError{Model: "z-ai/glm-5.3", Quantization: Quantization{Levels: []string{"int8"}, Mode: "required"}},
+			want: friendly + " (model z-ai/glm-5.3; filters sent: quantizations required [int8] (each tried in order)). " + routingRemedy,
+		},
+		{
+			name: "control characters collapsed",
+			err:  RoutingExhaustionError{Model: "z-ai/glm-5.3", Quantization: Quantization{Levels: []string{"fp\n8", "fp4"}, Mode: "re\nquired"}},
+			want: friendly + " (model z-ai/glm-5.3; filters sent: quantizations re quired [fp 8 fp4] (each tried in order)). " + routingRemedy,
+		},
+		{
+			name: "mode without levels",
+			err:  RoutingExhaustionError{Model: "z-ai/glm-5.3", Quantization: Quantization{Mode: "preferred"}},
+			want: friendly + " (model z-ai/glm-5.3; codemeld sent no routing filters). Check the provider settings in your OpenRouter account.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.err.HTTP = &HTTPError{Status: 404, Body: capturedMaxPriceBody}
+			if got := FriendlyRoutingExhaustionMessage("openrouter", &tc.err); got != tc.want {
+				t.Fatalf("got  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}

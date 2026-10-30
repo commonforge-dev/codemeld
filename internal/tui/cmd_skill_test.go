@@ -411,7 +411,7 @@ func TestSkillCommands_RegistrationSurfaces(t *testing.T) {
 	for _, c := range f.reg.Commands() {
 		names = append(names, c.Name)
 	}
-	builtins := []string{"help", "clear", "connect", "status", "context", "effort", "model", "mode", "resume", "settings", "blocked", "exit", "rename", "color", "fork", "compact", "systemone", "skills"}
+	builtins := []string{"help", "clear", "connect", "status", "context", "effort", "model", "mode", "resume", "settings", "openrouter", "blocked", "exit", "rename", "color", "fork", "compact", "systemone", "skills"}
 	if want := append(slices.Clone(builtins), "zeta-skill", "alpha-skill"); !slices.Equal(names, want) {
 		t.Fatalf("registry order = %q, want %q", names, want)
 	}

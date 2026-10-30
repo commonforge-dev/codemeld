@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,9 +15,12 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/openai/openai-go/v3/packages/ssestream"
 )
 
 // roundTripFunc adapts a function to http.RoundTripper so a test can return a
@@ -777,16 +781,16 @@ func TestChatCompletion_NonOpenRouterNeverSendsRouting(t *testing.T) {
 }
 
 func TestChatCompletion_OpenRouterBestValueSort(t *testing.T) {
-	picked := func(ctx context.Context, model string, ignored []string) string {
-		if model != "some-model" || !slices.Equal(ignored, []string{"together"}) {
-			t.Errorf("BestValueTag(%q, %q), want some-model and the request's ignored providers", model, ignored)
+	picked := func(ctx context.Context, model, level string, ignored []string) string {
+		if model != "some-model" || level != "" || !slices.Equal(ignored, []string{"together"}) {
+			t.Errorf("BestValueTag(%q, %q, %q), want some-model, no level and the request's ignored providers", model, level, ignored)
 		}
 		return "baseten/fp8/us"
 	}
-	none := func(context.Context, string, []string) string { return "" }
+	none := func(context.Context, string, string, []string) string { return "" }
 	cases := []struct {
 		name   string
-		lookup func(context.Context, string, []string) string
+		lookup func(context.Context, string, string, []string) string
 		want   map[string]any
 	}{
 		{"pick", picked, map[string]any{"order": []any{"baseten/fp8/us"}, "ignore": []any{"together"}}},
@@ -819,7 +823,7 @@ func TestChatCompletion_BestValueTagOnlyForOpenRouterBestValue(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			called := false
-			lookup := func(context.Context, string, []string) string {
+			lookup := func(context.Context, string, string, []string) string {
 				called = true
 				return "picked"
 			}
@@ -1334,6 +1338,468 @@ func TestChatCompletion_RoutingExhaustionNotRecognized(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+type orReply struct {
+	status      int
+	body        string
+	contentType string
+	retryAfter  string
+}
+
+func quantExhausted(msg string) orReply {
+	return orReply{status: http.StatusNotFound, body: `{"error":{"message":"` + msg + `","code":404,"metadata":{"failed_routing_step":"Filter by Quantization"}}}`}
+}
+
+type orFake struct {
+	srv    *httptest.Server
+	mu     sync.Mutex
+	bodies map[string][][]byte
+}
+
+func newORFake(t *testing.T, stream bool, replies map[string][]orReply, onRequest func(model string, attempt int)) *orFake {
+	t.Helper()
+	f := &orFake{bodies: map[string][][]byte{}}
+	f.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(raw, &body)
+		f.mu.Lock()
+		attempt := len(f.bodies[body.Model])
+		f.bodies[body.Model] = append(f.bodies[body.Model], raw)
+		f.mu.Unlock()
+		if onRequest != nil {
+			onRequest(body.Model, attempt)
+		}
+		var reply orReply
+		if rs := replies[body.Model]; attempt < len(rs) {
+			reply = rs[attempt]
+		}
+		if reply.status != 0 {
+			if reply.retryAfter != "" {
+				w.Header().Set("Retry-After", reply.retryAfter)
+			}
+			w.Header().Set("Content-Type", cmp.Or(reply.contentType, "application/json"))
+			w.WriteHeader(reply.status)
+			_, _ = io.WriteString(w, reply.body)
+			return
+		}
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, cmp.Or(reply.body, "data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, minimalCompletionBody)
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *orFake) providerObjects(t *testing.T, model string) []map[string]any {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []map[string]any
+	for _, raw := range f.bodies[model] {
+		out = append(out, decodeProviderObject(t, raw))
+	}
+	return out
+}
+
+func (f *orFake) client(routing Routing, bestValueTag func(context.Context, string, string, []string) string) Client {
+	return NewClient(ClientConfig{
+		Name:         "openrouter",
+		BaseURL:      f.srv.URL,
+		AuthHeader:   "Authorization",
+		AuthValue:    "Bearer sk-test",
+		Routing:      routing,
+		HTTPClient:   f.srv.Client(),
+		BestValueTag: bestValueTag,
+	})
+}
+
+func levelTag(_ context.Context, model, level string, _ []string) string {
+	return model + "@" + cmp.Or(level, "any")
+}
+
+func quantRouting(model string, q Quantization) Routing {
+	return Routing{
+		Sort:              "best_value",
+		DataCollection:    "deny",
+		RequireParameters: true,
+		MaxPrice:          map[string]MaxPrice{model: {Prompt: 1, HasPrompt: true}},
+		Quantizations:     map[string]Quantization{model: q},
+	}
+}
+
+func wantQuantProvider(model, level string) map[string]any {
+	want := map[string]any{
+		"ignore":             []any{"together"},
+		"order":              []any{model + "@" + cmp.Or(level, "any")},
+		"data_collection":    "deny",
+		"require_parameters": true,
+		"max_price":          map[string]any{"prompt": float64(1)},
+	}
+	if level != "" {
+		want["quantizations"] = []any{level}
+	}
+	return want
+}
+
+func quantChat(ctx context.Context, c Client, model string, stream bool) error {
+	resp, err := c.ChatCompletion(ctx, Request{
+		Model:            model,
+		Messages:         []Message{{Role: "user", Content: "hi"}},
+		Stream:           stream,
+		IgnoredProviders: []string{"together"},
+	})
+	if err == nil && stream {
+		for resp.Stream.Next() {
+		}
+		err = resp.Stream.Err()
+	}
+	return err
+}
+
+func TestChatCompletion_QuantizationLevelSequence(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	first, last := quantExhausted("first"), quantExhausted("last")
+	cases := []struct {
+		name       string
+		q          Quantization
+		replies    []orReply
+		wantLevels []string
+		wantErr    *orReply
+	}{
+		{"first level serves", Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}, nil, []string{"fp8"}, nil},
+		{"exhaustion advances to the next level", Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}, []orReply{first}, []string{"fp8", "fp4"}, nil},
+		{"middle level serves", Quantization{Levels: []string{"fp8", "fp4", "int8"}, Mode: "required"}, []orReply{first}, []string{"fp8", "fp4"}, nil},
+		{"required returns the last exhaustion", Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}, []orReply{first, last}, []string{"fp8", "fp4"}, &last},
+		{"preferred ends with an unfiltered attempt", Quantization{Levels: []string{"fp8", "fp4"}, Mode: "preferred"}, []orReply{first, first}, []string{"fp8", "fp4", ""}, nil},
+		{"preferred unfiltered exhaustion is returned", Quantization{Levels: []string{"fp8"}, Mode: "preferred"}, []orReply{first, last}, []string{"fp8", ""}, &last},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%v", tc.name, stream), func(t *testing.T) {
+				f := newORFake(t, stream, map[string][]orReply{model: tc.replies}, nil)
+				err := quantChat(context.Background(), f.client(quantRouting(model, tc.q), levelTag), model, stream)
+				got := f.providerObjects(t, model)
+				var want []map[string]any
+				for _, l := range tc.wantLevels {
+					want = append(want, wantQuantProvider(model, l))
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("provider objects = %#v, want %#v", got, want)
+				}
+				if tc.wantErr == nil {
+					if err != nil {
+						t.Fatalf("error = %v, want nil", err)
+					}
+					return
+				}
+				var routingErr *RoutingExhaustionError
+				if !errors.As(err, &routingErr) || routingErr.Model != model {
+					t.Fatalf("error = %v (%T), want *RoutingExhaustionError for %s", err, err, model)
+				}
+				if routingErr.HTTP.Status != http.StatusNotFound || routingErr.HTTP.Body != tc.wantErr.body {
+					t.Fatalf("HTTPError = (%d, %q), want the final attempt's (404, %q)", routingErr.HTTP.Status, routingErr.HTTP.Body, tc.wantErr.body)
+				}
+			})
+		}
+	}
+}
+
+func TestChatCompletion_QuantizationNonExhaustionStops(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	for _, reply := range []orReply{
+		{status: http.StatusTooManyRequests, body: `{"error":{"message":"slow down"}}`},
+		{status: http.StatusBadGateway, body: `{"error":{"message":"upstream"}}`},
+		{status: http.StatusNotFound, body: fmt.Sprintf(routingStepBody, `"Initial Endpoints"`)},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/stream=%v", reply.status, stream), func(t *testing.T) {
+				f := newORFake(t, stream, map[string][]orReply{model: {reply}}, nil)
+				q := Quantization{Levels: []string{"fp8", "fp4"}, Mode: "preferred"}
+				err := quantChat(context.Background(), f.client(quantRouting(model, q), levelTag), model, stream)
+				if got := len(f.providerObjects(t, model)); got != 1 {
+					t.Fatalf("requests = %d, want 1", got)
+				}
+				var routingErr *RoutingExhaustionError
+				var httpErr *HTTPError
+				if errors.As(err, &routingErr) || !errors.As(err, &httpErr) || httpErr.Status != reply.status || httpErr.Body != reply.body {
+					t.Fatalf("error = %v (%T), want the plain *HTTPError %d", err, err, reply.status)
+				}
+			})
+		}
+	}
+}
+
+func TestChatCompletion_QuantizationExhaustionReportsLevelsSent(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	const otherFilters = "max_price prompt 1, data_collection deny, require_parameters true"
+	const remedies = "Change provider.openrouter.routing to let a provider through. The ignore list is session-only; start a new session to clear it."
+	first := quantExhausted("no fp8 host")
+	first.retryAfter = "11"
+	last := quantExhausted("no fp4 host")
+	last.retryAfter = "22"
+	upstream := orReply{status: http.StatusBadGateway, body: `{"error":{"message":"upstream"}}`, retryAfter: "33"}
+	cases := []struct {
+		name       string
+		q          Quantization
+		replies    []orReply
+		wantSent   [][]any
+		wantFinal  orReply
+		wantQuant  *Quantization
+		wantFilter string
+	}{
+		{
+			name:       "required",
+			q:          Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"},
+			replies:    []orReply{first, last},
+			wantSent:   [][]any{{"fp8"}, {"fp4"}},
+			wantFinal:  last,
+			wantQuant:  &Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"},
+			wantFilter: otherFilters + ", quantizations required [fp8 fp4] (each tried in order), ignore [together]",
+		},
+		{
+			name:       "preferred",
+			q:          Quantization{Levels: []string{"fp8"}, Mode: "preferred"},
+			replies:    []orReply{first, last},
+			wantSent:   [][]any{{"fp8"}, nil},
+			wantFinal:  last,
+			wantQuant:  &Quantization{},
+			wantFilter: otherFilters + ", ignore [together]",
+		},
+		{
+			name:      "required last level non-exhaustion",
+			q:         Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"},
+			replies:   []orReply{first, upstream},
+			wantSent:  [][]any{{"fp8"}, {"fp4"}},
+			wantFinal: upstream,
+		},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%v", tc.name, stream), func(t *testing.T) {
+				f := newORFake(t, stream, map[string][]orReply{model: tc.replies}, nil)
+				err := quantChat(context.Background(), f.client(quantRouting(model, tc.q), levelTag), model, stream)
+				var sent [][]any
+				for _, obj := range f.providerObjects(t, model) {
+					levels, _ := obj["quantizations"].([]any)
+					sent = append(sent, levels)
+				}
+				if !reflect.DeepEqual(sent, tc.wantSent) {
+					t.Fatalf("quantizations sent = %#v, want %#v", sent, tc.wantSent)
+				}
+				var httpErr *HTTPError
+				if !errors.As(err, &httpErr) {
+					t.Fatalf("error = %v (%T), want a wrapped *HTTPError", err, err)
+				}
+				if httpErr.Status != tc.wantFinal.status || httpErr.Body != tc.wantFinal.body || httpErr.RetryAfter != tc.wantFinal.retryAfter {
+					t.Fatalf("HTTPError = (%d, %q, %q), want the last attempt's (%d, %q, %q)", httpErr.Status, httpErr.Body, httpErr.RetryAfter, tc.wantFinal.status, tc.wantFinal.body, tc.wantFinal.retryAfter)
+				}
+				wantSurface := fmt.Sprintf("provider openrouter returned HTTP %d: %s", tc.wantFinal.status, tc.wantFinal.body)
+				if httpErr.Surface != wantSurface || err.Error() != wantSurface {
+					t.Fatalf("surface = %q, Error() = %q, want %q", httpErr.Surface, err.Error(), wantSurface)
+				}
+				var routingErr *RoutingExhaustionError
+				if tc.wantQuant == nil {
+					if errors.As(err, &routingErr) || err != error(httpErr) {
+						t.Fatalf("error = %v (%T), want the unwrapped *HTTPError", err, err)
+					}
+					return
+				}
+				if !errors.As(err, &routingErr) {
+					t.Fatalf("error = %v (%T), want *RoutingExhaustionError", err, err)
+				}
+				if !reflect.DeepEqual(routingErr.Quantization, *tc.wantQuant) {
+					t.Fatalf("Quantization = %#v, want %#v", routingErr.Quantization, *tc.wantQuant)
+				}
+				var body struct {
+					Error struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				if jsonErr := json.Unmarshal([]byte(tc.wantFinal.body), &body); jsonErr != nil {
+					t.Fatal(jsonErr)
+				}
+				want := fmt.Sprintf("provider openrouter returned HTTP 404: %s (model %s; filters sent: %s). %s", body.Error.Message, model, tc.wantFilter, remedies)
+				if got := FriendlyRoutingExhaustionMessage("openrouter", routingErr); got != want {
+					t.Fatalf("message = %q\nwant      %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestChatCompletion_QuantizationAbsentEntryBodyUnchanged(t *testing.T) {
+	routing := Routing{Sort: "throughput", Quantizations: map[string]Quantization{"other-model": {Levels: []string{"fp8"}, Mode: "required"}}}
+	cases := []struct {
+		stream bool
+		want   string
+	}{
+		{false, `{"messages":[{"content":"hi","role":"user"}],"model":"some-model","provider":{"ignore":["together"],"sort":"throughput"}}`},
+		{true, `{"messages":[{"content":"hi","role":"user"}],"model":"some-model","stream_options":{"include_usage":true},"provider":{"ignore":["together"],"sort":"throughput"},"stream":true}`},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("stream=%v", tc.stream), func(t *testing.T) {
+			if raw := captureRoutingBody(t, "openrouter", routing, []string{"together"}, tc.stream); string(raw) != tc.want {
+				t.Fatalf("body = %s, want %s", raw, tc.want)
+			}
+		})
+	}
+}
+
+const closeProbeContentType = "application/x-codemeld-close-probe"
+
+var closeProbeCloses atomic.Int32
+
+type closeProbeDecoder struct{ io.ReadCloser }
+
+func (closeProbeDecoder) Event() ssestream.Event { return ssestream.Event{} }
+func (closeProbeDecoder) Next() bool             { return false }
+func (closeProbeDecoder) Err() error             { return nil }
+func (d closeProbeDecoder) Close() error {
+	closeProbeCloses.Add(1)
+	return d.ReadCloser.Close()
+}
+
+func init() {
+	ssestream.RegisterDecoder(closeProbeContentType, func(rc io.ReadCloser) ssestream.Decoder { return closeProbeDecoder{rc} })
+}
+
+func TestChatCompletion_QuantizationFailedStreamsClosed(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	probe := quantExhausted("probe")
+	probe.contentType = closeProbeContentType
+	closeProbeCloses.Store(0)
+	f := newORFake(t, true, map[string][]orReply{model: {probe, probe}}, nil)
+	q := Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}
+	err := quantChat(context.Background(), f.client(quantRouting(model, q), levelTag), model, true)
+	var routingErr *RoutingExhaustionError
+	if !errors.As(err, &routingErr) {
+		t.Fatalf("error = %v, want *RoutingExhaustionError", err)
+	}
+	if got := closeProbeCloses.Load(); got != 2 {
+		t.Fatalf("failed streams closed = %d, want 2", got)
+	}
+}
+
+func TestChatCompletion_QuantizationStreamFailureAfterReturnDoesNotAdvance(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	streamErr := orReply{body: `data: {"error":{"message":"No endpoints found","code":404,"metadata":{"failed_routing_step":"Filter by Quantization"}}}` + "\n\n"}
+	f := newORFake(t, true, map[string][]orReply{model: {streamErr}}, nil)
+	q := Quantization{Levels: []string{"fp8", "fp4"}, Mode: "preferred"}
+	if err := quantChat(context.Background(), f.client(quantRouting(model, q), levelTag), model, true); err == nil {
+		t.Fatal("stream error = nil, want the mid-stream failure")
+	}
+	if got := len(f.providerObjects(t, model)); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelOnCloseBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
+}
+
+func TestChatCompletion_QuantizationCancellationStopsAttempts(t *testing.T) {
+	const model = "z-ai/glm-5.3"
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			f := newORFake(t, stream, map[string][]orReply{model: {quantExhausted("first")}}, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var trips atomic.Int32
+			inner := f.srv.Client().Transport
+			hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				trips.Add(1)
+				res, err := inner.RoundTrip(r)
+				if err == nil {
+					res.Body = cancelOnCloseBody{ReadCloser: res.Body, cancel: cancel}
+				}
+				return res, err
+			})}
+			var lookups atomic.Int32
+			c := NewClient(ClientConfig{
+				Name: "openrouter", BaseURL: f.srv.URL, AuthHeader: "Authorization", AuthValue: "Bearer sk-test",
+				Routing:    quantRouting(model, Quantization{Levels: []string{"fp8", "fp4"}, Mode: "preferred"}),
+				HTTPClient: hc,
+				BestValueTag: func(ctx context.Context, model, level string, ignored []string) string {
+					lookups.Add(1)
+					return levelTag(ctx, model, level, ignored)
+				},
+			})
+			err := quantChat(ctx, c, model, stream)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if got := trips.Load(); got != 1 {
+				t.Fatalf("requests attempted = %d, want 1", got)
+			}
+			if got := lookups.Load(); got != 1 {
+				t.Fatalf("best-value lookups = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestChatCompletion_QuantizationConcurrentCallsIndependent(t *testing.T) {
+	const modelA, modelB = "a/model", "b/model"
+	var firsts sync.WaitGroup
+	firsts.Add(2)
+	aLast := quantExhausted("a-last")
+	f := newORFake(t, false, map[string][]orReply{
+		modelA: {quantExhausted("a-first"), aLast},
+		modelB: {quantExhausted("b-first")},
+	}, func(_ string, attempt int) {
+		if attempt == 0 {
+			firsts.Done()
+			firsts.Wait()
+		}
+	})
+	routing := quantRouting(modelA, Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"})
+	routing.MaxPrice[modelB] = MaxPrice{Prompt: 1, HasPrompt: true}
+	routing.Quantizations[modelB] = Quantization{Levels: []string{"int8"}, Mode: "preferred"}
+	c := f.client(routing, levelTag)
+
+	errs := make(map[string]error, 2)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, m := range []string{modelA, modelB} {
+		wg.Go(func() {
+			err := quantChat(context.Background(), c, m, false)
+			mu.Lock()
+			errs[m] = err
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+
+	for model, levels := range map[string][]string{modelA: {"fp8", "fp4"}, modelB: {"int8", ""}} {
+		var want []map[string]any
+		for _, l := range levels {
+			want = append(want, wantQuantProvider(model, l))
+		}
+		if got := f.providerObjects(t, model); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s provider objects = %#v, want %#v", model, got, want)
+		}
+	}
+	var routingErr *RoutingExhaustionError
+	if !errors.As(errs[modelA], &routingErr) || routingErr.Model != modelA || routingErr.HTTP.Body != aLast.body {
+		t.Fatalf("%s error = %v, want its own final exhaustion", modelA, errs[modelA])
+	}
+	if errs[modelB] != nil {
+		t.Fatalf("%s error = %v, want nil", modelB, errs[modelB])
 	}
 }
 

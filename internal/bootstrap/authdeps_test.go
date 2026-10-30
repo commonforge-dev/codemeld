@@ -3810,6 +3810,121 @@ func TestInflightKeyOf_IsolatesAssignmentVariants(t *testing.T) {
 	}
 }
 
+func homeStateRequest(t *testing.T, expanding bool) permissions.MatchRequest {
+	t.Helper()
+	tokens := []string{"mv", "x", "~/target"}
+	subject, err := permissions.DirectStageRequestSubject(tokens, nil, false, []bool{false, false, expanding})
+	if err != nil {
+		t.Fatalf("DirectStageRequestSubject: %v", err)
+	}
+	return permissions.MatchRequest{Kind: "direct", Subject: subject, SubjectTokens: tokens, PathScope: "/proj"}
+}
+
+func TestInflightKeyOf_IsolatesHomeExpansionState(t *testing.T) {
+	expanding, literal := homeStateRequest(t, true), homeStateRequest(t, false)
+	if inflightKeyOf(expanding) == inflightKeyOf(literal) {
+		t.Fatalf("the expanding and literal requests share the in-flight key %+v", inflightKeyOf(expanding))
+	}
+	if inflightKeyOf(expanding) != inflightKeyOf(homeStateRequest(t, true)) {
+		t.Fatalf("identical expanding requests have different in-flight keys")
+	}
+}
+
+func TestProductionAuthorizer_HomeStateActorsDoNotShareApprovalOrFallback(t *testing.T) {
+	prependFixturePrograms(t, "mv")
+	cwd := t.TempDir()
+	home := t.TempDir()
+	store := mkStore(t)
+	app := tui.New(nil)
+	app.SetActiveStore(store)
+	cache := emptyCache(t, cwd)
+
+	globalParent := filepath.Dir(SettingsPath(home))
+	if err := os.MkdirAll(filepath.Dir(globalParent), 0o755); err != nil {
+		t.Fatalf("seed global parent dir: %v", err)
+	}
+	if err := os.WriteFile(globalParent, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed global parent file: %v", err)
+	}
+
+	const actorA, actorB = "mv x ~/target", "mv x '~/target'"
+	var (
+		mu    sync.Mutex
+		shown []string
+	)
+	entered := make(chan struct{}, 8)
+	proceed := make(chan struct{})
+	show := func(req tui.PromptRequest) (tui.PromptDecision, error) {
+		mu.Lock()
+		shown = append(shown, req.Subject)
+		mu.Unlock()
+		entered <- struct{}{}
+		<-proceed
+		if req.Subject == actorA {
+			return tui.PromptDecision{Option: tui.OptionAllowGlobal, StoredSubject: permissions.ExactSubject("mv", []string{"x", "~/target"})}, nil
+		}
+		return tui.PromptDecision{Option: tui.OptionDeny}, nil
+	}
+	auth := newProductionAuthorizer(app, cache, permissions.NewTurnCache(), newPromptGateBuilder(show), home, cwd, mode.NewActiveState(mode.Build, mode.SourceDefault))
+
+	runA, runA2, runB := &fakeDispatchRunner{}, &fakeDispatchRunner{}, &fakeDispatchRunner{}
+	var errA, errA2, errB error
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		_, errA = dispatch.DispatchShell(context.Background(), actorA, home, cwd, auth, runA)
+	}()
+	<-entered
+
+	go func() {
+		defer wg.Done()
+		_, errA2 = dispatch.DispatchShell(context.Background(), actorA, home, cwd, auth, runA2)
+	}()
+	go func() {
+		defer wg.Done()
+		_, errB = dispatch.DispatchShell(context.Background(), actorB, home, cwd, auth, runB)
+	}()
+	waitForPromptShown(store, 3, time.Second)
+	if got := countPermissionEvents(store, events.KindPermissionPromptShown); got != 2 {
+		t.Fatalf("permission_prompt_shown = %d while A holds its prompt, want 2 (B reaches its own prompt; A's duplicate parks)", got)
+	}
+	close(proceed)
+	wg.Wait()
+
+	if errA != nil || runA.callCount() != 1 {
+		t.Fatalf("actor A: err = %v, runs = %d; want approved and run once", errA, runA.callCount())
+	}
+	if errA2 != nil || runA2.callCount() != 1 {
+		t.Fatalf("actor A duplicate: err = %v, runs = %d; want resolved by A's fallback grant and run once", errA2, runA2.callCount())
+	}
+	var denied *dispatch.DeniedError
+	if !errors.As(errB, &denied) || runB.callCount() != 0 {
+		t.Fatalf("actor B: err = %v, runs = %d; want *dispatch.DeniedError and nothing run", errB, runB.callCount())
+	}
+	if !slices.Equal(shown, []string{actorA, actorB}) {
+		t.Fatalf("prompts shown = %q, want A then B only", shown)
+	}
+	if got := countPermissionEvents(store, events.KindPermissionPersistFailed); got != 1 {
+		t.Fatalf("permission_persist_failed events = %d, want 1 (A's global persist degrades)", got)
+	}
+	grants := cache.Permissions()
+	wantA := homeStateRequest(t, true).Subject
+	if len(grants) != 1 || grants[0].Subject != wantA || grants[0].GrantKind != "session" {
+		t.Fatalf("grants = %+v, want only A's session fallback carrying %q", grants, wantA)
+	}
+
+	if _, err := dispatch.DispatchShell(context.Background(), actorB, home, cwd, auth, runB); !errors.As(err, &denied) || runB.callCount() != 0 {
+		t.Fatalf("actor B retry: err = %v, runs = %d; want B's cached denial to stand", err, runB.callCount())
+	}
+	if _, err := dispatch.DispatchShell(context.Background(), actorA, home, cwd, auth, runA); err != nil || runA.callCount() != 2 {
+		t.Fatalf("actor A retry: err = %v, runs = %d; want A's grant to cover it", err, runA.callCount())
+	}
+	if len(shown) != 2 {
+		t.Fatalf("prompts shown = %q, want no further prompts", shown)
+	}
+}
+
 // One choice authorizes every stage, so the batched summary must describe the whole batch: the
 // stage count plus the union of the stages' effects and targets, and the unknown fallback for the
 // entire batch as soon as one stage cannot be classified.

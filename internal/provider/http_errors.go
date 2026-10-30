@@ -68,6 +68,7 @@ type RoutingExhaustionError struct {
 	DataCollectionDeny bool
 	RequireParameters  bool
 	Ignore             []string
+	Quantization       Quantization
 	HTTP               *HTTPError
 }
 

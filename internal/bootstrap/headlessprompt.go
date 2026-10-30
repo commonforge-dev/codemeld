@@ -367,7 +367,7 @@ func headlessScopeChoices(model permissions.DirectScopeModel) []permissions.Dire
 }
 
 func scopePathNotice(boundary string) string {
-	return "The path choice is fixed at " + boundary +
+	return "The path choice is fixed at " + permissions.SingleLineControlEscape(boundary) +
 		", the widest boundary below / and your home directory; the interactive prompt can walk that boundary with ← and →, this one reads a single number and cannot." +
 		" The command's path argument is resolved and checked against that boundary at the moment permission is decided — the boundary is not an execution-time sandbox and does not confine what the program opens afterwards."
 }
@@ -378,16 +378,16 @@ func (p *terminalPrompter) renderScopeChoices(req permissions.MatchRequest, mode
 	_, _ = fmt.Fprintln(p.out)
 	_, _ = fmt.Fprintln(p.out, "codemeld: this grant stores a command subject — choose its scope")
 	_, _ = fmt.Fprintln(p.out, "  subject kind: direct-command")
-	_, _ = fmt.Fprintf(p.out, "  canonical command: %s\n", permissions.ExactSubject(model.Program, model.Args))
+	_, _ = fmt.Fprintf(p.out, "  canonical command: %s\n", permissions.SingleLineControlEscape(permissions.ExactSubject(model.Program, model.Args)))
 	if req.PathScope != "" {
-		_, _ = fmt.Fprintf(p.out, "  run folder: %s\n", req.PathScope)
+		_, _ = fmt.Fprintf(p.out, "  run folder: %s\n", fact(req.PathScope))
 	}
 	p.renderProjectRoot(req)
 	if persisted {
 		p.renderPersistTarget(req)
 	}
 	for i, c := range choices {
-		_, _ = fmt.Fprintf(p.out, "  [%d] %s%s\n", i+1, p.scopeLabel(model, c), recommendedMark(i == model.Recommended))
+		_, _ = fmt.Fprintf(p.out, "  [%d] %s%s\n", i+1, permissions.SingleLineControlEscape(p.scopeLabel(model, c)), recommendedMark(i == model.Recommended))
 	}
 	_, _ = fmt.Fprintf(p.out, "  %s\n", scopePrefixNotice)
 	if row := model.PathRow(); row >= 0 {
@@ -400,7 +400,7 @@ func (p *terminalPrompter) renderScopeChoices(req permissions.MatchRequest, mode
 // renderPersistTarget assumes renderProjectRoot has already run for this decision; it adds
 // only the remaining persisted-folder facts.
 func (p *terminalPrompter) renderPersistTarget(req permissions.MatchRequest) {
-	_, _ = fmt.Fprintf(p.out, "  saved to: %s\n", p.folderTarget())
+	_, _ = fmt.Fprintf(p.out, "  saved to: %s\n", fact(p.folderTarget()))
 	if coverage := folderCoverage(req.PathScope); coverage != "" {
 		_, _ = fmt.Fprintf(p.out, "  applies to: %s\n", coverage)
 	}
@@ -442,7 +442,7 @@ func (p *terminalPrompter) renderProgramConfirm(req permissions.MatchRequest, pr
 		_, _ = fmt.Fprintf(p.out, "  %s\n", scopeDestructiveProgramWarning)
 	}
 	_, _ = fmt.Fprintf(p.out, "  %s\n", scopeProgramWarning)
-	_, _ = fmt.Fprintf(p.out, "  effective grant: %s (direct command)\n", subject)
+	_, _ = fmt.Fprintf(p.out, "  effective grant: %s (direct command)\n", permissions.SingleLineControlEscape(subject))
 	if persisted {
 		_, _ = fmt.Fprintln(p.out, "  lifetime: permanent")
 		p.renderPersistTarget(req)

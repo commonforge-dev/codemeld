@@ -3,6 +3,7 @@ package permissionpersist
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -610,6 +611,138 @@ func TestVersionedDirectSubjectSurvivesTheOnDiskRoundTrip(t *testing.T) {
 	}
 	if permissions.MatchesDirectSubject([]string{"hg", "status"}, nil, false, got.Subject) {
 		t.Fatal("the reloaded grant authorized the bare command")
+	}
+}
+
+func homeStateEnvelope(t *testing.T, scope string, expanding, literal []int) string {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		Subject   string `json:"subject"`
+		Expanding []int  `json:"expanding"`
+		Literal   []int  `json:"literal"`
+	}{scope, expanding, literal})
+	if err != nil {
+		t.Fatalf("marshal direct-home payload: %v", err)
+	}
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+type homeStateGrantCase struct {
+	name, subject       string
+	tokens, assignments []string
+	clearEnvironment    bool
+	approved, other     []bool
+}
+
+func homeStateGrantCases(t *testing.T) []homeStateGrantCase {
+	t.Helper()
+	boundary, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	target := filepath.Join(boundary, "f")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	under, err := permissions.EncodeDirectUnderSubject([]string{"mv", "$HOME", target}, 2, boundary, false)
+	if err != nil {
+		t.Fatalf("EncodeDirectUnderSubject: %v", err)
+	}
+	clearLiteral, err := permissions.EncodeDirectEnvSubject([]string{"FOO=a b"}, true,
+		homeStateEnvelope(t, "mv x '~/target'", []int{}, []int{2}))
+	if err != nil {
+		t.Fatalf("EncodeDirectEnvSubject: %v", err)
+	}
+	return []homeStateGrantCase{
+		{
+			name: "plain expanding exact", subject: homeStateEnvelope(t, "mv x '~/target'", []int{2}, []int{}),
+			tokens: []string{"mv", "x", "~/target"}, approved: []bool{false, false, true}, other: []bool{false, false, false},
+		},
+		{
+			name: "env-wrapped literal exact", subject: clearLiteral,
+			tokens: []string{"mv", "x", "~/target"}, assignments: []string{"FOO=a b"}, clearEnvironment: true,
+			approved: []bool{false, false, false}, other: []bool{false, false, true},
+		},
+		{
+			name: "containment-wrapped expanding fixed argument", subject: homeStateEnvelope(t, under, []int{1}, []int{}),
+			tokens: []string{"mv", "$HOME", target}, approved: []bool{false, true, false}, other: []bool{false, false, false},
+		},
+	}
+}
+
+func homeStateRequest(t *testing.T, tc homeStateGrantCase, expands []bool, pathScope string) permissions.MatchRequest {
+	t.Helper()
+	subject, err := permissions.DirectStageRequestSubject(tc.tokens, tc.assignments, tc.clearEnvironment, expands)
+	if err != nil {
+		t.Fatalf("DirectStageRequestSubject: %v", err)
+	}
+	return permissions.MatchRequest{
+		Kind: "direct", Subject: subject, SubjectTokens: tc.tokens, Assignments: tc.assignments,
+		ClearEnvironment: tc.clearEnvironment, PathScope: pathScope,
+	}
+}
+
+func assertHomeStateGrantKeepsItsState(t *testing.T, tc homeStateGrantCase, entries []permissions.PermissionEntry, pathScope string) {
+	t.Helper()
+	if len(entries) != 1 || entries[0].Subject != tc.subject {
+		t.Fatalf("reloaded entries = %+v, want one grant with subject %q", entries, tc.subject)
+	}
+	if _, ok := permissions.DirectHomeSubjectReadable(entries[0].Subject); !ok {
+		t.Fatalf("reloaded subject %q no longer decodes as a home-state subject", entries[0].Subject)
+	}
+	if !permissions.Match(homeStateRequest(t, tc, tc.approved, pathScope), entries).Matched {
+		t.Fatal("the reloaded grant no longer authorizes the request that created it")
+	}
+	if permissions.Match(homeStateRequest(t, tc, tc.other, pathScope), entries).Matched {
+		t.Fatal("the reloaded grant authorized the same tokens with the other home expansion state")
+	}
+}
+
+func TestHomeStateDirectSubjectSurvivesTheOnDiskRoundTrip(t *testing.T) {
+	for _, tc := range homeStateGrantCases(t) {
+		for _, grantKind := range []string{"folder", "global"} {
+			t.Run(tc.name+" "+grantKind, func(t *testing.T) {
+				project := t.TempDir()
+				path, scope, layer := config.LocalSettingsPath(project), project, permissions.LayerLocal
+				if grantKind == "global" {
+					path, scope, layer = filepath.Join(t.TempDir(), "global", "settings.yaml"), "*", permissions.LayerGlobal
+				}
+				entry := permissions.PermissionEntry{Kind: "direct", Subject: tc.subject, PathScope: scope, GrantKind: grantKind}
+				if _, _, err := PersistGrantReportingCreate(newStore(), &recordingUI{}, path, project, entry); err != nil {
+					t.Fatalf("PersistGrantReportingCreate: %v", err)
+				}
+				_, raw, _, err := config.LoadYAML(path)
+				if err != nil {
+					t.Fatalf("LoadYAML(%s): %v", path, err)
+				}
+				entries, err := config.LayerPermissions(raw, layer)
+				if err != nil {
+					t.Fatalf("LayerPermissions: %v", err)
+				}
+				assertHomeStateGrantKeepsItsState(t, tc, entries, project)
+			})
+		}
+	}
+}
+
+func TestHomeStateDirectSubjectSurvivesThePersistFailureFallback(t *testing.T) {
+	failPersist(t, config.ReasonWriteError, fserrors.NoSpace, errors.New("no space"))
+	for _, tc := range homeStateGrantCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore()
+			entry := permissions.PermissionEntry{Kind: "direct", Subject: tc.subject, PathScope: "*", GrantKind: "global"}
+			got, err := persistGrantForTest(store, &recordingUI{}, targetPath, scopeProj, entry)
+			if err == nil {
+				t.Fatal("persist error = nil, want the forced failure")
+			}
+			if got.GrantKind != "session" || got.PathScope != scopeProj {
+				t.Fatalf("fallback entry = %+v, want a session grant scoped to %s", got, scopeProj)
+			}
+			if p := decodePersistFailed(t, kindEvents(t, store, events.KindPermissionPersistFailed)[0]); p.Subject != tc.subject {
+				t.Fatalf("permission_persist_failed subject = %q, want %q", p.Subject, tc.subject)
+			}
+			assertHomeStateGrantKeepsItsState(t, tc, []permissions.PermissionEntry{got}, scopeProj)
+		})
 	}
 }
 

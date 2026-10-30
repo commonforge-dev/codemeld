@@ -17,7 +17,7 @@ checks. Switch with `/mode <plan|build|auto-edits>` or shift+tab.
 |---|---|---|---|
 | **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (writes and network fail); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
 | **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Never sandboxed; asked unless read-only or already approved |
-| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder; everything else is asked | Sandboxed where available, and then run without asking unless recognized as network access or a history rewrite, or while a settings file is broken; elsewhere as in Build, plus the project's `declared_commands` |
+| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder; everything else is asked | Sandboxed where available, and then run without asking unless recognized as network access or a history rewrite, or while a settings file is broken; elsewhere as in Build, plus the project's `declared_commands` |
 
 - Auto edits approves only a target that is inside the project after symlinks are resolved, apart
   from the declared folders in [Writing outside the project](#writing-outside-the-project). A move
@@ -40,18 +40,37 @@ When codemeld asks, you choose one of:
   project's `.codemeld/settings.local.yaml`. Not offered in an unapproved project.
 - **Allow globally**: saved to `~/.codemeld/global/settings.yaml` and used in every folder. Not
   offered for web access or in a headless run.
-- **Deny**: nothing runs and nothing is saved. The model is told and may continue another way; the
-  same request is denied without asking for the rest of the turn, except the requests that Allow
+- **Deny**: nothing runs and no approval is saved. The denial is recorded in the session and shown
+  to you, and the turn stops after that round, so the model gets no further round to try another
+  way. Within that round the same request is denied without asking, except the requests that Allow
   once asks every time and a web request on a non-default scheme or port, which are asked again.
+  A refusal by a mode, by the protection of codemeld's settings files and blocked paths, or because
+  nobody can approve is different: the model sees it in the next round and may continue another
+  way. A file change outside a declared file scope starts as a refusal like yours. The scope comes
+  from a headless run's `--files-authorized` and `--files-authorized-delete` flags, or, for a child
+  agent, from the `files`, `files_delete`, `files_move` and `files_mkdir` its parent declared; it
+  covers codemeld's file tools, not what a shell command writes. When someone can approve, which in
+  a headless run means `--prompt-for-approval`, the turn stops as after your Deny, and codemeld does
+  not ask you to widen the scope. When nobody can approve, as for every child agent even under the
+  terminal UI, it becomes a refusal with no approver and the model may continue another way; after
+  repeated refusals of the same call, tool use ends and the model writes its final answer.
+  Continuing never carries out the refused change. In Plan the declared scope is not checked: Plan
+  refuses the file change as a mode refusal, declared or not.
 
 An approval for a file tool covers a folder and its subfolders, not one file. When you approve a
 plain shell command for the session or permanently, you choose what is stored: the exact command,
 a prefix such as `go test :*` that covers later `go test` commands, or the whole program (after an
-extra confirmation). A command codemeld judges as one piece (below) is stored exactly. Apart from a
+extra confirmation). A command codemeld judges as one piece (below) is stored exactly, except a
+simple compound: plain commands joined by `&&`, `||`, `;` or `|`, written bare (`go build ./... &&
+gofmt -w a.go`) or as a plain `sh -c '<body>'` with nothing in the body that expands. There you
+choose what is stored for each of its stages (`RecognizeSimpleCompoundForGrant`,
+`internal/permissions/compound.go`). If a stage runs a
+program codemeld treats as destructive, the whole command is stored exactly. Apart from a
 global approval, an approval applies in its folder and below.
 
 codemeld writes the shared `.codemeld/settings.yaml` only when you share an approval into it or
-remove one through `/settings`, or add a shared entry with `/blocked add`.
+remove one through `/settings`, add a shared entry with `/blocked add`, or remove a shared entry
+in `/blocked` after you confirm it.
 
 ## Reviewing and revoking approvals
 
@@ -103,7 +122,8 @@ command you approve is not checked against blocked paths.
 A create or edit outside the project is never silent: it asks, unless a saved approval already
 covers that folder, and the approval covers the real folder after symlinks are resolved. The one
 exception is a folder you declare in the project's `writable_folders`: in Auto edits, while shell
-commands are sandboxed and no settings file is broken, create, edit and make-folder inside a
+commands are sandboxed, no settings file is broken and the project's settings were admitted by
+[project approval](#project-approval-for-cloned-repositories) at launch, create, edit and make-folder inside a
 declared folder run without asking, and so does a delete inside it, though not of the declared
 folder itself (`sandboxedDelete`, `internal/permissions/orchestrate.go`). A declared folder never
 approves a move.
@@ -125,10 +145,13 @@ still holds anything, so it can never remove a whole tree.
 
 ## Shell commands
 
-**Read-only commands run without asking, in every mode.** A command runs without a prompt only when
+**Read-only commands run without asking, in every mode**, except that in Plan and Auto edits, while
+shell commands are sandboxed, a broken settings file makes every shell command ask. A command counts as read-only only when
 codemeld can tell from its exact text that it cannot write a file, start another program, reach the
 network, or leave its scope: for example `ls`, `cat`, `grep`, `git log`, `hg status`, or a
 `find . -name '*.go'` listing. When codemeld cannot tell, the command is treated as a change.
+Read-only is not the only way to run without a prompt: the sandbox in Auto edits, a saved approval,
+a declared command and the System One check can also let a command run, as this page explains.
 Options from configuration codemeld did not check are kept out: when a read-only command runs
 automatically outside the sandbox, a Mercurial command ignores your hgrc files and `jj` its
 configuration, and approving the same command at a prompt runs it with your configuration. `rg`
@@ -166,7 +189,10 @@ judged on its own: read-only stages run without asking and the others ask (or, w
 sandbox, are refused in Plan). Stages that need approval share one prompt, and one denied stage
 stops the whole chain before anything runs. A command codemeld cannot split safely, for example
 one with `sh -c`, a redirection to a file, or a `$(...)` inside double quotes, is judged as one
-piece and needs an exact approval, except with the sandbox in Auto edits and valid settings. There,
+piece and needs an approval of the whole command (a simple compound, bare or in a plain `sh -c`,
+can be approved stage by stage, see [Approving a request](#approving-a-request)), except with the
+sandbox in Auto edits and
+valid settings. There,
 every command codemeld accepts runs in the sandbox without asking unless one of its stages is
 recognized as network access or a history rewrite (`SandboxedAutoEditsAuthority`,
 `internal/permissions/exceptional.go`). To find those stages codemeld splits the command itself,

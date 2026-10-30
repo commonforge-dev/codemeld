@@ -12,6 +12,18 @@ import (
 	"testing"
 )
 
+func testHomeSubject(scope string, expanding, literal []int) string {
+	payload, err := json.Marshal(struct {
+		Subject   string `json:"subject"`
+		Expanding []int  `json:"expanding"`
+		Literal   []int  `json:"literal"`
+	}{scope, append([]int{}, expanding...), append([]int{}, literal...)})
+	if err != nil {
+		panic(err)
+	}
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString(payload)
+}
+
 func TestNormalizeDirectStage_Direct(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1774,5 +1786,407 @@ func TestDirectUnderSubject_EnvironmentAssignmentsStayPartOfAuthorization(t *tes
 	}
 	if _, err := EncodeDirectEnvSubject([]string{"FOO=bar"}, false, directUnderSubjectPrefix+"garbage"); err == nil {
 		t.Error("EncodeDirectEnvSubject accepted a malformed containment subject")
+	}
+}
+
+func normalizedHomeRequest(t *testing.T, stage string, home bool) MatchRequest {
+	t.Helper()
+	norm, err := NormalizeDirectStage(stage, StageSolo)
+	if err != nil || norm.Route != RouteDirect {
+		t.Fatalf("NormalizeDirectStage(%q) = route %v, error %v; want a direct stage", stage, norm.Route, err)
+	}
+	expands := make([]bool, len(norm.Tokens))
+	for i := range expands {
+		expands[i] = home && i < len(norm.ExecForms) && norm.ExecForms[i].Expand
+	}
+	subject, err := DirectStageRequestSubject(norm.Tokens, norm.Assignments, norm.ClearEnvironment, expands)
+	if err != nil {
+		t.Fatalf("DirectStageRequestSubject(%q): %v", stage, err)
+	}
+	return MatchRequest{
+		Kind: subjectKindDirect, Subject: subject, SubjectTokens: norm.Tokens,
+		Assignments: norm.Assignments, ClearEnvironment: norm.ClearEnvironment, PathScope: scopeProj,
+	}
+}
+
+func homeStateList(on bool, position int) []int {
+	if on {
+		return []int{position}
+	}
+	return nil
+}
+
+func TestDirectStageRequestSubject_CrossFormTable(t *testing.T) {
+	forms := []struct {
+		stage   string
+		value   string
+		expands bool
+	}{
+		{`mv a ~`, "~", true},
+		{`mv a '~'`, "~", false},
+		{`mv a ~/x`, "~/x", true},
+		{`mv a '~/x'`, "~/x", false},
+		{`mv a $HOME`, "$HOME", true},
+		{`mv a '$HOME'`, "$HOME", false},
+		{`mv a $HOME/x`, "$HOME/x", true},
+		{`mv a "$HOME"/x`, "$HOME/x", false},
+		{`mv a \~/x`, "~/x", false},
+		{`mv a \$HOME/x`, "$HOME/x", false},
+		{`mv a ~'/'x`, "~/x", false},
+		{`mv a ~"/x"`, "~/x", false},
+	}
+	reqs := make([]MatchRequest, len(forms))
+	for i, f := range forms {
+		norm, err := NormalizeDirectStage(f.stage, StageSolo)
+		if err != nil {
+			t.Fatalf("NormalizeDirectStage(%q): %v", f.stage, err)
+		}
+		if !slices.Equal(norm.Tokens, []string{"mv", "a", f.value}) || len(norm.ExecForms) != 3 || norm.ExecForms[2].Expand != f.expands {
+			t.Fatalf("NormalizeDirectStage(%q) = tokens %v forms %+v, want [mv a %s] expanding %v", f.stage, norm.Tokens, norm.ExecForms, f.value, f.expands)
+		}
+		reqs[i] = normalizedHomeRequest(t, f.stage, true)
+		want := testHomeSubject(ExactSubject("mv", []string{"a", f.value}), homeStateList(f.expands, 2), homeStateList(!f.expands, 2))
+		if reqs[i].Subject != want {
+			t.Fatalf("request identity for %q = %q, want %q", f.stage, reqs[i].Subject, want)
+		}
+	}
+	for i, a := range forms {
+		for j, b := range forms {
+			want := a.value == b.value && a.expands == b.expands
+			grant := PermissionEntry{Kind: subjectKindDirect, Subject: reqs[i].Subject}
+			if got := subjectMatches(reqs[j], grant); got != want {
+				t.Errorf("grant for %q matching %q = %v, want %v", a.stage, b.stage, got, want)
+			}
+		}
+	}
+}
+
+func TestDirectStageRequestSubject_EmptyHomeSharesTheLiteralIdentity(t *testing.T) {
+	for _, pair := range [][2]string{{`mv a ~/x`, `mv a '~/x'`}, {`mv a $HOME`, `mv a "$HOME"`}, {`mv a ~`, `mv a \~`}} {
+		bare := normalizedHomeRequest(t, pair[0], false)
+		quoted := normalizedHomeRequest(t, pair[1], false)
+		want := testHomeSubject(ExactSubject("mv", bare.SubjectTokens[1:]), nil, []int{2})
+		if bare.Subject != want || quoted.Subject != want {
+			t.Fatalf("empty-home identities = %q and %q, want both %q", bare.Subject, quoted.Subject, want)
+		}
+		if !subjectMatches(bare, PermissionEntry{Kind: subjectKindDirect, Subject: quoted.Subject}) {
+			t.Fatalf("empty-home %q does not share the grant for %q", pair[0], pair[1])
+		}
+		expanding := normalizedHomeRequest(t, pair[0], true)
+		if subjectMatches(expanding, PermissionEntry{Kind: subjectKindDirect, Subject: bare.Subject}) {
+			t.Fatalf("expanding %q matched the empty-home grant", pair[0])
+		}
+		if subjectMatches(bare, PermissionEntry{Kind: subjectKindDirect, Subject: expanding.Subject}) {
+			t.Fatalf("empty-home %q matched the expanding grant", pair[0])
+		}
+	}
+}
+
+func TestDirectStageRequestSubject_NonHomeBytesUnchanged(t *testing.T) {
+	tests := []struct {
+		tokens  []string
+		assigns []string
+		clear   bool
+	}{
+		{tokens: []string{"hg", "status"}},
+		{tokens: []string{"git", "commit", "-m", "a b"}},
+		{tokens: []string{"echo", "~alice/x", "$HOMEDIR", "HOME=$HOME", "x~", "a/$HOME"}},
+		{tokens: []string{"~/bin/tool", "x"}},
+		{tokens: []string{"$HOME", "x"}},
+		{tokens: []string{"cmd", "x"}, assigns: []string{"FOO=1", "BAR=2"}},
+		{tokens: []string{"cmd"}, assigns: []string{"PATH=/usr/bin"}, clear: true},
+	}
+	for _, tt := range tests {
+		want, err := DirectRequestSubject(tt.tokens, tt.assigns, tt.clear)
+		if err != nil {
+			t.Fatalf("DirectRequestSubject(%v): %v", tt.tokens, err)
+		}
+		got, err := DirectStageRequestSubject(tt.tokens, tt.assigns, tt.clear, make([]bool, len(tt.tokens)))
+		if err != nil {
+			t.Fatalf("DirectStageRequestSubject(%v): %v", tt.tokens, err)
+		}
+		if got != want {
+			t.Fatalf("DirectStageRequestSubject(%v, %v, %v) = %q, want the token-only bytes %q", tt.tokens, tt.assigns, tt.clear, got, want)
+		}
+	}
+}
+
+func TestDirectStageRequestSubject_RejectsImpossibleExpansion(t *testing.T) {
+	tests := []struct {
+		name    string
+		tokens  []string
+		expands []bool
+	}{
+		{"program token", []string{"~/bin/tool", "x"}, []bool{true, false}},
+		{"non-home argument", []string{"cat", "x"}, []bool{false, true}},
+		{"tilde user", []string{"cat", "~alice/x"}, []bool{false, true}},
+		{"longer variable", []string{"cat", "$HOMEDIR"}, []bool{false, true}},
+		{"short state", []string{"cat", "~/x"}, []bool{false}},
+		{"long state", []string{"cat", "~/x"}, []bool{false, true, false}},
+		{"missing state", []string{"cat", "~/x"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := DirectStageRequestSubject(tt.tokens, nil, false, tt.expands); err == nil {
+				t.Fatalf("DirectStageRequestSubject(%v, %v) = %q, want an error", tt.tokens, tt.expands, got)
+			}
+		})
+	}
+}
+
+func TestDirectHomeSubject_MalformedEnvelopesMatchNothing(t *testing.T) {
+	f := newUnderFixture(t)
+	quote := func(s string) string {
+		b, err := json.Marshal(s)
+		if err != nil {
+			t.Fatalf("json.Marshal(%q): %v", s, err)
+		}
+		return string(b)
+	}
+	raw := func(body string) string {
+		return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString([]byte(body))
+	}
+	tokens := []string{"mv", "a", "~/x", "$HOME"}
+	scope := ExactSubject("mv", tokens[1:])
+	q := quote(scope)
+	validBody := `{"subject":` + q + `,"expanding":[2],"literal":[3]}`
+	valid := testHomeSubject(scope, []int{2}, []int{3})
+	if raw(validBody) != valid {
+		t.Fatalf("hand-built body %q does not encode to %q", raw(validBody), valid)
+	}
+	if !matchesDirectSubject(tokens, nil, false, []bool{false, false, true, false}, valid) {
+		t.Fatalf("the well-formed envelope %q does not match its own state", valid)
+	}
+	if err := checkDirectRequestIdentity(valid, tokens, nil, false); err != nil {
+		t.Fatalf("checkDirectRequestIdentity(%q): %v", valid, err)
+	}
+	padded := "'direct-home/v1 " + base64.URLEncoding.EncodeToString([]byte(validBody))
+	if !strings.HasSuffix(padded, "=") {
+		t.Fatalf("padded encoding %q carries no padding; change the fixture body", padded)
+	}
+	under := mustEncodeUnder(t, []string{"mv", "$HOME", f.run}, 2, f.tmp, false)
+	underTokens := []string{"mv", "$HOME", f.run}
+
+	tests := []struct {
+		name    string
+		encoded string
+		tokens  []string
+	}{
+		{name: "missing expanding", encoded: raw(`{"subject":` + q + `,"literal":[2,3]}`)},
+		{name: "missing literal", encoded: raw(`{"subject":` + q + `,"expanding":[2,3]}`)},
+		{name: "null expanding", encoded: raw(`{"subject":` + q + `,"expanding":null,"literal":[2,3]}`)},
+		{name: "null literal", encoded: raw(`{"subject":` + q + `,"expanding":[2,3],"literal":null}`)},
+		{name: "missing subject", encoded: raw(`{"expanding":[2],"literal":[3]}`)},
+		{name: "duplicate field", encoded: raw(`{"subject":` + q + `,"expanding":[2],"expanding":[2],"literal":[3]}`)},
+		{name: "unknown field", encoded: raw(`{"subject":` + q + `,"expanding":[2],"literal":[3],"extra":1}`)},
+		{name: "reordered fields", encoded: raw(`{"expanding":[2],"literal":[3],"subject":` + q + `}`)},
+		{name: "extra whitespace", encoded: raw(`{"subject": ` + q + `,"expanding":[2],"literal":[3]}`)},
+		{name: "trailing data", encoded: raw(validBody + `{}`)},
+		{name: "padded base64", encoded: padded},
+		{name: "not base64", encoded: "'direct-home/v1 !!"},
+		{name: "sentinel without payload", encoded: "'direct-home/v1"},
+		{name: "unknown version", encoded: "'direct-home/v2 " + base64.RawURLEncoding.EncodeToString([]byte(validBody))},
+		{name: "duplicate position", encoded: raw(`{"subject":` + q + `,"expanding":[2,2],"literal":[3]}`)},
+		{name: "out of order positions", encoded: raw(`{"subject":` + q + `,"expanding":[3,2],"literal":[]}`)},
+		{name: "position in both lists", encoded: raw(`{"subject":` + q + `,"expanding":[2],"literal":[2,3]}`)},
+		{name: "non-home position", encoded: raw(`{"subject":` + q + `,"expanding":[1,2],"literal":[3]}`)},
+		{name: "position past the tokens", encoded: raw(`{"subject":` + q + `,"expanding":[2,9],"literal":[3]}`)},
+		{name: "uncovered position", encoded: raw(`{"subject":` + q + `,"expanding":[2],"literal":[]}`)},
+		{name: "program position", encoded: testHomeSubject(ExactSubject("~/bin/tool", []string{"~/x"}), []int{0, 1}, nil),
+			tokens: []string{"~/bin/tool", "~/x"}},
+		{name: "wildcard tail position", encoded: testHomeSubject(PrefixSubject("mv", []string{"a", "~/x"}), []int{2, 3}, nil)},
+		{name: "containment path slot", encoded: testHomeSubject(under, []int{1, 2}, nil), tokens: underTokens},
+		{name: "pins no home form", encoded: testHomeSubject(ExactSubject("mv", []string{"a", "b"}), nil, nil), tokens: []string{"mv", "a", "b"}},
+		{name: "non-canonical scope", encoded: raw(`{"subject":` + quote("'mv'"+strings.TrimPrefix(scope, "mv")) + `,"expanding":[2],"literal":[3]}`)},
+		{name: "home inside home", encoded: testHomeSubject(valid, []int{2}, []int{3})},
+		{name: "env inside home", encoded: testHomeSubject(mustEncodeDirectEnv(t, []string{"A=1"}, scope), []int{2}, []int{3})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			toks := tt.tokens
+			if toks == nil {
+				toks = tokens
+			}
+			if _, err := decodeDirectHomeSubject(tt.encoded); err == nil {
+				t.Fatalf("decodeDirectHomeSubject(%q) accepted a malformed envelope", tt.encoded)
+			}
+			if err := checkDirectRequestIdentity(tt.encoded, toks, nil, false); err == nil {
+				t.Fatalf("checkDirectRequestIdentity(%q) accepted a malformed envelope", tt.encoded)
+			}
+			if _, _, ok := DecodeDirectRequestSubject(tt.encoded, ExactSubject(toks[0], toks[1:])); ok {
+				t.Fatalf("DecodeDirectRequestSubject(%q) accepted a malformed envelope", tt.encoded)
+			}
+			if _, err := EncodeDirectEnvSubject([]string{"A=1"}, false, tt.encoded); err == nil {
+				t.Fatalf("EncodeDirectEnvSubject wrapped the malformed envelope %q", tt.encoded)
+			}
+			if MatchesDirectSubject(toks, nil, false, tt.encoded) {
+				t.Fatalf("token-only matching accepted the malformed envelope %q", tt.encoded)
+			}
+			for mask := 0; mask < 1<<len(toks); mask++ {
+				expands := make([]bool, len(toks))
+				for i := range expands {
+					expands[i] = mask&(1<<i) != 0
+				}
+				if matchesDirectSubject(toks, nil, false, expands, tt.encoded) {
+					t.Fatalf("malformed envelope %q matched %v with expansion %v", tt.encoded, toks, expands)
+				}
+			}
+		})
+	}
+}
+
+type envMutation struct {
+	name    string
+	encoded string
+}
+
+func directEnvOuterMutations(t *testing.T, assignments []string, clear bool, subject string) (string, []envMutation) {
+	t.Helper()
+	field := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal(%v): %v", v, err)
+		}
+		return string(b)
+	}
+	prefix := directEnvSubjectPrefix
+	if clear {
+		prefix = directEnvSubjectPrefixV2
+	}
+	raw := func(body string) string {
+		return prefix + base64.RawURLEncoding.EncodeToString([]byte(body))
+	}
+	a := `"assignments":` + field(assignments)
+	sub := `"subject":` + field(subject)
+	mid := ""
+	if clear {
+		mid = `"clear_environment":true,`
+	}
+	body := "{" + a + "," + mid + sub + "}"
+	valid, err := EncodeDirectEnvSubject(assignments, clear, subject)
+	if err != nil {
+		t.Fatalf("EncodeDirectEnvSubject(%v, %v, %q): %v", assignments, clear, subject, err)
+	}
+	if raw(body) != valid {
+		t.Fatalf("hand-built body %q does not encode to %q", raw(body), valid)
+	}
+	mutations := []envMutation{
+		{"duplicate subject", raw("{" + a + "," + mid + sub + "," + sub + "}")},
+		{"duplicate assignments", raw("{" + a + "," + a + "," + mid + sub + "}")},
+		{"reordered fields", raw("{" + mid + sub + "," + a + "}")},
+		{"extra whitespace", raw("{ " + a + "," + mid + sub + "}")},
+	}
+	if padded := prefix + base64.URLEncoding.EncodeToString([]byte(body)); padded != valid {
+		mutations = append(mutations, envMutation{"padded base64", padded})
+	}
+	if clear {
+		mutations = append(mutations, envMutation{"duplicate clear_environment", raw("{" + a + "," + mid + mid + sub + "}")})
+	}
+	return valid, mutations
+}
+
+func TestDirectEnvSubject_HomeStateWrapperMustBeCanonical(t *testing.T) {
+	command := ExactSubject("mv", []string{"~/x", "b"})
+	tokens := []string{"mv", "~/x", "b"}
+	expands := []bool{false, true, false}
+	home := testHomeSubject(command, []int{1}, nil)
+	for _, v := range []struct {
+		name    string
+		assigns []string
+		clear   bool
+	}{
+		{"v1", []string{"FOO=1", "BAR=2"}, false},
+		{"v2", []string{"PATH=/usr/bin"}, true},
+	} {
+		valid, mutations := directEnvOuterMutations(t, v.assigns, v.clear, home)
+		t.Run(v.name+" canonical", func(t *testing.T) {
+			if assigns, clear, ok := DecodeDirectRequestSubject(valid, command); !ok || clear != v.clear || !slices.Equal(assigns, v.assigns) {
+				t.Fatalf("DecodeDirectRequestSubject(%q) = %v, %v, %v; want the canonical wrapper accepted", valid, assigns, clear, ok)
+			}
+			if !matchesDirectSubject(tokens, v.assigns, v.clear, expands, valid) {
+				t.Fatalf("live matching rejected the canonical wrapper %q", valid)
+			}
+			if !AuditSubjectMatches(subjectKindDirect, valid, tokens, v.assigns, v.clear, valid) {
+				t.Fatalf("audit matching rejected the canonical wrapper %q", valid)
+			}
+		})
+		for _, m := range mutations {
+			t.Run(v.name+" "+m.name, func(t *testing.T) {
+				if _, err := decodeDirectEnvSubject(m.encoded); err == nil {
+					t.Fatalf("decodeDirectEnvSubject(%q) accepted a non-canonical wrapper", m.encoded)
+				}
+				if _, _, ok := DecodeDirectRequestSubject(m.encoded, command); ok {
+					t.Fatalf("DecodeDirectRequestSubject(%q) accepted a non-canonical wrapper", m.encoded)
+				}
+				if err := checkDirectRequestIdentity(m.encoded, tokens, v.assigns, v.clear); err == nil {
+					t.Fatalf("checkDirectRequestIdentity(%q) accepted a non-canonical wrapper", m.encoded)
+				}
+				if matchesDirectSubject(tokens, v.assigns, v.clear, expands, m.encoded) {
+					t.Fatalf("live matching accepted the stored non-canonical wrapper %q", m.encoded)
+				}
+				if AuditSubjectMatches(subjectKindDirect, valid, tokens, v.assigns, v.clear, m.encoded) {
+					t.Fatalf("audit matching accepted the stored non-canonical wrapper %q", m.encoded)
+				}
+				if AuditSubjectMatches(subjectKindDirect, m.encoded, tokens, v.assigns, v.clear, valid) {
+					t.Fatalf("audit matching accepted the non-canonical request %q", m.encoded)
+				}
+			})
+		}
+	}
+}
+
+func TestDecodeDirectRequestSubject_HomeStateRoundTrip(t *testing.T) {
+	command := ExactSubject("mv", []string{"~/x", "b"})
+	home := testHomeSubject(command, []int{1}, nil)
+	assigned := mustEncodeDirectEnv(t, []string{"FOO=1", "BAR=2"}, home)
+	cleared := mustEncodeDirectEnvClear(t, []string{"PATH=/usr/bin"}, home)
+	brokenHome := "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString([]byte(`{"subject":"mv b","expanding":[],"literal":[]}`))
+	brokenEnvBody, err := json.Marshal(struct {
+		Assignments []string `json:"assignments"`
+		Subject     string   `json:"subject"`
+	}{[]string{"FOO=1"}, brokenHome})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	brokenEnv := directEnvSubjectPrefix + base64.RawURLEncoding.EncodeToString(brokenEnvBody)
+
+	for _, built := range []struct {
+		stage string
+		want  string
+	}{
+		{"mv ~/x b", home},
+		{"FOO=1 BAR=2 mv ~/x b", assigned},
+		{"env -i PATH=/usr/bin mv ~/x b", cleared},
+	} {
+		if got := normalizedHomeRequest(t, built.stage, true).Subject; got != built.want {
+			t.Fatalf("request identity for %q = %q, want %q", built.stage, got, built.want)
+		}
+	}
+
+	tests := []struct {
+		name    string
+		request string
+		command string
+		assigns []string
+		clear   bool
+		ok      bool
+	}{
+		{name: "home state alone", request: home, command: command, ok: true},
+		{name: "assignments around home state", request: assigned, command: command, assigns: []string{"FOO=1", "BAR=2"}, ok: true},
+		{name: "cleared environment around home state", request: cleared, command: command, assigns: []string{"PATH=/usr/bin"}, clear: true, ok: true},
+		{name: "home state naming another command", request: home, command: ExactSubject("mv", []string{"~/y", "b"})},
+		{name: "assigned identity naming another command", request: assigned, command: ExactSubject("mv", []string{"~/x", "c"})},
+		{name: "cleared identity naming another command", request: cleared, command: "mv b"},
+		{name: "malformed home state", request: brokenHome, command: "mv b"},
+		{name: "malformed home state inside env", request: brokenEnv, command: "mv b"},
+		{name: "env inside home state", request: testHomeSubject(mustEncodeDirectEnv(t, []string{"FOO=1"}, command), []int{1}, nil), command: command},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assigns, clear, ok := DecodeDirectRequestSubject(tt.request, tt.command)
+			if ok != tt.ok || clear != tt.clear || !slices.Equal(assigns, tt.assigns) {
+				t.Fatalf("DecodeDirectRequestSubject(%q, %q) = %v, %v, %v; want %v, %v, %v", tt.request, tt.command, assigns, clear, ok, tt.assigns, tt.clear, tt.ok)
+			}
+		})
 	}
 }

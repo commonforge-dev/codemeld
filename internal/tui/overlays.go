@@ -59,6 +59,9 @@ func (a *App) overlays() []overlay {
 			name:   "settingsPicker",
 			isOpen: func() bool { return a.settingsPickerOpen },
 			dismiss: func() {
+				if a.dismissOpenRouterModelsLayer() {
+					return
+				}
 				if a.pages.HasPage(settingsDeletePage) {
 					a.cancelSettingsDelete()
 					return

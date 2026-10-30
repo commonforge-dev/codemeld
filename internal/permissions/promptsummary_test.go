@@ -1,6 +1,7 @@
 package permissions
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -337,6 +338,83 @@ func TestBoundPromptFact_EscapesControlBytesAtomically(t *testing.T) {
 	}
 	if atCap != strings.Repeat("x", 118)+"…" {
 		t.Fatalf("atomic escape truncation = %q", atCap)
+	}
+}
+
+func TestPromptControlEscapes_EscapeC0DELAndC1(t *testing.T) {
+	const hostile = "a\x00b\x07c\x1b[2Jd\x7fe\u0080f\u009b31mg\u009fh"
+	const escaped = `a\x00b\x07c\x1B[2Jd\x7Fe\u0080f\u009B31mg\u009Fh`
+	const ordinary = "~ é日本Ā"
+	for name, render := range map[string]func(string) string{
+		"preview":     VisibleControlEscape,
+		"single line": SingleLineControlEscape,
+		"bound fact":  BoundPromptFact,
+	} {
+		if got := render(hostile + ordinary); got != escaped+ordinary {
+			t.Errorf("%s = %q, want %q", name, got, escaped+ordinary)
+		}
+	}
+
+	if got := VisibleControlEscape("x\ny\tz"); got != "x\ny\tz" {
+		t.Errorf("preview changed its LF/TAB layout: %q", got)
+	}
+	if got := SingleLineControlEscape("x\ny\tz\r"); got != `x\x0Ay\x09z\x0D` {
+		t.Errorf("single line = %q, want LF/TAB/CR escaped", got)
+	}
+	if got := BoundPromptFact("x\ny\tz"); got != `x\x0Ay\x09z` {
+		t.Errorf("bound fact = %q, want LF/TAB escaped", got)
+	}
+}
+
+func TestPromptControlEscapes_CoverEveryControlCodePoint(t *testing.T) {
+	for r := rune(0); r <= 0xa0; r++ {
+		in := string(r)
+		var want string
+		switch {
+		case r < 0x20 || r == 0x7f:
+			want = fmt.Sprintf(`\x%02X`, r)
+		case r >= 0x80 && r <= 0x9f:
+			want = fmt.Sprintf(`\u%04X`, r)
+		default:
+			want = in
+		}
+		if got := SingleLineControlEscape(in); got != want {
+			t.Errorf("single line U+%04X = %q, want %q", r, got, want)
+		}
+		if got := BoundPromptFact(in); got != want {
+			t.Errorf("bound fact U+%04X = %q, want %q", r, got, want)
+		}
+		previewWant := want
+		if r == '\n' || r == '\t' {
+			previewWant = in
+		}
+		if got := VisibleControlEscape(in); got != previewWant {
+			t.Errorf("preview U+%04X = %q, want %q", r, got, previewWant)
+		}
+	}
+}
+
+func TestBoundPromptFact_TruncatesAtAWholeC1Escape(t *testing.T) {
+	if got := BoundPromptFact(strings.Repeat("x", 115) + "\u009btail"); got != strings.Repeat("x", 115)+"…" {
+		t.Fatalf("a C1 escape crossing the cap was split or kept: %q", got)
+	}
+	if got := BoundPromptFact(strings.Repeat("x", 114) + "\u009btail"); got != strings.Repeat("x", 114)+`\u009B`+"…" {
+		t.Fatalf("a C1 escape ending at the cap was not kept whole: %q", got)
+	}
+}
+
+func TestPromptSummary_RequestedTargetRowEscapesC1(t *testing.T) {
+	rows := literalSummary("touch 'a\u0080b\u009bc\u009fd'").DisplayRows()
+	if len(rows) != 3 || rows[2] != `Requested target: a\u0080b\u009Bc\u009Fd` {
+		t.Fatalf("rows = %q, want one escaped requested-target row", rows)
+	}
+}
+
+func TestSingleLineControlEscape_NeverTruncates(t *testing.T) {
+	long := strings.Repeat("y", 300) + "\u009b\x1b" + "TAILMARKER"
+	want := strings.Repeat("y", 300) + `\u009B\x1B` + "TAILMARKER"
+	if got := SingleLineControlEscape(long); got != want {
+		t.Fatalf("single line = %q, want the whole value escaped", got)
 	}
 }
 

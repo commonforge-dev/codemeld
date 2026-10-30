@@ -1276,3 +1276,197 @@ func TestMatch_ContainmentIsDecidedWhenAuthorizationIsEvaluated(t *testing.T) {
 		t.Fatalf("SubjectTokens = %v, want the original lexical tokens %v", req.SubjectTokens, tokens)
 	}
 }
+
+func TestMatch_HomeFormGrantsMatchOnlyTheirRecordedState(t *testing.T) {
+	f := newUnderFixture(t)
+	exact := ExactSubject("mv", []string{"a", "~/x"})
+	prefix := PrefixSubject("mv", []string{"a", "~/x"})
+	under := mustEncodeUnder(t, []string{"mv", "$HOME", f.run}, 2, f.tmp, false)
+	assigns := []string{"FOO=1"}
+	stages := map[string]string{
+		"expanding":           `mv a ~/x`,
+		"literal":             `mv a '~/x'`,
+		"tail literal home":   `mv a ~/x '$HOME'`,
+		"tail expanding home": `mv a ~/x $HOME`,
+		"tail under literal":  `mv a '~/x' $HOME`,
+		"env expanding":       `FOO=1 mv a ~/x`,
+		"env literal":         `FOO=1 mv a '~/x'`,
+		"under expanding":     `mv $HOME ` + f.run,
+		"under literal":       `mv '$HOME' ` + f.run,
+		"under other path":    `mv $HOME ` + f.file,
+		"under outside":       `mv $HOME ` + f.home,
+	}
+	names := make([]string, 0, len(stages))
+	for name := range stages {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	tests := []struct {
+		name  string
+		grant string
+		want  []string
+	}{
+		{name: "legacy exact", grant: exact},
+		{name: "legacy prefix", grant: prefix},
+		{name: "legacy env exact", grant: mustEncodeDirectEnv(t, assigns, exact)},
+		{name: "legacy containment", grant: under},
+		{name: "expanding exact", grant: testHomeSubject(exact, []int{2}, nil), want: []string{"expanding"}},
+		{name: "literal exact", grant: testHomeSubject(exact, nil, []int{2}), want: []string{"literal"}},
+		{name: "expanding prefix", grant: testHomeSubject(prefix, []int{2}, nil),
+			want: []string{"expanding", "tail literal home", "tail expanding home"}},
+		{name: "literal prefix", grant: testHomeSubject(prefix, nil, []int{2}), want: []string{"literal", "tail under literal"}},
+		{name: "env expanding exact", grant: mustEncodeDirectEnv(t, assigns, testHomeSubject(exact, []int{2}, nil)), want: []string{"env expanding"}},
+		{name: "env literal exact", grant: mustEncodeDirectEnv(t, assigns, testHomeSubject(exact, nil, []int{2})), want: []string{"env literal"}},
+		{name: "expanding containment", grant: testHomeSubject(under, []int{1}, nil), want: []string{"under expanding", "under other path"}},
+		{name: "literal containment", grant: testHomeSubject(under, nil, []int{1}), want: []string{"under literal"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			grants := []PermissionEntry{directGrant(tt.grant, scopeProj, grantKindFolder)}
+			for _, name := range names {
+				req := normalizedHomeRequest(t, stages[name], true)
+				if got, want := Match(req, grants).Matched, slices.Contains(tt.want, name); got != want {
+					t.Errorf("grant %q against %s request %q = %v, want %v", tt.grant, name, stages[name], got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestMatch_UnpinnedHomeFormsKeepWildcardBreadth(t *testing.T) {
+	grants := []string{
+		ProgramSubject("cat"),
+		PrefixSubject("cat", []string{"-n"}),
+		ExactSubject("cat", []string{"-n", "~alice/x"}),
+		ExactSubject("cat", []string{"-n", "$HOMEDIR"}),
+	}
+	stages := map[string][]string{
+		`cat -n ~/x`:        {grants[0], grants[1]},
+		`cat -n '~/x'`:      {grants[0], grants[1]},
+		`cat -n $HOME`:      {grants[0], grants[1]},
+		`cat -n "$HOME"`:    {grants[0], grants[1]},
+		`cat -n ~alice/x`:   {grants[0], grants[1], grants[2]},
+		`cat -n '$HOMEDIR'`: {grants[0], grants[1], grants[3]},
+		`cat ~`:             {grants[0]},
+	}
+	for stage, matching := range stages {
+		for _, home := range []bool{true, false} {
+			reqs := []MatchRequest{normalizedHomeRequest(t, stage, home)}
+			tokenOnly := reqs[0]
+			subject, err := DirectRequestSubject(tokenOnly.SubjectTokens, nil, false)
+			if err != nil {
+				t.Fatalf("DirectRequestSubject: %v", err)
+			}
+			tokenOnly.Subject = subject
+			reqs = append(reqs, tokenOnly)
+			for _, req := range reqs {
+				for _, grant := range grants {
+					want := slices.Contains(matching, grant)
+					if got := Match(req, []PermissionEntry{directGrant(grant, scopeProj, grantKindFolder)}).Matched; got != want {
+						t.Errorf("grant %q against %q (identity %q) = %v, want %v", grant, stage, req.Subject, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestMatch_InvalidRequestIdentityMatchesNoWildcardGrant(t *testing.T) {
+	grants := []string{ProgramSubject("mv"), PrefixSubject("mv", []string{"x"})}
+	valid := normalizedHomeRequest(t, `mv x ~/target`, true)
+	tokenOnly := valid
+	tokenOnly.Subject = ExactSubject(valid.SubjectTokens[0], valid.SubjectTokens[1:])
+	otherHome := valid
+	otherHome.SubjectTokens = []string{"mv", "x", "~/other"}
+	noHome := valid
+	noHome.SubjectTokens = []string{"mv", "x", "target"}
+	malformed := valid
+	malformed.Subject = "'direct-home/v1 not-a-payload"
+	unknownVersion := valid
+	unknownVersion.Subject = strings.Replace(valid.Subject, "direct-home/v1", "direct-home/v9", 1)
+	malformedNoHome := noHome
+	malformedNoHome.Subject = malformed.Subject
+	envClaimed := valid
+	envClaimed.Subject = normalizedHomeRequest(t, `FOO=1 mv x ~/target`, true).Subject
+	clearClaimed := valid
+	clearClaimed.Subject = normalizedHomeRequest(t, `env -i PATH=/usr/bin mv x ~/target`, true).Subject
+	envDropped := normalizedHomeRequest(t, `FOO=1 mv x ~/target`, true)
+	envDropped.Assignments = nil
+
+	tests := []struct {
+		name string
+		req  MatchRequest
+		want bool
+	}{
+		{"valid state-bearing identity", valid, true},
+		{"legacy token-only identity", tokenOnly, true},
+		{"tokens naming another home argument", otherHome, false},
+		{"tokens with no home argument", noHome, false},
+		{"malformed home identity", malformed, false},
+		{"unknown home version", unknownVersion, false},
+		{"malformed identity, tokens with no home argument", malformedNoHome, false},
+		{"identity claiming assignments the request lacks", envClaimed, false},
+		{"identity claiming a cleared environment", clearClaimed, false},
+		{"request dropping its identity's assignments", envDropped, false},
+	}
+	for _, tt := range tests {
+		for _, grant := range grants {
+			t.Run(tt.name+"/"+grant, func(t *testing.T) {
+				if got := Match(tt.req, []PermissionEntry{directGrant(grant, scopeProj, grantKindFolder)}).Matched; got != tt.want {
+					t.Errorf("Match(%q, tokens %q) = %v, want %v", tt.req.Subject, tt.req.SubjectTokens, got, tt.want)
+				}
+				if got := AuditSubjectMatches(subjectKindDirect, tt.req.Subject, tt.req.SubjectTokens, tt.req.Assignments, tt.req.ClearEnvironment, grant); got != tt.want {
+					t.Errorf("AuditSubjectMatches(%q, tokens %q) = %v, want %v", tt.req.Subject, tt.req.SubjectTokens, got, tt.want)
+				}
+			})
+		}
+	}
+}
+
+func TestAuditSubjectMatches_HomeStateFollowsLiveMatch(t *testing.T) {
+	exact := ExactSubject("mv", []string{"a", "~/x"})
+	clearAssigns := []string{"PATH=/usr/bin"}
+	expandingGrant := testHomeSubject(exact, []int{2}, nil)
+	clearExpanding := mustEncodeDirectEnvClear(t, clearAssigns, expandingGrant)
+	expanding := normalizedHomeRequest(t, `mv a ~/x`, true)
+	literal := normalizedHomeRequest(t, `mv a '~/x'`, true)
+	clearExpandingReq := normalizedHomeRequest(t, `env -i PATH=/usr/bin mv a ~/x`, true)
+	clearLiteralReq := normalizedHomeRequest(t, `env -i PATH=/usr/bin mv a '~/x'`, true)
+	tokenOnly := expanding
+	tokenOnly.Subject = exact
+	envClaimed := expanding
+	envClaimed.Subject = normalizedHomeRequest(t, `FOO=1 mv a ~/x`, true).Subject
+	otherTokens := expanding
+	otherTokens.Subject = normalizedHomeRequest(t, `mv b ~/x`, true).Subject
+
+	tests := []struct {
+		name   string
+		req    MatchRequest
+		stored string
+		want   bool
+	}{
+		{"expanding request, expanding grant", expanding, expandingGrant, true},
+		{"literal request, expanding grant", literal, expandingGrant, false},
+		{"literal request, literal grant", literal, testHomeSubject(exact, nil, []int{2}), true},
+		{"expanding request, legacy grant", expanding, exact, false},
+		{"literal request, legacy grant", literal, exact, false},
+		{"cleared expanding request, cleared expanding grant", clearExpandingReq, clearExpanding, true},
+		{"cleared literal request, cleared expanding grant", clearLiteralReq, clearExpanding, false},
+		{"cleared expanding request, inherited expanding grant", clearExpandingReq, expandingGrant, false},
+		{"cleared expanding request, legacy cleared grant", clearExpandingReq, mustEncodeDirectEnvClear(t, clearAssigns, exact), false},
+		{"token-only request identity", tokenOnly, expandingGrant, false},
+		{"identity claiming assignments the request lacks", envClaimed, expandingGrant, false},
+		{"identity naming other tokens", otherTokens, expandingGrant, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := AuditSubjectMatches(subjectKindDirect, tt.req.Subject, tt.req.SubjectTokens, tt.req.Assignments, tt.req.ClearEnvironment, tt.stored)
+			if got != tt.want {
+				t.Fatalf("AuditSubjectMatches(%q, %q) = %v, want %v", tt.req.Subject, tt.stored, got, tt.want)
+			}
+			if live := Match(tt.req, []PermissionEntry{directGrant(tt.stored, scopeProj, grantKindFolder)}).Matched; live != tt.want {
+				t.Fatalf("live Match = %v, want %v — the audit helper no longer follows the live rule", live, tt.want)
+			}
+		})
+	}
+}

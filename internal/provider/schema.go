@@ -4,6 +4,7 @@ package provider
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 )
 
@@ -45,6 +46,12 @@ type Routing struct {
 	DataCollection    string
 	RequireParameters bool
 	MaxPrice          map[string]MaxPrice
+	Quantizations     map[string]Quantization
+}
+
+type Quantization struct {
+	Levels []string
+	Mode   string
 }
 
 type MaxPrice struct {
@@ -70,8 +77,9 @@ func (p ProviderEntry) ResolveAuthHeader() (name, value string) {
 // entries keyed by provider name, filling the Bearer default for entries without
 // an explicit auth_header. An absent or empty provider block yields an empty
 // map. Schema-level shape rules (required fields, unknown keys, auth_header
-// shape) are enforced upstream by config.Validate; this returns an error only on
-// a value whose runtime type does not match the validated schema.
+// shape) are enforced upstream by config.Validate; this returns an error on a
+// value whose runtime type does not match the validated schema, and on a routing
+// quantizations entry whose levels or mode are invalid.
 func ParseProviders(composed map[string]any) (map[string]ProviderEntry, error) {
 	out := map[string]ProviderEntry{}
 	raw, ok := composed["provider"]
@@ -199,7 +207,73 @@ func parseRouting(m map[string]any) (Routing, error) {
 	if err != nil {
 		return Routing{}, fmt.Errorf("routing.%w", err)
 	}
-	return Routing{Sort: sort, DataCollection: dataCollection, RequireParameters: requireParameters, MaxPrice: maxPrice}, nil
+	quantizations, err := parseQuantizations(obj)
+	if err != nil {
+		return Routing{}, fmt.Errorf("routing.%w", err)
+	}
+	return Routing{Sort: sort, DataCollection: dataCollection, RequireParameters: requireParameters, MaxPrice: maxPrice, Quantizations: quantizations}, nil
+}
+
+func parseQuantizations(m map[string]any) (map[string]Quantization, error) {
+	raw, ok := m["quantizations"]
+	if !ok {
+		return nil, nil
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("quantizations: expected object, got %T", raw)
+	}
+	if len(obj) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]Quantization, len(obj))
+	for model, rawEntry := range obj {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("quantizations.%s: expected object, got %T", model, rawEntry)
+		}
+		rawLevels, ok := entry["levels"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("quantizations.%s.levels: expected list, got %T", model, entry["levels"])
+		}
+		levels := make([]string, len(rawLevels))
+		for i, v := range rawLevels {
+			if levels[i], ok = v.(string); !ok {
+				return nil, fmt.Errorf("quantizations.%s.levels: expected string, got %T", model, v)
+			}
+		}
+		if err := ValidateQuantizationLevels(levels); err != nil {
+			return nil, fmt.Errorf("quantizations.%s.levels: %w", model, err)
+		}
+		mode, err := asString(entry, "mode")
+		if err != nil {
+			return nil, fmt.Errorf("quantizations.%s.%w", model, err)
+		}
+		if mode != "preferred" && mode != "required" {
+			return nil, fmt.Errorf("quantizations.%s.mode: expected \"preferred\" or \"required\", got %q", model, mode)
+		}
+		out[model] = Quantization{Levels: levels, Mode: mode}
+	}
+	return out, nil
+}
+
+var quantizationLevels = []string{"int4", "int8", "fp4", "mxfp4", "nvfp4", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"}
+
+func ValidateQuantizationLevels(levels []string) error {
+	if len(levels) == 0 {
+		return fmt.Errorf("expected at least one level")
+	}
+	seen := make(map[string]bool, len(levels))
+	for _, l := range levels {
+		if !slices.Contains(quantizationLevels, l) {
+			return fmt.Errorf("unknown level %q, expected one of %s", l, strings.Join(quantizationLevels, ", "))
+		}
+		if seen[l] {
+			return fmt.Errorf("duplicate level %q", l)
+		}
+		seen[l] = true
+	}
+	return nil
 }
 
 func parseMaxPrice(m map[string]any) (map[string]MaxPrice, error) {

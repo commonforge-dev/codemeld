@@ -282,10 +282,6 @@ type parentTurnSnapshot struct {
 	systemPrompt string
 }
 
-// parentTurnHolder carries one turn's model, mode, and assembled system prompt from the
-// event-loop goroutine to the tool-dispatch goroutine a general_agent call runs on. The run-scoped
-// model and mode active states cannot be read there: they have no synchronization and pickers
-// and slash commands mutate them on the event loop.
 type parentTurnHolder struct {
 	mu        sync.RWMutex
 	published bool
@@ -307,9 +303,6 @@ func (h *parentTurnHolder) current() (parentTurnSnapshot, bool) {
 	return h.snapshot, h.published
 }
 
-// generalAgentBinding reads the parent turn each child inherits from the run-scoped holder the
-// turn publisher writes, so a model or mode change made while a turn is in flight reaches the
-// next turn's children rather than this turn's.
 type generalAgentBinding struct {
 	parent      *parentTurnHolder
 	notices     tui.NoticeRenderer
@@ -328,10 +321,14 @@ func (b generalAgentBinding) deps(reg *tools.Registry, cache *config.Cache, turn
 		LaunchDir:   processCWD,
 		ProjectRoot: cache.ProjectRoot(),
 		Store:       turnStore,
-		Snapshot: func() (subagenttool.Snapshot, bool) {
+		Snapshot: func(ctx context.Context) (subagenttool.Snapshot, bool) {
 			parent, ok := b.parent.current()
 			if !ok {
 				return subagenttool.Snapshot{}, false
+			}
+			modeName := parent.mode
+			if pinned, ok := vcs.ConfinementMode(ctx); ok {
+				modeName = pinned
 			}
 			sel := parent.model
 			catalog := cache.SelectableCatalog()
@@ -343,15 +340,14 @@ func (b generalAgentBinding) deps(reg *tools.Registry, cache *config.Cache, turn
 			if !ok {
 				return subagenttool.Snapshot{}, false
 			}
-			m := mode.Mode(parent.mode)
 			return subagenttool.Snapshot{
-				Mode:            parent.mode,
+				Mode:            modeName,
 				Model:           sel,
 				ModelSource:     parent.modelSource,
 				SupportedEffort: catalog.SupportedEffort,
 				SystemPrompt:    parent.systemPrompt,
 				Client:          client,
-				Tools:           advertisedTools(reg, m),
+				Tools:           advertisedTools(reg, mode.Mode(modeName)),
 				Registered:      reg.List(),
 			}, true
 		},
@@ -372,12 +368,12 @@ func (b generalAgentBinding) deps(reg *tools.Registry, cache *config.Cache, turn
 				home, processCWD, turnStore, cache.MaxToolOutputBytes(), guard)
 			child.childCeiling = modeCtx.ChildAgent
 			child.childInvocationID = modeCtx.ChildInvocationID
+			childMode := modeCtx.Mode
+			child.childMode = &childMode
 			if b.confinement != nil {
-				childMode := modeCtx.Mode
 				conf := *b.confinement
 				conf.mode = func() string { return childMode }
 				child.confinement = &conf
-				child.childMode = &childMode
 			}
 			return child
 		},
@@ -650,7 +646,7 @@ func (d *productionToolDispatcher) prepareGeneralAgents(calls []turn.AssembledTo
 }
 
 func (d *productionToolDispatcher) dispatchPreparedGeneralAgent(ctx context.Context, prepared dispatch.PreparedTool) (turn.ToolResult, error) {
-	res, derr := dispatch.DispatchPreparedGeneralAgent(d.childCtx(ctx), prepared, d.authorizer, d.childCeiling)
+	res, derr := dispatch.DispatchPreparedGeneralAgent(d.pinMode(ctx), prepared, d.authorizer, d.childCeiling)
 	return d.adaptTool(subagenttool.ToolName, res, derr)
 }
 

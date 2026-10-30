@@ -1069,6 +1069,42 @@ func TestCacheProviderMaxPriceIsolated(t *testing.T) {
 	}
 }
 
+func TestCacheProviderQuantizationsIsolated(t *testing.T) {
+	c := newCacheOrFatal(t, map[string]any{}, t.TempDir(), nil)
+	want := map[string]provider.Quantization{"m": {Levels: []string{"fp8", "fp4"}, Mode: "required"}}
+	supplied := map[string]provider.Quantization{"m": {Levels: []string{"fp8", "fp4"}, Mode: "required"}}
+	c.SetProvider("openrouter", provider.ProviderEntry{BaseURL: "u", APIKey: "k", Routing: provider.Routing{Quantizations: supplied}})
+
+	supplied["m"].Levels[0] = "int4"
+	supplied["x"] = provider.Quantization{}
+	got, _ := c.Provider("openrouter")
+	if !reflect.DeepEqual(got.Routing.Quantizations, want) {
+		t.Fatalf("after mutating the SetProvider input, Quantizations = %+v, want %+v", got.Routing.Quantizations, want)
+	}
+
+	all := c.Providers()
+	got.Routing.Quantizations["m"].Levels[0] = "int4"
+	got.Routing.Quantizations["m"] = provider.Quantization{Levels: []string{"bf16"}, Mode: "preferred"}
+	got.Routing.Quantizations["x"] = provider.Quantization{}
+	again, _ := c.Provider("openrouter")
+	if !reflect.DeepEqual(again.Routing.Quantizations, want) {
+		t.Fatalf("after mutating the Provider result, Quantizations = %+v, want %+v", again.Routing.Quantizations, want)
+	}
+	if !reflect.DeepEqual(all["openrouter"].Routing.Quantizations, want) {
+		t.Fatalf("after mutating the Provider result, retained Providers snapshot = %+v, want %+v", all["openrouter"].Routing.Quantizations, want)
+	}
+
+	all["openrouter"].Routing.Quantizations["m"].Levels[1] = "int8"
+	all["openrouter"].Routing.Quantizations["x"] = provider.Quantization{}
+	again2, _ := c.Provider("openrouter")
+	if !reflect.DeepEqual(again2.Routing.Quantizations, want) {
+		t.Fatalf("after mutating the Providers result, Quantizations = %+v, want %+v", again2.Routing.Quantizations, want)
+	}
+	if !reflect.DeepEqual(again.Routing.Quantizations, want) {
+		t.Fatalf("after mutating the Providers result, retained Provider snapshot = %+v, want %+v", again.Routing.Quantizations, want)
+	}
+}
+
 func TestCacheReloadDiscoveredCatalogRetainsCatalogInvariants(t *testing.T) {
 	globalPath := filepath.Join(t.TempDir(), "settings.yaml")
 	if err := UpdateDiscoveredModelsProvider(DiscoveredModelsPath(globalPath), "openai", DiscoveredProvider{
@@ -1915,6 +1951,104 @@ func TestCacheOpenRouterMaxPrice_SetThenRemove(t *testing.T) {
 	}
 }
 
+func TestCacheOpenRouterQuantizations_SetDeleteAndSnapshot(t *testing.T) {
+	c, global := openRouterSettingsCache(t, openRouterRoutingSeed)
+	if got := c.OpenRouterQuantizations(); len(got) != 0 {
+		t.Fatalf("OpenRouterQuantizations() before any set = %+v, want none", got)
+	}
+
+	levels := []string{"fp8", "fp4"}
+	if reason, cat, err := c.SetOpenRouterQuantization("z/m", provider.Quantization{Levels: levels, Mode: "required"}); reason != ReasonNone || err != nil {
+		t.Fatalf("SetOpenRouterQuantization(z/m) = (%q, %q, %v), want success", reason, cat, err)
+	}
+	levels[0] = "int4"
+	if reason, cat, err := c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{"unknown"}, Mode: "preferred"}); reason != ReasonNone || err != nil {
+		t.Fatalf("SetOpenRouterQuantization(a/m) = (%q, %q, %v), want success", reason, cat, err)
+	}
+	want := []OpenRouterQuantization{
+		{Model: "a/m", Quantization: provider.Quantization{Levels: []string{"unknown"}, Mode: "preferred"}},
+		{Model: "z/m", Quantization: provider.Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}},
+	}
+	snap := c.OpenRouterQuantizations()
+	if !reflect.DeepEqual(snap, want) {
+		t.Fatalf("OpenRouterQuantizations() = %+v, want %+v", snap, want)
+	}
+	snap[1].Quantization.Levels[0] = "bf16"
+	snap[0].Quantization.Mode = "required"
+	if got := c.OpenRouterQuantizations(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("mutating the snapshot changed the cache: %+v, want %+v", got, want)
+	}
+	wantFile := openRouterRoutingSeed + "      quantizations:\n        \"z/m\": {levels: [fp8, fp4], mode: required}\n        \"a/m\": {levels: [unknown], mode: preferred}\n"
+	if got := readAt(t, global); got != wantFile {
+		t.Fatalf("settings after set = %q, want %q", got, wantFile)
+	}
+
+	for _, model := range []string{"z/m", "a/m"} {
+		if reason, cat, err := c.DeleteOpenRouterQuantization(model); reason != ReasonNone || err != nil {
+			t.Fatalf("DeleteOpenRouterQuantization(%s) = (%q, %q, %v), want success", model, reason, cat, err)
+		}
+	}
+	if got := c.OpenRouterQuantizations(); len(got) != 0 {
+		t.Fatalf("OpenRouterQuantizations() after delete = %+v, want none", got)
+	}
+	if got := readAt(t, global); got != openRouterRoutingSeed {
+		t.Fatalf("settings after delete = %q, want the seed back", got)
+	}
+	if reason, cat, err := c.DeleteOpenRouterQuantization("never/set"); reason != ReasonNone || err != nil {
+		t.Fatalf("DeleteOpenRouterQuantization(absent) = (%q, %q, %v), want a successful no-op", reason, cat, err)
+	}
+}
+
+func TestCacheOpenRouterQuantization_RejectsBeforePersisting(t *testing.T) {
+	c, _ := openRouterSettingsCache(t, openRouterRoutingSeed)
+	for name, tc := range map[string]struct {
+		prefix string
+		write  func() (PersistReason, fserrors.Category, error)
+	}{
+		"empty model": {"config.SetOpenRouterQuantization: ", func() (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("", provider.Quantization{Levels: []string{"fp8"}, Mode: "preferred"})
+		}},
+		"empty model delete": {"config.DeleteOpenRouterQuantization: ", func() (PersistReason, fserrors.Category, error) { return c.DeleteOpenRouterQuantization("") }},
+		"no levels": {"config.SetOpenRouterQuantization: ", func() (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Mode: "preferred"})
+		}},
+		"unknown level": {"config.SetOpenRouterQuantization: ", func() (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{"fp9"}, Mode: "preferred"})
+		}},
+		"invalid mode": {"config.SetOpenRouterQuantization: ", func() (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{"fp8"}, Mode: ""})
+		}},
+	} {
+		reason, _, err := tc.write()
+		if reason != ReasonRereadParseError || err == nil || !strings.HasPrefix(err.Error(), tc.prefix) {
+			t.Errorf("%s = (%q, %v), want a %q refusal before Persist", name, reason, err, tc.prefix)
+		}
+	}
+}
+
+func TestCacheOpenRouterQuantization_PersistFailureLeavesCache(t *testing.T) {
+	c, global := openRouterSettingsCache(t, openRouterRoutingSeed+"      quantizations: {a/m: {levels: [fp8], mode: preferred}}\n")
+	const external = "provider:\n  venice:\n    base_url: v\n    api_key: k\n"
+	writeAt(t, global, external)
+	before := c.OpenRouterQuantizations()
+	for name, write := range map[string]func() (PersistReason, fserrors.Category, error){
+		"set": func() (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("b/m", provider.Quantization{Levels: []string{"fp4"}, Mode: "required"})
+		},
+		"delete": func() (PersistReason, fserrors.Category, error) { return c.DeleteOpenRouterQuantization("a/m") },
+	} {
+		if _, _, err := write(); err == nil {
+			t.Fatalf("%s succeeded against a file without provider.openrouter", name)
+		}
+		if got := c.OpenRouterQuantizations(); !reflect.DeepEqual(got, before) {
+			t.Fatalf("failed %s changed the cache: %+v, want %+v", name, got, before)
+		}
+		if got := readAt(t, global); got != external {
+			t.Fatalf("failed %s changed the file: %q", name, got)
+		}
+	}
+}
+
 func assertOpenRouterRouting(t *testing.T, c *Cache, want provider.Routing) {
 	t.Helper()
 	entry, ok := c.Provider("openrouter")
@@ -1948,6 +2082,27 @@ func TestCacheOpenRouterRouting_SettersRefuseWithoutChanges(t *testing.T) {
 		}},
 		{"empty max_price model id", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
 			return c.SetOpenRouterMaxPrice("", provider.MaxPrice{Prompt: 1, HasPrompt: true})
+		}},
+		{"empty quantizations model id", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("", provider.Quantization{Levels: []string{"fp8"}, Mode: "preferred"})
+		}},
+		{"empty quantizations model id on delete", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.DeleteOpenRouterQuantization("")
+		}},
+		{"empty quantizations levels", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{}, Mode: "preferred"})
+		}},
+		{"unknown quantizations level", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{"fp8", "fp9"}, Mode: "preferred"})
+		}},
+		{"duplicate quantizations level", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{"fp8", "fp8"}, Mode: "required"})
+		}},
+		{"invalid quantizations mode", openRouterRoutingSeed, func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.SetOpenRouterQuantization("a/m", provider.Quantization{Levels: []string{"fp8"}, Mode: "strict"})
+		}},
+		{"missing openrouter entry for quantizations", "attribution: true\n", func(c *Cache) (PersistReason, fserrors.Category, error) {
+			return c.DeleteOpenRouterQuantization("a/m")
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -4,6 +4,8 @@ package dispatch
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -83,6 +85,18 @@ func (f *fakeAuthorizer) AuthorizeBatch(ctx context.Context, reqs []BatchAuthReq
 		decs[i] = d
 	}
 	return decs, nil
+}
+
+func homeSubject(scope string, expanding, literal []int) string {
+	payload, err := json.Marshal(struct {
+		Subject   string `json:"subject"`
+		Expanding []int  `json:"expanding"`
+		Literal   []int  `json:"literal"`
+	}{scope, append([]int{}, expanding...), append([]int{}, literal...)})
+	if err != nil {
+		panic(err)
+	}
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString(payload)
 }
 
 func envRequestSubject(t *testing.T, assignments []string, tokens ...string) string {
@@ -564,6 +578,9 @@ func TestDispatchShell_InertQuotedSubstitutionTextKeepsItsRoute(t *testing.T) {
 				t.Fatalf("DispatchShell: %v", err)
 			}
 			wantSubject := envRequestSubject(t, nil, tc.argv...)
+			if tc.argv[1] == "$HOME" {
+				wantSubject = homeSubject(wantSubject, nil, []int{1})
+			}
 			if len(auth.requests) != 1 || auth.requests[0].Kind != "direct" || auth.requests[0].Subject != wantSubject ||
 				!reflect.DeepEqual(auth.requests[0].SubjectTokens, tc.argv) {
 				t.Fatalf("requests = %+v, want one direct subject %q", auth.requests, wantSubject)
@@ -2097,9 +2114,10 @@ func TestDispatchShell_HomeArgsExpandOnlyForExecution(t *testing.T) {
 		wantSubjTok []string
 		wantArgv    []string
 	}{
-		{"cat ~/srht/que", "cat '~/srht/que'", []string{"cat", "~/srht/que"}, []string{"cat", home + "/srht/que"}},
-		{"cat $HOME/srht/que", "cat '$HOME/srht/que'", []string{"cat", "$HOME/srht/que"}, []string{"cat", home + "/srht/que"}},
-		{"ls ~", "ls '~'", []string{"ls", "~"}, []string{"ls", home}},
+		{"cat ~/srht/que", homeSubject("cat '~/srht/que'", []int{1}, nil), []string{"cat", "~/srht/que"}, []string{"cat", home + "/srht/que"}},
+		{"cat $HOME/srht/que", homeSubject("cat '$HOME/srht/que'", []int{1}, nil), []string{"cat", "$HOME/srht/que"}, []string{"cat", home + "/srht/que"}},
+		{"ls ~", homeSubject("ls '~'", []int{1}, nil), []string{"ls", "~"}, []string{"ls", home}},
+		{"ls $HOME", homeSubject("ls '$HOME'", []int{1}, nil), []string{"ls", "$HOME"}, []string{"ls", home}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
@@ -2138,9 +2156,15 @@ func TestDispatchShell_HomeArgsQuotedRemainLiteral(t *testing.T) {
 		wantSubject string
 		wantArgv    []string
 	}{
-		{`cat '~/srht/que'`, "cat '~/srht/que'", []string{"cat", "~/srht/que"}},
-		{`cat '$HOME/srht/que'`, "cat '$HOME/srht/que'", []string{"cat", "$HOME/srht/que"}},
-		{`cat "$HOME"/srht/que`, "cat '$HOME/srht/que'", []string{"cat", "$HOME/srht/que"}},
+		{`cat '~/srht/que'`, homeSubject("cat '~/srht/que'", nil, []int{1}), []string{"cat", "~/srht/que"}},
+		{`cat '$HOME/srht/que'`, homeSubject("cat '$HOME/srht/que'", nil, []int{1}), []string{"cat", "$HOME/srht/que"}},
+		{`cat "$HOME"/srht/que`, homeSubject("cat '$HOME/srht/que'", nil, []int{1}), []string{"cat", "$HOME/srht/que"}},
+		{`ls '~'`, homeSubject("ls '~'", nil, []int{1}), []string{"ls", "~"}},
+		{`ls '$HOME'`, homeSubject("ls '$HOME'", nil, []int{1}), []string{"ls", "$HOME"}},
+		{`cat \~/srht/que`, homeSubject("cat '~/srht/que'", nil, []int{1}), []string{"cat", "~/srht/que"}},
+		{`cat \$HOME/srht/que`, homeSubject("cat '$HOME/srht/que'", nil, []int{1}), []string{"cat", "$HOME/srht/que"}},
+		{`cat ~'/'srht/que`, homeSubject("cat '~/srht/que'", nil, []int{1}), []string{"cat", "~/srht/que"}},
+		{`cat ~"/srht/que"`, homeSubject("cat '~/srht/que'", nil, []int{1}), []string{"cat", "~/srht/que"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
@@ -2157,6 +2181,315 @@ func TestDispatchShell_HomeArgsQuotedRemainLiteral(t *testing.T) {
 				t.Fatalf("runner Argv = %v, want %v (quoted HOME forms stay literal in argv)", run.calls[0].Argv, tc.wantArgv)
 			}
 		})
+	}
+}
+
+type grantList []permissions.PermissionEntry
+
+func (g *grantList) Permissions() []permissions.PermissionEntry     { return *g }
+func (g *grantList) AppendPermission(e permissions.PermissionEntry) { *g = append(*g, e) }
+
+type promptingAuthorizer struct {
+	root     string
+	grants   grantList
+	cache    *permissions.TurnCache
+	answers  []permissions.PromptChoice
+	prompts  int
+	requests []permissions.MatchRequest
+	rewrite  func(*permissions.MatchRequest)
+}
+
+func (a *promptingAuthorizer) prepare(req *permissions.MatchRequest, modeCtx *permissions.ModeContext) {
+	if a.rewrite != nil {
+		a.rewrite(req)
+	}
+	a.requests = append(a.requests, *req)
+	modeCtx.Mode = "build"
+	modeCtx.ProjectRoot = a.root
+}
+
+func (a *promptingAuthorizer) answer(req permissions.MatchRequest) (permissions.PromptOutcome, error) {
+	if len(a.answers) == 0 {
+		return permissions.PromptOutcome{}, fmt.Errorf("unexpected prompt for %q", req.Subject)
+	}
+	a.prompts++
+	out := permissions.PromptOutcome{Choice: a.answers[0]}
+	a.answers = a.answers[1:]
+	if out.Choice == permissions.PromptAllowSession {
+		out.StoredSubject = permissions.ExactSubject(req.SubjectTokens[0], req.SubjectTokens[1:])
+	}
+	return out, nil
+}
+
+func (a *promptingAuthorizer) deps(req permissions.MatchRequest) permissions.AuthorizeDeps {
+	return permissions.AuthorizeDeps{
+		Grants: &a.grants,
+		Cache:  a.cache,
+		Prompt: func(context.Context, permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+			return a.answer(req)
+		},
+		PromptBatch: func(_ context.Context, reqs []permissions.BatchPromptRequest) (permissions.PromptOutcome, error) {
+			return a.answer(reqs[0].Req)
+		},
+		EmitPromptShown:   func(_, _, _ string, _ []string, _ permissions.DirectIdentity) error { return nil },
+		EmitDecision:      func(_, _, _, _, _, _ string, _ permissions.DirectIdentity) error { return nil },
+		EmitDecisionGrant: func(_, _, _, _, _, _ string, _ permissions.DirectIdentity) error { return nil },
+		EmitMatched:       func(_, _, _, _, _, _, _, _, _ string) error { return nil },
+	}
+}
+
+func (a *promptingAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ PromptDisplay, modeCtx permissions.ModeContext) (permissions.Decision, error) {
+	a.prepare(&req, &modeCtx)
+	return permissions.Authorize(ctx, req, modeCtx, a.deps(req))
+}
+
+func (a *promptingAuthorizer) AuthorizeBatch(ctx context.Context, reqs []BatchAuthRequest) ([]permissions.Decision, error) {
+	batch := make([]permissions.BatchRequest, len(reqs))
+	for i, r := range reqs {
+		a.prepare(&r.Req, &r.ModeCtx)
+		batch[i] = permissions.BatchRequest{Req: r.Req, ModeCtx: r.ModeCtx}
+	}
+	return permissions.AuthorizeBatch(ctx, batch, a.deps(permissions.MatchRequest{}))
+}
+
+func authorizerVia(a *promptingAuthorizer, single bool) Authorizer {
+	if single {
+		return struct{ Authorizer }{a}
+	}
+	return a
+}
+
+func lastMvArgv(run *fakeRunner) []string {
+	for i := len(run.calls) - 1; i >= 0; i-- {
+		if run.calls[i].Argv[0] == "mv" {
+			return run.calls[i].Argv
+		}
+	}
+	return nil
+}
+
+func TestDispatchShell_HomeStateApprovalsDoNotCrossExpansionThroughRealAuthorization(t *testing.T) {
+	prependFixturePrograms(t, "mv")
+	cwd := mustEval(t, t.TempDir())
+	home := mustEval(t, t.TempDir())
+	cases := []struct {
+		name       string
+		firstHome  string
+		first      string
+		firstArgv  []string
+		secondHome string
+		second     string
+		shared     bool
+	}{
+		{"bare then quoted", home, "mv x ~/target", []string{"mv", "x", home + "/target"}, home, "mv x '~/target'", false},
+		{"quoted then bare", home, "mv x '~/target'", []string{"mv", "x", "~/target"}, home, "mv x ~/target", false},
+		{"bare HOME then quoted", home, "mv x $HOME/target", []string{"mv", "x", home + "/target"}, home, `mv x "$HOME"/target`, false},
+		{"quoted HOME then bare", home, `mv x "$HOME"/target`, []string{"mv", "x", "$HOME/target"}, home, "mv x $HOME/target", false},
+		{"bare tilde then quoted", home, "mv x ~", []string{"mv", "x", home}, home, "mv x '~'", false},
+		{"expanding then empty home", home, "mv x ~/target", []string{"mv", "x", home + "/target"}, "", "mv x ~/target", false},
+		{"empty home then expanding", "", "mv x ~/target", []string{"mv", "x", "~/target"}, home, "mv x ~/target", false},
+		{"empty-home bare then quoted", "", "mv x ~/target", []string{"mv", "x", "~/target"}, home, "mv x '~/target'", true},
+		{"quoted then empty-home bare", home, "mv x '~/target'", []string{"mv", "x", "~/target"}, "", "mv x ~/target", true},
+		{"empty-home quoted then bare", "", "mv x '~/target'", []string{"mv", "x", "~/target"}, "", "mv x ~/target", true},
+		{"escaped then quoted", home, `mv x \~/target`, []string{"mv", "x", "~/target"}, home, "mv x '~/target'", true},
+	}
+	for _, staged := range []bool{false, true} {
+		for _, choice := range []permissions.PromptChoice{permissions.PromptAllowSession, permissions.PromptAllowOnce} {
+			for _, single := range []bool{false, true} {
+				for _, tc := range cases {
+					t.Run(fmt.Sprintf("%s staged=%v choice=%d single=%v", tc.name, staged, choice, single), func(t *testing.T) {
+						a := &promptingAuthorizer{root: cwd, cache: permissions.NewTurnCache(), answers: []permissions.PromptChoice{choice}}
+						dispatchAs := func(input, h string) (*fakeRunner, error) {
+							if staged {
+								input = "ls && " + input
+							}
+							run := &fakeRunner{}
+							_, err := DispatchShell(context.Background(), input, h, cwd, authorizerVia(a, single), run)
+							return run, err
+						}
+						forgetTurn := func() {
+							if choice == permissions.PromptAllowSession {
+								a.cache = permissions.NewTurnCache()
+							}
+						}
+
+						run, err := dispatchAs(tc.first, tc.firstHome)
+						if err != nil || a.prompts != 1 {
+							t.Fatalf("first dispatch: err = %v, prompts = %d; want approved after one prompt", err, a.prompts)
+						}
+						if got := lastMvArgv(run); !reflect.DeepEqual(got, tc.firstArgv) {
+							t.Fatalf("runner argv = %v, want %v run directly", got, tc.firstArgv)
+						}
+						approved := a.requests[len(a.requests)-1]
+						if choice == permissions.PromptAllowSession {
+							if len(a.grants) != 1 || a.grants[0].Subject != approved.Subject {
+								t.Fatalf("stored grants = %+v, want one carrying the request identity %q", a.grants, approved.Subject)
+							}
+						}
+						forgetTurn()
+						if run, err := dispatchAs(tc.first, tc.firstHome); err != nil || a.prompts != 1 || lastMvArgv(run) == nil {
+							t.Fatalf("repeat dispatch: err = %v, prompts = %d; want the approval to cover its own request", err, a.prompts)
+						}
+						forgetTurn()
+
+						if tc.shared {
+							if run, err := dispatchAs(tc.second, tc.secondHome); err != nil || a.prompts != 1 || lastMvArgv(run) == nil {
+								t.Fatalf("second dispatch: err = %v, prompts = %d; want the same literal identity reused", err, a.prompts)
+							}
+							return
+						}
+						a.answers = []permissions.PromptChoice{permissions.PromptDeny}
+						run, err = dispatchAs(tc.second, tc.secondHome)
+						var denied *DeniedError
+						if !errors.As(err, &denied) {
+							t.Fatalf("second dispatch error = %v, want *DeniedError", err)
+						}
+						if a.prompts != 2 {
+							t.Fatalf("prompts = %d, want 2 (the second spelling needs its own approval)", a.prompts)
+						}
+						if len(run.calls) != 0 {
+							t.Fatalf("runner calls = %+v, want none after the denial", run.calls)
+						}
+						if got := a.requests[len(a.requests)-1].Subject; got == approved.Subject {
+							t.Fatalf("second request reused the approved identity %q", got)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestDispatchShell_NonHomeRequestsKeepTheirSubjectThroughRealAuthorization(t *testing.T) {
+	prependFixturePrograms(t, "mv")
+	cwd := mustEval(t, t.TempDir())
+	home := mustEval(t, t.TempDir())
+	a := &promptingAuthorizer{root: cwd, cache: permissions.NewTurnCache(), answers: []permissions.PromptChoice{permissions.PromptAllowSession}}
+	run := &fakeRunner{}
+	if _, err := DispatchShell(context.Background(), "mv x target", home, cwd, a, run); err != nil {
+		t.Fatalf("DispatchShell: %v", err)
+	}
+	if a.prompts != 1 || len(a.requests) != 1 || a.requests[0].Subject != "mv x target" {
+		t.Fatalf("prompts = %d, requests = %+v; want one prompt for subject \"mv x target\"", a.prompts, a.requests)
+	}
+	if len(a.grants) != 1 || a.grants[0].Subject != "mv x target" {
+		t.Fatalf("grants = %+v, want the unwrapped subject \"mv x target\"", a.grants)
+	}
+	if len(run.calls) != 1 || !reflect.DeepEqual(run.calls[0].Argv, []string{"mv", "x", "target"}) {
+		t.Fatalf("runner calls = %+v, want argv [mv x target] run directly", run.calls)
+	}
+
+	run = &fakeRunner{}
+	if _, err := DispatchShell(context.Background(), "cat notes", home, cwd, a, run); err != nil {
+		t.Fatalf("DispatchShell(cat notes): %v", err)
+	}
+	if a.prompts != 1 || a.requests[1].Subject != "cat notes" {
+		t.Fatalf("prompts = %d, subject = %q; want read-only auto-allow for \"cat notes\"", a.prompts, a.requests[1].Subject)
+	}
+	if len(run.calls) != 1 || !reflect.DeepEqual(run.calls[0].Argv, []string{"cat", "notes"}) {
+		t.Fatalf("runner calls = %+v, want argv [cat notes]", run.calls)
+	}
+}
+
+func TestDispatchShell_ReadOnlyPreflightBuildsTheExecutedHomeState(t *testing.T) {
+	cwd := mustEval(t, t.TempDir())
+	home := mustEval(t, t.TempDir())
+	homeSSH := mkdir(t, filepath.Join(home, ".ssh"))
+	literalSSH := mkdir(t, filepath.Join(cwd, "~", ".ssh"))
+	guardOf := func(blocked string) securitystate.Policy {
+		return securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, []permissions.BlockedEntry{{Path: blocked, Source: "/cfg/settings.yaml"}})}
+	}
+	expanding := homeSubject("cat '~/f'", []int{1}, nil)
+	literal := homeSubject("cat '~/f'", nil, []int{1})
+
+	for _, single := range []bool{false, true} {
+		for _, tc := range []struct {
+			input   string
+			home    string
+			subject string
+			argv    []string
+		}{
+			{"cat ~/f", home, expanding, []string{"cat", home + "/f"}},
+			{"cat ~/f", "", literal, []string{"cat", "~/f"}},
+			{"cat '~/f'", home, literal, []string{"cat", "~/f"}},
+			{"cat notes && cat ~/f", home, expanding, []string{"cat", home + "/f"}},
+			{"cat notes && cat ~/f", "", literal, []string{"cat", "~/f"}},
+			{"cat ~/.ssh/k", "", homeSubject("cat '~/.ssh/k'", nil, []int{1}), []string{"cat", "~/.ssh/k"}},
+		} {
+			t.Run(fmt.Sprintf("%s home=%v single=%v", tc.input, tc.home != "", single), func(t *testing.T) {
+				a := &promptingAuthorizer{root: cwd, cache: permissions.NewTurnCache()}
+				run := &fakeRunner{}
+				if _, err := DispatchShell(context.Background(), tc.input, tc.home, cwd, authorizerVia(a, single), run, guardOf(homeSSH)); err != nil {
+					t.Fatalf("DispatchShell: %v", err)
+				}
+				if a.prompts != 0 {
+					t.Fatalf("prompts = %d, want the read-only command auto-allowed", a.prompts)
+				}
+				if got := a.requests[len(a.requests)-1].Subject; got != tc.subject {
+					t.Fatalf("request subject = %q, want %q", got, tc.subject)
+				}
+				last := run.calls[len(run.calls)-1].Argv
+				if !reflect.DeepEqual(last, tc.argv) {
+					t.Fatalf("runner argv = %v, want %v", last, tc.argv)
+				}
+			})
+		}
+	}
+
+	refused := homeSubject("cat '~/.ssh/k'", nil, []int{1})
+	for _, tc := range []struct {
+		input string
+		home  string
+	}{
+		{"cat ~/.ssh/k", ""},
+		{"cat '~/.ssh/k'", home},
+		{"cat notes && cat ~/.ssh/k", ""},
+	} {
+		t.Run(fmt.Sprintf("refuses %s home=%v", tc.input, tc.home != ""), func(t *testing.T) {
+			a := &promptingAuthorizer{root: cwd, cache: permissions.NewTurnCache()}
+			run := &fakeRunner{}
+			_, err := DispatchShell(context.Background(), tc.input, tc.home, cwd, a, run, guardOf(literalSSH))
+			var got *securitystate.Refusal
+			if !errors.As(err, &got) || got.Entry != literalSSH {
+				t.Fatalf("error = %v, want a refusal for %q", err, literalSSH)
+			}
+			if got.DirectRequestSubject != refused {
+				t.Fatalf("refusal request subject = %q, want the literal identity %q", got.DirectRequestSubject, refused)
+			}
+			if _, _, ok := permissions.DecodeDirectRequestSubject(got.DirectRequestSubject, "cat '~/.ssh/k'"); !ok {
+				t.Fatalf("refusal request subject %q does not decode against its command", got.DirectRequestSubject)
+			}
+			if len(a.requests) != 0 || len(run.calls) != 0 {
+				t.Fatalf("requests = %d, runner calls = %d; want nothing authorized or run", len(a.requests), len(run.calls))
+			}
+		})
+	}
+}
+
+func TestDispatchShell_ContradictoryHomeIdentityCannotReuseAnApproval(t *testing.T) {
+	prependFixturePrograms(t, "mv")
+	cwd := mustEval(t, t.TempDir())
+	home := mustEval(t, t.TempDir())
+	for _, single := range []bool{false, true} {
+		for _, input := range []string{"mv y ~/target", "FOO=1 mv x ~/target"} {
+			t.Run(fmt.Sprintf("%s single=%v", input, single), func(t *testing.T) {
+				a := &promptingAuthorizer{root: cwd, cache: permissions.NewTurnCache(), answers: []permissions.PromptChoice{permissions.PromptAllowOnce}}
+				if _, err := DispatchShell(context.Background(), "mv x ~/target", home, cwd, authorizerVia(a, single), &fakeRunner{}); err != nil {
+					t.Fatalf("approving dispatch: %v", err)
+				}
+				approved := a.requests[0].Subject
+				a.rewrite = func(r *permissions.MatchRequest) { r.Subject = approved }
+				run := &fakeRunner{}
+				_, err := DispatchShell(context.Background(), input, home, cwd, authorizerVia(a, single), run)
+				var denied *DeniedError
+				if err == nil || errors.As(err, &denied) {
+					t.Fatalf("error = %v, want the contradictory identity rejected", err)
+				}
+				if a.prompts != 1 || len(run.calls) != 0 {
+					t.Fatalf("prompts = %d, runner calls = %d; want no prompt and nothing run", a.prompts, len(run.calls))
+				}
+			})
+		}
 	}
 }
 
@@ -2796,7 +3129,7 @@ func TestDispatchShell_ScriptInvocationArgvStaysLiteral(t *testing.T) {
 		},
 		{
 			input:       "bash script.sh ~/data",
-			wantSubject: "bash script.sh '~/data'",
+			wantSubject: homeSubject("bash script.sh '~/data'", []int{2}, nil),
 			wantTokens:  []string{"bash", "script.sh", "~/data"},
 			wantArgv:    []string{"bash", "script.sh", home + "/data"},
 		},
@@ -4652,6 +4985,11 @@ func TestDispatchShell_GuardRefusesReadOnlyBlockedPathsBeforeAuthorization(t *te
 	direct := func(tokens ...string) securitystate.Refusal {
 		return securitystate.Refusal{SubjectKind: "direct", Subject: strings.Join(tokens, " "), DirectRequestSubject: envRequestSubject(t, nil, tokens...)}
 	}
+	directHome := func(pos int, tokens ...string) securitystate.Refusal {
+		r := direct(tokens...)
+		r.DirectRequestSubject = homeSubject(r.DirectRequestSubject, []int{pos}, nil)
+		return r
+	}
 	literal := func(input string) securitystate.Refusal {
 		canonical, err := permissions.CanonicalLiteralForm(input)
 		if err != nil {
@@ -4664,13 +5002,13 @@ func TestDispatchShell_GuardRefusesReadOnlyBlockedPathsBeforeAuthorization(t *te
 		scope string
 		want  securitystate.Refusal
 	}{
-		{"cat ~/.ssh/k", cwd, direct("cat", "~/.ssh/k")},
-		{"cat -- ~/.ssh/k", cwd, direct("cat", "--", "~/.ssh/k")},
-		{"cat ~/tmp/../.ssh/k", cwd, direct("cat", "~/tmp/../.ssh/k")},
-		{"cat notes | cat ~/.ssh/k", cwd, direct("cat", "~/.ssh/k")},
+		{"cat ~/.ssh/k", cwd, directHome(1, "cat", "~/.ssh/k")},
+		{"cat -- ~/.ssh/k", cwd, directHome(2, "cat", "--", "~/.ssh/k")},
+		{"cat ~/tmp/../.ssh/k", cwd, directHome(1, "cat", "~/tmp/../.ssh/k")},
+		{"cat notes | cat ~/.ssh/k", cwd, directHome(1, "cat", "~/.ssh/k")},
 		{"cd " + ssh + " && ls", ssh, direct("ls")},
-		{"ls && cat ~/.ssh/k", cwd, direct("cat", "~/.ssh/k")},
-		{"rm x && cat ~/.ssh/k", cwd, direct("cat", "~/.ssh/k")},
+		{"ls && cat ~/.ssh/k", cwd, directHome(1, "cat", "~/.ssh/k")},
+		{"rm x && cat ~/.ssh/k", cwd, directHome(1, "cat", "~/.ssh/k")},
 		{"cat ~/.ssh/k 2>/dev/null", cwd, literal("cat ~/.ssh/k 2>/dev/null")},
 		{`cat ~/.ssh/k 2> "/dev/null"`, cwd, literal(`cat ~/.ssh/k 2> "/dev/null"`)},
 		{"ls 2>/dev/null; cat $HOME/.ssh/k 2>/dev/null", cwd, literal("ls 2>/dev/null; cat $HOME/.ssh/k 2>/dev/null")},

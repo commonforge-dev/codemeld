@@ -31,7 +31,7 @@ const outcomeSourceGrant = "grant"
 
 // MatchRequest describes one permission check. Subject is the canonical subject
 // string used by literal and tool matching, cache keys, and events; for a direct
-// request it is the boundary-preserving request identity DirectRequestSubject
+// request it is the boundary-preserving request identity DirectStageRequestSubject
 // builds, not the flattened command text. SubjectTokens is the canonical command
 // token sequence and is required only when Kind == subjectKindDirect; literal and
 // tool matching use Subject and ignore SubjectTokens. PathScope is the request's
@@ -119,7 +119,11 @@ func hostGrantMatches(req MatchRequest, grant PermissionEntry) bool {
 func subjectMatches(req MatchRequest, grant PermissionEntry) bool {
 	switch req.Kind {
 	case subjectKindDirect:
-		return MatchesDirectSubject(req.SubjectTokens, req.Assignments, req.ClearEnvironment, grant.Subject)
+		if checkDirectRequestIdentity(req.Subject, req.SubjectTokens, req.Assignments, req.ClearEnvironment) != nil {
+			return false
+		}
+		expands, _ := requestHomeExpansion(req.Subject, req.SubjectTokens, req.Assignments, req.ClearEnvironment)
+		return matchesDirectSubject(req.SubjectTokens, req.Assignments, req.ClearEnvironment, expands, grant.Subject)
 	case subjectKindLiteral:
 		if isCompoundSubject(grant.Subject) {
 			return matchesCompoundSubject(req.Subject, grant.Subject)

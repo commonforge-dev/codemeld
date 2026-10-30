@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,6 +62,7 @@ const (
 	dataCollectionRowLabel = "data collection"
 	sortRowLabel           = "sort"
 	maxPriceRowLabel       = "max price"
+	modelsRowLabel         = "models"
 	retentionRowLabel      = "session retention (days)"
 )
 
@@ -67,7 +70,7 @@ const (
 	settingsRowAttribution = iota
 	settingsRowDataCollection
 	settingsRowSort
-	settingsRowMaxPrice
+	settingsRowModels
 	settingsRowRetention
 )
 
@@ -91,6 +94,7 @@ type settingsPickerSession struct {
 	footer    *tview.TextView
 	deps      SettingsDeps
 	maxPrice  *maxPriceEditor
+	models    *openRouterModelsTable
 	session   SessionSettings
 	retention *tview.InputField
 }
@@ -98,6 +102,13 @@ type settingsPickerSession struct {
 type maxPriceEditor struct {
 	model              string
 	prompt, completion *tview.InputField
+	levels             *tview.InputField
+	mode               *tview.DropDown
+	offeredText        string
+	levelsHelp         *tview.TextView
+	offered            *tview.TextView
+	modeHelp, errView  *tview.TextView
+	form, rows, frame  *tview.Flex
 }
 
 type OpenRouterSettings struct {
@@ -108,9 +119,14 @@ type OpenRouterSettings struct {
 	Sort              func() string
 	SetSort           func(string) error
 	MaxPrice          func(model string) (provider.MaxPrice, bool)
+	MaxPrices         func() map[string]provider.MaxPrice
 	SetMaxPrice       func(model string, p provider.MaxPrice) error
+	Quantizations     func() map[string]provider.Quantization
+	SetQuantization   func(model string, q provider.Quantization) error
+	ClearQuantization func(model string) error
+	Models            func() []string
 	ActiveModel       func() (providerID, modelID string)
-	SortEstimate      func(model, sortMode string, fetched func()) (provider.OpenRouterEstimate, bool)
+	HostQuantizations func(model string, fetched func()) (map[string]int, provider.OpenRouterHostsState)
 }
 
 type SessionSettings struct {
@@ -173,6 +189,7 @@ func (a *App) openSettingsPicker(rows []PermissionRow, deps SettingsDeps, sessio
 	body.SetBorder(true)
 	body.SetTitle(" settings ")
 
+	pp.activeTab = deps.tab
 	a.renderSettingsTab()
 	a.pages.AddPage(settingsPickerPage, wrapOverlayPage(body), true, true)
 	a.app.SetFocus(pp.list)
@@ -228,15 +245,14 @@ func (a *App) routingSort() string {
 	return a.openRouterSettings.Sort()
 }
 
-// Only the requested tab's rows are built: the OpenRouter sort row can start a credentialed fetch.
 func (a *App) settingsTabRows(tab int) []string {
 	switch tab {
 	case permTabIndexOpenRouter:
 		return []string{
 			renderAttributionRow(a.attributionOn()),
 			renderSettingsRow(dataCollectionRowLabel, a.dataCollection()),
-			renderSettingsRow(sortRowLabel, a.sortRowValue()),
-			a.maxPriceRow(),
+			renderSettingsRow(sortRowLabel, renderSortValue(a.routingSort())),
+			a.modelsRow(),
 		}
 	case permTabIndexSettings:
 		return []string{renderSettingsRow(retentionRowLabel, a.retentionRowValue())}
@@ -253,7 +269,7 @@ func settingsRowPlace(id int) (tab, index int) {
 
 func settingsRowID(tab, index int) (int, bool) {
 	switch {
-	case tab == permTabIndexOpenRouter && index >= settingsRowAttribution && index <= settingsRowMaxPrice:
+	case tab == permTabIndexOpenRouter && index >= settingsRowAttribution && index <= settingsRowModels:
 		return index, true
 	case tab == permTabIndexSettings && index == 0:
 		return settingsRowRetention, true
@@ -267,49 +283,6 @@ func (a *App) retentionRowValue() string {
 		return "default"
 	}
 	return strconv.Itoa(pp.session.RetentionDays())
-}
-
-func (a *App) sortRowValue() string {
-	sortMode := a.routingSort()
-	label := renderSortValue(sortMode)
-	model := a.maxPriceModel()
-	if model == "" || a.openRouterSettings.SortEstimate == nil {
-		return label
-	}
-	pp := a.settingsPicker
-	est, ok := a.openRouterSettings.SortEstimate(model, sortMode, func() { a.redrawSortRow(pp, model) })
-	if !ok {
-		return label
-	}
-	return label + " (" + renderSortEstimate(est) + ")"
-}
-
-func (a *App) redrawSortRow(pp *settingsPickerSession, model string) {
-	a.streamUpdate(func() {
-		if pp == nil || a.settingsPicker != pp || pp.activeTab != permTabIndexOpenRouter || a.maxPriceModel() != model {
-			return
-		}
-		_, i := settingsRowPlace(settingsRowSort)
-		pp.list.SetItemText(i, renderSettingsRow(sortRowLabel, a.sortRowValue()), "")
-	})
-}
-
-func renderSortEstimate(est provider.OpenRouterEstimate) string {
-	text := "about $" + estimatePriceText(est.PromptPerM) + " / $" + estimatePriceText(est.CompletionPerM) + " per M"
-	if est.Discount > 0 {
-		text += ", " + strconv.FormatFloat(math.Floor(discountPercent(est.Discount)+0.5), 'f', 0, 64) + "% off"
-	}
-	return text
-}
-
-// Shifting the decimal point in the shortest decimal text avoids the rounding error of multiplying the float by 100.
-func discountPercent(d float64) float64 {
-	v, _ := strconv.ParseFloat(strconv.FormatFloat(d, 'f', -1, 64)+"e2", 64)
-	return v
-}
-
-func estimatePriceText(v float64) string {
-	return strings.TrimSuffix(strings.TrimRight(strconv.FormatFloat(v, 'f', 4, 64), "0"), ".")
 }
 
 func (a *App) maxPriceModel() string {
@@ -328,19 +301,6 @@ func (a *App) maxPrice(model string) (provider.MaxPrice, bool) {
 		return provider.MaxPrice{}, false
 	}
 	return a.openRouterSettings.MaxPrice(model)
-}
-
-func (a *App) maxPriceRow() string {
-	model := a.maxPriceModel()
-	if model == "" {
-		return renderSettingsRow(maxPriceRowLabel, "active model is not an OpenRouter model")
-	}
-	p, ok := a.maxPrice(model)
-	if !ok {
-		return renderSettingsRow(maxPriceRowLabel+" ("+model+")", "none")
-	}
-	return renderSettingsRow(maxPriceRowLabel+" ("+model+")",
-		"input "+renderPrice(p.Prompt, p.HasPrompt)+" / output "+renderPrice(p.Completion, p.HasCompletion)+" per M tokens")
 }
 
 func renderPrice(v float64, set bool) string {
@@ -384,10 +344,8 @@ func (a *App) actOnSettingsRow(row int) {
 			return
 		}
 		label, write = sortRowLabel, func() error { return s.SetSort(nextRoutingSort(a.routingSort())) }
-	case settingsRowMaxPrice:
-		if model := a.maxPriceModel(); s.SetMaxPrice != nil && model != "" {
-			a.showMaxPriceEditor(model)
-		}
+	case settingsRowModels:
+		a.openOpenRouterModels()
 		return
 	case settingsRowRetention:
 		a.showRetentionEditor()
@@ -411,19 +369,50 @@ func (a *App) writeSettingsRow(row int, label string, write func() error) {
 	}
 }
 
+const (
+	quantizationsLabel   = "quantizations"
+	levelsHelpText       = "Quantizations to try, first to last; codemeld moves on when no provider serves one. Blank: any."
+	modeHelpText         = "If no provider serves selected levels: Preferred accepts any quantization, Required stops with an error."
+	openRouterEditFooter = "save enter   next field tab   mode \u2190/\u2192   esc back"
+)
+
+var quantizationModes = []string{"Preferred", "Required"}
+
 func (a *App) showMaxPriceEditor(model string) {
 	pp := a.settingsPicker
 	if pp == nil {
 		return
 	}
 	current, _ := a.maxPrice(model)
+	quant, hasQuant := a.quantization(model)
 	ed := &maxPriceEditor{
 		model:      model,
-		prompt:     newMaxPriceField("input  $ ", priceText(current.Prompt, current.HasPrompt)),
-		completion: newMaxPriceField("output $ ", priceText(current.Completion, current.HasCompletion)),
+		prompt:     newMaxPriceField("Input per million  $ ", priceText(current.Prompt, current.HasPrompt)),
+		completion: newMaxPriceField("Output per million $ ", priceText(current.Completion, current.HasCompletion)),
+		levels:     newMaxPriceField("Quantization levels  ", strings.Join(quant.Levels, " ")),
+		mode:       tview.NewDropDown(),
+		levelsHelp: newEditorHelp(),
+		offered:    newEditorHelp(),
+		modeHelp:   newEditorHelp(),
+		errView:    tview.NewTextView(),
 	}
+	ed.mode.SetLabel("Quantization mode    ")
+	ed.mode.SetLabelStyle(tcell.StyleDefault.Foreground(tcell.ColorDefault).Background(tcell.ColorDefault))
+	ed.mode.SetOptions(quantizationModes, nil)
+	ed.mode.SetCurrentOption(0)
+	if hasQuant && quant.Mode == "required" {
+		ed.mode.SetCurrentOption(1)
+	}
+	ed.errView.SetWordWrap(true)
 	pp.maxPrice = ed
-	for _, field := range []*tview.InputField{ed.prompt, ed.completion} {
+	ed.offeredText = a.offeredLevels(pp, ed)
+
+	order := []tview.Primitive{ed.prompt, ed.completion, ed.levels, ed.mode}
+	move := func(from tview.Primitive, step int) {
+		i := slices.Index(order, from)
+		a.app.SetFocus(order[(i+step+len(order))%len(order)])
+	}
+	for _, field := range []*tview.InputField{ed.prompt, ed.completion, ed.levels} {
 		field.SetDoneFunc(func(key tcell.Key) {
 			if key == tcell.KeyEnter {
 				a.submitMaxPrice(ed)
@@ -431,25 +420,142 @@ func (a *App) showMaxPriceEditor(model string) {
 		})
 		field.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 			switch ev.Key() {
-			case tcell.KeyTab, tcell.KeyUp, tcell.KeyDown:
-				next := ed.prompt
-				if field == ed.prompt {
-					next = ed.completion
-				}
-				a.app.SetFocus(next)
+			case tcell.KeyTab, tcell.KeyDown:
+				move(field, 1)
+				return nil
+			case tcell.KeyUp:
+				move(field, -1)
 				return nil
 			}
 			return ev
 		})
 	}
-	form := tview.NewFlex().
+	ed.mode.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch ev.Key() {
+		case tcell.KeyEnter:
+			a.submitMaxPrice(ed)
+		case tcell.KeyTab, tcell.KeyDown:
+			move(ed.mode, 1)
+		case tcell.KeyUp:
+			move(ed.mode, -1)
+		case tcell.KeyLeft, tcell.KeyRight:
+			i, _ := ed.mode.GetCurrentOption()
+			ed.mode.SetCurrentOption(1 - i)
+		case tcell.KeyRune:
+			if ev.Rune() != ' ' {
+				return ev
+			}
+			i, _ := ed.mode.GetCurrentOption()
+			ed.mode.SetCurrentOption(1 - i)
+		default:
+			return ev
+		}
+		return nil
+	})
+
+	footer := tview.NewTextView().SetText(openRouterEditFooter)
+	ed.form = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(ed.prompt, 1, 0, true).
-		AddItem(ed.completion, 1, 0, false)
-	form.SetBorder(true)
-	form.SetTitle(" " + tview.Escape(openRouterNoticePrefix+maxPriceRowLabel+" per M tokens ("+model+")") + " ")
-	a.pages.AddPage(settingsDeletePage, centeredModal(form), true, true)
+		AddItem(ed.completion, 1, 0, false).
+		AddItem(nil, 1, 0, false).
+		AddItem(ed.levels, 1, 0, false).
+		AddItem(ed.levelsHelp, 1, 0, false).
+		AddItem(ed.offered, 1, 0, false).
+		AddItem(nil, 1, 0, false).
+		AddItem(ed.mode, 1, 0, false).
+		AddItem(ed.modeHelp, 1, 0, false).
+		AddItem(ed.errView, 1, 0, false).
+		AddItem(footer, 1, 0, false)
+	ed.form.SetBorder(true)
+	ed.form.SetTitle(" " + tview.Escape(openRouterNoticePrefix+"model settings ("+model+")") + " ")
+	ed.rows = tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).
+		AddItem(ed.form, 1, 0, true).
+		AddItem(nil, 0, 1, false)
+	ed.frame = tview.NewFlex().
+		AddItem(ed.rows, 0, 1, true)
+	ed.frame.SetDrawFunc(func(_ tcell.Screen, x, y, width, height int) (int, int, int, int) {
+		ed.fit(width, height)
+		return x, y, width, height
+	})
+	a.pages.AddPage(openRouterModelsEditPage, ed.frame, true, true)
 	a.app.SetFocus(ed.prompt)
+}
+
+func (ed *maxPriceEditor) fit(screenWidth, screenHeight int) {
+	inner := max(screenWidth-2, 1)
+	levelsHelp := setEditorHelp(ed.levelsHelp, levelsHelpText, inner)
+	offered := setEditorHelp(ed.offered, ed.offeredText, inner)
+	modeHelp := setEditorHelp(ed.modeHelp, modeHelpText, inner)
+	errLines := 1
+	if text := ed.errView.GetText(false); text != "" {
+		errLines = max(len(tview.WordWrap(text, inner)), 1)
+	}
+	ed.form.ResizeItem(ed.levelsHelp, levelsHelp, 0)
+	ed.form.ResizeItem(ed.offered, offered, 0)
+	ed.form.ResizeItem(ed.modeHelp, modeHelp, 0)
+	ed.form.ResizeItem(ed.errView, errLines, 0)
+	ed.rows.ResizeItem(ed.form, min(2+4+2+levelsHelp+offered+modeHelp+errLines+1, screenHeight), 0)
+}
+
+func newEditorHelp() *tview.TextView {
+	return tview.NewTextView().SetTextStyle(tcell.StyleDefault.Dim(true))
+}
+
+func setEditorHelp(view *tview.TextView, text string, inner int) int {
+	lines := tview.WordWrap(text, max(inner-2, 1))
+	for i := range lines {
+		lines[i] = "  " + lines[i]
+	}
+	view.SetText(strings.Join(lines, "\n"))
+	return len(lines)
+}
+
+func (a *App) offeredLevels(pp *settingsPickerSession, ed *maxPriceEditor) string {
+	if a.openRouterSettings.HostQuantizations == nil {
+		return renderOfferedLevels(nil, provider.OpenRouterHostsFailed)
+	}
+	return renderOfferedLevels(a.openRouterSettings.HostQuantizations(ed.model, func() { a.redrawOfferedLevels(pp, ed) }))
+}
+
+func (a *App) redrawOfferedLevels(pp *settingsPickerSession, ed *maxPriceEditor) {
+	a.streamUpdate(func() {
+		if a.settingsPicker != pp || pp.maxPrice != ed {
+			return
+		}
+		ed.offeredText = a.offeredLevels(pp, ed)
+	})
+}
+
+func renderOfferedLevels(counts map[string]int, state provider.OpenRouterHostsState) string {
+	switch {
+	case state == provider.OpenRouterHostsPending:
+		return "checking providers\u2026"
+	case state == provider.OpenRouterHostsFailed:
+		return "provider list unavailable"
+	case len(counts) == 0:
+		return "providers per level: none"
+	}
+	var parts []string
+	for _, level := range slices.Sorted(maps.Keys(counts)) {
+		if level != "" {
+			parts = append(parts, level+" "+strconv.Itoa(counts[level]))
+		}
+	}
+	if n := counts[""]; n > 0 {
+		parts = append(parts, "unspecified "+strconv.Itoa(n))
+	}
+	return fserrors.CollapseControls("providers per level: " + strings.Join(parts, ", "))
+}
+
+func (a *App) quantization(model string) (provider.Quantization, bool) {
+	if a.openRouterSettings.Quantizations == nil {
+		return provider.Quantization{}, false
+	}
+	q, ok := a.openRouterSettings.Quantizations()[model]
+	return q, ok
 }
 
 func newMaxPriceField(label, text string) *tview.InputField {
@@ -461,19 +567,54 @@ func newMaxPriceField(label, text string) *tview.InputField {
 }
 
 func (a *App) submitMaxPrice(ed *maxPriceEditor) {
-	a.cancelSettingsDelete()
 	var p provider.MaxPrice
 	var err error
 	if p.Prompt, p.HasPrompt, err = parsePriceField("input", ed.prompt.GetText()); err == nil {
 		p.Completion, p.HasCompletion, err = parsePriceField("output", ed.completion.GetText())
 	}
+	_, mode := ed.mode.GetCurrentOption()
+	q := provider.Quantization{Levels: strings.Fields(ed.levels.GetText()), Mode: strings.ToLower(mode)}
+	if err == nil && len(q.Levels) > 0 {
+		if err = provider.ValidateQuantizationLevels(q.Levels); err != nil {
+			err = fmt.Errorf("levels: %w", err)
+		}
+	}
 	if err != nil {
-		a.Notice(renderSettingFailedNotice(openRouterNoticePrefix+maxPriceRowLabel, err))
+		ed.errView.SetText(fserrors.CollapseControls(err.Error()))
 		return
 	}
-	a.writeSettingsRow(settingsRowMaxPrice, openRouterNoticePrefix+maxPriceRowLabel, func() error {
-		return a.openRouterSettings.SetMaxPrice(ed.model, p)
-	})
+
+	s := a.openRouterSettings
+	capsWritten := false
+	if current, _ := a.maxPrice(ed.model); p != current {
+		if err := s.SetMaxPrice(ed.model, p); err != nil {
+			a.Notice(renderSettingFailedNotice(openRouterNoticePrefix+maxPriceRowLabel, err))
+			a.finishOpenRouterModelsChild("")
+			return
+		}
+		capsWritten = true
+	}
+	current, has := a.quantization(ed.model)
+	switch {
+	case len(q.Levels) == 0 && has:
+		err = s.ClearQuantization(ed.model)
+	case len(q.Levels) > 0 && (!has || current.Mode != q.Mode || !slices.Equal(current.Levels, q.Levels)):
+		err = s.SetQuantization(ed.model, q)
+	}
+	if err != nil {
+		a.Notice(quantizationFailedNotice(err, capsWritten, "saved"))
+		a.finishOpenRouterModelsChild("")
+		return
+	}
+	a.finishOpenRouterModelsChild(ed.model)
+}
+
+func quantizationFailedNotice(err error, capsWritten bool, done string) string {
+	notice := renderSettingFailedNotice(openRouterNoticePrefix+quantizationsLabel, err)
+	if capsWritten {
+		notice += "; the price caps were " + done
+	}
+	return notice
 }
 
 func (a *App) showRetentionEditor() {
@@ -585,8 +726,8 @@ func (a *App) settingsRowHelp(id int) string {
 		return "allow: may use providers that store or train on prompts; deny: avoid them"
 	case settingsRowSort:
 		return sortHelp(a.routingSort())
-	case settingsRowMaxPrice:
-		return "Input/output price caps per M tokens for OpenRouter models; empty: no cap"
+	case settingsRowModels:
+		return "Price caps and quantizations, per OpenRouter model; Enter edits them"
 	case settingsRowRetention:
 		return "Idle days before auto-deletion; pruning runs at a fresh launch, not on resume"
 	}
@@ -654,6 +795,9 @@ func (a *App) dismissSettingsPicker() {
 	}
 	a.settingsPickerOpen = false
 	a.pages.RemovePage(settingsDeletePage)
+	for _, page := range openRouterModelsPages {
+		a.pages.RemovePage(page)
+	}
 	a.closeOverlayPage(settingsPickerPage, &a.settingsPickerPrev)
 	a.settingsPicker = nil
 }
@@ -802,16 +946,20 @@ func shareConfirmFact(s string) string {
 }
 
 func (a *App) showSettingsConfirm(text, action string, apply func()) {
+	a.showConfirmPage(settingsDeletePage, text, action, apply, a.refocusSettingsList)
+}
+
+func (a *App) showConfirmPage(page, text, action string, apply, cancel func()) {
 	modal := tview.NewModal().
 		SetText(text).
 		AddButtons([]string{action, "Cancel"}).
 		SetDoneFunc(func(_ int, label string) {
-			a.pages.RemovePage(settingsDeletePage)
+			a.pages.RemovePage(page)
 			if label == action {
 				apply()
 				return
 			}
-			a.refocusSettingsList()
+			cancel()
 		})
 	// The terminal-default theme flattens PrimaryTextColor and ContrastBackgroundColor both to
 	// ColorDefault, which collapses tview.Modal's focused-button background (PrimaryTextColor)
@@ -825,7 +973,7 @@ func (a *App) showSettingsConfirm(text, action string, apply func()) {
 	// otherwise never switch buttons. Route them to the Tab/Backtab the button row understands
 	// so the destructive confirmation is navigable with the arrow keys a user reaches for.
 	modal.SetInputCapture(permissionsDeleteKeys)
-	a.pages.AddPage(settingsDeletePage, modal, true, true)
+	a.pages.AddPage(page, modal, true, true)
 	a.app.SetFocus(modal)
 }
 
@@ -1027,16 +1175,6 @@ func (a *App) SortRowForTest() string {
 	return main
 }
 
-func (a *App) SetMaxPriceForTest(prompt, completion string) string {
-	a.pressEnterOnSettingsRowForTest(settingsRowMaxPrice)
-	if pp := a.settingsPicker; pp != nil && pp.maxPrice != nil && a.pages.HasPage(settingsDeletePage) {
-		pp.maxPrice.prompt.SetText(prompt)
-		pp.maxPrice.completion.SetText(completion)
-		a.submitMaxPrice(pp.maxPrice)
-	}
-	return a.settingsRowTextForTest(settingsRowMaxPrice)
-}
-
 func (a *App) SetRetentionForTest(text string, confirm bool) string {
 	a.pressEnterOnSettingsRowForTest(settingsRowRetention)
 	if pp := a.settingsPicker; pp != nil && pp.retention != nil && a.pages.HasPage(settingsDeletePage) {
@@ -1139,6 +1277,9 @@ func permissionSubjectPhrase(e permissions.PermissionEntry) string {
 			return "allow " + phrase
 		}
 		return "allow the " + e.Subject + " tool"
+	}
+	if readable, ok := permissions.DirectHomeSubjectReadable(e.Subject); ok {
+		return "run " + readable
 	}
 	return "run " + e.Subject
 }

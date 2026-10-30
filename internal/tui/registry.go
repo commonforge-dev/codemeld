@@ -414,6 +414,7 @@ var builtinCommands = []Command{
 	{Name: "mode", Description: "Set the interaction mode (plan/build/auto-edits)", ArgSig: ArgOneOptional, Phase: PhaseOne, Handler: recordHandler},
 	{Name: "resume", Description: "Open the session picker to resume a session", ArgSig: ArgNone, Phase: PhaseOne, Handler: recordHandler},
 	{Name: "settings", Description: "Show and change settings and stored permission grants", ArgSig: ArgNone, Phase: PhaseOne, Handler: recordHandler},
+	{Name: "openrouter", Description: "Open the OpenRouter routing settings", ArgSig: ArgNone, Phase: PhaseOne, Handler: recordHandler},
 	{Name: "blocked", Description: "Show blocked paths and where each comes from; /blocked add <path> blocks another", ArgSig: ArgRestOptional, Phase: PhaseOne, Handler: recordHandler},
 	{Name: "exit", Aliases: []string{"quit"}, Description: "Exit codemeld", ArgSig: ArgNone, Phase: PhaseOne, Handler: recordHandler},
 	{Name: "rename", Description: "Rename the current session", ArgSig: ArgRestRequired, Phase: PhaseTwo, Handler: recordHandler},

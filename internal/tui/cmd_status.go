@@ -13,6 +13,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/agentinstr"
 	"codemeld.dev/codemeld/internal/events"
+	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/trust"
 )
@@ -196,7 +197,7 @@ func statusSectionTitle(title string) string {
 // titles are left as live markup.
 func RenderStatus(snap StatusSnapshot) string {
 	var b strings.Builder
-	esc := tview.Escape
+	esc := func(s string) string { return tview.Escape(permissions.SingleLineControlEscape(s)) }
 
 	// Session: version (1), id (2), started (3).
 	b.WriteString(statusSectionTitle("Session") + "\n")
@@ -325,7 +326,7 @@ func webResearchLine(enabled bool) string {
 // "[tag]"-like sequence renders literally instead of being swallowed as color markup; only
 // the fixed fill tags are live markup.
 func RenderStatusLine(state StatusState) string {
-	esc := tview.Escape
+	esc := func(s string) string { return tview.Escape(permissions.SingleLineControlEscape(s)) }
 	sandbox, _, _ := state.SandboxStatus()
 	tail := statusSegment(statusSegmentCap4, statusSegmentBody4, esc(state.LaunchDir())) +
 		statusSegment(statusSegmentCap5, statusSegmentBody5, "sandbox: "+esc(sandbox))

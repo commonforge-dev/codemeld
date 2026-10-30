@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2083,6 +2084,255 @@ func TestTerminalPrompter_PathScopeWildcardsATailAndNeedsNoConfirmation(t *testi
 	}
 	if !permissions.MatchesDirectSubject([]string{"git", "-C", repo, "rev-parse", "HEAD"}, nil, false, outcome.StoredSubject) {
 		t.Error("the stored grant does not authorize the same command with a different tail")
+	}
+}
+
+func isTerminalControl(r rune) bool { return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) }
+
+func rawControls(s, allowed string) []rune {
+	var found []rune
+	for _, r := range s {
+		if isTerminalControl(r) && !strings.ContainsRune(allowed, r) {
+			found = append(found, r)
+		}
+	}
+	return found
+}
+
+func withoutControls(s string) string {
+	return strings.Map(func(r rune) rune {
+		if isTerminalControl(r) {
+			return 'x'
+		}
+		return r
+	}, s)
+}
+
+func splitDirectRequest(t *testing.T, command, scope string) (permissions.MatchRequest, dispatch.PromptDisplay) {
+	t.Helper()
+	split, err := permissions.SplitCommand(command)
+	if err != nil || split.LiteralRoute || len(split.Stages) != 1 {
+		t.Fatalf("SplitCommand(%q) = %+v, %v; want one direct stage", command, split, err)
+	}
+	stage := split.Stages[0]
+	solo, err := permissions.NormalizeDirectStage(command, permissions.StageSolo)
+	if err != nil || solo.Route != permissions.RouteDirect || !slices.Equal(solo.Tokens, stage.Tokens) {
+		t.Fatalf("NormalizeDirectStage(%q) = %+v, %v; want the split stage's direct tokens", command, solo, err)
+	}
+	subject, err := permissions.DirectRequestSubject(stage.Tokens, stage.Assignments, stage.ClearEnvironment)
+	if err != nil {
+		t.Fatalf("DirectRequestSubject: %v", err)
+	}
+	req := permissions.MatchRequest{Kind: matchKindDirect, Subject: subject, SubjectTokens: stage.Tokens, PathScope: scope}
+	return req, dispatch.PromptDisplay{Action: dispatch.ActionRunCommand, Subject: stage.Source}
+}
+
+type promptSections struct{ preview, chooser, confirm string }
+
+func renderDirectSections(t *testing.T, input, home string, req permissions.MatchRequest, disp dispatch.PromptDisplay, d terminalDisclosure) (promptSections, permissions.PromptOutcome) {
+	t.Helper()
+	var out bytes.Buffer
+	p := newTerminalPrompter(strings.NewReader(input), &out)
+	p.notifyTTY = false
+	p.disclosure = d
+	p.home = home
+	outcome, err := p.build(req, disp)(context.Background(), permissions.ScopeEscalation{})
+	if err != nil {
+		t.Fatalf("direct prompt: %v", err)
+	}
+	got := out.String()
+	chooserAt := strings.Index(got, "\ncodemeld: this grant stores a command subject")
+	if chooserAt < 0 {
+		t.Fatalf("no scope chooser:\n%q", got)
+	}
+	s := promptSections{preview: got[:chooserAt], chooser: got[chooserAt:]}
+	const choosePrompt = "codemeld: choose 1-"
+	promptAt := strings.Index(s.chooser, choosePrompt) + len(choosePrompt)
+	confirmAt := promptAt + strings.Index(s.chooser[promptAt:], ": ") + len(": ")
+	s.chooser, s.confirm = s.chooser[:confirmAt], s.chooser[confirmAt:]
+	return s, outcome
+}
+
+func TestTerminalPrompter_ScopeChooserEscapesHostileCommandText(t *testing.T) {
+	const tail = "TAILMARKER9Q"
+	command := "'gr\x1b[2Jep\u009b' 'a\x1b]0;pwn\x07b\u0080c\u009f' 'one\ntwo\tthree' " + strings.Repeat("long", 35) + " " + tail
+	root := "/proj\x1b[2J\u009bR\nS"
+	scope := root + "/sub"
+	d := terminalDisclosure{
+		projectRoot:        root,
+		launchDir:          root,
+		boundary:           "project-root",
+		folderSettingsPath: root + "/.codemeld/settings.yaml",
+	}
+	benignD := d
+	benignD.projectRoot, benignD.launchDir, benignD.folderSettingsPath = withoutControls(root), withoutControls(root), withoutControls(d.folderSettingsPath)
+
+	req, disp := splitDirectRequest(t, command, scope)
+	benignReq, benignDisp := splitDirectRequest(t, withoutControls(command), withoutControls(scope))
+	model, ok := permissions.NewDirectScopeModel(req.SubjectTokens, "")
+	if !ok || len(model.Choices) != 6 {
+		t.Fatalf("model = %+v, %v; want six choices", model, ok)
+	}
+	program := `'gr\x1B[2Jep\u009B'`
+	hostileArg := `'a\x1B]0;pwn\x07b\u0080c\u009F'`
+	exact := program + " " + hostileArg + ` 'one\x0Atwo\x09three' ` + strings.Repeat("long", 35) + " " + tail
+
+	cases := []struct {
+		name      string
+		input     string
+		row       int
+		persisted bool
+	}{
+		{"exact session", "3\n1\n", 0, false},
+		{"exact project", "4\n1\n", 0, true},
+		{"prefix session", "3\n2\n", 1, false},
+		{"prefix project", "4\n2\n", 1, true},
+		{"program session", "3\n6\n1\n", 5, false},
+		{"program project", "4\n6\n1\n", 5, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, outcome := renderDirectSections(t, tc.input, "", req, disp, d)
+			benign, _ := renderDirectSections(t, tc.input, "", benignReq, benignDisp, benignD)
+
+			if outcome.StoredSubject != model.Choices[tc.row].Subject || !strings.Contains(outcome.StoredSubject, "\x1b") {
+				t.Fatalf("stored subject = %q, want the unescaped model subject %q", outcome.StoredSubject, model.Choices[tc.row].Subject)
+			}
+			if raw := rawControls(s.preview, "\n\t"); len(raw) > 0 {
+				t.Fatalf("preview emitted raw controls %q:\n%q", raw, s.preview)
+			}
+			for name, pair := range map[string][2]string{"chooser": {s.chooser, benign.chooser}, "confirmation": {s.confirm, benign.confirm}} {
+				if raw := rawControls(pair[0], "\n"); len(raw) > 0 {
+					t.Fatalf("%s emitted raw controls %q:\n%q", name, raw, pair[0])
+				}
+				if got, want := strings.Count(pair[0], "\n"), strings.Count(pair[1], "\n"); got != want {
+					t.Fatalf("%s has %d rows, want the benign %d:\n%s", name, got, want, pair[0])
+				}
+			}
+			for _, want := range []string{
+				"  canonical command: " + exact + "\n",
+				"  [1] exact: " + exact + " — only this exact command\n",
+				"  [2] prefix: " + exact + " :* — fixed: " + exact + "; any later arguments may vary",
+				"  [6] program (advanced): " + program + ` :* — ANY invocation of gr\x1B[2Jep\u009B (widest)`,
+				`  run folder: /proj\x1B[2J\u009BR\x0AS/sub` + "\n",
+				`  project root: /proj\x1B[2J\u009BR\x0AS` + "\n",
+			} {
+				if !strings.Contains(s.chooser, want) {
+					t.Fatalf("chooser missing %q:\n%s", want, s.chooser)
+				}
+			}
+			saved := `  saved to: /proj\x1B[2J\u009BR\x0AS/.codemeld/settings.yaml` + "\n"
+			if strings.Contains(s.chooser, saved) != tc.persisted {
+				t.Fatalf("chooser persisted target presence = %v, want %v:\n%s", !tc.persisted, tc.persisted, s.chooser)
+			}
+			if tc.row != 5 {
+				if s.confirm != "" {
+					t.Fatalf("non-Program choice showed a confirmation:\n%s", s.confirm)
+				}
+				return
+			}
+			if !strings.Contains(s.confirm, "  effective grant: "+program+" :* (direct command)\n") {
+				t.Fatalf("confirmation missing the escaped effective grant:\n%s", s.confirm)
+			}
+			if strings.Contains(s.confirm, saved) != tc.persisted {
+				t.Fatalf("confirmation persisted target presence = %v, want %v:\n%s", !tc.persisted, tc.persisted, s.confirm)
+			}
+		})
+	}
+}
+
+func TestTerminalPrompter_PreviewFactsEscapeC1Controls(t *testing.T) {
+	var out bytes.Buffer
+	p := newTerminalPrompter(strings.NewReader("2\n"), &out)
+	p.notifyTTY = false
+	root := "/proj\u009bR\u0080"
+	p.disclosure = terminalDisclosure{
+		projectRoot:             root,
+		launchDir:               root,
+		boundary:                "launch-dir-only",
+		folderSettingsPath:      root + "/.codemeld/settings.yaml",
+		wouldCreateSettingsFile: true,
+	}
+	req := permissions.MatchRequest{Kind: matchKindTool, Subject: "create", PathScope: root + "/sub"}
+	disp := dispatch.PromptDisplay{Action: "Create file", Subject: "a\u009b.md", RequestedTarget: "a\u009b.md", Body: "one\n\ttwo\u009f"}
+	esc := permissions.ScopeEscalation{Note: "note\u009b2J", NarrowerScope: root + "/sub/deeper\u009f"}
+	if _, err := p.build(req, disp)(context.Background(), esc); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	got := out.String()
+
+	if raw := rawControls(got, "\n\t"); len(raw) > 0 {
+		t.Fatalf("preview emitted raw controls %q:\n%q", raw, got)
+	}
+	if !strings.Contains(got, "one\n\ttwo") {
+		t.Fatalf("preview lost its LF/TAB layout:\n%q", got)
+	}
+	for _, want := range []string{
+		`  Create file: a\u009B.md` + "\n",
+		`two\u009F` + "\n",
+		`  path: /proj\u009BR\u0080/sub` + "\n",
+		`  project root: /proj\u009BR\u0080` + "\n",
+		`  note\u009B2J` + "\n",
+		`PARENT of /proj\u009BR\u0080/sub/deeper\u009F` + "\n",
+		`  Requested target: a\u009B.md` + "\n",
+		`permanently in /proj\u009BR\u0080/.codemeld/settings.yaml` + "\n",
+		`applies when run from: /proj\u009BR\u0080/sub and its descendants` + "\n",
+		`created /proj\u009BR\u0080/.codemeld/settings.yaml — this file`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("preview missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestTerminalPrompter_PathBoundaryNoticeEscapesHostileBoundary(t *testing.T) {
+	render := func(t *testing.T, dirName string) (promptSections, permissions.PromptOutcome, string, permissions.MatchRequest) {
+		t.Helper()
+		root, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatalf("resolve temp root: %v", err)
+		}
+		home := filepath.Join(root, "home", "user")
+		widest := filepath.Join(root, dirName)
+		entry := filepath.Join(widest, "run", "id")
+		if err := os.MkdirAll(home, 0o755); err != nil {
+			t.Fatalf("mkdir home: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(entry), 0o755); err != nil {
+			t.Fatalf("mkdir run: %v", err)
+		}
+		if err := os.WriteFile(entry, nil, 0o644); err != nil {
+			t.Fatalf("write entry: %v", err)
+		}
+		req, disp := splitDirectRequest(t, "chmod +x '"+entry+"'", "/proj")
+		s, outcome := renderDirectSections(t, "3\n3\n", home, req, disp, projectDisclosure("/proj"))
+		return s, outcome, root, req
+	}
+
+	s, outcome, root, req := render(t, "t\x1b[2J\u009bX\nY\tZ")
+	benign, _, _, _ := render(t, withoutControls("t\x1b[2J\u009bX\nY\tZ"))
+
+	want, err := permissions.EncodeDirectUnderSubject(req.SubjectTokens, 2, filepath.Join(root, "t\x1b[2J\u009bX\nY\tZ"), false)
+	if err != nil {
+		t.Fatalf("EncodeDirectUnderSubject: %v", err)
+	}
+	if outcome.StoredSubject != want {
+		t.Fatalf("stored subject = %q, want the unescaped widest boundary grant %q", outcome.StoredSubject, want)
+	}
+	if raw := rawControls(s.chooser, "\n"); len(raw) > 0 {
+		t.Fatalf("chooser emitted raw controls %q:\n%q", raw, s.chooser)
+	}
+	if got, want := strings.Count(s.chooser, "\n"), strings.Count(benign.chooser, "\n"); got != want {
+		t.Fatalf("chooser has %d rows, want the benign %d:\n%s", got, want, s.chooser)
+	}
+	boundary := root + `/t\x1B[2J\u009BX\x0AY\x09Z`
+	for _, want := range []string{
+		"  [3] path: chmod +x :under='" + boundary + "' — chmod +x against any path resolving under " + boundary + ", checked when permission is decided [recommended]\n",
+		"  The path choice is fixed at " + boundary + ", the widest boundary below / and your home directory;",
+	} {
+		if !strings.Contains(s.chooser, want) {
+			t.Fatalf("chooser missing %q:\n%s", want, s.chooser)
+		}
 	}
 }
 

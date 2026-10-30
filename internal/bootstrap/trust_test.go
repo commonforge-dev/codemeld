@@ -566,6 +566,77 @@ func writeLocalProjectSettings(t *testing.T, root, content string) {
 	}
 }
 
+const (
+	controlName        = "proj\x1b[2J\nx\ry\u009bz"
+	escapedControlName = `proj\x1B[2J\x0Ax\x0Dy\u009Bz`
+	settingsOnlyBody   = "This folder has its own codemeld settings, which can let commands run and files be changed without asking you.\n" +
+		"If you say no, codemeld still runs but ignores those settings.\n"
+)
+
+func controlProject(t *testing.T) (root, escapedRoot string) {
+	t.Helper()
+	parent := t.TempDir()
+	root = filepath.Join(parent, controlName)
+	writeProjectSettings(t, root, "model: {}\n")
+	return root, parent + "/" + escapedControlName
+}
+
+func TestGateTrust_ControlCharactersInTheFolderNameAreEscapedButRecordedRaw(t *testing.T) {
+	home := t.TempDir()
+	root, escapedRoot := controlProject(t)
+	var stderr strings.Builder
+
+	decision := gateTrust(home, root, root, strings.NewReader("y\n"), &stderr, true)
+
+	want := "Do you trust " + escapedRoot + "?\n" + settingsOnlyBody + "Trust this folder? [y/N] "
+	if stderr.String() != want {
+		t.Fatalf("prompt = %q, want %q", stderr.String(), want)
+	}
+	if !decision.Trusted {
+		t.Fatalf("decision = %#v, want approved", decision)
+	}
+	data, err := os.ReadFile(trust.StorePath(home))
+	if err != nil {
+		t.Fatalf("read trust store: %v", err)
+	}
+	var store trust.Store
+	if err := yaml.Unmarshal(data, &store); err != nil {
+		t.Fatalf("decode trust store %q: %v", data, err)
+	}
+	if !slices.Equal(store.Projects, []string{root}) {
+		t.Fatalf("stored projects = %q, want the raw root %q", store.Projects, root)
+	}
+	if got := trust.Lookup(home, root); !got.Trusted || got.Root != root {
+		t.Fatalf("later lookup = %#v, want trusted %q", got, root)
+	}
+}
+
+func TestGateTrust_RecordFailureAndNoticeEscapeControlCharacters(t *testing.T) {
+	home := filepath.Join(t.TempDir(), controlName)
+	escapedHome := filepath.Dir(home) + "/" + escapedControlName
+	if err := os.MkdirAll(filepath.Join(home, ".codemeld"), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codemeld", "global"), nil, 0o600); err != nil {
+		t.Fatalf("write file over store dir: %v", err)
+	}
+	root, escapedRoot := controlProject(t)
+	var stderr strings.Builder
+
+	decision := gateTrust(home, root, root, strings.NewReader("y\n"), &stderr, true)
+
+	want := "Do you trust " + escapedRoot + "?\n" + settingsOnlyBody + "Trust this folder? [y/N] " +
+		"codemeld: could not record approval of " + escapedRoot + ", project stays unapproved: trust: ensure store directory: mkdir " +
+		escapedHome + "/.codemeld/global: not a directory\n" +
+		"codemeld: unapproved project " + escapedRoot + ": ignoring project settings " + escapedRoot + "/.codemeld/settings.yaml\n"
+	if stderr.String() != want {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+	}
+	if decision.Trusted {
+		t.Fatalf("decision = %#v, want unapproved", decision)
+	}
+}
+
 func TestAskTrust_PromptMatchesThePresentGatedInputs(t *testing.T) {
 	settingsOnly := "This folder has its own codemeld settings, which can let commands run and files be changed without asking you.\n" +
 		"If you say no, codemeld still runs but ignores those settings.\n"

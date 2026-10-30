@@ -1,26 +1,35 @@
 # codemeld
 
-> An agentic code editor for the terminal — without vendor lock-in, permission re-prompt fatigue, or telemetry.
+> An agentic code editor for the terminal — without vendor lock-in or telemetry, and with you in control of what it may do.
 
-**codemeld** is a coding assistant you run in your own projects, from your own terminal. You choose the model provider and the version-control system, you decide what leaves your machine, and you approve a command once instead of every time it's written slightly differently.
+**codemeld** is a coding assistant you run in your own projects, from your own terminal. You choose the model provider and the version-control system, you decide what leaves your machine, and you set how much the agent may do before it asks, from read-only to auto-approved edits inside your project.
 
-> **Status:** v0.4.7 is the latest release. See [the roadmap](ROADMAP.md) for what's planned.
+> **Status:** v0.4.8 is the latest release. See [the roadmap](ROADMAP.md) for what's planned.
 
 ---
-
-## Before you try it
-
-- It is alpha software and under heavy development.
-- AI was used in its development.
 
 ## Why try it
 
 - **Your choice of provider:** ChatGPT subscription, OpenRouter, or Venice.
-- **Tuned OpenRouter routing:** pick providers by speed or best value, and cap the price per model so you get speed without the most expensive providers.
 - **Your choice of version control:** Git, Jujutsu, and Mercurial work out of the box. Other systems are added with YAML templates.
 - **Permission modes** from read-only to auto-approved edits inside your project. See below.
 - **No phone-home:** no telemetry, analytics, crash reporter, or auto-updater.
 - **Open formats:** config and permissions are YAML, and each session is a JSON-lines log you can query with `jq`.
+
+### OpenRouter features
+
+Get the most out of OpenRouter:
+
+- **Speed or value:** route each request to the fastest provider, or to the fastest of those at least as fast as the median and priced within 20% of the cheapest of them. When codemeld cannot pick one that way, because none qualifies or the provider list cannot be read, it asks OpenRouter to sort by price.
+- **Price caps per model:** get speed without landing on the most expensive providers.
+- **Quantization control:** let a model prefer or require the quantization levels you list, tried in your order.
+- **One place for it all:** `/openrouter` opens these settings, with a models table holding each model's price caps and quantization levels.
+
+## Before you try it
+
+- **Beta.** Stable enough for everyday work, and still changing quickly, so expect changes between releases. See the [roadmap](ROADMAP.md).
+- **Linux first.** Release binaries and the sandbox are Linux-only; see [Runs where developers work](#runs-where-developers-work).
+- **Built with AI assistance.**
 
 ---
 
@@ -45,14 +54,13 @@ What codemeld asks and when: [docs/approvals.md](docs/approvals.md).
 
 ### Confined shell commands (Linux)
 
-On Linux amd64 and arm64 hosts with Landlock ABI 3 or newer (kernel 6.2+) that pass codemeld's startup self-test, Plan and Auto edits shell commands run inside a fixed boundary built from Landlock, seccomp, and resource limits. No setting turns it off.
+On Linux amd64 and arm64 hosts with Landlock ABI 3 or newer (kernel 6.2+) that pass codemeld's startup self-test, Plan and Auto edits shell commands run inside a fixed boundary. No setting turns it off.
 
-- **Plan:** no filesystem writes (except `/dev/null`) and no network. A blocked write or network call simply fails.
-- **Auto edits:** writes are limited to the project's top-level files and folders (not `.codemeld`, and not symlinks that leave the project), plus a private temp folder for the session and each folder declared in `writable_folders`. Commands get that private folder as `TMPDIR`; codemeld adds no other temp grant, so `/tmp` and the launch `$TMPDIR` are writable only when an effective declared `writable_folders` entry covers where they resolve, or when they resolve inside a granted project top-level entry (never the project root itself, `.codemeld`, or an entry resolving outside the project), and blocked and protected paths stay carved out. Approving network access for one command opens sockets for that command only.
-- **Every confined command** can read the filesystem except `~/.codemeld` and your blocked paths, and cannot write `~/.codemeld` or `<project>/.codemeld`. The one exception: it may read and run files in `~/.codemeld/skills`, under conditions listed in [docs/skills.md](docs/skills.md#global-skills-and-the-sandbox). Those files stay unwritable, and codemeld's file tools still refuse them.
-- **Build** shell commands always run outside the boundary, with ordinary prompts.
+- **Plan:** no file writes (except `/dev/null`) and no network.
+- **Auto edits:** writes only to the project's top-level files and folders (not `.codemeld`), a private temp folder for the session, and folders declared in `writable_folders`; a command recognized as network access or a history rewrite asks.
+- **Build:** always outside the boundary, with ordinary prompts.
 
-The status bar shows `sandbox: on`, `sandbox: off`, or `sandbox: unavailable`. `unavailable` has two meanings. If the self-test failed or the host is unsupported, the boundary is off, so Plan and Auto edits use ordinary permission behavior: prompts, and Plan's usual refusals. If the self-test passed but a settings file's blocked-path list is broken, commands stay confined, and every shell command asks until the file is fixed, except one you already denied this turn (see [the broken-settings case](SECURITY.md#broken-settings) for version-control tool calls). `/status` shows the reason. What the boundary does not cover is in [SECURITY.md](SECURITY.md); fallback cases are in [docs/architecture.md](docs/architecture.md#what-the-capability-authorizes).
+The status bar shows `sandbox: on` (Plan or Auto edits inside the boundary), `sandbox: off` (Build on a host where the self-test passed), or `sandbox: unavailable`. `unavailable` means either the self-test failed or the host is unsupported, so commands run outside the boundary with ordinary prompts and Plan's usual refusals, or a settings file is broken, so commands stay confined but every shell command asks ([the broken-settings case](SECURITY.md#broken-settings)). `/status` shows the reason. The security model and what the boundary does not cover: [SECURITY.md](SECURITY.md). How the boundary works: [docs/architecture.md](docs/architecture.md#execution-capability).
 
 ---
 
@@ -107,9 +115,9 @@ Then follow the steps below, using `./codemeld` in place of `codemeld`.
 
    A ChatGPT subscription and the OpenAI Platform are separate, separately billed options.
 
-   Without the app (for CI or servers): set `OPENAI_API_KEY`, which takes precedence over a saved key, or add `api_key` under `provider.openai`, `provider.openrouter`, or `provider.venice` in the settings file.
+   For CI or servers with an API key (`codemeld run`): a headless run never loads a provider's model list, so its model must already be in `~/.codemeld/global/models.yaml`. Load the list once in the app, through `/connect` or the model picker, or copy to the host a `models.yaml` the app wrote that lists the provider and model. The host's settings file also needs the provider's entry under `provider:`, with `base_url` and `api_key`. Then pick the model with `codemeld run --model <provider>/<id>`; a model missing from `models.yaml` is rejected. For `openai` only, a set `OPENAI_API_KEY` takes precedence over the entry's `api_key` (which may then be empty) when the run sends requests. The variable does not create the entry, and the app loads the model list with the saved or pasted key, not `OPENAI_API_KEY`.
 
-   Check your setup with `codemeld auth status`. It prints no secrets; add `--json` for machine-readable output.
+   Check your OpenAI setup with `codemeld auth status`. It reports only the OpenAI Platform key and the ChatGPT login, reads only local files, and prints no secrets; add `--json` for machine-readable output.
 4. **Resume a session in the same folder:** `codemeld --resume` lists resumable sessions, and `codemeld --resume <id>` opens one.
 
 > **Keep the global settings file private.** It is written with mode `0600`, but it holds plaintext provider API keys and your ChatGPT session token (there is no OS keychain support). Don't commit it, paste it into bug reports, or sync it to untrusted places.

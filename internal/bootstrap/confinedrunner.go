@@ -163,6 +163,10 @@ func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string) (runn
 	if err != nil {
 		return runner.RunSpec{}, err
 	}
+	// The helper is this binary, whose package init resolves TERM through infocmp on the unconfined launch PATH; RunHelper restores TERM=dumb.
+	if i := slices.Index(prepared.Env, "TERM=dumb"); i >= 0 {
+		prepared.Env[i] = "TERM="
+	}
 	policy, err := c.policy(current, tmpDir, spec.ExceptionalAuthority, blocked)
 	if err != nil {
 		return runner.RunSpec{}, err
@@ -197,7 +201,16 @@ func (c *confinement) policy(current, tmpDir, authority string, blocked *permiss
 	if err != nil {
 		return enforce.Policy{}, err
 	}
-	p.NoWritePaths = append([]string{filepath.Join(root, ".codemeld")}, skills...)
+	p.NoWritePaths = []string{filepath.Join(root, ".codemeld")}
+	if candidate, ok := c.skillsCandidate(blocked); ok {
+		resolved, ok, err := resolvedDir(candidate)
+		if err != nil {
+			return enforce.Policy{}, err
+		}
+		if ok {
+			p.NoWritePaths = append(p.NoWritePaths, resolved)
+		}
+	}
 	for _, e := range entries {
 		if e.Name() == ".codemeld" {
 			continue
@@ -231,14 +244,10 @@ func (c *confinement) skillsReadRoots(blocked *permissions.BlockedPaths) ([]stri
 	if blocked.Degraded() {
 		return nil, nil
 	}
-	home := c.home
-	if home == "" {
-		home = blocked.Home()
-	}
-	if !filepath.IsAbs(home) {
+	candidate, ok := c.skillsCandidate(blocked)
+	if !ok {
 		return nil, nil
 	}
-	candidate := filepath.Join(home, ".codemeld", "skills")
 	fold := blocked.FoldCase()
 	var floor string
 	for _, entry := range blocked.Entries() {
@@ -265,6 +274,17 @@ func (c *confinement) skillsReadRoots(blocked *permissions.BlockedPaths) ([]stri
 		return nil, nil
 	}
 	return []string{resolved}, nil
+}
+
+func (c *confinement) skillsCandidate(blocked *permissions.BlockedPaths) (string, bool) {
+	home := c.home
+	if home == "" {
+		home = blocked.Home()
+	}
+	if !filepath.IsAbs(home) {
+		return "", false
+	}
+	return filepath.Join(home, ".codemeld", "skills"), true
 }
 
 func resolvedWithin(path, base string) bool {

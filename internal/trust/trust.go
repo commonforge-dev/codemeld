@@ -3,6 +3,7 @@
 package trust
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/goccy/go-yaml"
 
@@ -147,6 +151,10 @@ func loadStore(path string) (Store, bool) {
 	if err != nil {
 		return Store{}, false
 	}
+	return decodeStore(data)
+}
+
+func decodeStore(data []byte) (Store, bool) {
 	var store Store
 	if err := yaml.Unmarshal(data, &store); err != nil || !store.valid() {
 		return Store{}, false
@@ -162,11 +170,36 @@ var openStore = func(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// binaryRoot is written as a !!binary scalar because goccy/go-yaml reads a quoted \xHH escape
+// back as the rune U+00HH, which would turn an invalid byte into a different, valid root.
+type binaryRoot string
+
+func (r binaryRoot) MarshalYAML() ([]byte, error) {
+	return []byte("!!binary " + base64.StdEncoding.EncodeToString([]byte(r))), nil
+}
+
+var encodeStore = func(store Store) ([]byte, error) {
+	projects := make([]any, len(store.Projects))
+	for i, root := range store.Projects {
+		projects[i] = root
+		if !utf8.ValidString(root) || strings.ContainsFunc(root, func(r rune) bool { return !unicode.IsGraphic(r) }) {
+			projects[i] = binaryRoot(root)
+		}
+	}
+	return yaml.Marshal(struct {
+		Version  int   `yaml:"version"`
+		Projects []any `yaml:"projects"`
+	}{store.Version, projects})
+}
+
 func writeStore(path string, store Store) (fsutil.AtomicWriteStep, error) {
 	store.Version = Version
-	data, err := yaml.Marshal(store)
+	data, err := encodeStore(store)
 	if err != nil {
 		return fsutil.LoadStep, err
+	}
+	if got, ok := decodeStore(data); !ok || got.Version != store.Version || !slices.Equal(got.Projects, store.Projects) {
+		return fsutil.LoadStep, errors.New("encoded store does not read back as the store to write")
 	}
 	step, _, werr := fsutil.WriteAtomic(path, data, storePerm)
 	return step, werr

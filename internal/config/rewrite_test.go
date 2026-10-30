@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -3255,6 +3256,287 @@ func TestRewriteKey_OpenRouterMaxPrice_RefusesAndLeavesFileUntouched(t *testing.
 			}
 			if got := readAt(t, path); got != tc.seed {
 				t.Fatalf("refused write changed the file:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_OpenRouterQuantizations(t *testing.T) {
+	const id = "meta-llama/llama-3.3-70b:free"
+	const q = `"` + id + `"`
+	const head = "# top\nprovider:\n  openrouter:\n    base_url: https://openrouter.ai/api/v1\n    api_key: sk-x # key\n"
+	const venice = "  venice:\n    base_url: https://api.venice.ai/api/v1\n    api_key: sk-v\n"
+	const caps = "    # routing prefs\n    routing:\n      sort: latency # fast\n      max_price:\n        " + q + ": {prompt: 1} # cap\n"
+	required := OpenRouterQuantization{Model: id, Quantization: provider.Quantization{Levels: []string{"fp8", "fp4"}, Mode: "required"}}
+	clear := OpenRouterQuantization{Model: id, Delete: true}
+	for _, rc := range []rewriteCase{
+		{
+			name:  "block: insert creates routing and quantizations",
+			input: head + venice,
+			value: required,
+			want:  head + "    routing:\n      quantizations:\n        " + q + ": {levels: [fp8, fp4], mode: required}\n" + venice,
+		},
+		{
+			name:  "block: insert beside caps keeps them and their comments",
+			input: head + caps + venice,
+			value: required,
+			want:  head + caps + "      quantizations:\n        " + q + ": {levels: [fp8, fp4], mode: required}\n" + venice,
+		},
+		{
+			name:  "block: new model joins another model's entry",
+			input: head + caps + "      quantizations:\n        other/m: {levels: [int8], mode: preferred} # theirs\n" + venice,
+			value: required,
+			want:  head + caps + "      quantizations:\n        other/m: {levels: [int8], mode: preferred} # theirs\n        " + q + ": {levels: [fp8, fp4], mode: required}\n" + venice,
+		},
+		{
+			name:  "block: replace a block entry with a block sequence keeps its comments",
+			input: head + caps + "      quantizations:\n        " + id + ": # mine\n          mode: preferred # m\n          levels:\n            - bf16\n        other/m: {levels: [int8], mode: preferred}\n" + venice,
+			value: required,
+			want:  head + caps + "      quantizations:\n        " + id + ": # mine\n          mode: required # m\n          levels:\n            - fp8\n            - fp4\n        other/m: {levels: [int8], mode: preferred}\n" + venice,
+		},
+		{
+			name:  "block: replace a compact block sequence at the end of the file",
+			input: head + caps + "      quantizations:\n        " + id + ":\n          levels: # order\n          - bf16\n          mode: preferred",
+			value: required,
+			want:  head + caps + "      quantizations:\n        " + id + ":\n          levels: # order\n          - fp8\n          - fp4\n          mode: required",
+		},
+		{
+			name:  "block: replace a flow entry",
+			input: head + caps + "      quantizations:\n        " + q + ": {levels: [bf16, fp16], mode: preferred} # q\n" + venice,
+			value: required,
+			want:  head + caps + "      quantizations:\n        " + q + ": {levels: [fp8, fp4], mode: required} # q\n" + venice,
+		},
+		{
+			name:  "block: clear one model while another stays",
+			input: head + caps + "      quantizations:\n        " + q + ": {levels: [fp8], mode: preferred}\n        other/m: {levels: [int8], mode: preferred} # theirs\n" + venice,
+			value: clear,
+			want:  head + caps + "      quantizations:\n        other/m: {levels: [int8], mode: preferred} # theirs\n" + venice,
+		},
+		{
+			name:  "block: clear the last model keeps caps",
+			input: head + caps + "      quantizations:\n        " + q + ": {levels: [fp8], mode: preferred}\n" + venice,
+			value: clear,
+			want:  head + caps + venice,
+		},
+		{
+			name:  "block: clear the last model without siblings removes routing",
+			input: head + "    routing:\n      quantizations:\n        " + q + ": {levels: [fp8], mode: preferred}\n" + venice,
+			value: clear,
+			want:  head + venice,
+		},
+		{
+			name:  "clear an absent model is a no-op",
+			input: head + caps + "      quantizations:\n        other/m: {levels: [int8], mode: preferred}\n" + venice,
+			value: clear,
+			want:  head + caps + "      quantizations:\n        other/m: {levels: [int8], mode: preferred}\n" + venice,
+		},
+		{
+			name:  "clear without a routing block is a no-op",
+			input: head + venice,
+			value: clear,
+			want:  head + venice,
+		},
+		{
+			name:  "flow: insert into routing without quantizations",
+			input: head + "    routing: {sort: latency} # r\n" + venice,
+			value: required,
+			want:  head + "    routing: {sort: latency, quantizations: {" + q + ": {levels: [fp8, fp4], mode: required}}} # r\n" + venice,
+		},
+		{
+			name:  "flow: replace keeps caps",
+			input: head + "    routing: {max_price: {" + q + ": {prompt: 1}}, quantizations: {" + q + ": {levels: [unknown], mode: preferred}}}\n" + venice,
+			value: required,
+			want:  head + "    routing: {max_price: {" + q + ": {prompt: 1}}, quantizations: {" + q + ": {levels: [fp8, fp4], mode: required}}}\n" + venice,
+		},
+		{
+			name:  "flow: clear the last model keeps caps",
+			input: head + "    routing: {max_price: {" + q + ": {prompt: 1}}, quantizations: {" + q + ": {levels: [fp8], mode: preferred}}}\n" + venice,
+			value: clear,
+			want:  head + "    routing: {max_price: {" + q + ": {prompt: 1}}}\n" + venice,
+		},
+		{
+			name:  "flow: clear the last model without siblings removes routing",
+			input: head + "    routing: {quantizations: {" + q + ": {levels: [fp8], mode: preferred}}}\n" + venice,
+			value: clear,
+			want:  head + venice,
+		},
+		{
+			name:  "flow openrouter: set creates routing",
+			input: "provider: {openrouter: {base_url: u, api_key: k}}\n",
+			value: required,
+			want:  "provider: {openrouter: {base_url: u, api_key: k, routing: {quantizations: {" + q + ": {levels: [fp8, fp4], mode: required}}}}}\n",
+		},
+	} {
+		rc.key = KeyOpenRouterRoutingQuantizations
+		t.Run(rc.name, func(t *testing.T) {
+			if _, cat, err := ValidateGlobalSettingsBytes([]byte(rc.input), "settings.yaml"); cat != LoadOK || err != nil {
+				t.Fatalf("source failed validation: %v %v", cat, err)
+			}
+			rc.run(t)
+			if _, cat, err := ValidateGlobalSettingsBytes([]byte(rc.want), "settings.yaml"); cat != LoadOK || err != nil {
+				t.Fatalf("result failed validation: %v %v", cat, err)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_OpenRouterQuantizations_BlockScalarModeAndLevelComments(t *testing.T) {
+	const head = "provider:\n  openrouter:\n    base_url: u\n    api_key: k # key\n    routing:\n      sort: latency # fast\n      quantizations:\n        a/m: # mine\n"
+	const venice = "  venice:\n    base_url: v\n    api_key: k\n"
+	set := func(mode string, levels ...string) OpenRouterQuantization {
+		return OpenRouterQuantization{Model: "a/m", Quantization: provider.Quantization{Levels: levels, Mode: mode}}
+	}
+	for _, rc := range []rewriteCase{
+		{
+			name:  "literal strip mode",
+			input: head + "          mode: |- # m\n            preferred\n          levels: [bf16] # l\n" + venice,
+			value: set("required", "fp8", "fp4"),
+			want:  head + "          mode: required # m\n          levels: [fp8, fp4] # l\n" + venice,
+		},
+		{
+			name:  "folded strip mode with a levels-only edit",
+			input: head + "          mode: >-\n            required\n          levels:\n            - bf16\n" + venice,
+			value: set("required", "fp8"),
+			want:  head + "          mode: required\n          levels:\n            - fp8\n" + venice,
+		},
+		{
+			name:  "block levels keep inline and standalone comments through reorder and removal",
+			input: head + "          mode: preferred\n          levels:\n            # best first\n            - fp8 # preferred host precision\n            # fallback\n            - bf16\n            - fp16 # legacy\n" + venice,
+			value: set("preferred", "bf16", "fp8", "int8"),
+			want:  head + "          mode: preferred\n          levels:\n            # legacy\n            # fallback\n            - bf16\n            # best first\n            - fp8 # preferred host precision\n            - int8\n" + venice,
+		},
+		{
+			name:  "multiline flow levels keep inline comments through reorder",
+			input: head + "          mode: preferred\n          levels: [fp8, # preferred host precision\n            bf16, # fallback\n            fp16]\n" + venice,
+			value: set("preferred", "bf16", "fp8"),
+			want:  head + "          mode: preferred\n          levels: [bf16, # fallback\n            fp8 # preferred host precision\n            ]\n" + venice,
+		},
+		{
+			name:  "multiline flow levels keep standalone and removed comments",
+			input: head + "          mode: preferred\n          levels: [\n            # best first\n            fp8, # preferred\n            fp16 # legacy\n          ]\n" + venice,
+			value: set("preferred", "int8", "fp8"),
+			want:  head + "          mode: preferred\n          levels: [ # best first\n            # legacy\n            int8, fp8 # preferred\n            ]\n" + venice,
+		},
+		{
+			name:  "final literal strip level replaced",
+			input: head + "          mode: preferred\n          levels:\n            - bf16 # keep\n            - |-\n              fp8\n" + venice,
+			value: set("preferred", "bf16", "fp4"),
+			want:  head + "          mode: preferred\n          levels:\n            - bf16 # keep\n            - fp4\n" + venice,
+		},
+		{
+			name:  "final folded strip level replaced",
+			input: head + "          mode: preferred\n          levels:\n            - >-\n              fp8\n" + venice,
+			value: set("preferred", "fp4"),
+			want:  head + "          mode: preferred\n          levels:\n            - fp4\n" + venice,
+		},
+		{
+			name:  "final folded strip level retained through reorder",
+			input: head + "          mode: preferred\n          levels:\n            - bf16\n            - >- # folded\n              fp8\n" + venice,
+			value: set("preferred", "fp8", "bf16"),
+			want:  head + "          mode: preferred\n          levels:\n            - >- # folded\n              fp8\n            - bf16\n" + venice,
+		},
+		{
+			name:  "literal strip level retained and moved last",
+			input: head + "          mode: preferred\n          levels:\n            - |-\n              fp8\n            - bf16 # keep\n" + venice,
+			value: set("preferred", "bf16", "fp8"),
+			want:  head + "          mode: preferred\n          levels:\n            - bf16 # keep\n            - |-\n              fp8\n" + venice,
+		},
+	} {
+		rc.key = KeyOpenRouterRoutingQuantizations
+		t.Run(rc.name, func(t *testing.T) {
+			if _, cat, err := ValidateGlobalSettingsBytes([]byte(rc.input), "settings.yaml"); cat != LoadOK || err != nil {
+				t.Fatalf("source failed validation: %v %v", cat, err)
+			}
+			rc.run(t)
+			c, _ := openRouterSettingsCache(t, rc.want)
+			entry, _ := c.Provider("openrouter")
+			if want := rc.value.(OpenRouterQuantization).Quantization; !reflect.DeepEqual(entry.Routing.Quantizations["a/m"], want) {
+				t.Fatalf("quantization read back = %+v, want %+v", entry.Routing.Quantizations["a/m"], want)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_OpenRouterQuantizations_RefusesAndLeavesFileUntouched(t *testing.T) {
+	const seed = "provider:\n  openrouter:\n    base_url: u\n    api_key: k\n"
+	q := provider.Quantization{Levels: []string{"fp8"}, Mode: "preferred"}
+	for _, tc := range []struct {
+		name  string
+		seed  string
+		value any
+	}{
+		{"no openrouter entry", "provider:\n  venice:\n    base_url: v\n    api_key: k\n", OpenRouterQuantization{Model: "a/m", Quantization: q}},
+		{"empty model id", seed, OpenRouterQuantization{Quantization: q}},
+		{"empty model id delete", seed, OpenRouterQuantization{Delete: true}},
+		{"wrong payload type", seed, q},
+		{"unknown level", seed, OpenRouterQuantization{Model: "a/m", Quantization: provider.Quantization{Levels: []string{"fp9"}, Mode: "preferred"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, path, tc.seed)
+			step, _, err := RewriteKey(path, KeyOpenRouterRoutingQuantizations, tc.value)
+			if err == nil || step != fsutil.LoadStep {
+				t.Fatalf("RewriteKey = (%q, %v), want a LoadStep refusal", step, err)
+			}
+			if got := readAt(t, path); got != tc.seed {
+				t.Fatalf("refused write changed the file:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestPersist_ConcurrentOpenRouterRoutingWriters(t *testing.T) {
+	const seed = "provider:\n  openrouter:\n    base_url: u\n    api_key: k # key\n    routing:\n      sort: latency\n      max_price: {keep/m: {prompt: 9}}\n      quantizations: {keep/m: {levels: [bf16], mode: preferred}}\n"
+	fp8 := provider.Quantization{Levels: []string{"fp8"}, Mode: "required"}
+	for _, tc := range []struct {
+		name    string
+		writers [2]any
+		keys    [2]string
+		want    provider.Routing
+	}{
+		{
+			name:    "distinct quantizations models",
+			writers: [2]any{OpenRouterQuantization{Model: "a/m", Quantization: fp8}, OpenRouterQuantization{Model: "b/m", Quantization: provider.Quantization{Levels: []string{"int4", "unknown"}, Mode: "preferred"}}},
+			keys:    [2]string{KeyOpenRouterRoutingQuantizations, KeyOpenRouterRoutingQuantizations},
+			want: provider.Routing{Sort: "latency", MaxPrice: map[string]provider.MaxPrice{"keep/m": {Prompt: 9, HasPrompt: true}}, Quantizations: map[string]provider.Quantization{
+				"keep/m": {Levels: []string{"bf16"}, Mode: "preferred"}, "a/m": fp8, "b/m": {Levels: []string{"int4", "unknown"}, Mode: "preferred"},
+			}},
+		},
+		{
+			name:    "caps and quantizations for one model",
+			writers: [2]any{OpenRouterMaxPrice{Model: "a/m", Price: provider.MaxPrice{Completion: 2, HasCompletion: true}}, OpenRouterQuantization{Model: "a/m", Quantization: fp8}},
+			keys:    [2]string{KeyOpenRouterRoutingMaxPrice, KeyOpenRouterRoutingQuantizations},
+			want: provider.Routing{Sort: "latency", MaxPrice: map[string]provider.MaxPrice{"keep/m": {Prompt: 9, HasPrompt: true}, "a/m": {Completion: 2, HasCompletion: true}}, Quantizations: map[string]provider.Quantization{
+				"keep/m": {Levels: []string{"bf16"}, Mode: "preferred"}, "a/m": fp8,
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, path, seed)
+			var wg sync.WaitGroup
+			errs := make([]error, 2)
+			reasons := make([]PersistReason, 2)
+			for i := range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					reasons[i], _, errs[i] = Persist(path, tc.keys[i], tc.writers[i])
+				}()
+			}
+			wg.Wait()
+			for i := range 2 {
+				if reasons[i] != ReasonNone || errs[i] != nil {
+					t.Fatalf("writer %d = (%q, %v), want success", i, reasons[i], errs[i])
+				}
+			}
+			got := readAt(t, path)
+			if !strings.Contains(got, "api_key: k # key\n") {
+				t.Fatalf("concurrent writes lost a sibling comment:\n%s", got)
+			}
+			c, _ := openRouterSettingsCache(t, got)
+			if entry, _ := c.Provider("openrouter"); !reflect.DeepEqual(entry.Routing, tc.want) {
+				t.Fatalf("routing after concurrent writes = %+v, want %+v\n%s", entry.Routing, tc.want, got)
 			}
 		})
 	}
