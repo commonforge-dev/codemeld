@@ -117,13 +117,13 @@ vcs:
   # tie-breaker order when a folder contains markers for more than one VCS.
   # Reorder this list to prefer one when both are present (e.g. [hg, git, jj]
   # to prefer Mercurial). It does not force a VCS that is not detected; for
-  # that, set 'preferred' below.
+  # that, set 'force' below.
   priority: [git, hg, jj]
-  # preferred (optional): a VCS template name used unconditionally, bypassing
+  # force (optional): a VCS template name used unconditionally, bypassing
   # detection. Allowed values are any built-in name (git, hg, jj) or a
   # user-defined template name under ~/.codemeld/global/vcs/ or
   # <project_root>/.codemeld/vcs/. Empty string means auto-detect (default).
-  preferred: ""
+  force: ""
 
 sessions:
   # number of days session JSON files in ~/.codemeld/sessions/ are kept before

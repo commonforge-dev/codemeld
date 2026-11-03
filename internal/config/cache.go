@@ -88,7 +88,7 @@ type Cache struct {
 	retentionDays          int
 	maxToolOutputBytes     int
 	vcsPriority            []string
-	vcsPreferred           string
+	vcsForce               string
 	modeDefault            string
 	modeConfigured         bool
 	attribution            bool
@@ -164,7 +164,7 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		retentionDays:          retentionDays,
 		maxToolOutputBytes:     maxToolOutputBytes,
 		vcsPriority:            vcsPriorityOr(composed),
-		vcsPreferred:           nestedStringOr(composed, "vcs", "preferred", ""),
+		vcsForce:               nestedStringOr(composed, "vcs", "force", ""),
 		providers:              providers,
 		permissions:            perms,
 		favorites:              favorites,
@@ -317,8 +317,8 @@ func (c *Cache) MaxToolOutputBytes() int { return c.maxToolOutputBytes }
 // (default [git, hg, jj]); mutating it does not change the cache.
 func (c *Cache) VCSPriority() []string { return slices.Clone(c.vcsPriority) }
 
-// VCSPreferred returns vcs.preferred, or "" when unset.
-func (c *Cache) VCSPreferred() string { return c.vcsPreferred }
+// VCSForce returns vcs.force, or "" when unset.
+func (c *Cache) VCSForce() string { return c.vcsForce }
 
 // ProviderRetry returns the resolved provider.retry auto-retry settings,
 // filled with the hard-coded defaults for any omitted key. Enum/range validity is

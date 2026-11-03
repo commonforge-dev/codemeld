@@ -128,7 +128,7 @@ func TestChildAgent_ClosesWithTheFullOutcome(t *testing.T) {
 			want: "✓ Child agent completed\n" +
 				"  may write:\n    /project/notes.md\n" +
 				"  3 provider request(s)\n" +
-				"  changed 1 file(s), none undone:\n    /project/notes.md",
+				"  changed 1 file(s):\n    /project/notes.md",
 		},
 		{
 			name:     "cancelled",
@@ -173,41 +173,124 @@ func TestChildAgent_ClosesWithTheFullOutcome(t *testing.T) {
 	}
 }
 
-// A child that changed nothing says so rather than printing an empty list, and every
-// rollback outcome stays visible on that line — including the two that record no paths.
 func TestChildAgent_ClosesWithNoChangedFiles(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
+		reason   string
 		rollback string
 		want     string
 	}{
 		{
-			name:     "clean",
+			name:     "completed",
+			reason:   events.ChildAgentReasonCompleted,
 			rollback: events.ChildRollbackNotNeeded,
-			want:     "  " + childAgentNoFilesLine + ", so nothing needed undoing",
+			want:     "\n  3 provider request(s)",
 		},
 		{
-			name:     "undone",
+			name:     "stopped and rolled back",
+			reason:   events.ChildAgentReasonCancelled,
 			rollback: events.ChildRollbackRolledBack,
-			want:     "  " + childAgentNoFilesLine + ", and its rollback completed",
+			want:     "\n  3 provider request(s)",
 		},
 		{
-			name:     "unrecovered",
+			name:     "completed and unrecovered",
+			reason:   events.ChildAgentReasonCompleted,
 			rollback: events.ChildRollbackUnrecovered,
-			want:     "  " + childAgentNoFilesLine + ", and its rollback did not complete",
+			want:     "\n  3 provider request(s)\n  changed no files, but its undo journal was kept; the next codemeld launch checks it again",
+		},
+		{
+			name:     "stopped and unrecovered",
+			reason:   events.ChildAgentReasonFailed,
+			rollback: events.ChildRollbackUnrecovered,
+			want:     "\n  3 provider request(s)\n  changed no files, but its undo journal was kept; the next codemeld launch checks it again",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := New(nil)
-			a.ChildAgentStarted(childStart(childA))
-			a.ChildAgentEnded(childEnd(childA, events.ChildAgentReasonCompleted, tc.rollback))
+			start := childStart(childA)
+			end := childEnd(childA, tc.reason, tc.rollback)
 
-			got := a.TranscriptText()
-			if !strings.HasSuffix(got, "\n"+tc.want) {
-				t.Fatalf("closed block = %q, want it to end with %q", got, tc.want)
+			live := New(nil)
+			live.ChildAgentStarted(start)
+			live.ChildAgentEnded(end)
+			replayed := New(nil)
+			replayed.ReplaySessionRecords([]sessions.Record{childStartEvent(start), childEndEvent(end)})
+
+			for label, got := range map[string]string{"live": live.TranscriptText(), "replayed": replayed.TranscriptText()} {
+				if !strings.HasSuffix(got, tc.want) {
+					t.Fatalf("%s block = %q, want it to end with %q", label, got, tc.want)
+				}
 			}
-			if strings.Contains(got, "changed 0 file(s)") {
-				t.Error("a child that changed nothing rendered a file count")
+		})
+	}
+}
+
+func TestChildAgent_ClosingFileLinesForEveryOutcomeLiveAndReplayed(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		reason   string
+		rollback string
+		heading  string
+		want     string
+	}{
+		{
+			name:     "completed",
+			reason:   events.ChildAgentReasonCompleted,
+			rollback: events.ChildRollbackNotNeeded,
+			heading:  "✓ Child agent completed",
+			want: "  changed 1 file(s):\n    /project/a.go\n" +
+				"  deleted 1 file(s):\n    /project/old.go\n" +
+				"  moved 1 file(s):\n    /project/old.md -> /project/new.md",
+		},
+		{
+			name:     "stopped and rolled back",
+			reason:   events.ChildAgentReasonCancelled,
+			rollback: events.ChildRollbackRolledBack,
+			heading:  "⚠ Child agent cancelled",
+			want: "  changed 1 file(s), since undone:\n    /project/a.go\n" +
+				"  deleted 1 file(s), since undone:\n    /project/old.go\n" +
+				"  moved 1 file(s), since undone:\n    /project/old.md -> /project/new.md",
+		},
+		{
+			name:     "stopped and unrecovered",
+			reason:   events.ChildAgentReasonFailed,
+			rollback: events.ChildRollbackUnrecovered,
+			heading:  "⚠ Child agent failed",
+			want: "  changed 1 file(s), which could not be undone and are still in the worktree:\n    /project/a.go\n" +
+				"  deleted 1 file(s), which could not be undone and are still missing from the worktree:\n    /project/old.go\n" +
+				"  moved 1 file(s), which could not be undone and are still at their new paths:\n    /project/old.md -> /project/new.md",
+		},
+		{
+			name:     "completed and unrecovered",
+			reason:   events.ChildAgentReasonCompleted,
+			rollback: events.ChildRollbackUnrecovered,
+			heading:  "✓ Child agent completed",
+			want: "  changed 1 file(s), but its undo journal was kept; the next codemeld launch checks it again:\n    /project/a.go\n" +
+				"  deleted 1 file(s), but its undo journal was kept; the next codemeld launch checks it again:\n    /project/old.go\n" +
+				"  moved 1 file(s), but its undo journal was kept; the next codemeld launch checks it again:\n    /project/old.md -> /project/new.md",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := childDeleteStart(childA, []string{"/project/a.go"}, []string{"/project/old.go"})
+			start.DeclaredMovePairs = []events.ChildMovePair{childMovedPair}
+			end := childEnd(childA, tc.reason, tc.rollback, "/project/a.go")
+			end.DeletedPaths = []string{"/project/old.go"}
+			end.MovedPairs = []events.ChildMovePair{childMovedPair}
+
+			live := New(nil)
+			live.ChildAgentStarted(start)
+			live.ChildAgentEnded(end)
+			replayed := New(nil)
+			replayed.ReplaySessionRecords([]sessions.Record{childStartEvent(start), childEndEvent(end)})
+
+			want := tc.heading + "\n" +
+				"  may write:\n    /project/a.go\n" +
+				"  may delete:\n    /project/old.go\n" +
+				"  may move:\n    /project/old.md -> /project/new.md\n" +
+				"  3 provider request(s)\n" + tc.want
+			for label, got := range map[string]string{"live": live.TranscriptText(), "replayed": replayed.TranscriptText()} {
+				if got != want {
+					t.Fatalf("%s block = %q, want %q", label, got, want)
+				}
 			}
 		})
 	}
@@ -223,7 +306,7 @@ func TestChildAgent_ClosesWithATruncatedChangedList(t *testing.T) {
 	a.ChildAgentEnded(end)
 
 	got := a.TranscriptText()
-	for _, want := range []string{"changed 30 file(s), none undone:", "    /project/a.go", "    /project/b.go", "    … and 28 more"} {
+	for _, want := range []string{"changed 30 file(s):", "    /project/a.go", "    /project/b.go", "    … and 28 more"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("closed block = %q, want it to contain %q", got, want)
 		}
@@ -283,7 +366,7 @@ func TestChildAgent_RoutesByInvocationIDAlone(t *testing.T) {
 		"  Read /project/a.go\n" +
 		"  Edit /project/a.go\n" +
 		"  3 provider request(s)\n" +
-		"  changed 1 file(s), none undone:\n    /project/a.go"
+		"  changed 1 file(s):\n    /project/a.go"
 	blockB := childAgentRunningHeading + "\n" +
 		"  may write:\n    /project/b.go\n" +
 		"  Read /project/b.go\n" +
@@ -360,7 +443,7 @@ func TestChildAgent_DeleteOnlyChildShowsDeleteAuthorityAndDeletion(t *testing.T)
 	want := "✓ Child agent completed\n" +
 		"  may delete:\n    /project/old.md\n" +
 		"  3 provider request(s)\n" +
-		"  deleted 1 file(s), none undone:\n    /project/old.md"
+		"  deleted 1 file(s):\n    /project/old.md"
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("closed block = %q, want %q", got, want)
 	}
@@ -419,7 +502,7 @@ func TestChildAgent_ClosesWithATruncatedDeletedList(t *testing.T) {
 	a.ChildAgentEnded(end)
 
 	got := a.TranscriptText()
-	for _, want := range []string{"deleted 30 file(s), none undone:", "    /project/old/a.go", "    /project/old/b.go", "    … and 28 more"} {
+	for _, want := range []string{"deleted 30 file(s):", "    /project/old/a.go", "    /project/old/b.go", "    … and 28 more"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("closed block = %q, want it to contain %q", got, want)
 		}
@@ -444,7 +527,7 @@ func TestReplaySessionRecords_DeleteChildBlockMatchesTheLivePath(t *testing.T) {
 	if got, want := replayed.TranscriptText(), live.TranscriptText(); got != want {
 		t.Fatalf("replayed block = %q, want the live block %q", got, want)
 	}
-	if !strings.Contains(replayed.TranscriptText(), "  deleted 1 file(s), none undone:\n    /project/old.go") {
+	if !strings.Contains(replayed.TranscriptText(), "  deleted 1 file(s):\n    /project/old.go") {
 		t.Fatalf("replayed block = %q, want the deletion shown", replayed.TranscriptText())
 	}
 }
@@ -459,7 +542,7 @@ func TestReplaySessionRecords_ChildRecordsWithoutDeleteFieldsShowNoDeleteAuthori
 	want := "✓ Child agent completed\n" +
 		"  may write:\n    /project/a.go\n" +
 		"  3 provider request(s)\n" +
-		"  changed 1 file(s), none undone:\n    /project/a.go"
+		"  changed 1 file(s):\n    /project/a.go"
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("replayed legacy block = %q, want %q", got, want)
 	}
@@ -490,7 +573,7 @@ func TestChildAgent_MoveOnlyChildShowsMoveAuthorityAndMove(t *testing.T) {
 	want := "✓ Child agent completed\n" +
 		"  may move:\n    /project/old.md -> /project/new.md\n" +
 		"  3 provider request(s)\n" +
-		"  moved 1 file(s), none undone:\n    /project/old.md -> /project/new.md"
+		"  moved 1 file(s):\n    /project/old.md -> /project/new.md"
 	if got := a.TranscriptText(); got != want {
 		t.Fatalf("closed block = %q, want %q", got, want)
 	}
@@ -542,7 +625,7 @@ func TestChildAgent_OffLoopMarshalsThroughQueue(t *testing.T) {
 		"  may write:\n    /project/notes.md\n" +
 		"  Edit /project/notes.md\n" +
 		"  3 provider request(s)\n" +
-		"  changed 1 file(s), none undone:\n    /project/notes.md"
+		"  changed 1 file(s):\n    /project/notes.md"
 	if got := transcriptText(t, a); got != want {
 		a.app.Stop()
 		t.Fatalf("rendered transcript = %q, want %q", got, want)

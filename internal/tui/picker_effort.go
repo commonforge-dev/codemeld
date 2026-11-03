@@ -94,10 +94,39 @@ func (a *App) dismissEffortPicker() {
 }
 
 func effortPickerRows(supported []string) []string {
-	if slices.Contains(supported, effortNoReasoning) {
-		return slices.Clone(supported)
+	rows := effortsHighToLow(supported)
+	if !slices.Contains(rows, effortNoReasoning) {
+		rows = append(rows, effortNoReasoning)
 	}
-	return append([]string{effortNoReasoning}, supported...)
+	return rows
+}
+
+func effortsHighToLow(efforts []string) []string {
+	out := slices.Clone(efforts)
+	slices.SortStableFunc(out, func(x, y string) int { return effortRank(x) - effortRank(y) })
+	return out
+}
+
+func effortRank(effort string) int {
+	switch effort {
+	case "xhigh":
+		return 0
+	case "high":
+		return 1
+	case "medium":
+		return 2
+	case "low":
+		return 3
+	case "minimal":
+		return 4
+	case "default":
+		return 5
+	case "none":
+		return 7
+	case effortNoReasoning:
+		return 8
+	}
+	return 6
 }
 
 func isNoReasoningOnlySet(rows []string) bool {
@@ -106,6 +135,9 @@ func isNoReasoningOnlySet(rows []string) bool {
 
 func effortPickerInitialIndex(rows []string, current string) int {
 	if i := slices.Index(rows, current); i >= 0 {
+		return i
+	}
+	if i := slices.Index(rows, effortNoReasoning); i >= 0 {
 		return i
 	}
 	return 0

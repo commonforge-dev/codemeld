@@ -460,6 +460,10 @@ func TestGateTrust_LegacyTrustRecordIsNeitherReadNorModified(t *testing.T) {
 	if decision := gateTrust(home, root, root, strings.NewReader("y\n"), &stderr, true); !decision.Trusted {
 		t.Fatalf("decision = %#v, want the answered launch approved", decision)
 	}
+	var relaunch strings.Builder
+	if decision := gateTrust(home, root, root, strings.NewReader(""), &relaunch, true); !decision.Trusted || decision.Reason != trust.ReasonTrusted || relaunch.Len() != 0 {
+		t.Fatalf("relaunch decision = %#v, stderr = %q, want a silent approved launch", decision, relaunch.String())
+	}
 
 	after, err := os.ReadFile(legacy)
 	if err != nil || string(after) != string(legacyBytes) {
@@ -468,6 +472,95 @@ func TestGateTrust_LegacyTrustRecordIsNeitherReadNorModified(t *testing.T) {
 	afterInfo, err := os.Stat(legacy)
 	if err != nil || !afterInfo.ModTime().Equal(legacyInfo.ModTime()) {
 		t.Fatalf("legacy mtime = %v (err %v), want %v", afterInfo.ModTime(), err, legacyInfo.ModTime())
+	}
+}
+
+func TestGateTrust_RootGatedOnlyByLocalSettingsOrTemplatesIsAskedOnceAndAppended(t *testing.T) {
+	for name, stage := range map[string]func(t *testing.T, root string){
+		"settings.local.yaml": func(t *testing.T, root string) { writeLocalProjectSettings(t, root, "model: {}\n") },
+		".codemeld/vcs": func(t *testing.T, root string) {
+			writeProjectTemplate(t, root, "git.yaml", "status:\n  argv: [git, status]\n")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			other := mustCanonical(t, t.TempDir())
+			approveRoot(t, home, other)
+			root := t.TempDir()
+			stage(t, root)
+			var stderr strings.Builder
+
+			if decision := gateTrust(home, root, root, strings.NewReader("y\n"), &stderr, true); !decision.Trusted {
+				t.Fatalf("decision = %#v, want the answered launch approved", decision)
+			}
+			if !strings.Contains(stderr.String(), approvePrompt) {
+				t.Fatalf("stderr = %q, want the approval prompt", stderr.String())
+			}
+			if got, want := trustStore(t, home).Projects, []string{other, mustCanonical(t, root)}; !slices.Equal(got, want) {
+				t.Fatalf("stored projects = %v, want %v", got, want)
+			}
+
+			var next strings.Builder
+			if decision := gateTrust(home, root, root, strings.NewReader(""), &next, true); !decision.Trusted || decision.Reason != trust.ReasonTrusted || next.Len() != 0 {
+				t.Fatalf("next launch decision = %#v, stderr = %q, want a silent approved launch", decision, next.String())
+			}
+		})
+	}
+}
+
+func TestGateTrust_StoreWithAnUnsafePostureApprovesNothingAndIsNotOverwritten(t *testing.T) {
+	listing := func(root string) []byte { return []byte("version: 1\nprojects:\n  - " + root + "\n") }
+	for name, stage := range map[string]func(t *testing.T, storePath, root string){
+		"symlink": func(t *testing.T, storePath, root string) {
+			target := filepath.Join(t.TempDir(), "approved-roots.yaml")
+			if err := os.WriteFile(target, listing(root), 0o600); err != nil {
+				t.Fatalf("write store target: %v", err)
+			}
+			if err := os.Symlink(target, storePath); err != nil {
+				t.Fatalf("symlink store: %v", err)
+			}
+		},
+		"mode 0640": func(t *testing.T, storePath, root string) {
+			if err := os.WriteFile(storePath, listing(root), 0o600); err != nil {
+				t.Fatalf("write store: %v", err)
+			}
+			if err := os.Chmod(storePath, 0o640); err != nil {
+				t.Fatalf("chmod store: %v", err)
+			}
+		},
+		"unknown version": func(t *testing.T, storePath, root string) {
+			if err := os.WriteFile(storePath, []byte("version: 2\nprojects:\n  - "+root+"\n"), 0o600); err != nil {
+				t.Fatalf("write store: %v", err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			root := mustCanonical(t, trustProject(t, "model: {}\n"))
+			storePath := trust.StorePath(home)
+			mkdirAll(t, filepath.Dir(storePath))
+			stage(t, storePath, root)
+			before := mustReadFile(t, storePath)
+			beforeInfo, err := os.Lstat(storePath)
+			if err != nil {
+				t.Fatalf("lstat store: %v", err)
+			}
+
+			if decision := headlessTrustGate(&strings.Builder{})(home, root, root); decision.Trusted {
+				t.Fatalf("headless decision = %#v, want the listed root not approved", decision)
+			}
+			if decision := gateTrust(home, root, root, strings.NewReader("y\n"), &strings.Builder{}, true); decision.Trusted {
+				t.Fatalf("interactive decision = %#v, want the launch unapproved", decision)
+			}
+
+			afterInfo, err := os.Lstat(storePath)
+			if err != nil {
+				t.Fatalf("lstat store after the launches: %v", err)
+			}
+			if got := mustReadFile(t, storePath); got != before || afterInfo.Mode() != beforeInfo.Mode() || !afterInfo.ModTime().Equal(beforeInfo.ModTime()) {
+				t.Fatalf("store changed: bytes %q -> %q, mode %v -> %v, mtime %v -> %v", before, got, beforeInfo.Mode(), afterInfo.Mode(), beforeInfo.ModTime(), afterInfo.ModTime())
+			}
+		})
 	}
 }
 

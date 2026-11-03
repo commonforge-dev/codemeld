@@ -393,6 +393,55 @@ func TestNormalizeDirectStage_CommandLookupRejectedSpellingsStayLiteral(t *testi
 	}
 }
 
+func TestNormalizeDirectStage_CommandLookupDelimiterKeepsCapturedPath(t *testing.T) {
+	dir := t.TempDir()
+	magick := filepath.Join(dir, "magick")
+	writeExecutable(t, magick)
+	t.Setenv("PATH", dir)
+
+	const stage = "command -v -- magick"
+	got, err := NormalizeDirectStage(stage, StageSolo)
+	if err != nil {
+		t.Fatalf("NormalizeDirectStage error = %v, want nil", err)
+	}
+	if got.Route != RouteDirect || !equalStrings(got.Tokens, []string{"command", "-v", "--", "magick"}) || got.LookupPath != magick {
+		t.Fatalf("NormalizeDirectStage(%q) = route %v tokens %v lookup %q, want direct [command -v -- magick] with %q", stage, got.Route, got.Tokens, got.LookupPath, magick)
+	}
+
+	if err := os.Remove(magick); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	if again, err := NormalizeDirectStage(stage, StageSolo); err != nil || again.Route != RouteLiteral {
+		t.Fatalf("NormalizeDirectStage(%q) after removal = route %v, %v; want the literal route", stage, again.Route, err)
+	}
+	if got.LookupPath != magick {
+		t.Fatalf("captured LookupPath = %q, want %q", got.LookupPath, magick)
+	}
+	req := MatchRequest{Kind: subjectKindDirect, Subject: strings.Join(got.Tokens, " "), SubjectTokens: got.Tokens, PathScope: scopeProj}
+	mc := ModeContext{Mode: "build", Class: ClassMutating, Stages: []StageNormalization{got}}
+	if class := classifyReadOnlyShell(req, mc); class != ClassReadOnly {
+		t.Fatalf("classifyReadOnlyShell on the captured stage = %q, want read_only without re-resolving", class)
+	}
+	f := newFixture(neverPrompt, nil)
+	assertModeAutoAllow(t, f, mustAuthorizeMode(t, req, mc, f.deps))
+}
+
+func TestNormalizeDirectStage_CommandLookupDelimiterRejectedSpellingsStayLiteral(t *testing.T) {
+	newSystemOneFixture(t)
+	for _, stage := range commandLookupDelimiterRejected {
+		t.Run(stage, func(t *testing.T) {
+			got, err := NormalizeDirectStage(stage, StageSolo)
+			if err != nil {
+				t.Fatalf("NormalizeDirectStage(%q) error = %v, want nil", stage, err)
+			}
+			if got.Route != RouteLiteral || got.LookupPath != "" {
+				t.Fatalf("NormalizeDirectStage(%q) = route %v lookup %q, want the literal route without a lookup path", stage, got.Route, got.LookupPath)
+			}
+		})
+	}
+}
+
 func TestNormalizeDirectStage_TypeLookupTakesDirectRoute(t *testing.T) {
 	typeLookupPATH(t)
 	want, err := exec.LookPath("ls")

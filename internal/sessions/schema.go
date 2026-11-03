@@ -102,6 +102,8 @@ type Event struct {
 	Timestamp time.Time
 	Payload   json.RawMessage
 	ParentID  string
+	rawLine   string
+	skipped   bool
 }
 
 func (Event) isRecord() {}
@@ -216,6 +218,9 @@ func forkOriginWire(o *ForkOrigin) *wireForkOrigin {
 func marshalRecordLine(rec Record) ([]byte, error) {
 	if compaction, ok := rec.(*Compaction); ok && compaction == nil {
 		return nil, fmt.Errorf("compaction must not be nil")
+	}
+	if ev, ok := rec.(Event); ok && ev.skipped && ev.rawLine != "" {
+		return []byte(ev.rawLine), nil
 	}
 	return json.Marshal(rec)
 }
@@ -463,6 +468,7 @@ func withParentID(rec Record, parentID string) Record {
 		return r
 	case Event:
 		r.ParentID = parentID
+		r.rawLine = ""
 		return r
 	case Compaction:
 		r.ParentID = parentID
@@ -904,7 +910,7 @@ func parseEvent(i int, raw json.RawMessage) (Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Event{ID: *re.ID, Kind: *re.Kind, Timestamp: ts, Payload: re.Payload, ParentID: parentID}, nil
+	return Event{ID: *re.ID, Kind: *re.Kind, Timestamp: ts, Payload: re.Payload, ParentID: parentID, rawLine: string(raw)}, nil
 }
 
 func parseCompaction(i int, raw json.RawMessage) (Record, error) {

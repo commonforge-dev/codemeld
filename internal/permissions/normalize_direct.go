@@ -330,9 +330,6 @@ func absolutePathEntries(value string) bool {
 // accepted: telling an absent program apart from a shell builtin such as `cd` would mean running a
 // shell, so the stage keeps its literal route and prompts instead.
 func commandLookupStage(tokens []ShellToken) (string, bool) {
-	if len(tokens) != 3 {
-		return "", false
-	}
 	values := make([]string, len(tokens))
 	for i, t := range tokens {
 		if t.Raw != t.Value {
@@ -343,7 +340,7 @@ func commandLookupStage(tokens []ShellToken) (string, bool) {
 	if !commandLookupTokens(values) {
 		return "", false
 	}
-	path, err := exec.LookPath(values[2])
+	path, err := exec.LookPath(values[len(values)-1])
 	if err != nil {
 		return "", false
 	}

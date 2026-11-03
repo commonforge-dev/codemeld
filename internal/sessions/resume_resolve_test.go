@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -189,6 +190,76 @@ func TestResolveResumeID_PayloadValidatorInvokedAndAccepts(t *testing.T) {
 	}
 	if len(seen) != 1 || seen[0] != "stream_interrupted" {
 		t.Errorf("validator invoked with %v, want exactly [stream_interrupted]", seen)
+	}
+}
+
+func TestResolveResumeID_UnknownEventKindResolves(t *testing.T) {
+	home, root, rawCWD, canonical, folderDir := resumeEnv(t)
+	dir := mkdir(t, filepath.Join(root, folderDir))
+	id := "sess-unknown-kind"
+	writeFile(t, filepath.Join(dir, id+".json"), sessionDoc(canonical, "")+unknownEventLine+"\n")
+	writeFile(t, filepath.Join(dir, folderFileName), canonical+"\n")
+
+	_, sess, err := ResolveResumeID(id, rawCWD, home, unknownKindValidator)
+	if err != nil {
+		t.Fatalf("ResolveResumeID() error = %v", err)
+	}
+	want := []SkippedKind{{Kind: "from_newer_build", Count: 1}}
+	if got := SkippedEventKinds(sess.Records); !reflect.DeepEqual(got, want) {
+		t.Fatalf("SkippedEventKinds = %v, want %v", got, want)
+	}
+}
+
+func TestResolveResumeID_UnknownEventKindDoesNotHideOtherFailures(t *testing.T) {
+	newerMeta := `{"type":"metadata","metadata":{"id":"` + testMetaID + `","folder":"%s",` +
+		`"started_at":"2026-05-25T12:00:00.000Z","updated_at":"2026-05-25T12:00:00.000Z","schema_version":2}}` + "\n"
+	tests := []struct {
+		name string
+		doc  func(canonical string) string
+		want string
+	}{
+		{
+			"known kind with invalid payload",
+			func(c string) string { return sessionDoc(c, streamInterruptedRecord(`{"source":"esc"}`)) },
+			"cannot be loaded: records[1].payload: stream_interrupted.content_chars: required field is absent",
+		},
+		{
+			"unknown record type",
+			func(c string) string {
+				return sessionDoc(c, "") + `{"type":"future_record","id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a03"}` + "\n"
+			},
+			`cannot be parsed: records[1]: unknown record type "future_record"`,
+		},
+		{
+			"malformed line",
+			func(c string) string { return sessionDoc(c, "") + "{not json\n" },
+			"cannot be parsed: records[1]",
+		},
+		{
+			"refused schema_version",
+			func(c string) string { return fmt.Sprintf(newerMeta, c) },
+			"schema_version 2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home, root, rawCWD, canonical, folderDir := resumeEnv(t)
+			dir := mkdir(t, filepath.Join(root, folderDir))
+			id := "sess-reject"
+			doc := tt.doc(canonical)
+			lines := strings.SplitN(doc, "\n", 2)
+			doc = lines[0] + "\n" + unknownEventLine + "\n" + lines[1]
+			writeFile(t, filepath.Join(dir, id+".json"), doc)
+			writeFile(t, filepath.Join(dir, folderFileName), canonical+"\n")
+
+			_, sess, err := ResolveResumeID(id, rawCWD, home, unknownKindValidator)
+			if err == nil || sess != nil {
+				t.Fatalf("ResolveResumeID() = (%v, %v), want a rejection", sess, err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Error() = %q, want it to contain %q", err.Error(), tt.want)
+			}
+		})
 	}
 }
 

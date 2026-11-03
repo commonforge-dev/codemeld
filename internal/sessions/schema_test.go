@@ -534,8 +534,18 @@ func TestRoundTrip_InMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
+	clearRawLines(got)
 	if !reflect.DeepEqual(want, got) {
 		t.Fatalf("round-trip mismatch:\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func clearRawLines(s *Session) {
+	for i, rec := range s.Records {
+		if ev, ok := rec.(Event); ok {
+			ev.rawLine = ""
+			s.Records[i] = ev
+		}
 	}
 }
 
@@ -984,6 +994,7 @@ func TestCompaction_RoundTrip(t *testing.T) {
 		t.Fatalf("records[1] = %T, want Event (a completed child may carry a later launch_began)", s.Records[1])
 	}
 
+	clearRawLines(s)
 	if !reflect.DeepEqual(compactionChildSession(), s) {
 		t.Fatalf("round-trip mismatch:\nwant: %#v\n got: %#v", compactionChildSession(), s)
 	}
@@ -1200,5 +1211,33 @@ func TestCompaction_ExistingV1Unaffected(t *testing.T) {
 		`{"type":"compaction_from_the_future","id":"` + childRec0ID + `"}` + "\n"
 	if _, err := Unmarshal([]byte(unknown)); err == nil || !strings.Contains(err.Error(), "unknown record type") {
 		t.Fatalf("Unmarshal(unknown discriminator) error = %v, want an unknown record type rejection", err)
+	}
+}
+
+func TestMarshal_KeepsSkippedUnknownEventLineByteIdentical(t *testing.T) {
+	known := `{"type":"event","id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a04","kind":"launch_began","timestamp":"2026-05-25T12:00:03.000Z","payload":{"source":"fresh"}}`
+	doc := "{" + validMetaHome + "}\n" + known + "\n" + unknownEventLine + "\n"
+	s, err := Unmarshal([]byte(doc))
+	if err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	unmarked, err := Marshal(s)
+	if err != nil {
+		t.Fatalf("Marshal() before validation error = %v", err)
+	}
+	if strings.Contains(string(unmarked), unknownEventLine) {
+		t.Fatal("an event never marked skipped was emitted from its raw line")
+	}
+
+	if err := ValidateEventPayloads(s.Records, unknownKindValidator); err != nil {
+		t.Fatalf("ValidateEventPayloads() = %v", err)
+	}
+	got, err := Marshal(s)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if string(got) != doc {
+		t.Fatalf("Marshal() =\n%s\nwant byte-identical\n%s", got, doc)
 	}
 }

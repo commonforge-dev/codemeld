@@ -320,6 +320,7 @@ const (
 	childAgentMoveHeading     = "may move:"
 	childAgentDirsHeading     = "may create directories:"
 	childAgentNoFilesLine     = "changed no files"
+	childAgentJournalKept     = ", but its undo journal was kept; the next codemeld launch checks it again"
 	childAgentRunningHeading  = "⋯ Child agent running"
 	childAgentUnclosedHeading = "⚠ Child agent — no outcome was recorded"
 )
@@ -395,26 +396,21 @@ func childAgentChangedLines(end events.ChildAgentEnd) []string {
 	deleted := childAgentPathTotal(end.DeletedPaths, end.DeletedPathsTotal)
 	moved := int64(len(end.MovedPairs))
 	if written == 0 && deleted == 0 && moved == 0 {
-		line := childAgentNoFilesLine
-		switch end.RollbackOutcome {
-		case events.ChildRollbackNotNeeded:
-			line += ", so nothing needed undoing"
-		case events.ChildRollbackRolledBack:
-			line += ", and its rollback completed"
-		case events.ChildRollbackUnrecovered:
-			line += ", and its rollback did not complete"
+		if end.RollbackOutcome != events.ChildRollbackUnrecovered {
+			return nil
 		}
-		return []string{childAgentIndent + line}
+		return []string{childAgentIndent + childAgentNoFilesLine + childAgentJournalKept}
 	}
+	completed := end.Reason == events.ChildAgentReasonCompleted
 	var lines []string
 	if written > 0 {
-		lines = append(lines, childAgentOutcomeLines("changed", written, "are still in the worktree", end.RollbackOutcome, end.WrittenPaths)...)
+		lines = append(lines, childAgentOutcomeLines("changed", written, "are still in the worktree", end.RollbackOutcome, completed, end.WrittenPaths)...)
 	}
 	if deleted > 0 {
-		lines = append(lines, childAgentOutcomeLines("deleted", deleted, "are still missing from the worktree", end.RollbackOutcome, end.DeletedPaths)...)
+		lines = append(lines, childAgentOutcomeLines("deleted", deleted, "are still missing from the worktree", end.RollbackOutcome, completed, end.DeletedPaths)...)
 	}
 	if moved > 0 {
-		lines = append(lines, childAgentOutcomeLines("moved", moved, "are still at their new paths", end.RollbackOutcome, childAgentPairLines(end.MovedPairs))...)
+		lines = append(lines, childAgentOutcomeLines("moved", moved, "are still at their new paths", end.RollbackOutcome, completed, childAgentPairLines(end.MovedPairs))...)
 	}
 	return lines
 }
@@ -434,14 +430,14 @@ func childAgentPathTotal(paths []string, bounded int64) int64 {
 	return bounded
 }
 
-func childAgentOutcomeLines(verb string, total int64, unrecovered, rollback string, paths []string) []string {
+func childAgentOutcomeLines(verb string, total int64, unrecovered, rollback string, completed bool, paths []string) []string {
 	heading := fmt.Sprintf("%s %d file(s)", verb, total)
-	switch rollback {
-	case events.ChildRollbackNotNeeded:
-		heading += ", none undone:"
-	case events.ChildRollbackRolledBack:
+	switch {
+	case rollback == events.ChildRollbackRolledBack:
 		heading += ", since undone:"
-	case events.ChildRollbackUnrecovered:
+	case rollback == events.ChildRollbackUnrecovered && completed:
+		heading += childAgentJournalKept + ":"
+	case rollback == events.ChildRollbackUnrecovered:
 		heading += ", which could not be undone and " + unrecovered + ":"
 	default:
 		heading += ":"

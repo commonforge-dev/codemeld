@@ -116,6 +116,25 @@ func TestLaunchBannerMeta_NoModelFallback(t *testing.T) {
 	}
 }
 
+func TestLaunchBannerMeta_EscapesControlCharactersInEverySegment(t *testing.T) {
+	raw := LaunchBannerMeta("open\x1bai", "gpt\r5", "hi\u009bgh", "/w/\x1b[31mred\r\nProject approval: approved\u009b")
+	want := "[" + bannerMetaProvider + "]open\\x1Bai[-]" +
+		"[" + bannerMetaSeparator + "] · [-]" +
+		"[" + bannerMetaModel + "]gpt\\x0D5[-]" +
+		"[" + bannerMetaSeparator + "] · [-]" +
+		"[" + bannerMetaEffort + "]hi\\u009Bgh effort[-]" +
+		"[" + bannerMetaSeparator + "] · [-]" +
+		"[" + bannerMetaDir + "]/w/\\x1B[31mred\\x0D\\x0AProject approval: approved\\u009B[-]"
+	if raw != want {
+		t.Errorf("banner meta = %q, want %q", raw, want)
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			t.Fatalf("banner meta %q holds raw control %U", raw, r)
+		}
+	}
+}
+
 func TestRenderStatusLine_SelectedAndFallback(t *testing.T) {
 	selected := &statusStateFake{provider: "openai", modelID: "gpt-5", effort: "medium", launchDir: "/work/proj"}
 	got := visibleStatusLine(selected)

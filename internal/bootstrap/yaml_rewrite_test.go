@@ -7,7 +7,7 @@
 // rewrite contract tests", integration bullet (1) global model.last_used mirror and
 // (2) project model.active. Exhaustive low-level writer-shape cases
 // live in internal/config/rewrite_test.go; these belt-and-suspenders the user-action
-// path with inline comments, an unknown top-level key, a block scalar, and the
+// path with inline comments, a block scalar, and the
 // leading comment block above the rewritten key.
 //
 // They live in internal/bootstrap rather than internal/integration because the
@@ -37,7 +37,7 @@ func readFileString(t *testing.T, path string) string {
 
 // TestYAMLRewrite_GlobalLastUsedMirror_PreservesUserBytes drives the picker's
 // global mirror write (step 2) and asserts that only the model.last_used
-// value changes in <home>/.codemeld/global/settings.yaml: the unknown top-level
+// value changes in <home>/.codemeld/global/settings.yaml: the other top-level
 // keys, the inline comment, the block scalar, the leading comment block above
 // last_used, and the trailing key all survive byte-for-byte.
 func TestYAMLRewrite_GlobalLastUsedMirror_PreservesUserBytes(t *testing.T) {
@@ -50,17 +50,18 @@ func TestYAMLRewrite_GlobalLastUsedMirror_PreservesUserBytes(t *testing.T) {
 		t.Fatalf("mkdir global dir: %v", err)
 	}
 	original := "# global settings, hand-authored\n" +
-		"editor: vim # preferred editor\n" +
-		"notes: |\n" +
-		"  keep this block\n" +
-		"  scalar intact\n" +
+		"agent: {max_concurrency: 2} # preferred editor\n" +
+		"vcs:\n" +
+		"  force: |\n" +
+		"    keep this block\n" +
+		"    scalar intact\n" +
 		"model:\n" +
 		"  # model.last_used is managed automatically by codemeld.\n" +
 		"  last_used:\n" +
 		"    provider: openai\n" +
 		"    id: gpt-5.5\n" +
 		"    effort: medium\n" +
-		"trailing_unknown: bar\n"
+		"attribution: true\n"
 	if err := os.WriteFile(globalPath, []byte(original), 0o600); err != nil {
 		t.Fatalf("seed global settings: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestYAMLRewrite_GlobalLastUsedMirror_PreservesUserBytes(t *testing.T) {
 
 // TestYAMLRewrite_ProjectModelActive_PreservesUserBytes drives the picker's
 // per-project model.active write (step 1) and asserts that only the
-// model.active value changes in <project_root>/.codemeld/settings.local.yaml: the unknown
+// model.active value changes in <project_root>/.codemeld/settings.local.yaml: the other
 // top-level keys, the inline comment, the block scalar, the leading comment block
 // above active (retained, not regenerated), and the adjacent/trailing comments all
 // survive byte-for-byte.
@@ -101,10 +102,10 @@ func TestYAMLRewrite_ProjectModelActive_PreservesUserBytes(t *testing.T) {
 		t.Fatalf("mkdir project dir: %v", err)
 	}
 	original := "# project settings, hand-authored\n" +
-		"editor: vim # preferred editor\n" +
-		"notes: |\n" +
-		"  multi-line note\n" +
-		"  second line\n" +
+		"blocked_paths: # preferred editor\n" +
+		"  - |\n" +
+		"    ~/multi-line note\n" +
+		"    second line\n" +
 		"model:\n" +
 		"  # model.active is managed automatically by codemeld.\n" +
 		"  # Manual edits will be overwritten on the next pick.\n" +
@@ -113,7 +114,7 @@ func TestYAMLRewrite_ProjectModelActive_PreservesUserBytes(t *testing.T) {
 		"    id: gpt-5.5\n" +
 		"    effort: medium\n" +
 		"# trailing comment kept verbatim\n" +
-		"trailing_unknown: bar\n"
+		"permissions: []\n"
 	if err := os.WriteFile(projPath, []byte(original), 0o600); err != nil {
 		t.Fatalf("seed project settings: %v", err)
 	}

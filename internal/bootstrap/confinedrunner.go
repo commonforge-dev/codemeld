@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,20 +34,63 @@ type confinement struct {
 	lookupPath  string
 	lookupSet   bool
 	tmpDir      string
+	owned       *ownedTempDirs
 	inherited   []string
-	retryPaths  []string
 	warning     string
+}
+
+type ownedTempDirs struct {
+	mu   sync.Mutex
+	dirs map[string]*sessionTempDir
+}
+
+func (c *confinement) own(dir *sessionTempDir) {
+	if dir == nil {
+		return
+	}
+	if c.owned == nil {
+		c.owned = &ownedTempDirs{dirs: map[string]*sessionTempDir{}}
+	}
+	c.owned.mu.Lock()
+	defer c.owned.mu.Unlock()
+	c.owned.dirs[dir.path] = dir
+}
+
+func (c *confinement) release(dir *sessionTempDir) error {
+	if c.owned == nil || dir == nil {
+		return nil
+	}
+	c.owned.mu.Lock()
+	defer c.owned.mu.Unlock()
+	if c.owned.dirs[dir.path] != dir {
+		return nil
+	}
+	if err := dir.remove(); err != nil {
+		return err
+	}
+	delete(c.owned.dirs, dir.path)
+	return nil
+}
+
+func (c *confinement) ownerOf(path string) *sessionTempDir {
+	if c.owned == nil {
+		return nil
+	}
+	c.owned.mu.Lock()
+	defer c.owned.mu.Unlock()
+	return c.owned.dirs[path]
 }
 
 func (c *confinement) prepareReplacement() (folder string, rollback func() error, err error) {
 	if c == nil || c.tmpDir == "" {
 		return "", func() error { return nil }, nil
 	}
-	folder, err = newSessionTempDir()
+	dir, err := newSessionTempDir()
+	c.own(dir)
 	if err != nil {
 		return "", func() error { return nil }, err
 	}
-	return folder, sync.OnceValue(func() error { return removeSessionTempDir(folder) }), nil
+	return dir.path, sync.OnceValue(func() error { return c.release(dir) }), nil
 }
 
 func (c *confinement) commitReplacement(folder string) {
@@ -55,8 +99,7 @@ func (c *confinement) commitReplacement(folder string) {
 	}
 	old := c.tmpDir
 	c.tmpDir = folder
-	if err := removeSessionTempDir(old); err != nil {
-		c.retryPaths = append(c.retryPaths, old)
+	if err := c.release(c.ownerOf(old)); err != nil {
 		c.warning = fmt.Sprintf("can't remove private temp folder %s: %v; codemeld retries when it exits", old, err)
 	}
 }
@@ -71,11 +114,15 @@ func (c *confinement) takeCleanupWarning() string {
 }
 
 func (c *confinement) cleanupAll() error {
+	if c.owned == nil {
+		return nil
+	}
+	c.owned.mu.Lock()
+	defer c.owned.mu.Unlock()
 	var errs []error
-	for _, path := range append([]string{c.tmpDir}, c.retryPaths...) {
-		if path != "" {
-			errs = append(errs, removeSessionTempDir(path))
-		}
+	for _, path := range slices.Sorted(maps.Keys(c.owned.dirs)) {
+		errs = append(errs, c.owned.dirs[path].removeAndRelease())
+		delete(c.owned.dirs, path)
 	}
 	return errors.Join(errs...)
 }
@@ -93,11 +140,9 @@ func (c *confinement) resolve(ctx context.Context) (current, tmpDir string, conf
 	switch mode.Mode(current) {
 	case mode.Build:
 		return current, "", false, nil
-	case mode.Plan:
-		return current, "", true, nil
-	case mode.AutoEdits:
+	case mode.Plan, mode.AutoEdits:
 		if c.tmpDir == "" {
-			return current, "", true, errors.New("bootstrap: confined auto_edits run has no private temporary folder")
+			return current, "", true, fmt.Errorf("bootstrap: confined %s run has no private temporary folder", current)
 		}
 		return current, c.tmpDir, true, nil
 	}
@@ -157,7 +202,7 @@ func gitGlobalConfigBlocked(home string, blocked *permissions.BlockedPaths) bool
 	return global || xdg
 }
 
-func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string) (runner.RunSpec, error) {
+func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string, storesWritable bool) (runner.RunSpec, error) {
 	blocked := c.blocked.Current()
 	prepared, err := c.prepare(spec, tmpDir, blocked)
 	if err != nil {
@@ -167,7 +212,7 @@ func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string) (runn
 	if i := slices.Index(prepared.Env, "TERM=dumb"); i >= 0 {
 		prepared.Env[i] = "TERM="
 	}
-	policy, err := c.policy(current, tmpDir, spec.ExceptionalAuthority, blocked)
+	policy, err := c.policy(current, tmpDir, spec.ExceptionalAuthority, blocked, storesWritable)
 	if err != nil {
 		return runner.RunSpec{}, err
 	}
@@ -180,13 +225,24 @@ func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string) (runn
 	return prepared, nil
 }
 
-func (c *confinement) policy(current, tmpDir, authority string, blocked *permissions.BlockedPaths) (enforce.Policy, error) {
+func (c *confinement) policy(current, tmpDir, authority string, blocked *permissions.BlockedPaths, storesWritable bool) (enforce.Policy, error) {
 	p := enforce.Policy{Mode: current, BlockedPaths: blocked.Forms()}
 	skills, err := c.skillsReadRoots(blocked)
 	if err != nil {
 		return enforce.Policy{}, err
 	}
 	p.ReadRoots = skills
+	if mode.Mode(current) == mode.Plan {
+		dir := c.ownerOf(tmpDir)
+		if dir == nil {
+			return enforce.Policy{}, fmt.Errorf("bootstrap: confined plan run has no private temporary folder handle for %s", tmpDir)
+		}
+		if p.TmpDirDev, p.TmpDirIno, err = dir.identity(); err != nil {
+			return enforce.Policy{}, err
+		}
+		p.TmpDir = tmpDir
+		return p, nil
+	}
 	if mode.Mode(current) != mode.AutoEdits {
 		return p, nil
 	}
@@ -226,18 +282,41 @@ func (c *confinement) policy(current, tmpDir, authority string, blocked *permiss
 		}
 		p.WriteRoots = append(p.WriteRoots, target)
 	}
+	repos := []string{root}
 	if c.writable != nil && !blocked.Degraded() {
 		for _, folder := range c.writable.current() {
+			repos = append(repos, folder)
 			if !slices.Contains(p.WriteRoots, folder) {
 				p.WriteRoots = append(p.WriteRoots, folder)
 			}
 		}
 	}
 	p.TmpDir = tmpDir
+	if !storesWritable {
+		if p.NoWritePaths, err = withHistoryStores(p.NoWritePaths, repos, p.WriteRoots, tmpDir); err != nil {
+			return enforce.Policy{}, err
+		}
+	}
 	if authority == enforce.NetworkAccessAuthority {
 		p.ExceptionalAuthority = authority
 	}
 	return p, nil
+}
+
+func withHistoryStores(noWrite, repos, writeRoots []string, tmpDir string) ([]string, error) {
+	writable := append(slices.Clone(writeRoots), tmpDir)
+	for _, repo := range repos {
+		stores, err := permissions.HistoryStores(repo)
+		if err != nil {
+			return nil, err
+		}
+		for _, store := range stores {
+			if slices.ContainsFunc(writable, func(w string) bool { return resolvedWithin(store, w) || resolvedWithin(w, store) }) {
+				noWrite = append(noWrite, store)
+			}
+		}
+	}
+	return noWrite, nil
 }
 
 func (c *confinement) skillsReadRoots(blocked *permissions.BlockedPaths) ([]string, error) {
@@ -323,11 +402,12 @@ func cloneSpec(spec runner.RunSpec) runner.RunSpec {
 }
 
 type confinedRunner struct {
-	inner   runner.Runner
-	conf    *confinement
-	cap     int
-	mu      sync.Mutex
-	pending map[string][]runner.RunSpec
+	inner          runner.Runner
+	conf           *confinement
+	cap            int
+	storesWritable bool
+	mu             sync.Mutex
+	pending        map[string][]runner.RunSpec
 }
 
 var (
@@ -349,7 +429,7 @@ func (r *confinedRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.
 	if !ok {
 		return runner.RunResult{}, errors.New("bootstrap: inner runner cannot bound command output")
 	}
-	prepared, err := r.conf.confine(spec, current, tmpDir)
+	prepared, err := r.conf.confine(spec, current, tmpDir, r.storesWritable)
 	if err != nil {
 		return runner.RunResult{}, err
 	}
@@ -465,7 +545,7 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 	if !confined {
 		return r.events.Exec(ctx, spec)
 	}
-	prepared, err := r.conf.confine(spec, current, tmpDir)
+	prepared, err := r.conf.confine(spec, current, tmpDir, false)
 	if err != nil {
 		return runner.RunResult{}, err
 	}

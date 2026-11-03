@@ -304,6 +304,9 @@ func TestValidate_Accepts(t *testing.T) {
 		},
 		{"confinement friendly and allow", `confinement: {program_lookup: friendly, shared_temp_folders: allow}`},
 		{"empty confinement map", `confinement: {}`},
+		{"vcs_user_config allow", `confinement: {vcs_user_config: allow}`},
+		{"vcs_user_config block", `confinement: {vcs_user_config: block}`},
+		{"vcs_user_config unknown string", `confinement: {vcs_user_config: later}`},
 		{"attribution enabled", `attribution: true`},
 		{"attribution disabled", `attribution: false`},
 		{"system_one off", `system_one: "off"`},
@@ -849,6 +852,13 @@ func TestValidate_Rejects(t *testing.T) {
 			"mode",
 		},
 		{
+			"old vcs.preferred key is rejected",
+			`vcs:
+  preferred: hg
+`,
+			"preferred",
+		},
+		{
 			"provider.retry unknown subkey",
 			`provider:
   retry:
@@ -1181,6 +1191,11 @@ func TestValidate_Rejects(t *testing.T) {
 `,
 			"confinement.shared_temp_folders",
 		},
+		{"confinement.vcs_user_config as a bool", `confinement: {vcs_user_config: true}`, "confinement.vcs_user_config"},
+		{"confinement.vcs_user_config as a number", `confinement: {vcs_user_config: 1}`, "confinement.vcs_user_config"},
+		{"confinement.vcs_user_config as a list", `confinement: {vcs_user_config: [allow]}`, "confinement.vcs_user_config"},
+		{"confinement.vcs_user_config as a map", `confinement: {vcs_user_config: {answer: allow}}`, "confinement.vcs_user_config"},
+		{"confinement.vcs_user_config as null", `confinement: {vcs_user_config: null}`, "confinement.vcs_user_config"},
 		{
 			"unknown key under confinement",
 			`confinement:
@@ -1212,8 +1227,8 @@ func TestValidate_RejectsInvalidMaxPriceAtExactKeys(t *testing.T) {
 	}{
 		{"negative prompt", "{ prompt: -1, completion: 2 }", model + ".prompt"},
 		{"empty per-model object", "{}", model},
-		{"unknown price key", "{ prompt: 1, request: 0.01 }", model},
-		{"image price key", "{ prompt: 1, image: 0.01 }", model},
+		{"unknown price key", "{ prompt: 1, request: 0.01 }", model + ".request"},
+		{"image price key", "{ prompt: 1, image: 0.01 }", model + ".image"},
 		{"non-object entry", "3", model},
 	}
 	for _, tt := range tests {
@@ -1266,7 +1281,7 @@ func TestValidate_RejectsInvalidQuantizations(t *testing.T) {
 		{"duplicate level", "          levels: [fp8, fp4, fp8]\n          mode: required\n", model + ".levels"},
 		{"missing mode", "          levels: [fp8]\n", model},
 		{"unknown mode", "          levels: [fp8]\n          mode: strict\n", model + ".mode"},
-		{"unknown entry key", "          levels: [fp8]\n          mode: required\n          fallback: true\n", model},
+		{"unknown entry key", "          levels: [fp8]\n          mode: required\n          fallback: true\n", model + ".fallback"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

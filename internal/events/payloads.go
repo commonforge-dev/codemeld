@@ -294,9 +294,10 @@ func (p LaunchBegan) validate() error {
 }
 
 type ExecutionCapability struct {
-	Capability string                   `json:"capability"`
-	Reason     string                   `json:"reason,omitempty"`
-	Legs       []ExecutionCapabilityLeg `json:"legs,omitempty"`
+	Capability          string                   `json:"capability"`
+	Reason              string                   `json:"reason,omitempty"`
+	Legs                []ExecutionCapabilityLeg `json:"legs,omitempty"`
+	WithheldEnvironment []string                 `json:"withheld_environment,omitempty"`
 }
 
 type ExecutionCapabilityLeg struct {
@@ -330,6 +331,17 @@ func (p ExecutionCapability) validate() error {
 		}
 		if err := enum(k, fmt.Sprintf("legs[%d].observed", i), leg.Observed, executionCapabilityObservations); err != nil {
 			return err
+		}
+	}
+	for i, name := range p.WithheldEnvironment {
+		if err := required(k, fmt.Sprintf("withheld_environment[%d]", i), name); err != nil {
+			return err
+		}
+		if strings.Contains(name, "=") {
+			return fmt.Errorf("%s: withheld_environment[%d] must be a name, not an assignment", k, i)
+		}
+		if i > 0 && name <= p.WithheldEnvironment[i-1] {
+			return fmt.Errorf("%s: withheld_environment must be sorted with no duplicates", k)
 		}
 	}
 	return nil
@@ -2288,7 +2300,7 @@ func unmarshalPayload(kind string, raw json.RawMessage) (EventPayload, error) {
 	case KindSecurityStateHalted:
 		return decodeSecurityStateHalted(kind, raw)
 	default:
-		return nil, fmt.Errorf("unknown event kind %q", kind)
+		return nil, fmt.Errorf("%w %q", sessions.ErrUnknownEventKind, kind)
 	}
 }
 

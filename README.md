@@ -4,7 +4,7 @@
 
 **codemeld** is a coding assistant you run in your own projects, from your own terminal. You choose the model provider and the version-control system, you decide what leaves your machine, and you set how much the agent may do before it asks, from read-only to auto-approved edits inside your project.
 
-> **Status:** v0.4.8 is the latest release. See [the roadmap](ROADMAP.md) for what's planned.
+> **Status:** v0.4.9 is the latest release. See [the roadmap](ROADMAP.md) for what's planned.
 
 ---
 
@@ -39,9 +39,9 @@ A mode sets how much the agent may do before it stops to ask. It never replaces 
 
 | Mode | What the agent may do | Changes |
 |---|---|---|
-| **Plan** | Read, search, and plan. | Denied. Write tools aren't offered to the model, and mutating requests to codemeld's own tools are refused without a prompt. On a host with confined shell commands (below), Plan's shell commands run inside the boundary, where writes fail. |
+| **Plan** | Read, search, and plan. | Denied. Write tools aren't offered to the model, and mutating requests to codemeld's own tools are refused without a prompt. On a host with confined shell commands (below), Plan's shell commands run inside the boundary, where they never change your files: writes fail everywhere except a private temp folder that is deleted when the session ends. |
 | **Build** (default) | Normal work. | Prompted, unless an existing grant covers the request. |
-| **Auto edits** | Continuous work with fewer interruptions. | Auto-approved inside your project: creating, editing, making folders, and moving files. Creating, editing, and making folders are also auto-approved inside a declared `writable_folders` entry (see below). With shell commands confined and no settings file broken, deleting is auto-approved inside the project and declared folders too. Version-control changes and any other change outside the project still prompt. |
+| **Auto edits** | Continuous work with fewer interruptions. | Auto-approved inside your project: creating, editing, making folders, and moving files. Creating, editing, and making folders are also auto-approved inside a declared `writable_folders` entry (see below). With shell commands confined and no settings file broken, deleting is auto-approved inside the project and declared folders too, and so are the version-control tools' write actions (such as commit, add and stash) when their templates are codemeld's own built-ins or unchanged copies of them; customized version-control templates and any other change outside the project still prompt. |
 
 - Switch with `/mode <plan|build|auto-edits>`, or press shift+tab to cycle through them.
 - Auto edits covers only those four operations, plus deleting while shell commands are confined (below) and no settings file is broken, and only when the target, after symlinks are resolved, is inside the project, or, for creating, editing, making folders, and deleting, inside a folder declared in `writable_folders` while shell commands are confined and no settings file is broken. Deleting the project folder or a declared folder itself still prompts. A move needs both ends inside the project; a declared folder never auto-approves a move.
@@ -56,8 +56,8 @@ What codemeld asks and when: [docs/approvals.md](docs/approvals.md).
 
 On Linux amd64 and arm64 hosts with Landlock ABI 3 or newer (kernel 6.2+) that pass codemeld's startup self-test, Plan and Auto edits shell commands run inside a fixed boundary. No setting turns it off.
 
-- **Plan:** no file writes (except `/dev/null`) and no network.
-- **Auto edits:** writes only to the project's top-level files and folders (not `.codemeld`), a private temp folder for the session, and folders declared in `writable_folders`; a command recognized as network access or a history rewrite asks.
+- **Plan:** never changes your files and has no network. Commands may write only `/dev/null` and a private temp folder for the session (their `TMPDIR`, which also holds Go's build cache), deleted when the session ends. Temporary build and test files work there; project outputs, module downloads, `go.mod`/`go.sum` updates and file mode or time changes still fail.
+- **Auto edits:** writes only to the project's top-level files and folders (not `.codemeld`), a private temp folder for the session, and folders declared in `writable_folders`, but not the Git or Mercurial history store of a repository at the project root or at a declared folder's root, including a worktree's `.git` pointer file (a nested repository stays writable, and a repository created after a command starts is not protected for it); a command recognized as network access asks, while a history rewrite runs without asking and fails if it writes a protected store.
 - **Build:** always outside the boundary, with ordinary prompts.
 
 The status bar shows `sandbox: on` (Plan or Auto edits inside the boundary), `sandbox: off` (Build on a host where the self-test passed), or `sandbox: unavailable`. `unavailable` means either the self-test failed or the host is unsupported, so commands run outside the boundary with ordinary prompts and Plan's usual refusals, or a settings file is broken, so commands stay confined but every shell command asks ([the broken-settings case](SECURITY.md#broken-settings)). `/status` shows the reason. The security model and what the boundary does not cover: [SECURITY.md](SECURITY.md). How the boundary works: [docs/architecture.md](docs/architecture.md#execution-capability).

@@ -15,6 +15,7 @@ import (
 	"github.com/rivo/uniseg"
 
 	"codemeld.dev/codemeld/internal/events"
+	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/sessions"
 )
 
@@ -1542,7 +1543,7 @@ func LaunchBannerBar(version string, width int) string {
 // live markup that AppendBanner's styled-append seam renders.
 func LaunchBannerMeta(provider, model, effort, dir string) string {
 	seg := func(color, text string) string {
-		return fmt.Sprintf("[%s]%s[-]", color, tview.Escape(text))
+		return fmt.Sprintf("[%s]%s[-]", color, tview.Escape(permissions.SingleLineControlEscape(text)))
 	}
 	sep := fmt.Sprintf("[%s] · [-]", bannerMetaSeparator)
 

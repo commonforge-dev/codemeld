@@ -258,7 +258,7 @@ func (f *toolRegistryFactory) realize(cache *config.Cache, turnStore func() *ses
 	}
 	vcsRunner := newVCSActionRunner()
 	if len(generalAgent) > 0 && generalAgent[0].confinement != nil {
-		vcsRunner = &confinedRunner{inner: vcsRunner, conf: generalAgent[0].confinement, cap: cache.MaxToolOutputBytes()}
+		vcsRunner = &confinedRunner{inner: vcsRunner, conf: generalAgent[0].confinement, cap: cache.MaxToolOutputBytes(), storesWritable: true}
 	}
 	if err := registerVCSActions(reg, av.Template, av.RepoRoot, vcsRunner, emit, cache.MaxToolOutputBytes()); err != nil {
 		return nil, err

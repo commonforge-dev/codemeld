@@ -147,7 +147,13 @@ func systemOneLookupStage(tokens []ShellToken) bool {
 		names = tokens[1:]
 	case len(tokens) >= 3 && tokens[0].Value == "command" && tokens[1].Value == "-v":
 		names = tokens[2:]
+		if names[0].Value == "--" {
+			names = names[1:]
+		}
 	default:
+		return false
+	}
+	if len(names) == 0 {
 		return false
 	}
 	for _, t := range tokens {

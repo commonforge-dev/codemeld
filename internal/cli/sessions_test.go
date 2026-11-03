@@ -5648,3 +5648,68 @@ func TestSessionsPermissions_SystemOneAllowedRowEscapesControls(t *testing.T) {
 		t.Fatalf("system_one.allowed = %+v, want the original subject and model_id", allowed)
 	}
 }
+
+func writeSessionByID(t *testing.T, records []sessions.Record) string {
+	t.Helper()
+	home, rawCWD := t.TempDir(), t.TempDir()
+	canonical, err := sessions.CanonicalizeFolder(rawCWD)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dir := filepath.Join(sessions.SessionRoot(home), sessions.FolderDirName(canonical))
+	writeFolderFile(t, dir, canonical)
+	id := ids.NewV7()
+	writeFixtureSession(t, filepath.Join(dir, id+".json"), &sessions.Session{
+		Metadata: sessions.Metadata{ID: id, Folder: canonical, StartedAt: fixtureTime, UpdatedAt: fixtureTime, SchemaVersion: 1},
+		Records:  records,
+	})
+	stubHomeAndCwd(t, home, rawCWD)
+	return id
+}
+
+func unknownKindSession(t *testing.T) string {
+	t.Helper()
+	return writeSessionByID(t, []sessions.Record{
+		textMsg("user", "hello"),
+		eventRecord("from_a_newer_build", map[string]string{"note": "opaque"}),
+	})
+}
+
+func runSessionsCmd(t *testing.T, args ...string) (stdout, stderr string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	if code := Run(context.Background(), append([]string{"codemeld", "sessions"}, args...), &out, &errOut); code != 0 {
+		t.Fatalf("sessions %v exit = %d, want 0 (stderr=%q)", args, code, errOut.String())
+	}
+	return out.String(), errOut.String()
+}
+
+func TestSessionsShow_UnknownEventKindWarnsOnStderr(t *testing.T) {
+	id := unknownKindSession(t)
+	want := "codemeld: session " + id + `: skipped 1 event records of unknown kinds ("from_a_newer_build"=1); a newer codemeld wrote them; inspect with: codemeld sessions show ` + id + "\n"
+
+	out, errOut := runSessionsCmd(t, "show", id)
+	if errOut != want {
+		t.Fatalf("stderr = %q, want %q", errOut, want)
+	}
+	if !strings.Contains(out, "kind=from_a_newer_build") || !strings.Contains(out, `"note": "opaque"`) {
+		t.Fatalf("show output missing the unknown event's kind or payload:\n%s", out)
+	}
+
+	out, errOut = runSessionsCmd(t, "show", id, "--json")
+	if errOut != want {
+		t.Fatalf("--json stderr = %q, want %q", errOut, want)
+	}
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("--json stdout is not valid JSON:\n%s", out)
+	}
+}
+
+func TestSessionsShow_KnownKindsWriteNothingToStderr(t *testing.T) {
+	id := writeSessionByID(t, buildFixtureSession("/unused").Records)
+	for _, extra := range [][]string{nil, {"--json"}} {
+		if _, errOut := runSessionsCmd(t, append([]string{"show", id}, extra...)...); errOut != "" {
+			t.Fatalf("show %v stderr = %q, want empty", extra, errOut)
+		}
+	}
+}

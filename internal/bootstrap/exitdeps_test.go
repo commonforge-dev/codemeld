@@ -430,7 +430,7 @@ func TestStartTUI_ExitRecordsACapabilityChangeQueuedBehindADelivery(t *testing.T
 	case <-time.After(5 * time.Second):
 		t.Fatal("StartTUI did not return after /exit; the deferred second stop must be a no-op")
 	}
-	if want := []events.ExecutionCapability{constrainedCapability, brokenCapability, constrainedCapability}; code != 0 || !reflect.DeepEqual(atExit, want) {
+	if want := []events.ExecutionCapability{launchCapability(constrainedCapability), brokenCapability, constrainedCapability}; code != 0 || !reflect.DeepEqual(atExit, want) {
 		t.Fatalf("exit code = %d, execution_capability on disk at process exit = %+v; want 0 and %+v", code, atExit, want)
 	}
 }

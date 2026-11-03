@@ -3855,6 +3855,7 @@ const clearedGrantSettings = "permissions: []\n"
 type guardedRun struct {
 	project    string
 	settings   string
+	local      string
 	global     string
 	auth       *recordingAuthorizer
 	run        *fakeDispatchRunner
@@ -3867,7 +3868,10 @@ func newGuardedRun(t *testing.T, active func() *sessions.Store) guardedRun {
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
-	return newGuardedRunIn(t, active, project, nil)
+	g := newGuardedRunIn(t, active, project, nil)
+	g.local = config.LocalSettingsPath(project)
+	seedProtectedSettings(t, g.local)
+	return g
 }
 
 func newGuardedRunIn(t *testing.T, active func() *sessions.Store, project string, av *ActiveVCS, blocked ...string) guardedRun {
@@ -3888,7 +3892,7 @@ func newGuardedRunIn(t *testing.T, active func() *sessions.Store, project string
 	auth := &recordingAuthorizer{decision: allow()}
 	run := &fakeDispatchRunner{}
 	policy := securitystate.Policy{
-		SettingsPaths: []string{projectSettingsPath(cache.ProjectRoot()), SettingsPath(home)},
+		SettingsPaths: mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil).SettingsPaths,
 	}
 	if len(blocked) > 0 {
 		entries := make([]permissions.BlockedEntry, len(blocked))
@@ -3910,7 +3914,10 @@ func newGuardedRunIn(t *testing.T, active func() *sessions.Store, project string
 // Changed bytes or an appeared sidecar is what a refusal that arrived after the tool ran looks like.
 func (g guardedRun) assertProtectedStateIntact(t *testing.T) {
 	t.Helper()
-	for _, path := range []string{g.settings, g.global} {
+	for _, path := range []string{g.settings, g.local, g.global} {
+		if path == "" {
+			continue
+		}
 		if got := mustReadFile(t, path); got != sevenGrantSettings {
 			t.Fatalf("settings file %q = %q, want the seven grants untouched", path, got)
 		}
@@ -4001,6 +4008,82 @@ func TestProductionDispatcher_GuardRefusesProtectedMutationBeforeInvocation(t *t
 				return map[string]any{"source": "spare.yaml", "destination": g.global}
 			},
 			scope: func(g guardedRun) string { return filepath.Dir(g.global) },
+		},
+		{
+			name:  "seven-grant removal through the local settings file",
+			tool:  filetools.EditToolName,
+			args:  func(guardedRun) map[string]any { return removeGrants(".codemeld/settings.local.yaml") },
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "local settings file create",
+			tool: filetools.CreateToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"path": ".codemeld/settings.local.yaml", "content": clearedGrantSettings}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "local settings file delete",
+			tool: filetools.DeleteToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"path": ".codemeld/settings.local.yaml"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "local settings file mkdir",
+			tool: filetools.MkdirToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"path": ".codemeld/settings.local.yaml"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "move whose source is the local settings file",
+			tool: filetools.MoveToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"source": ".codemeld/settings.local.yaml", "destination": "spare.yaml"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name:  "local sidecar edit",
+			tool:  filetools.EditToolName,
+			args:  func(guardedRun) map[string]any { return removeGrants(".codemeld/settings.local.yaml.lock") },
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "local sidecar create",
+			tool: filetools.CreateToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"path": ".codemeld/settings.local.yaml.lock", "content": "held\n"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "local sidecar delete",
+			tool: filetools.DeleteToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"path": ".codemeld/settings.local.yaml.lock"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "local sidecar mkdir",
+			tool: filetools.MkdirToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"path": ".codemeld/settings.local.yaml.lock"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
+		},
+		{
+			name: "move whose destination is the local sidecar",
+			tool: filetools.MoveToolName,
+			args: func(guardedRun) map[string]any {
+				return map[string]any{"source": "spare.yaml", "destination": ".codemeld/settings.local.yaml.lock"}
+			},
+			scope: func(g guardedRun) string { return filepath.Dir(g.local) },
 		},
 		{
 			name: "move carrying away the directory that holds the project settings file",
@@ -7934,7 +8017,7 @@ func TestGeneralAgentBinding_AChildDeleteReachesTheSessionAndBothChildBlocks(t *
 	replayed.ReplaySessionRecords(reloaded.Records())
 	for name, app := range map[string]*tui.App{"live": live, "replayed": replayed} {
 		text := app.TranscriptText()
-		for _, want := range []string{"may delete:", "deleted 1 file(s), none undone:", "    " + target} {
+		for _, want := range []string{"may delete:", "deleted 1 file(s):", "    " + target} {
 			if !strings.Contains(text, want) {
 				t.Errorf("%s child block = %q, want it to contain %q", name, text, want)
 			}
@@ -8010,7 +8093,7 @@ func TestGeneralAgentBinding_AChildMoveReachesTheSessionAndBothChildBlocks(t *te
 	replayed.ReplaySessionRecords(reloaded.Records())
 	for name, app := range map[string]*tui.App{"live": live, "replayed": replayed} {
 		text := app.TranscriptText()
-		for _, want := range []string{"may move:", "moved 1 file(s), none undone:", "    " + source + " -> " + destination} {
+		for _, want := range []string{"may move:", "moved 1 file(s):", "    " + source + " -> " + destination} {
 			if !strings.Contains(text, want) {
 				t.Errorf("%s child block = %q, want it to contain %q", name, text, want)
 			}
@@ -8449,7 +8532,7 @@ func TestProductionDispatcher_ConfinedBashRefusalIsInBand(t *testing.T) {
 		t.Run(tc.command, func(t *testing.T) {
 			run := &fakeDispatchRunner{}
 			d := dispatcherFor(t, tools.NewRegistry(), run, &recordingAuthorizer{decision: allow()})
-			d.confinement = &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), blocked: testBlocked(t)}
+			d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), blocked: testBlocked(t)})
 
 			res, err := d.Dispatch(context.Background(), bashCall("c1", tc.command))
 			if err != nil {
@@ -8486,7 +8569,7 @@ func confinedVCSRegistry(t *testing.T, conf *confinement, inner *confineInner) (
 }
 
 func TestProductionDispatcher_ConfinedVCSSharesTheRealizedConfinement(t *testing.T) {
-	conf := &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: t.TempDir(), blocked: testBlocked(t)}
+	conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: t.TempDir(), blocked: testBlocked(t)})
 	inner := &confineInner{}
 	reg, _, cache, home, project, store := confinedVCSRegistry(t, conf, inner)
 	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()}, home, project,
@@ -8513,7 +8596,7 @@ func TestProductionDispatcher_ConfinedVCSSharesTheRealizedConfinement(t *testing
 		t.Fatalf("bounded/exec = %d/%d at cap %d, want one bounded run at the output cap", len(inner.bounded), len(inner.execs), inner.boundedCap)
 	}
 	got := inner.bounded[0]
-	want, err := cmdrunner.FixedEnvironment(conf.blocked.Home(), got.Cwd, "", conf.lookupPath, nil)
+	want, err := cmdrunner.FixedEnvironment(conf.blocked.Home(), got.Cwd, conf.tmpDir, conf.lookupPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -8534,8 +8617,8 @@ func TestGeneralAgentBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 		}
 	}
 	launch := string(mode.Build)
-	conf := &confinement{constrained: true, mode: func() string { return launch }, home: "/launch-home", lookupPath: lookup,
-		projectRoot: "/launch-project", blocked: permissions.NewBlockedPaths("/launch-home", nil), tmpDir: "/launch-tmp"}
+	conf := withSessionTemp(t, &confinement{constrained: true, mode: func() string { return launch }, home: "/launch-home", lookupPath: lookup,
+		projectRoot: "/launch-project", blocked: permissions.NewBlockedPaths("/launch-home", nil)})
 	inner := &confineInner{}
 	childInner := &confineInner{}
 	prevChild := newChildToolRunner
@@ -8641,7 +8724,7 @@ func newChildModeHarness(t *testing.T, published mode.Mode, wiring string) *chil
 
 	var top, bound *confinement
 	live := func() *confinement {
-		return &confinement{constrained: true, mode: liveMode(h.modeActive), lookupPath: programDir(t, "git"), blocked: testBlocked(t), tmpDir: t.TempDir(), projectRoot: project}
+		return withSessionTemp(t, &confinement{constrained: true, mode: liveMode(h.modeActive), lookupPath: programDir(t, "git"), blocked: testBlocked(t), projectRoot: project})
 	}
 	switch wiring {
 	case "shared":
@@ -8995,7 +9078,7 @@ type pinnedVCSHarness struct {
 func newPinnedVCSHarness(t *testing.T, active *mode.ActiveState) pinnedVCSHarness {
 	t.Helper()
 	inner := &confineInner{}
-	conf := &confinement{constrained: true, mode: liveMode(active), lookupPath: programDir(t, "git"), blocked: testBlocked(t), tmpDir: t.TempDir()}
+	conf := withSessionTemp(t, &confinement{constrained: true, mode: liveMode(active), lookupPath: programDir(t, "git"), blocked: testBlocked(t)})
 	reg, _, cache, home, project, store := confinedVCSRegistry(t, conf, inner)
 	conf.projectRoot = project
 	app := tui.New(nil)
@@ -10562,5 +10645,40 @@ func TestProductionDispatcher_SkillToolFailuresStayInBand(t *testing.T) {
 	res, err := run.dispatcher.Dispatch(context.Background(), structuredCall("c", "skill", map[string]any{"name": "deploy", "file": "scripts/run.sh"}))
 	if err != nil || res.Content != "echo deploy" {
 		t.Fatalf("later call = (%+v, %v), want the dispatcher still serving", res, err)
+	}
+}
+
+func TestProductionDispatcher_OnlyTheVCSRunnerMayWriteTheHistoryStore(t *testing.T) {
+	skillsHome := canonicalTempDir(t)
+	skills := filepath.Join(skillsHome, ".codemeld", "skills")
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf := &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), home: skillsHome, lookupPath: programDir(t, "git", "ls"),
+		blocked: testBlocked(t), tmpDir: t.TempDir()}
+	inner := &confineInner{}
+	reg, _, cache, home, project, store := confinedVCSRegistry(t, conf, inner)
+	conf.projectRoot = project
+	gitStore := filepath.Join(project, ".git")
+	if err := os.Mkdir(gitStore, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shellInner := &confineInner{}
+	d := newProductionToolDispatcher(reg, shellInner, &recordingAuthorizer{decision: allow()}, home, project,
+		func() *sessions.Store { return store }, cache.MaxToolOutputBytes(), mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+	d.confinement = conf
+	kept := []string{filepath.Join(project, ".codemeld"), skills}
+
+	if res, err := d.Dispatch(context.Background(), structuredCall("c1", "vcs_status", map[string]any{})); err != nil || res.Denied || len(inner.bounded) != 1 {
+		t.Fatalf("vcs Dispatch = %+v, %v; bounded runs %d, want one confined run", res, err, len(inner.bounded))
+	}
+	if policy, _ := decodeFrame(t, inner.bounded[0].Stdin); !slices.Equal(policy.NoWritePaths, kept) {
+		t.Fatalf("vcs no-write paths = %q, want %q without the store", policy.NoWritePaths, kept)
+	}
+	if res, err := d.Dispatch(context.Background(), bashCall("c2", "ls")); err != nil || res.Denied || len(shellInner.bounded) != 1 {
+		t.Fatalf("bash Dispatch = %+v, %v; bounded runs %d, want one confined run", res, err, len(shellInner.bounded))
+	}
+	if policy, _ := decodeFrame(t, shellInner.bounded[0].Stdin); !slices.Equal(policy.NoWritePaths, append(kept, gitStore)) {
+		t.Fatalf("bash no-write paths = %q, want %q", policy.NoWritePaths, append(kept, gitStore))
 	}
 }

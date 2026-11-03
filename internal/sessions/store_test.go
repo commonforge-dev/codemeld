@@ -1565,3 +1565,35 @@ func TestStore_TitleSourceAndIsChild_ReadStoredMetadata(t *testing.T) {
 		t.Fatal("IsChild = false for a session with forked_from")
 	}
 }
+
+func TestStore_RewriteKeepsSkippedUnknownEventLineByteIdentical(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	meta := `{"type":"metadata","metadata":{"id":"` + testMetaID + `","folder":"/home/u/proj",` +
+		`"started_at":"2026-05-25T12:00:00.000Z","updated_at":"2026-05-25T12:00:00.000Z","schema_version":1}}`
+	user := `{"type":"message","id":"` + testRecID1 + `","role":"user","content":"hi","timestamp":"2026-05-25T12:00:00.000Z"}`
+	if err := os.WriteFile(path, []byte(meta+"\n"+user+"\n"+unknownEventLine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sess, _, err := OpenSession(path)
+	if err != nil {
+		t.Fatalf("OpenSession() error = %v", err)
+	}
+	if err := ValidateEventPayloads(sess.Records, unknownKindValidator); err != nil {
+		t.Fatalf("ValidateEventPayloads() = %v", err)
+	}
+	store := New(path, sess)
+	if _, _, err := store.RefreshUpdatedAt(context.Background()); err != nil {
+		t.Fatalf("RefreshUpdatedAt() error = %v", err)
+	}
+
+	lines := strings.Split(string(mustRead(t, path)), "\n")
+	if len(lines) != 4 || lines[1] != user || lines[2] != unknownEventLine || lines[3] != "" {
+		t.Fatalf("rewritten file lines = %q, want the user line then the unknown line byte-identical", lines)
+	}
+	if lines[0] == meta {
+		t.Fatal("metadata line unchanged, want a refreshed updated_at")
+	}
+	if got := len(store.Records()); got != 2 {
+		t.Fatalf("store records = %d, want 2 (the skipped event stays a record)", got)
+	}
+}

@@ -30,6 +30,8 @@ type Policy struct {
 	NoWritePaths         []string `json:"no_write_paths"`
 	ReadRoots            []string `json:"read_roots"`
 	TmpDir               string   `json:"tmp_dir"`
+	TmpDirDev            uint64   `json:"tmp_dir_dev"`
+	TmpDirIno            uint64   `json:"tmp_dir_ino"`
 }
 
 var errPolicyFrameTooLarge = fmt.Errorf("policy frame exceeds %d bytes", MaxPolicyFrameBytes)
@@ -80,14 +82,24 @@ func ReadPolicyFrame(r io.Reader) (Policy, error) {
 }
 
 func (p Policy) validate() error {
+	identity := p.TmpDirDev != 0 || p.TmpDirIno != 0
+	if identity && p.TmpDir == "" {
+		return errors.New("policy: tmp_dir_dev and tmp_dir_ino require tmp_dir")
+	}
 	switch p.Mode {
 	case ModePlan:
-		if p.TmpDir != "" || len(p.WriteRoots) > 0 || len(p.NoWritePaths) > 0 || p.ExceptionalAuthority != "" {
-			return errors.New("policy: plan mode carries no tmp_dir, write_roots, no_write_paths or exceptional_authority")
+		if len(p.WriteRoots) > 0 || len(p.NoWritePaths) > 0 || p.ExceptionalAuthority != "" {
+			return errors.New("policy: plan mode carries no write_roots, no_write_paths or exceptional_authority")
+		}
+		if p.TmpDir != "" && p.TmpDirIno == 0 {
+			return errors.New("policy: plan tmp_dir requires tmp_dir_ino")
 		}
 	case ModeAutoEdits:
 		if p.TmpDir == "" {
 			return errors.New("policy: auto_edits requires tmp_dir")
+		}
+		if identity {
+			return errors.New("policy: auto_edits carries no tmp_dir_dev or tmp_dir_ino")
 		}
 		if p.ExceptionalAuthority != "" && p.ExceptionalAuthority != NetworkAccessAuthority {
 			return fmt.Errorf("policy: unknown exceptional_authority %q", p.ExceptionalAuthority)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/goccy/go-yaml"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 
 	"codemeld.dev/codemeld/schemas"
 )
@@ -67,19 +68,40 @@ func Validate(yamlBytes []byte, filePath string) error {
 		if verr == nil {
 			return fmt.Errorf("%s: %w", filePath, err)
 		}
-		keys := offendingKeys(verr)
+		keys, allUnknown := offendingKeys(verr)
+		if allUnknown {
+			return &UnknownSettingsError{Path: filePath, Keys: keys}
+		}
 		return fmt.Errorf("%s: schema validation failed at %s: %w", filePath, strings.Join(keys, ", "), verr)
 	}
 	return nil
 }
 
+type UnknownSettingsError struct {
+	Path string
+	Keys []string
+}
+
+func (e *UnknownSettingsError) Error() string {
+	return fmt.Sprintf("%s: schema validation failed at %s: not a known setting", e.Path, strings.Join(e.Keys, ", "))
+}
+
 // offendingKeys walks the validation-error tree and returns the dotted keys of the most specific (leaf) failures, with array indices as path segments.
-func offendingKeys(verr *jsonschema.ValidationError) []string {
+func offendingKeys(verr *jsonschema.ValidationError) (keys []string, allUnknown bool) {
 	seen := map[string]struct{}{}
+	allUnknown = true
 	var collect func(*jsonschema.ValidationError)
 	collect = func(v *jsonschema.ValidationError) {
 		if len(v.Causes) == 0 {
-			seen[dottedKey(v.InstanceLocation)] = struct{}{}
+			extra, ok := v.ErrorKind.(*kind.AdditionalProperties)
+			if !ok {
+				allUnknown = false
+				seen[dottedKey(v.InstanceLocation)] = struct{}{}
+				return
+			}
+			for _, p := range extra.Properties {
+				seen[dottedKey(append(append([]string{}, v.InstanceLocation...), p))] = struct{}{}
+			}
 			return
 		}
 		for _, c := range v.Causes {
@@ -88,12 +110,12 @@ func offendingKeys(verr *jsonschema.ValidationError) []string {
 	}
 	collect(verr)
 
-	keys := make([]string, 0, len(seen))
+	keys = make([]string, 0, len(seen))
 	for k := range seen {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return keys
+	return keys, allUnknown
 }
 
 func dottedKey(loc []string) string {

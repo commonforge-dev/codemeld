@@ -36,6 +36,7 @@ const (
 	KeyAttribution       = "attribution"
 	KeySystemOne         = "system_one"
 	KeyRetentionDays    = "sessions.retention_days"
+	KeyVCSUserConfig     = "confinement.vcs_user_config"
 	keyModelFavorites    = "model.favorites"
 )
 
@@ -249,6 +250,12 @@ func rewriteKey(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWrit
 			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires an int >= 1, got %T %v", key, newValue, newValue)
 		}
 		return setNestedScalar(r, "sessions", "retention_days", strconv.Itoa(days))
+	case KeyVCSUserConfig:
+		v, ok := newValue.(string)
+		if !ok || (v != "allow" && v != "block") {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires \"allow\" or \"block\", got %T %v", key, newValue, newValue)
+		}
+		return setNestedScalar(r, "confinement", "vcs_user_config", v)
 	case blockedPathsKey:
 		return rewriteBlockedPaths(r, newValue)
 	case KeyOpenRouterRoutingDataCollection, KeyOpenRouterRoutingSort:

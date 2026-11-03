@@ -73,14 +73,27 @@ then the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TER
 - **Files.** Reads are allowed everywhere except the blocked paths, which always include
   `~/.codemeld`; the one exception is `~/.codemeld/skills`, readable under the conditions in
   [Global skills and the sandbox](skills.md#global-skills-and-the-sandbox)
-  (`skillsReadRoots`). Plan may write only `/dev/null`. Auto edits may write each top-level entry of the
+  (`skillsReadRoots`). Plan may write only `/dev/null` and the session's private temp folder, and
+  only while that folder is still the one codemeld created: the policy carries its device and inode
+  numbers, and the helper grants it through a handle it opened and checked (`applyLandlock`). Auto edits may write each top-level entry of the
   project except `.codemeld` (skipping an entry that resolves outside the project, to the project
   itself, into `.codemeld`, or nowhere), the session's private temp folder (given to the command
   as `TMPDIR` and removed when the session ends), and declared `writable_folders`. Blocked
-  paths and the `.codemeld` folders are carved out of every write root, and `/dev/shm` itself is
-  never writable. codemeld adds no other temporary write grant: `/tmp` and the `$TMPDIR` codemeld
+  paths, the `.codemeld` folders and, for shell commands, the version history stores below are
+  carved out of every write root, and `/dev/shm` itself is never writable. codemeld adds no other temporary write grant: `/tmp` and the `$TMPDIR` codemeld
   was launched with are writable only when an effective declared `writable_folders` entry covers
   where they resolve, or when they resolve inside a granted top-level project entry.
+- **Version history.** In Auto edits, shell commands, a child agent's included, cannot write the
+  history store of a repository at the project root or at a declared `writable_folders` root:
+  its `.git` or `.hg` folder, the gitdir and `commondir` folders a `.git` pointer file names (a
+  worktree or submodule), an hg share's `sharedpath` folder, the `.git` pointer file itself, and a
+  `.git` or `.hg` symlink (`permissions.HistoryStores`). A store outside every write root gets no
+  entry (`withHistoryStores` in `internal/bootstrap/confinedrunner.go`). A marker naming a missing
+  or invalid store stops the shell command before it starts. A nested repository below one of
+  those roots stays writable, and a repository created or repointed after a command starts is not
+  protected for that command. The version-control tools' commands keep write access to the
+  stores (`storesWritable` on the runner `internal/bootstrap/tooldispatch.go` builds for them), so
+  built-in commits still work.
 - **Nested write roots.** A write root that another write root's grant already covers (for
   example, a private temp folder inside a declared writable folder) is never granted on its own,
   so replacing it with a symlink gives commands no access to the symlink's target. A declared
@@ -102,11 +115,12 @@ then the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TER
 
 On a `constrained` host, the sandbox is the authorization for Plan and Auto edits shell commands:
 they run inside it with no ordinary prompt, and nothing is saved. The same boundary wraps the
-commands of the version-control tools and of child agents. Build is never sandboxed.
+commands of the version-control tools, which alone may write the history stores, and of child
+agents. Build is never sandboxed.
 
 | Startup self-test | Settings file | Recorded capability | Shell commands in Plan and Auto edits |
 |---|---|---|---|
-| passed | valid | `constrained` | sandboxed, no ordinary prompt; in Auto edits, a command with a recognized network or history-rewrite stage asks, and file deletion and commands codemeld cannot split run without asking |
+| passed | valid | `constrained` | sandboxed, no ordinary prompt; in Auto edits, a command with a recognized network stage asks (`SandboxedAutoEditsAuthority`), and file deletion, history rewrites and commands codemeld cannot split run without asking; a rewrite cannot write the history stores under **Version history** above, and a version-control tool write action from a product-authored template runs without asking while a customized template's does not (`sandboxedVCSWrite`) |
 | passed | broken | `refused` (broken settings) | still sandboxed, every command asks |
 | failed or unsupported | any | `refused` with its reason | unsandboxed, ordinary prompts and Plan refusals |
 

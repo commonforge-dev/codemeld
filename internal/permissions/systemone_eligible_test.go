@@ -430,6 +430,7 @@ func TestSystemOneEligible_AllowsLookups(t *testing.T) {
 	for _, mode := range []string{"auto_edits", "plan"} {
 		for _, command := range []string{
 			"command -v jq",
+			"command -v -- jq",
 			"type jq",
 			"command -v git",
 			"type git",
@@ -484,7 +485,6 @@ func TestSystemOneEligible_RefusesNonLookupShapes(t *testing.T) {
 		"type",
 		"type -p jq",
 		"type -a jq",
-		"command -v -- jq",
 		"command -v jq -x",
 		`"command" -v jq`,
 		`\type jq`,
@@ -514,6 +514,15 @@ func TestSystemOneEligible_RefusesNonLookupShapes(t *testing.T) {
 	}
 }
 
+func TestSystemOneEligible_RefusesDelimiterAdversarialLookups(t *testing.T) {
+	f := newSystemOneFixture(t)
+	for _, command := range commandLookupDelimiterRejected {
+		if SystemOneEligible(f.request(t, command), f.mode(), f.blocked, command) == "" {
+			t.Errorf("SystemOneEligible(%q) = \"\", want a reason", command)
+		}
+	}
+}
+
 func TestSystemOneEligible_LookupInCompound(t *testing.T) {
 	f := newSystemOneFixture(t)
 	if command := "command -v jq; hg status"; SystemOneEligible(f.request(t, command), f.mode(), f.blocked, command) != "" {
@@ -534,6 +543,8 @@ func TestSystemOneEligible_LookupGrammarWiderThanRouting(t *testing.T) {
 		route             StageRoute
 	}{
 		{"command -v git", true, true, RouteDirect},
+		{"command -v -- git", true, true, RouteDirect},
+		{"command -v -- jq", true, true, RouteLiteral},
 		{"type git", true, true, RouteDirect},
 		{"command -v git diff", false, true, RouteLiteral},
 		{"type git diff", false, true, RouteLiteral},

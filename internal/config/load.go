@@ -230,6 +230,11 @@ func FormatLoadError(path string, cat LoadFailure, err error, consequence LoadCo
 		what, fix := parseFailureDetail(err)
 		return attribute(path, frameLoadFailure(parsePhrase, consequence, what, fix))
 	case SchemaValidationError:
+		var unknown *UnknownSettingsError
+		if errors.As(err, &unknown) {
+			what, fix := unknownSettingsDetail(unknown.Keys)
+			return attribute(path, frameLoadFailure(schemaPhrase, consequence, what, fix))
+		}
 		// Validate's message already opens with the path, which attribute is about to add.
 		detail := strings.TrimPrefix(fserrors.CollapseControls(err.Error()), path+": ")
 		return attribute(path, frameLoadFailure(schemaPhrase, consequence, detail, schemaFix))
@@ -243,6 +248,26 @@ func FormatLoadError(path string, cat LoadFailure, err error, consequence LoadCo
 func FormatYAMLParseFailure(src []byte, err error, consequence LoadConsequence) string {
 	what, fix := parseFailureDetail(annotateParseError(src, err))
 	return frameLoadFailure(parsePhrase, consequence, what, fix)
+}
+
+var renamedSettings = map[string]string{"vcs.preferred": "vcs.force"}
+
+func unknownSettingsDetail(keys []string) (what, fix string) {
+	names := make([]string, len(keys))
+	fixes := make([]string, len(keys))
+	for i, k := range keys {
+		names[i] = fserrors.CollapseControls(k)
+		if to, ok := renamedSettings[k]; ok {
+			fixes[i] = fmt.Sprintf("rename %s to %s, its new name", names[i], to)
+		} else {
+			fixes[i] = fmt.Sprintf("remove %s or correct its name", names[i])
+		}
+	}
+	what = "unknown setting " + strings.Join(names, ", ")
+	if len(keys) > 1 {
+		what = "unknown settings " + strings.Join(names, ", ")
+	}
+	return what, strings.Join(fixes, "; ") + ", then start codemeld again"
 }
 
 func attribute(path, body string) string {

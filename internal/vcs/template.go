@@ -192,7 +192,7 @@ func parseTemplate(path, name string) (*Template, error) {
 // *Template values keyed by name. It is the in-memory base map a caller overlays the global and
 // per-project template directories onto at bootstrap step 4, so the built-ins are always
 // present even when their first-run reference copies under ~/.codemeld/global/vcs/ have been
-// deleted — the union of names this base provides is part (a) of the vcs.preferred cross-reference set. Each
+// deleted — the union of names this base provides is part (a) of the vcs.force cross-reference set. Each
 // Template.Source is the synthetic token "built-in:<name>" because the bytes come from the binary,
 // not a file on disk.
 func LoadBuiltinTemplates() (map[string]*Template, error) {

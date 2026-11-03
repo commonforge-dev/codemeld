@@ -103,11 +103,14 @@ func ClassifyExceptional(req MatchRequest, mc ModeContext) (authority string, cl
 	return stagesAuthority(stages, ""), true
 }
 
-// File deletion is dropped from each token before any reduction, because deletion outranks history
-// rewrite and dropping it afterwards would hide a rewrite in the same command.
+// Deletions and history rewrites run in the sandbox, which keeps the protected history stores
+// read-only, so only network access asks.
 func SandboxedAutoEditsAuthority(req MatchRequest, mc ModeContext) string {
 	stages, _ := exceptionalStages(req, mc)
-	return stagesAuthority(stages, authorityFileDeletion)
+	if stagesAuthority(stages, authorityFileDeletion) == authorityNetwork {
+		return authorityNetwork
+	}
+	return ""
 }
 
 func stagesAuthority(stages []StageNormalization, dropped string) (authority string) {
@@ -302,6 +305,9 @@ func lookupWrapperStage(toks []ShellToken) bool {
 		names = names[1:]
 	case toks[0].Value != "type":
 		return false
+	}
+	if toks[0].Value == "command" && toks[1].Value == "-v" && len(names) > 0 && names[0].Value == "--" {
+		names = names[1:]
 	}
 	return len(names) > 0 && tokensExpansionFree(toks[1:]) && !slices.ContainsFunc(names, func(t ShellToken) bool { return strings.HasPrefix(t.Value, "-") })
 }

@@ -60,7 +60,7 @@ func (l preparedChildLifecycle) Prepare(parent *sessions.Store, title string, ch
 		}
 		tmpDir = folder
 		capability = l.recorder.current()
-		return undo, recordExecutionCapability(l.ctx, child, capability, notices)
+		return undo, recordExecutionCapability(l.ctx, child, capability, nil, notices)
 	}
 	owned, err := sessionfork.CreateOwnedChild(l.ctx, l.home, parent.MetadataSnapshot(), parent,
 		sessionfork.Child{Title: title, Records: childRecords}, terminalParentRecords, postLaunch, onWriteFailure)

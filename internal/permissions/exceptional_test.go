@@ -131,6 +131,12 @@ var classifyExceptionalCases = []struct {
 	{shell: `find . -exec rm {} \;`, wantAuthority: authorityFileDeletion, wantClassifiable: true},
 	{shell: "find . -execdir rm {} +", wantAuthority: authorityFileDeletion, wantClassifiable: true},
 	{shell: "git -C dir rebase", wantAuthority: authorityHistoryRewrite, wantClassifiable: true},
+	{shell: "hg strip tip", wantAuthority: authorityHistoryRewrite, wantClassifiable: true},
+	{shell: "git rebase main", wantAuthority: authorityHistoryRewrite, wantClassifiable: true},
+	{shell: "rm x | hg strip .", wantAuthority: authorityFileDeletion, wantClassifiable: true},
+	{shell: "curl x", wantAuthority: authorityNetwork, wantClassifiable: true},
+	{shell: "git push", wantAuthority: authorityNetwork, wantClassifiable: true},
+	{shell: "git push origin rebase", wantAuthority: authorityNetwork, wantClassifiable: true},
 	{shell: "git commit --amend", wantAuthority: authorityHistoryRewrite, wantClassifiable: true},
 	{shell: `sh -c 'ls && git commit -m x --amend'`, wantAuthority: authorityHistoryRewrite, wantClassifiable: true},
 	{shell: `sh -c 'ls && find . -name "*.o" -delete'`, wantAuthority: authorityFileDeletion, wantClassifiable: true},
@@ -468,6 +474,8 @@ var literalChainCases = []struct {
 	{`ls; A=1 B="2 3" curl u`, authorityNetwork, true},
 	{`bash x.sh; rm y`, authorityFileDeletion, true},
 	{`ls && cd sub && rm x`, authorityFileDeletion, true},
+	{`rm x && git rebase main`, authorityFileDeletion, true},
+	{`rm x; curl y`, authorityNetwork, true},
 
 	{`X=1 bash script.sh; ls`, "", false},
 	{`X=1 sh script.sh`, "", false},
@@ -653,6 +661,46 @@ func TestClassifyExceptionalShellAndWrapperStages(t *testing.T) {
 	}
 }
 
+func TestClassifyExceptionalLookupDelimiter(t *testing.T) {
+	newSystemOneFixture(t)
+	for _, tc := range []struct {
+		source, withoutDelimiter string
+		wantClassifiable         bool
+	}{
+		{"command -v -- jq", "command -v jq", true},
+		{"command -v -- git", "command -v git", true},
+		{"command -v -- git jq", "command -v git jq", true},
+		{"command -v -- ./jq", "command -v ./jq", true},
+		{"command -v -- /usr/bin/jq", "command -v /usr/bin/jq", true},
+		{"command -v -- 'jq;id'", "command -v 'jq;id'", true},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			authority, classifiable := ClassifyExceptional(shellCtx(t, tc.source))
+			wantAuthority, wantClassifiable := ClassifyExceptional(shellCtx(t, tc.withoutDelimiter))
+			if authority != wantAuthority || classifiable != wantClassifiable || classifiable != tc.wantClassifiable {
+				t.Fatalf("ClassifyExceptional(%q) = (%q, %v), want (%q, %v) like %q", tc.source, authority, classifiable, wantAuthority, tc.wantClassifiable, tc.withoutDelimiter)
+			}
+		})
+	}
+}
+
+func TestClassifyExceptionalLookupDelimiterRejectedForms(t *testing.T) {
+	newSystemOneFixture(t)
+	classified := map[string]bool{
+		"command -v -- ./jq":        true,
+		"command -v -- /usr/bin/jq": true,
+		"command -v -- 'jq;id'":     true,
+		"command -- -v git":         true,
+	}
+	for _, source := range commandLookupDelimiterRejected {
+		t.Run(source, func(t *testing.T) {
+			if authority, classifiable := ClassifyExceptional(shellCtx(t, source)); authority != "" || classifiable != classified[source] {
+				t.Fatalf("ClassifyExceptional(%q) = (%q, %v), want (\"\", %v)", source, authority, classifiable, classified[source])
+			}
+		})
+	}
+}
+
 func TestClassifyExceptionalWrappedPathProgram(t *testing.T) {
 	dir := t.TempDir()
 	rm := filepath.Join(dir, "rm")
@@ -790,8 +838,8 @@ func TestExceptionalClassificationsStayPerCallConcurrently(t *testing.T) {
 		`ls -la`:                     {"", true, ""},
 		`rm -rf build`:               {"file deletion", true, ""},
 		`curl x`:                     {"network access", true, "network access"},
-		`hg strip tip`:               {"VCS history rewrite", true, "VCS history rewrite"},
-		`rm x && git rebase main`:    {"file deletion", true, "VCS history rewrite"},
+		`hg strip tip`:               {"VCS history rewrite", true, ""},
+		`rm x && git rebase main`:    {"file deletion", true, ""},
 		`rm x; curl y`:               {"network access", true, "network access"},
 		`cat <<< x | sh`:             {"", false, ""},
 		`ls && cu` + "\\\n" + `rl x`: {"", false, ""},
@@ -873,7 +921,7 @@ func TestSandboxedAutoEditsAuthorityParityWithClassifierTable(t *testing.T) {
 				t.Fatalf("ClassifyExceptional = (%q, %v), want (%q, %v)", authority, classifiable, tc.authority, tc.classifiable)
 			}
 			want := tc.authority
-			if want == "file deletion" || !tc.classifiable {
+			if want != "network access" || !tc.classifiable {
 				want = ""
 			}
 			if got := SandboxedAutoEditsAuthority(tc.req, tc.mc); got != want {
@@ -891,18 +939,18 @@ func TestSandboxedAutoEditsAuthorityChecksEveryStage(t *testing.T) {
 		{`find . -delete`, "file deletion", ""},
 		{`bash -c 'rm x'`, "file deletion", ""},
 		{`nice rm x`, "file deletion", ""},
-		{`rm x && git rebase main`, "file deletion", "VCS history rewrite"},
-		{`git rebase main; rm x`, "file deletion", "VCS history rewrite"},
-		{`rm x | hg strip .`, "file deletion", "VCS history rewrite"},
+		{`rm x && git rebase main`, "file deletion", ""},
+		{`git rebase main; rm x`, "file deletion", ""},
+		{`rm x | hg strip .`, "file deletion", ""},
 		{`rm x; curl y`, "network access", "network access"},
 		{`git reset --hard && git push`, "network access", "network access"},
 		{`rm x && command git push`, "network access", "network access"},
 		{`rm x && nice git push`, "network access", "network access"},
 		{`rm x | xargs git push`, "network access", "network access"},
 		{`rm x; bash -c 'git push'`, "network access", "network access"},
-		{`rm x && git commit --amend`, "file deletion", "VCS history rewrite"},
-		{`git commit --amend -m clean`, "file deletion", "VCS history rewrite"},
-		{`find . -delete && hg histedit`, "file deletion", "VCS history rewrite"},
+		{`rm x && git commit --amend`, "file deletion", ""},
+		{`git commit --amend -m clean`, "file deletion", ""},
+		{`find . -delete && hg histedit`, "file deletion", ""},
 		{`which -a x; file "$(which x)"`, "", ""},
 		{`env PATH="/d:$PATH" /abs/check.sh`, "", ""},
 	} {

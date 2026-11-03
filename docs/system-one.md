@@ -30,8 +30,10 @@ model about such a command just before it would show you a prompt, or before Pla
   (`SystemOneEligible`).
 - **Name lookups.** `command -v NAME…` and `type NAME…` with one or more plain, unquoted names such
   as `jq` or `python3` (no paths, options or patterns) can be checked (`systemOneLookupStage`,
-  called by `systemOneStageEligible`). These forms only look the names up and never run them, so a
-  name that is found inside the project, or not found at all, does not stop the check. Only the
+  called by `systemOneStageEligible`). One unquoted `--` may also sit between `command -v` and the
+  names (`command -v -- jq`); `type` takes no `--`. These forms only look the names up and never
+  run them, so a name that is found inside the project, or not found at all, does not stop the
+  check. Only the
   lookup's own `command` or `type` word skips the checks on how and from where a program runs; the
   other stages of a compound command are checked as usual, so `type jq && ./x.sh` is still
   excluded. Every other check above still applies, and qualifying only means the model is asked; it
@@ -47,7 +49,8 @@ model about such a command just before it would show you a prompt, or before Pla
 - **What is never sent.** Network access, file deletion, and version-control history rewrites
   always go to the ordinary prompt when they ask (`ClassifyExceptional`,
   `internal/permissions/exceptional.go`). In sandboxed Auto edits with valid settings a file
-  deletion does not ask: it runs in the sandbox without a prompt or a check.
+  deletion or history rewrite does not ask: it runs in the sandbox without a prompt or a check
+  (`SandboxedAutoEditsAuthority`).
   The model is asked only whether a command reads, never whether it may write, delete, use the
   network or run other code.
 - **When it allows.** The model returns three probabilities: that the command only reads, that it

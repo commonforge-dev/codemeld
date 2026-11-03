@@ -58,7 +58,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.8"
+var codemeldVersion = "Beta 0.4.9"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -110,19 +110,19 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	}
 	execution := resolveExecutionCapability(enforce.ResolveInput{Home: result.Home})
 	app := tui.New(nil)
-	tmpDir, err := startExecutionCapability(execution, app)
-	if err != nil {
-		return fmt.Errorf("bootstrap: StartTUI create confinement temp folder: %w", err)
-	}
+	owned, err := startExecutionCapability(execution, app)
 	var conf *confinement
 	defer func() {
 		switch {
 		case conf != nil:
 			retErr = errors.Join(retErr, conf.cleanupAll())
-		case tmpDir != "":
-			retErr = errors.Join(retErr, removeSessionTempDir(tmpDir))
+		case owned != nil:
+			retErr = errors.Join(retErr, owned.removeAndRelease())
 		}
 	}()
+	if err != nil {
+		return fmt.Errorf("bootstrap: StartTUI create confinement temp folder: %w", err)
+	}
 
 	app.SetActiveStore(result.Session)
 	app.SetCommandFlush(newCommandFlush(ctx, app))
@@ -140,7 +140,11 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	}
 	stopBlockedDelivery := queueBlockedNotices(app, guard.Blocked, recordTransition)
 	defer stopBlockedDelivery()
-	if err := recordExecutionCapability(ctx, result.Session, initialExecution, app); err != nil {
+	inherited, withheld := runner.InheritedEnvironment(os.Environ())
+	if !execution.SelfTestPassed {
+		withheld = nil
+	}
+	if err := recordExecutionCapability(ctx, result.Session, initialExecution, withheld, app); err != nil {
 		return fmt.Errorf("bootstrap: StartTUI record execution capability: %w", err)
 	}
 	// Pass the resolved home so the '@' file-reference picker can honor the
@@ -173,8 +177,8 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	if err != nil {
 		return fmt.Errorf("bootstrap: StartTUI build blocked paths: %w", err)
 	}
-	inherited, _ := runner.InheritedEnvironment(os.Environ())
-	conf = launchConfinement(execution, tmpDir, modeActive, cache, result.Home, guard, inherited)
+	conf = launchConfinement(execution, owned.folder(), modeActive, cache, result.Home, guard, inherited)
+	conf.own(owned)
 	systemOne := newSystemOneCheck(cache, guard.Blocked)
 	registry, err := realizeToolRegistry(result.ToolRegistry, cache, toolEvents.Active, result.Home, result.LaunchDir, guard,
 		generalAgentBinding{parent: generalAgentParent, notices: app, confinement: conf, systemOne: systemOne})
@@ -310,7 +314,11 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	// launches leave ResumeReplay false and are unaffected. Run is not yet active, so
 	// ReplaySessionRecords mutates the pane directly.
 	if result.ResumeReplay {
-		app.ReplaySessionRecords(result.Session.Records())
+		records := result.Session.Records()
+		app.ReplaySessionRecords(records)
+		if notice := sessions.SkippedEventsNotice(result.Session.SessionID(), sessions.SkippedEventKinds(records)); notice != "" {
+			app.Notice(notice)
+		}
 	}
 
 	// Install the same effort deps the /effort registry uses on the app itself so
@@ -459,7 +467,7 @@ func (r *capabilityRecorder) deliver(ctx context.Context, app *tui.App, degraded
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if store := app.ActiveStore(); store != nil {
-		_ = recordExecutionCapability(ctx, store, liveExecutionCapability(r.launch, degraded), notices)
+		_ = recordExecutionCapability(ctx, store, liveExecutionCapability(r.launch, degraded), nil, notices)
 	}
 }
 
@@ -467,7 +475,7 @@ func (r *capabilityRecorder) activate(ctx context.Context, app *tui.App, target 
 	r.refresh()
 	var held heldNotices
 	r.mu.Lock()
-	err := recordExecutionCapability(ctx, target, r.cached(), &held)
+	err := recordExecutionCapability(ctx, target, r.cached(), nil, &held)
 	if err == nil {
 		app.SetActiveStore(target)
 	}
@@ -481,7 +489,7 @@ func (r *capabilityRecorder) reconcile(ctx context.Context, app *tui.App, target
 	var held heldNotices
 	r.mu.Lock()
 	if live := r.cached(); live.Capability != recorded.Capability || live.Reason != recorded.Reason {
-		if err := recordExecutionCapability(ctx, target, live, &held); err != nil && len(held) == 0 {
+		if err := recordExecutionCapability(ctx, target, live, nil, &held); err != nil && len(held) == 0 {
 			held.Notice(fmt.Sprintf("can't record the execution capability in %s: %v", target.Path(), err))
 		}
 	}
@@ -1481,24 +1489,24 @@ func turnUnavailable(app *tui.App, ctl *turnController) func() bool {
 
 var resolveExecutionCapability = enforce.Resolve
 
-func startExecutionCapability(resolution enforce.Resolution, notices tui.NoticeRenderer) (string, error) {
+func startExecutionCapability(resolution enforce.Resolution, notices tui.NoticeRenderer) (*sessionTempDir, error) {
 	if runtime.GOOS == "linux" {
 		if err := removeStaleSessionTempDirs(); err != nil {
 			notices.Notice(fmt.Sprintf("codemeld: could not remove a leftover confinement temp folder: %v", err))
 		}
 	}
 	if !resolution.SelfTestPassed {
-		return "", nil
+		return nil, nil
 	}
 	return newSessionTempDir()
 }
 
-var recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
+var recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
 	var legs []events.ExecutionCapabilityLeg
 	for _, leg := range resolution.Legs {
 		legs = append(legs, events.ExecutionCapabilityLeg{Name: leg.Name, Observed: leg.Observed})
 	}
-	if _, err := events.Append(store, events.ExecutionCapability{Capability: string(resolution.Capability), Reason: resolution.Reason, Legs: legs}); err != nil {
+	if _, err := events.Append(store, events.ExecutionCapability{Capability: string(resolution.Capability), Reason: resolution.Reason, Legs: legs, WithheldEnvironment: withheld}); err != nil {
 		return err
 	}
 	cat, reason, err := store.Flush(context.WithoutCancel(ctx))

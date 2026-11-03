@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1215,6 +1216,10 @@ type steppedReader struct {
 	lines []string
 	next  chan struct{}
 	i     int
+
+	mu       sync.Mutex
+	entered  int
+	released int
 }
 
 func newSteppedReader(lines ...string) *steppedReader {
@@ -1222,6 +1227,9 @@ func newSteppedReader(lines ...string) *steppedReader {
 }
 
 func (r *steppedReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	r.entered++
+	r.mu.Unlock()
 	<-r.next
 	if r.i >= len(r.lines) {
 		return 0, io.EOF
@@ -1231,7 +1239,38 @@ func (r *steppedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (r *steppedReader) release() { r.next <- struct{}{} }
+func (r *steppedReader) release() {
+	r.mu.Lock()
+	r.released++
+	r.mu.Unlock()
+	r.next <- struct{}{}
+}
+
+func (r *steppedReader) counts() (entered, released int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.entered, r.released
+}
+
+func (r *steppedReader) awaitBlocked(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if entered, released := r.counts(); entered > released {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no stdin read is blocked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (r *steppedReader) releaseAbandoned() {
+	if entered, released := r.counts(); entered > released {
+		r.release()
+	}
+}
 
 // promptOutput reads out under the prompter's own writer lock, which is the only safe way
 // to look at it while the notifier's goroutine may be writing.
@@ -1346,31 +1385,30 @@ func TestTerminalPrompter_AnswerInsideTheFirstIntervalIsSilent(t *testing.T) {
 	}
 }
 
-// The prompt reads block on stdin, which no cancellation interrupts, so the notifier has
-// to watch the context itself.
 func TestTerminalPrompter_CancelledContextStopsTheAlerts(t *testing.T) {
 	var out bytes.Buffer
 	in := newSteppedReader("1\n")
+	t.Cleanup(in.releaseAbandoned)
 	p, clk := newAlertingPrompter(in, &out)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
+	done := make(chan promptResult, 1)
 	go func() {
-		_, _ = p.build(hostRequest("WebFetch", "example.com"), dispatch.PromptDisplay{})(ctx, permissions.ScopeEscalation{})
-		in.release()
+		outcome, err := p.build(hostRequest("WebFetch", "example.com"), dispatch.PromptDisplay{})(ctx, permissions.ScopeEscalation{})
+		done <- promptResult{outcome, err}
 	}()
 
 	waitForOutput(t, p, &out, "choose 1-4")
 	fireAlert(t, clk, p, &out, 1)
+	in.awaitBlocked(t)
 
 	cancel()
-	// The prompt is still blocked on stdin, so only the cancellation can end the notifier.
-	time.Sleep(100 * time.Millisecond)
+	awaitCancelledPrompt(t, done)
 	assertClockIdle(t, clk)
 	if got := strings.Count(promptOutput(p, &out), headlessAlert); got != 1 {
 		t.Fatalf("%d alerts written, want only the one fired before cancellation", got)
 	}
-
-	in.release()
 }
 
 // gateWriter holds the first write containing trigger until release is closed, so a test
@@ -2598,5 +2636,268 @@ func TestHeadlessAuthorizer_ExceptionalGrantInputsDeny(t *testing.T) {
 		if strings.Contains(out.String(), "choose its scope") {
 			t.Fatalf("input %q opened the scope chooser:\n%s", input, out.String())
 		}
+	}
+}
+
+type promptResult struct {
+	outcome permissions.PromptOutcome
+	err     error
+}
+
+func startPrompt(ctx context.Context, p *terminalPrompter, subject string) <-chan promptResult {
+	done := make(chan promptResult, 1)
+	go func() {
+		outcome, err := p.build(permissions.MatchRequest{}, dispatch.PromptDisplay{Action: "Run command", Subject: subject})(ctx, permissions.ScopeEscalation{})
+		done <- promptResult{outcome, err}
+	}()
+	return done
+}
+
+func awaitCancelledPrompt(t *testing.T, done <-chan promptResult) {
+	t.Helper()
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, context.Canceled) || r.outcome != (permissions.PromptOutcome{}) {
+			t.Fatalf("prompt = %+v / %v, want no outcome and context.Canceled", r.outcome, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the prompt stayed blocked on stdin after cancellation")
+	}
+}
+
+func TestTerminalPrompter_CancelWhileReadingStdinReturnsTheContextError(t *testing.T) {
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() { _ = stdinWriter.Close() })
+	var out bytes.Buffer
+	p := newTerminalPrompter(stdin, &out)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := startPrompt(ctx, p, "rm notes.txt")
+	waitForOutput(t, p, &out, "choose 1-4")
+	cancel()
+	awaitCancelledPrompt(t, done)
+}
+
+func TestTerminalPrompter_AbandonedReadFailsLaterPromptsWithoutReadingOrRendering(t *testing.T) {
+	var out bytes.Buffer
+	in := newSteppedReader("1\n", "1\n")
+	t.Cleanup(in.releaseAbandoned)
+	p := newTerminalPrompter(in, &out)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first := startPrompt(ctx, p, "rm a.txt")
+	in.awaitBlocked(t)
+	cancel()
+	awaitCancelledPrompt(t, first)
+	rendered := promptOutput(p, &out)
+
+	awaitCancelledPrompt(t, startPrompt(context.Background(), p, "rm b.txt"))
+	if got := promptOutput(p, &out); got != rendered {
+		t.Fatalf("a prompt after the abandoned read rendered:\n%s", strings.TrimPrefix(got, rendered))
+	}
+	if entered, _ := in.counts(); entered != 1 {
+		t.Fatalf("stdin reads started = %d, want only the abandoned one", entered)
+	}
+}
+
+func TestTerminalPrompter_RunCancelEndsTheActiveAndTheQueuedPromptWithOneReader(t *testing.T) {
+	var out bytes.Buffer
+	in := newSteppedReader("1\n", "1\n")
+	t.Cleanup(in.releaseAbandoned)
+	p := newTerminalPrompter(in, &out)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	p.runCtx = runCtx
+	activeWork, cancelActive := context.WithCancel(runCtx)
+	defer cancelActive()
+	queuedWork, cancelQueued := context.WithCancel(runCtx)
+	defer cancelQueued()
+
+	active := startPrompt(activeWork, p, "rm a.txt")
+	in.awaitBlocked(t)
+	queued := startPrompt(queuedWork, p, "rm b.txt")
+	select {
+	case <-queued:
+		t.Fatal("the queued prompt returned while the active prompt held the gate")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancelRun()
+	awaitCancelledPrompt(t, active)
+	awaitCancelledPrompt(t, queued)
+	if n := strings.Count(promptOutput(p, &out), "approval required"); n != 1 {
+		t.Fatalf("%d prompts rendered, want only the active one", n)
+	}
+	if entered, _ := in.counts(); entered != 1 {
+		t.Fatalf("stdin reads started = %d, want only the active prompt's", entered)
+	}
+}
+
+func promptingRmAuthorizer(t *testing.T, stdin io.Reader, out io.Writer, runCtx context.Context) (*headlessAuthorizer, *sessions.Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	store := mkStore(t)
+	terminal := newTerminalPrompter(stdin, out)
+	terminal.runCtx = runCtx
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), terminal, &recordingNotices{})
+	return auth, store, dir
+}
+
+func authorizeRm(ctx context.Context, auth *headlessAuthorizer, dir string) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		req := directRequest(dir, "rm", "notes.txt")
+		dec, err := auth.Authorize(ctx, req, dispatch.PromptDisplay{Action: dispatch.ActionRunCommand, Subject: req.Subject},
+			permissions.ModeContext{Class: permissions.ClassMutating})
+		if err == nil {
+			err = fmt.Errorf("decision %+v returned without an error", dec)
+		}
+		done <- err
+	}()
+	return done
+}
+
+func requireCancelledWithNoGrant(t *testing.T, done <-chan error, auth *headlessAuthorizer, store *sessions.Store) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Authorize err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Authorize stayed blocked after cancellation")
+	}
+	if grants := auth.grants.Permissions(); len(grants) != 0 {
+		t.Fatalf("grants = %+v, want none", grants)
+	}
+	if n := countPermissionEvents(store, events.KindPermissionDecision); n != 0 {
+		t.Fatalf("permission_decision events = %d, want none", n)
+	}
+}
+
+func TestHeadlessAuthorizer_RunCancelAtEachStdinStageCreatesNoGrant(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		answered int
+		marker   string
+	}{
+		{"choice", 0, "choose 1-4"},
+		{"direct scope", 1, "choose its scope"},
+		{"program confirmation", 2, "confirm program-wide grant"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := newSteppedReader("3\n", "3\n", "1\n")
+			t.Cleanup(in.releaseAbandoned)
+			var out bytes.Buffer
+			runCtx, cancelRun := context.WithCancel(context.Background())
+			defer cancelRun()
+			auth, store, dir := promptingRmAuthorizer(t, in, &out, runCtx)
+			work, cancelWork := context.WithCancel(runCtx)
+			defer cancelWork()
+
+			done := authorizeRm(work, auth, dir)
+			for range tc.answered {
+				in.awaitBlocked(t)
+				in.release()
+			}
+			waitForOutput(t, auth.terminal, &out, tc.marker)
+			in.awaitBlocked(t)
+			cancelRun()
+			requireCancelledWithNoGrant(t, done, auth, store)
+		})
+	}
+}
+
+type errOnlyCtx struct {
+	context.Context
+	cancelled atomic.Bool
+}
+
+func (c *errOnlyCtx) Err() error {
+	if c.cancelled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+type cancelOnText struct {
+	buf     bytes.Buffer
+	trigger string
+	cancel  func()
+}
+
+func (w *cancelOnText) Write(p []byte) (int, error) {
+	w.buf.Write(p)
+	if w.trigger != "" && strings.Contains(w.buf.String(), w.trigger) {
+		w.cancel()
+	}
+	return len(p), nil
+}
+
+func TestHeadlessAuthorizer_RunCancelRacingAnAnswerCreatesNoGrant(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		answers      []string
+		cancelOnRead int32
+		cancelOnText string
+		reads        int32
+	}{
+		{"allow once ready with cancellation", []string{"1\n"}, 1, "", 1},
+		{"session choice ready with cancellation", []string{"3\n", "3\n", "1\n"}, 1, "", 1},
+		{"scope ready with cancellation", []string{"3\n", "3\n", "1\n"}, 2, "", 2},
+		{"confirmation ready with cancellation", []string{"3\n", "3\n", "1\n"}, 3, "", 3},
+		{"cancelled between choice and scope read", []string{"3\n", "3\n", "1\n"}, 0, "choose its scope", 1},
+		{"cancelled between scope and confirmation read", []string{"3\n", "3\n", "1\n"}, 0, "confirm program-wide grant", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runCtx := &errOnlyCtx{Context: context.Background()}
+			var reads atomic.Int32
+			stdin := readerFunc(func(b []byte) (int, error) {
+				n := reads.Add(1)
+				if int(n) > len(tc.answers) {
+					return 0, io.EOF
+				}
+				if n == tc.cancelOnRead {
+					runCtx.cancelled.Store(true)
+				}
+				return copy(b, tc.answers[n-1]), nil
+			})
+			out := &cancelOnText{trigger: tc.cancelOnText, cancel: func() { runCtx.cancelled.Store(true) }}
+			auth, store, dir := promptingRmAuthorizer(t, stdin, out, runCtx)
+
+			requireCancelledWithNoGrant(t, authorizeRm(context.Background(), auth, dir), auth, store)
+			if n := reads.Load(); n != tc.reads {
+				t.Fatalf("stdin reads = %d, want %d (no read after cancellation)", n, tc.reads)
+			}
+		})
+	}
+}
+
+func TestHeadlessAuthorizer_WorkDeadlineLeavesAWaitingPromptOpenButAuthorizesNothing(t *testing.T) {
+	in := newSteppedReader("3\n", "3\n", "1\n")
+	t.Cleanup(in.releaseAbandoned)
+	var out bytes.Buffer
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	auth, store, dir := promptingRmAuthorizer(t, in, &out, runCtx)
+	work, expire := context.WithCancel(runCtx)
+	defer expire()
+
+	done := authorizeRm(work, auth, dir)
+	in.awaitBlocked(t)
+	expire()
+	select {
+	case err := <-done:
+		t.Fatalf("the work deadline closed a prompt already waiting for an answer: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	in.release()
+	requireCancelledWithNoGrant(t, done, auth, store)
+	if entered, _ := in.counts(); entered != 1 {
+		t.Fatalf("stdin reads = %d, want none after the late answer", entered)
 	}
 }

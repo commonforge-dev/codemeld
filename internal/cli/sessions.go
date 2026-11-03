@@ -159,7 +159,7 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					&ucli.BoolFlag{Name: "json", Usage: "emit a machine-readable JSON report"},
 				},
 				Action: func(_ context.Context, c *ucli.Command) error {
-					return runSessionsDoctor(c.Args().Slice(), c.Bool("json"), stdout)
+					return runSessionsDoctor(c.Args().Slice(), c.Bool("json"), stdout, stderr)
 				},
 			},
 			{
@@ -210,7 +210,7 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 						last:    c.Int("last"),
 						lastSet: c.IsSet("last"),
 						asJSON:  c.Bool("json"),
-					}, stdout)
+					}, stdout, stderr)
 				},
 			},
 			{
@@ -270,7 +270,7 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					&ucli.BoolFlag{Name: "json", Usage: "emit a machine-readable JSON report"},
 				},
 				Action: func(_ context.Context, c *ucli.Command) error {
-					return runSessionsPermissions(c.Args().Slice(), c.Bool("json"), stdout)
+					return runSessionsPermissions(c.Args().Slice(), c.Bool("json"), stdout, stderr)
 				},
 			},
 			{
@@ -305,7 +305,7 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					&ucli.BoolFlag{Name: "json", Usage: "emit a machine-readable JSON report"},
 				},
 				Action: func(_ context.Context, c *ucli.Command) error {
-					return runSessionsResearch(c.Args().Slice(), c.Bool("json"), stdout)
+					return runSessionsResearch(c.Args().Slice(), c.Bool("json"), stdout, stderr)
 				},
 			},
 			{
@@ -383,7 +383,7 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					&ucli.BoolFlag{Name: "json", Usage: "emit a machine-readable JSON report"},
 				},
 				Action: func(_ context.Context, c *ucli.Command) error {
-					return runSessionsSummary(c.Args().Slice(), c.Bool("json"), stdout)
+					return runSessionsSummary(c.Args().Slice(), c.Bool("json"), stdout, stderr)
 				},
 			},
 		},
@@ -402,12 +402,12 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 // runSessionsDoctor resolves the target, builds the diagnostics report, and
 // renders it (JSON when asJSON). A load/validation failure exits non-zero with
 // the typed loader message; findings never change the exit code.
-func runSessionsDoctor(args []string, asJSON bool, stdout io.Writer) error {
+func runSessionsDoctor(args []string, asJSON bool, stdout, stderr io.Writer) error {
 	target, err := singleTarget(args, "doctor")
 	if err != nil {
 		return err
 	}
-	path, sess, err := resolveSession(target)
+	path, sess, err := resolveSession(target, stderr)
 	if err != nil {
 		return err
 	}
@@ -419,7 +419,7 @@ func runSessionsDoctor(args []string, asJSON bool, stdout io.Writer) error {
 	return nil
 }
 
-func runSessionsShow(args []string, opts showOptions, stdout io.Writer) error {
+func runSessionsShow(args []string, opts showOptions, stdout, stderr io.Writer) error {
 	target, err := singleTarget(args, "show")
 	if err != nil {
 		return err
@@ -427,7 +427,7 @@ func runSessionsShow(args []string, opts showOptions, stdout io.Writer) error {
 	if err := opts.validate(); err != nil {
 		return err
 	}
-	path, sess, err := resolveSession(target)
+	path, sess, err := resolveSession(target, stderr)
 	if err != nil {
 		return err
 	}
@@ -439,12 +439,12 @@ func runSessionsShow(args []string, opts showOptions, stdout io.Writer) error {
 	return nil
 }
 
-func runSessionsResearch(args []string, asJSON bool, stdout io.Writer) error {
+func runSessionsResearch(args []string, asJSON bool, stdout, stderr io.Writer) error {
 	target, err := singleTarget(args, "research")
 	if err != nil {
 		return err
 	}
-	path, sess, err := resolveSession(target)
+	path, sess, err := resolveSession(target, stderr)
 	if err != nil {
 		return err
 	}
@@ -456,12 +456,12 @@ func runSessionsResearch(args []string, asJSON bool, stdout io.Writer) error {
 	return nil
 }
 
-func runSessionsPermissions(args []string, asJSON bool, stdout io.Writer) error {
+func runSessionsPermissions(args []string, asJSON bool, stdout, stderr io.Writer) error {
 	target, err := singleTarget(args, "permissions")
 	if err != nil {
 		return err
 	}
-	path, sess, err := resolveSession(target)
+	path, sess, err := resolveSession(target, stderr)
 	if err != nil {
 		return err
 	}
@@ -589,7 +589,18 @@ func singleTarget(args []string, sub string) (string, error) {
 // recorded. Anything else is loaded directly as a file path. Every failure is
 // returned already wrapped as a ucli.Exit (status 1) carrying the existing typed
 // loader message.
-func resolveSession(target string) (string, *sessions.Session, error) {
+func resolveSession(target string, stderr io.Writer) (string, *sessions.Session, error) {
+	path, sess, err := locateSession(target)
+	if err != nil {
+		return "", nil, err
+	}
+	if notice := sessions.SkippedEventsNotice(sess.Metadata.ID, sessions.SkippedEventKinds(sess.Records)); notice != "" {
+		_, _ = fmt.Fprintln(stderr, notice)
+	}
+	return path, sess, nil
+}
+
+func locateSession(target string) (string, *sessions.Session, error) {
 	if ids.IsValidV7(target) {
 		home, err := resolveHome()
 		if err != nil {

@@ -601,9 +601,9 @@ func TestConfigCheck_ApprovedLocalLayerUsesLaunchLocalRules(t *testing.T) {
 			home, project := t.TempDir(), t.TempDir()
 			writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
 			if withShared {
-				writeProjectSettings(t, project, "vcs:\n  preferred: hg\n")
+				writeProjectSettings(t, project, "vcs:\n  force: hg\n")
 			}
-			writeLocalSettings(t, project, "vcs:\n  preferred: hg\n")
+			writeLocalSettings(t, project, "vcs:\n  force: hg\n")
 			trustProject(t, home, project)
 			stubConfigEnv(t, home, project)
 
@@ -634,7 +634,7 @@ func TestConfigCheck_UnapprovedLocalLayerIsNamedNotParsed(t *testing.T) {
 			if withShared {
 				writeProjectSettings(t, project, "mode:\n  default: plan\n")
 			}
-			path := writeLocalSettings(t, project, "vcs:\n  preferred: hg\nmode:\n  default: plan\n  default: build\n")
+			path := writeLocalSettings(t, project, "vcs:\n  force: hg\nmode:\n  default: plan\n  default: build\n")
 			if err := os.Chmod(path, 0o000); err != nil {
 				t.Fatalf("chmod local settings: %v", err)
 			}
@@ -691,7 +691,7 @@ func TestConfigCheck_UnapprovedLocalLayerIsNamedNotParsed(t *testing.T) {
 func TestConfigCheck_NamedLocalPathUsesLocalRules(t *testing.T) {
 	home, project := t.TempDir(), t.TempDir()
 	writeGlobalSettings(t, home, "agent:\n  max_concurrency: 2\n")
-	local := writeLocalSettings(t, project, "vcs:\n  preferred: hg\n")
+	local := writeLocalSettings(t, project, "vcs:\n  force: hg\n")
 	stubConfigEnv(t, home, project)
 
 	t.Run("absolute", func(t *testing.T) {
@@ -723,7 +723,7 @@ func TestConfigCheck_NamedLocalPathUsesLocalRules(t *testing.T) {
 
 	t.Run("outside a .codemeld directory keeps project rules", func(t *testing.T) {
 		outside := filepath.Join(t.TempDir(), "settings.local.yaml")
-		if err := os.WriteFile(outside, []byte("vcs:\n  preferred: hg\n"), 0o600); err != nil {
+		if err := os.WriteFile(outside, []byte("vcs:\n  force: hg\n"), 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		code, stdout, stderr := runConfig(t, "config", "check", outside)

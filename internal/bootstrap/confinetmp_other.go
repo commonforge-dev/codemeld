@@ -2,15 +2,28 @@
 
 package bootstrap
 
-import (
-	"os"
+import "errors"
 
-	"golang.org/x/sys/unix"
-)
+type sessionTempDir struct {
+	path string
+}
 
-func chmodPrivateNoFollow(created string) error {
-	if err := unix.Fchmodat(unix.AT_FDCWD, created, 0o700, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return &os.PathError{Op: "chmod", Path: created, Err: err}
-	}
-	return nil
+var errSessionTempDirUnsupported = errors.New("bootstrap: private temp folders are created only on linux")
+
+func newSessionTempDir() (*sessionTempDir, error) {
+	return nil, errSessionTempDirUnsupported
+}
+
+func (d *sessionTempDir) identity() (dev, ino uint64, err error) {
+	return 0, 0, errSessionTempDirUnsupported
+}
+
+func (d *sessionTempDir) remove() error {
+	return errSessionTempDirUnsupported
+}
+
+func (d *sessionTempDir) close() {}
+
+func removeStaleSessionTempDirs() error {
+	return errSessionTempDirUnsupported
 }

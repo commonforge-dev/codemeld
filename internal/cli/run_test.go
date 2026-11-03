@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -351,6 +353,69 @@ func TestRun_RunThreadsParentCancellation(t *testing.T) {
 	}
 	if seamErr == nil {
 		t.Fatal("the run context was not cancelled though the parent was; Ctrl-C threading is not wired through the parent context")
+	}
+}
+
+func TestRun_SIGTERMCancelsTheRunContext(t *testing.T) {
+	backstop := make(chan os.Signal, 1)
+	signal.Notify(backstop, syscall.SIGTERM)
+	defer signal.Stop(backstop)
+
+	cancelled := make(chan error, 1)
+	stubHeadlessBootstrap(t, func(ctx context.Context, _ string, _ bootstrap.FreshSteps, _ *bootstrap.HeadlessDriver) ([]bootstrap.DeniedCall, error) {
+		self, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			err = self.Signal(syscall.SIGTERM)
+		}
+		if err != nil {
+			t.Errorf("send SIGTERM: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			cancelled <- ctx.Err()
+		case <-time.After(5 * time.Second):
+			cancelled <- nil
+		}
+		return nil, nil
+	})
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"codemeld", "run", "hello"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr=%q)", code, stderr.String())
+	}
+	if err := <-cancelled; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run context err after SIGTERM = %v, want context.Canceled", err)
+	}
+}
+
+func TestRun_Cancellation_HelpDocuments(t *testing.T) {
+	for _, form := range [][]string{
+		{"codemeld", "run", "-h"},
+		{"codemeld", "run", "--help"},
+		{"codemeld", "help", "run"},
+	} {
+		t.Run(strings.Join(form, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := Run(context.Background(), form, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit = %d, want 0 (stderr=%q)", code, stderr.String())
+			}
+			out := stdout.String()
+			for _, want := range []string{
+				"Ctrl-C or SIGTERM cancels the run, including while",
+				"a terminal approval prompt is waiting for your answer: the waiting prompt closes",
+				"without authorizing the call, and the session is still saved.",
+				"way exits 0 once that final save succeeds; if the final save fails, it exits 1.",
+				"answer, and on a run cancelled by Ctrl-C or SIGTERM whose session was saved;",
+				"approval prompt already waiting for your answer is not interrupted, but an answer given",
+				"after the limit authorizes nothing; only Ctrl-C or SIGTERM closes a waiting prompt.",
+			} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
+				}
+			}
+			if strings.Contains(out, "Ctrl-C cancels the turn") {
+				t.Fatalf("run help (%q) still names only Ctrl-C:\n%s", form, out)
+			}
+		})
 	}
 }
 

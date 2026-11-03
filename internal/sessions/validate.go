@@ -4,8 +4,14 @@ package sessions
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 )
+
+var ErrUnknownEventKind = errors.New("unknown event kind")
 
 // launchBeganSources is the closed set of launch_began.source values.
 // It is duplicated from internal/events (LaunchBegan / launchSources) on
@@ -87,11 +93,53 @@ func ValidateEventPayloads(records []Record, validate PayloadValidator) error {
 		if !ok {
 			continue
 		}
-		if err := validate(ev.Kind, ev.Payload); err != nil {
+		err := validate(ev.Kind, ev.Payload)
+		skipped := errors.Is(err, ErrUnknownEventKind)
+		if err != nil && !skipped {
 			return fmt.Errorf("records[%d].payload: %w", i, err)
+		}
+		if ev.skipped != skipped {
+			ev.skipped = skipped
+			records[i] = ev
 		}
 	}
 	return nil
+}
+
+type SkippedKind struct {
+	Kind  string
+	Count int
+}
+
+func SkippedEventKinds(records []Record) []SkippedKind {
+	counts := map[string]int{}
+	for _, rec := range records {
+		if ev, ok := rec.(Event); ok && ev.skipped {
+			counts[ev.Kind]++
+		}
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	out := make([]SkippedKind, 0, len(counts))
+	for _, kind := range slices.Sorted(maps.Keys(counts)) {
+		out = append(out, SkippedKind{Kind: kind, Count: counts[kind]})
+	}
+	return out
+}
+
+func SkippedEventsNotice(sessionID string, skipped []SkippedKind) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	total := 0
+	parts := make([]string, len(skipped))
+	for i, s := range skipped {
+		total += s.Count
+		parts[i] = fmt.Sprintf("%q=%d", s.Kind, s.Count)
+	}
+	return fmt.Sprintf("codemeld: session %s: skipped %d event records of unknown kinds (%s); a newer codemeld wrote them; inspect with: codemeld sessions show %s",
+		sessionID, total, strings.Join(parts, ", "), sessionID)
 }
 
 // validateSiblingFields rejects the correlation sibling fields appearing on a

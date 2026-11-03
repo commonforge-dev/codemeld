@@ -52,6 +52,14 @@ type terminalPrompter struct {
 	// Its false zero value means trusted, so only that production assembly can withhold the
 	// project choice; nothing here may infer trust from the disclosure or the cache.
 	projectUntrusted bool
+
+	runCtx  context.Context
+	readErr error
+}
+
+type lineRead struct {
+	line string
+	err  error
 }
 
 // newTerminalPrompter builds the terminal prompt over the injected stdin and the run's stderr.
@@ -90,25 +98,56 @@ func (p *terminalPrompter) build(req permissions.MatchRequest, disp dispatch.Pro
 			return permissions.PromptOutcome{}, err
 		}
 		defer p.gate.release()
+		if p.readErr != nil {
+			return permissions.PromptOutcome{}, p.readErr
+		}
+		readCtx := p.runCtx
+		if readCtx == nil {
+			readCtx = ctx
+		}
 		// One notifier for the whole closure: a direct-command grant is still blocked at
 		// readDirectScope and the Program confirmation long after the first choice.
 		notifier := tui.StartPromptNotifier(ctx, p.after, p.notify)
 		defer notifier.Stop()
 		p.render(req, disp, esc)
 		host := req.Kind == matchKindHost
-		outcome, err := p.readChoice(host, (host && req.FreshConfirmation) || disp.ExceptionalAuthority != "")
+		outcome, err := p.readChoice(readCtx, host, (host && req.FreshConfirmation) || disp.ExceptionalAuthority != "")
 		if err != nil {
-			return outcome, err
+			return permissions.PromptOutcome{}, err
 		}
 		if err := ctx.Err(); err != nil {
 			return permissions.PromptOutcome{}, err
 		}
 		outcome = applyCapabilitySubject(req, disp, outcome)
-		outcome = p.readDirectScope(req, outcome)
+		outcome, err = p.readDirectScope(readCtx, req, outcome)
+		if err != nil {
+			return permissions.PromptOutcome{}, err
+		}
 		if err := ctx.Err(); err != nil {
 			return permissions.PromptOutcome{}, err
 		}
 		return outcome, nil
+	}
+}
+
+func (p *terminalPrompter) readLine(ctx context.Context) (lineRead, error) {
+	if err := ctx.Err(); err != nil {
+		return lineRead{}, err
+	}
+	result := make(chan lineRead, 1)
+	go func() {
+		line, err := p.in.ReadString('\n')
+		result <- lineRead{line: line, err: err}
+	}()
+	select {
+	case r := <-result:
+		if err := ctx.Err(); err != nil {
+			return lineRead{}, err
+		}
+		return r, nil
+	case <-ctx.Done():
+		p.readErr = ctx.Err()
+		return lineRead{}, p.readErr
 	}
 }
 
@@ -289,10 +328,13 @@ func (p *terminalPrompter) renderHost(req permissions.MatchRequest, disp dispatc
 	_, _ = fmt.Fprint(p.out, "codemeld: choose 1-4: ")
 }
 
-func (p *terminalPrompter) readChoice(host, fresh bool) (permissions.PromptOutcome, error) {
-	line, err := p.in.ReadString('\n')
-	choice := strings.ToLower(strings.TrimSpace(line))
-	if err != nil && choice == "" {
+func (p *terminalPrompter) readChoice(ctx context.Context, host, fresh bool) (permissions.PromptOutcome, error) {
+	read, err := p.readLine(ctx)
+	if err != nil {
+		return permissions.PromptOutcome{}, err
+	}
+	choice := strings.ToLower(strings.TrimSpace(read.line))
+	if read.err != nil && choice == "" {
 		return denyOutcome(), nil
 	}
 	switch choice {
@@ -316,35 +358,42 @@ func (p *terminalPrompter) readChoice(host, fresh bool) (permissions.PromptOutco
 	}
 }
 
-func (p *terminalPrompter) readDirectScope(req permissions.MatchRequest, outcome permissions.PromptOutcome) permissions.PromptOutcome {
+func (p *terminalPrompter) readDirectScope(ctx context.Context, req permissions.MatchRequest, outcome permissions.PromptOutcome) (permissions.PromptOutcome, error) {
 	if req.Kind != matchKindDirect {
-		return outcome
+		return outcome, nil
 	}
 	if outcome.Choice != permissions.PromptAllowSession && outcome.Choice != permissions.PromptAllowFolder {
-		return outcome
+		return outcome, nil
 	}
 	model, ok := permissions.NewDirectScopeModel(req.SubjectTokens, p.home)
 	if !ok {
-		return outcome
+		return outcome, nil
 	}
 	choices := headlessScopeChoices(model)
 
 	persisted := outcome.Choice == permissions.PromptAllowFolder
 	p.renderScopeChoices(req, model, choices, persisted)
-	index, ok := p.readIndex(len(choices))
+	index, ok, err := p.readIndex(ctx, len(choices))
+	if err != nil {
+		return permissions.PromptOutcome{}, err
+	}
 	if !ok {
-		return denyOutcome()
+		return denyOutcome(), nil
 	}
 
 	selected := choices[index]
 	if selected.RequiresConfirmation() {
 		p.renderProgramConfirm(req, model.Program, selected.Subject, persisted)
-		if !p.readConfirm() {
-			return denyOutcome()
+		confirmed, err := p.readConfirm(ctx)
+		if err != nil {
+			return permissions.PromptOutcome{}, err
+		}
+		if !confirmed {
+			return denyOutcome(), nil
 		}
 	}
 	outcome.StoredSubject = selected.Subject
-	return outcome
+	return outcome, nil
 }
 
 const scopePrefixNotice = "A prefix choice stores every token shown before :* verbatim; only the tokens after it may vary. Changing a fixed token re-prompts."
@@ -459,22 +508,25 @@ func (p *terminalPrompter) renderProgramConfirm(req permissions.MatchRequest, pr
 
 // readIndex fails closed: anything that is not a number in 1..count, including a blank line
 // and EOF, reports false rather than falling back to a scope the user did not pick.
-func (p *terminalPrompter) readIndex(count int) (int, bool) {
-	line, err := p.in.ReadString('\n')
-	answer := strings.TrimSpace(line)
-	if err != nil && answer == "" {
-		return 0, false
+func (p *terminalPrompter) readIndex(ctx context.Context, count int) (int, bool, error) {
+	read, err := p.readLine(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	answer := strings.TrimSpace(read.line)
+	if read.err != nil && answer == "" {
+		return 0, false, nil
 	}
 	n, convErr := strconv.Atoi(answer)
 	if convErr != nil || n < 1 || n > count {
-		return 0, false
+		return 0, false, nil
 	}
-	return n - 1, true
+	return n - 1, true, nil
 }
 
-func (p *terminalPrompter) readConfirm() bool {
-	index, ok := p.readIndex(2)
-	return ok && index == 0
+func (p *terminalPrompter) readConfirm(ctx context.Context) (bool, error) {
+	index, ok, err := p.readIndex(ctx, 2)
+	return ok && index == 0, err
 }
 
 // denyOutcome is the deny result the terminal prompt returns for an explicit deny, EOF, or

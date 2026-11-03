@@ -4150,25 +4150,29 @@ func TestCommandLookupTakesDirectRouteAndClassifiesReadOnly(t *testing.T) {
 
 func TestCommandLookupAutoAllowsInEveryMode(t *testing.T) {
 	for _, mode := range []string{"build", modeAutoEdits, modePlan} {
-		t.Run(mode, func(t *testing.T) {
-			commandLookupPATH(t)
-			f := newFixture(neverPrompt, nil)
-			req, mc := shellReqCtxFor(t, mode, "command -v magick")
-			assertModeAutoAllow(t, f, mustAuthorizeMode(t, req, mc, f.deps))
-		})
+		for _, input := range []string{"command -v magick", "command -v -- magick"} {
+			t.Run(mode+"/"+input, func(t *testing.T) {
+				commandLookupPATH(t)
+				f := newFixture(neverPrompt, nil)
+				req, mc := shellReqCtxFor(t, mode, input)
+				assertModeAutoAllow(t, f, mustAuthorizeMode(t, req, mc, f.deps))
+			})
+		}
 	}
 }
 
 func TestCommandLookupStagedChainAutoAllowsInEveryMode(t *testing.T) {
 	for _, mode := range []string{"build", modeAutoEdits, modePlan} {
-		for _, input := range []string{"command -v magick && ls", "command -v magick; ls"} {
+		for _, input := range []string{"command -v magick && ls", "command -v magick; ls", "command -v -- magick && ls"} {
 			t.Run(mode+"/"+input, func(t *testing.T) {
 				commandLookupPATH(t)
 				stages := stagedCtxs(t, mode, input)
 				if len(stages) != 2 {
 					t.Fatalf("stagedCtxs(%q) = %d stages, want 2", input, len(stages))
 				}
-				assertDirectStageTokens(t, input, stages[0].mc.Stages[0], []string{"command", "-v", "magick"})
+				lookup, _, _ := strings.Cut(input, " &&")
+				lookup, _, _ = strings.Cut(lookup, ";")
+				assertDirectStageTokens(t, input, stages[0].mc.Stages[0], strings.Fields(lookup))
 				for _, s := range stages {
 					if got := classifyReadOnlyShell(s.req, s.mc); got != ClassReadOnly {
 						t.Fatalf("classifyReadOnlyShell(%q stage %q) = %q, want read_only", input, s.req.Subject, got)
@@ -4365,10 +4369,20 @@ func TestCommandLookupPolicyFailsClosed(t *testing.T) {
 		{"type", "./magick"},
 		{"type", "ls=1"},
 		{"/usr/bin/type", "magick"},
+		{"command", "-v", "--"},
+		{"command", "-v", "--", ""},
+		{"command", "-v", "--", "--", "magick"},
+		{"command", "-v", "--", "magick", "--"},
+		{"command", "-v", "--", "magick", "ls"},
+		{"command", "-v", "--", "-magick"},
+		{"command", "-v", "--magick"},
+		{"command", "--", "-v", "magick"},
+		{"command", "-V", "--", "magick"},
+		{"type", "--", "magick"},
 	} {
 		t.Run(strings.Join(tokens, " "), func(t *testing.T) {
 			if stageTokensReadOnly(tokens) {
-				t.Fatalf("stageTokensReadOnly(%v) = true, want false (only `command -v <plain-name>` and `type <plain-name>` are admitted)", tokens)
+				t.Fatalf("stageTokensReadOnly(%v) = true, want false (only `command -v [--] <plain-name>` and `type <plain-name>` are admitted)", tokens)
 			}
 		})
 	}
@@ -4379,10 +4393,118 @@ func TestCommandLookupPolicyFailsClosed(t *testing.T) {
 		{"command", "-v", "python3.12"},
 		{"command", "-v", "g++"},
 		{"command", "-v", "x86_64-linux-gnu-gcc"},
+		{"command", "-v", "--", "magick"},
 	} {
 		t.Run(strings.Join(tokens, " "), func(t *testing.T) {
 			if !stageTokensReadOnly(tokens) {
 				t.Fatalf("stageTokensReadOnly(%v) = false, want true (accepted builtin lookup grammar)", tokens)
+			}
+		})
+	}
+}
+
+type lookupLayers struct {
+	literal                     bool
+	lookupPath                  string
+	class                       OperationClass
+	buildPrompts, autoPrompts   int
+	buildOutcome, autoOutcome   string
+	eligibleAuto, eligibleBuild bool
+	authority                   string
+	classifiable                bool
+}
+
+func lookupLayersFor(t *testing.T, f systemOneFixture, command string) lookupLayers {
+	t.Helper()
+	split, err := SplitCommand(command)
+	if err != nil {
+		t.Fatalf("SplitCommand(%q) returned error: %v", command, err)
+	}
+	got := lookupLayers{literal: split.LiteralRoute}
+	if !split.LiteralRoute && len(split.Stages) == 1 {
+		got.lookupPath = split.Stages[0].LookupPath
+	}
+	got.class = classifyReadOnlyShell(shellCtx(t, command))
+	for _, mode := range []string{"build", modeAutoEdits} {
+		fx := newFixture(choose(PromptAllowOnce), nil)
+		req, mc := shellReqCtxFor(t, mode, command)
+		d := mustAuthorizeMode(t, req, mc, fx.deps)
+		if mode == "build" {
+			got.buildPrompts, got.buildOutcome = fx.cap.prompts, d.Outcome
+		} else {
+			got.autoPrompts, got.autoOutcome = fx.cap.prompts, d.Outcome
+		}
+	}
+	mc := f.mode()
+	got.eligibleAuto = SystemOneEligible(f.request(t, command), mc, f.blocked, command) == ""
+	mc.Mode = "build"
+	got.eligibleBuild = SystemOneEligible(f.request(t, command), mc, f.blocked, command) == ""
+	got.authority, got.classifiable = ClassifyExceptional(shellCtx(t, command))
+	return got
+}
+
+func TestCommandLookupEndOfOptionsParity(t *testing.T) {
+	f := newSystemOneFixture(t)
+	allowed := lookupLayers{class: ClassReadOnly, buildOutcome: outcomeOnce, autoOutcome: outcomeOnce, eligibleAuto: true, classifiable: true}
+	prompted := lookupLayers{literal: true, class: ClassMutating, buildPrompts: 1, autoPrompts: 1, buildOutcome: outcomeOnce, autoOutcome: outcomeOnce, eligibleAuto: true, classifiable: true}
+	installed, local := allowed, allowed
+	installed.lookupPath = filepath.Join(f.bin, "git")
+	local.lookupPath = filepath.Join(f.rootBin, "inproj")
+	for _, tc := range []struct {
+		names string
+		want  lookupLayers
+	}{
+		{"git", installed},
+		{"jq", prompted},
+		{"git jq", prompted},
+		{"inproj", local},
+	} {
+		t.Run(tc.names, func(t *testing.T) {
+			for _, command := range []string{"command -v " + tc.names, "command -v -- " + tc.names} {
+				if got := lookupLayersFor(t, f, command); got != tc.want {
+					t.Errorf("%q layers = %+v, want %+v", command, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestCommandLookupQuotedDelimiterMatchesQuotedName(t *testing.T) {
+	f := newSystemOneFixture(t)
+	for _, suffix := range []string{"", " 2>/dev/null", " && ls"} {
+		want := lookupLayersFor(t, f, `command -v 'git'`+suffix)
+		for _, quoted := range []string{`command -v '--' git`, `command -v "--" git`} {
+			command := quoted + suffix
+			t.Run(command, func(t *testing.T) {
+				if got := lookupLayersFor(t, f, command); got != want {
+					t.Fatalf("%q layers = %+v, want the quoted-name result %+v", command, got, want)
+				}
+			})
+		}
+	}
+}
+
+var commandLookupDelimiterRejected = []string{
+	"command -v -- ./jq",
+	"command -v -- /usr/bin/jq",
+	"command -v -- 'jq;id'",
+	"command -- -v git",
+	"command -v -- -- git",
+	"command -v -- git --",
+	"command -v --git",
+	"command -v -- -x",
+	"command -v -- $X",
+	"command -v --",
+	"command -V -- git",
+	"type -- git",
+}
+
+func TestCommandLookupDelimiterRejectedFormsMutating(t *testing.T) {
+	newSystemOneFixture(t)
+	for _, command := range commandLookupDelimiterRejected {
+		t.Run(command, func(t *testing.T) {
+			if got := classifyReadOnlyShell(shellCtx(t, command)); got != ClassMutating {
+				t.Fatalf("classifyReadOnlyShell(%q) = %q, want mutating", command, got)
 			}
 		})
 	}

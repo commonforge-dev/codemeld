@@ -62,9 +62,9 @@ func recordingSteps(order *[]string) FreshSteps {
 			rec("4:LoadVCSTemplates")
 			return nil, nil
 		},
-		ValidatePreferredVCS: func(map[string]any, any) error { rec("5:ValidatePreferredVCS"); return nil },
-		DetectVCS:            func(string, map[string]any, any) (any, error) { rec("6:DetectVCS"); return nil, nil },
-		BuildToolRegistry:    func(any) (any, error) { rec("6c:BuildToolRegistry"); return nil, nil },
+		ValidateForceVCS:  func(map[string]any, any) error { rec("5:ValidateForceVCS"); return nil },
+		DetectVCS:         func(string, map[string]any, any) (any, error) { rec("6:DetectVCS"); return nil, nil },
+		BuildToolRegistry: func(any) (any, error) { rec("6c:BuildToolRegistry"); return nil, nil },
 		DetermineModel: func(map[string]any, map[string]any, string, []string) (any, bool, error) {
 			rec("7:DetermineModel")
 			return nil, false, nil
@@ -107,7 +107,7 @@ func TestRunFresh_StepOrder(t *testing.T) {
 		"2.6:RecoverJournals",
 		"3:ComposeConfig",
 		"4:LoadVCSTemplates",
-		"5:ValidatePreferredVCS",
+		"5:ValidateForceVCS",
 		"6:DetectVCS",
 		"6c:BuildToolRegistry",
 		"7:DetermineModel",
@@ -229,9 +229,9 @@ func TestRunFresh_ShortCircuitsOnStepError(t *testing.T) {
 			s.LoadVCSTemplates = func(string, string, map[string]any, bool) (any, error) {
 				return nil, sentinel
 			}
-		}, "5:ValidatePreferredVCS"},
-		{"step5_ValidatePreferredVCS", func(s *FreshSteps) {
-			s.ValidatePreferredVCS = func(map[string]any, any) error { return sentinel }
+		}, "5:ValidateForceVCS"},
+		{"step5_ValidateForceVCS", func(s *FreshSteps) {
+			s.ValidateForceVCS = func(map[string]any, any) error { return sentinel }
 		}, "6:DetectVCS"},
 		{"step6_DetectVCS", func(s *FreshSteps) {
 			s.DetectVCS = func(string, map[string]any, any) (any, error) { return nil, sentinel }
@@ -356,7 +356,7 @@ func TestRunFreshCore_RunsStepsThroughAgentsWithoutStartTUI(t *testing.T) {
 	assertOrder(t, []string{
 		"0a:ResolveHome", "0:RunFirstRun", "1:LoadGlobalSettings", "2:ResolveProjectRoot",
 		"2b:GateTrust", "2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals", "3:ComposeConfig", "4:LoadVCSTemplates",
-		"5:ValidatePreferredVCS",
+		"5:ValidateForceVCS",
 		"6:DetectVCS", "6c:BuildToolRegistry", "7:DetermineModel", "7b:EnsureFreshSession",
 		"7b:AcquireLock", "7b1:AppendLaunchBegan", "7b2:InitMode", "7c:LoadAgentInstructions",
 	}, order)
@@ -2748,18 +2748,52 @@ func TestRunFresh_TrustedLaunchComposesTheLocalSettingsLayer(t *testing.T) {
 	}
 }
 
+func TestRunFresh_AGrantWrittenToTheSharedFileBeforeTheSplitStillApplies(t *testing.T) {
+	var order []string
+	steps, _, projectRoot := localLayerFixture(t, &order, true, map[string]string{
+		"settings.yaml": localFolderGrantYAML,
+	})
+	sharedPath := projectSettingsPath(projectRoot)
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(sharedPath, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	res, err := RunFresh(context.Background(), projectRoot, steps)
+	if err != nil {
+		t.Fatalf("RunFresh error: %v", err)
+	}
+	if got := composedPermissionSubjects(t, res.Config); !slices.Equal(got, []string{"ls"}) {
+		t.Fatalf("permissions = %v, want the settings.yaml grant in force", got)
+	}
+	data, err := os.ReadFile(sharedPath)
+	if err != nil || string(data) != localFolderGrantYAML {
+		t.Fatalf("settings.yaml = %q, %v; want it unchanged", data, err)
+	}
+	if info, err := os.Stat(sharedPath); err != nil || !info.ModTime().Equal(old) {
+		t.Fatalf("settings.yaml mtime = %v, %v; want %v", info.ModTime(), err, old)
+	}
+	if _, err := os.Lstat(config.LocalSettingsPath(projectRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat settings.local.yaml = %v, want no local file created", err)
+	}
+}
+
 func TestRunFresh_UntrustedLaunchWithholdsTheLocalSettingsLayer(t *testing.T) {
+	localBlocked, globalBlocked := t.TempDir(), t.TempDir()
+	localYAML := localFolderGrantYAML + blockedYAML(localBlocked)
 	cases := map[string]map[string]string{
-		"local file only": {"settings.local.yaml": localFolderGrantYAML},
+		"local file only": {"settings.local.yaml": localYAML},
 		"both project-scope files": {
 			"settings.yaml":       "agent:\n  max_concurrency: 7\n",
-			"settings.local.yaml": localFolderGrantYAML,
+			"settings.local.yaml": localYAML,
 		},
 	}
 	for name, files := range cases {
 		t.Run(name, func(t *testing.T) {
 			var order []string
 			steps, home, projectRoot := localLayerFixture(t, &order, false, files)
+			writeGlobalSettings(t, home, blockedYAML(globalBlocked), 0o600)
+			steps.LoadGlobalSettings = defaultLoadGlobalSettings
 			gate := steps.GateTrust
 			steps.GateTrust = func(gateHome, root, cwd string) trust.Decision {
 				decision := gate(gateHome, root, cwd)
@@ -2791,6 +2825,21 @@ func TestRunFresh_UntrustedLaunchWithholdsTheLocalSettingsLayer(t *testing.T) {
 			}
 			if _, present := files["settings.yaml"]; present && len(res.WithheldInputs) == 0 {
 				t.Fatalf("WithheldInputs = %#v, want the project's settings reported as withheld", res.WithheldInputs)
+			}
+
+			localPath := config.LocalSettingsPath(projectRoot)
+			if err := os.Remove(localPath); err != nil {
+				t.Fatalf("remove the directory standing in for the local file: %v", err)
+			}
+			if err := os.WriteFile(localPath, []byte(localYAML), 0o600); err != nil {
+				t.Fatalf("restore local settings: %v", err)
+			}
+			blocked := mustProtectedStatePolicy(t, home, projectRoot, res.SettingsLayers).Blocked
+			if entry, ok := blocked.Blocking(filepath.Join(localBlocked, "file")); ok {
+				t.Fatalf("Blocking = %+v, want the unapproved local file's blocked_paths to contribute nothing", entry)
+			}
+			if entry, ok := blocked.Blocking(filepath.Join(globalBlocked, "file")); !ok || entry.Source != SettingsPath(home) {
+				t.Fatalf("Blocking = %+v, %v; want the global entry still in force", entry, ok)
 			}
 		})
 	}
@@ -2885,10 +2934,14 @@ func TestDefaultFreshSteps_ComposeConfig_LocalLayerWinsOverTheSharedFile(t *test
 }
 
 func TestDefaultFreshSteps_ComposeConfig_AbortsOnAnUnusableLocalFile(t *testing.T) {
-	for name, content := range map[string]string{
-		"malformed YAML":     "model:\n  active: [\n",
-		"disallowed key":     "declared_commands: [\"ls\"]\n",
-		"machine-wide grant": "permissions:\n  - kind: direct\n    subject: ls\n    path_scope: \"*\"\n    grant_kind: global\n",
+	for name, tc := range map[string]struct{ content, key string }{
+		"malformed YAML":     {"model:\n  active: [\n", ""},
+		"declared_commands":  {"declared_commands: [\"ls\"]\n", "declared_commands"},
+		"readable_folders":   {"readable_folders: [\"/tmp\"]\n", "readable_folders"},
+		"writable_folders":   {"writable_folders: [\"/tmp\"]\n", "writable_folders"},
+		"global-only key":    {"discovery:\n  boundary: project-root\n", "discovery.boundary"},
+		"model subkey":       {"model:\n  last_used: m\n", "model.last_used"},
+		"machine-wide grant": {"permissions:\n  - kind: direct\n    subject: ls\n    path_scope: \"*\"\n    grant_kind: global\n", "permissions.0"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			projectRoot := t.TempDir()
@@ -2897,7 +2950,7 @@ func TestDefaultFreshSteps_ComposeConfig_AbortsOnAnUnusableLocalFile(t *testing.
 				t.Fatalf("mkdir .codemeld: %v", err)
 			}
 			localPath := filepath.Join(dir, "settings.local.yaml")
-			if err := os.WriteFile(localPath, []byte(content), 0o600); err != nil {
+			if err := os.WriteFile(localPath, []byte(tc.content), 0o600); err != nil {
 				t.Fatalf("write local settings: %v", err)
 			}
 
@@ -2907,6 +2960,9 @@ func TestDefaultFreshSteps_ComposeConfig_AbortsOnAnUnusableLocalFile(t *testing.
 			}
 			if !strings.Contains(err.Error(), localPath) {
 				t.Fatalf("error %q must name %s", err, localPath)
+			}
+			if tc.key != "" && !strings.Contains(err.Error(), "failed at "+tc.key+":") && !strings.Contains(err.Error(), "unknown setting "+tc.key+"\n") {
+				t.Fatalf("error %q must name the offending key %q", err, tc.key)
 			}
 		})
 	}
@@ -3769,4 +3825,74 @@ func TestReportJournalRecovery_ReportsCompletedAndInterruptedJournalsSeparately(
 			t.Fatalf("stderr = %q, want the cleanup failure under the confirmed heading without a question", got)
 		}
 	})
+}
+
+func TestRunFresh_AsksAboutVCSUserConfigAfterTrustAndLaterStepsSeeTheSavedSettings(t *testing.T) {
+	forceStdinTerminal(t, true)
+	home := vcsQuestionHome(t, blockedYAML("~/.hgrc", "~/.ssh"), ".hgrc")
+	stageOSStdin(t, "y\n")
+	var order []string
+	rec := func(name string) { order = append(order, name) }
+	steps := recordingSteps(&order)
+	steps.ResolveHome = func() (string, error) { rec("0a:ResolveHome"); return home, nil }
+	steps.LoadGlobalSettings = func(h string) (map[string]any, error) {
+		rec("1:LoadGlobalSettings")
+		return defaultLoadGlobalSettings(h)
+	}
+	ask := DefaultFreshSteps(io.Discard, io.Discard).AskVCSUserConfig
+	steps.AskVCSUserConfig = func(h string, global map[string]any) bool {
+		rec("2c:AskVCSUserConfig")
+		return ask(h, global)
+	}
+	var recovered, composed map[string]any
+	steps.RecoverJournals = func(_, _ string, global map[string]any, _ trust.Decision) {
+		rec("2.6:RecoverJournals")
+		recovered = global
+	}
+	steps.ComposeConfig = func(global map[string]any, _ string) (ConfigComposition, error) {
+		rec("3:ComposeConfig")
+		composed = global
+		return ConfigComposition{}, nil
+	}
+
+	if _, err := RunFresh(context.Background(), "/cwd", steps); err != nil {
+		t.Fatalf("RunFresh error: %v", err)
+	}
+
+	want := []string{"0a:ResolveHome", "0:RunFirstRun", "1:LoadGlobalSettings", "2:ResolveProjectRoot", "2b:GateTrust",
+		"2c:AskVCSUserConfig", "1:LoadGlobalSettings", "2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals", "3:ComposeConfig"}
+	if !slices.Equal(order[:len(want)], want) {
+		t.Fatalf("order = %v, want it to start %v", order, want)
+	}
+	requireVCSAllowed(t, "RecoverJournals", recovered, "~/.ssh")
+	requireVCSAllowed(t, "ComposeConfig", composed, "~/.ssh")
+}
+
+func TestRunFresh_StopsWhenSettingsCannotBeReloadedAfterTheVCSQuestion(t *testing.T) {
+	forceStdinTerminal(t, true)
+	home := vcsQuestionHome(t, blockedYAML("~/.hgrc"), ".hgrc")
+	stageOSStdin(t, "n\n")
+	var order []string
+	steps := recordingSteps(&order)
+	steps.ResolveHome = func() (string, error) { return home, nil }
+	reloadErr := errors.New("settings no longer valid")
+	loads := 0
+	steps.LoadGlobalSettings = func(h string) (map[string]any, error) {
+		if loads++; loads > 1 {
+			return nil, reloadErr
+		}
+		return defaultLoadGlobalSettings(h)
+	}
+	steps.AskVCSUserConfig = DefaultFreshSteps(io.Discard, io.Discard).AskVCSUserConfig
+
+	_, err := RunFresh(context.Background(), "/cwd", steps)
+
+	if !errors.Is(err, reloadErr) {
+		t.Fatalf("RunFresh error = %v, want the reload failure", err)
+	}
+	for _, step := range []string{"2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals", "3:ComposeConfig"} {
+		if slices.Contains(order, step) {
+			t.Fatalf("%s ran after the reload failed; order = %v", step, order)
+		}
+	}
 }

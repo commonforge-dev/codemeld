@@ -347,8 +347,8 @@ func TestModelPicker_EffortRefreshesPerHighlightedModel(t *testing.T) {
 
 	// Selection is by table row, resolved through the data-index mapping.
 	tbl.Select(modelTableRow(tbl, 1), 0)
-	if a.modelPicker.effort != "low" {
-		t.Errorf("effort after move to gpt-5-mini = %q, want %q (fallback default)", a.modelPicker.effort, "low")
+	if a.modelPicker.effort != "high" {
+		t.Errorf("effort after move to gpt-5-mini = %q, want %q (nearest offered to medium, tie rounds up)", a.modelPicker.effort, "high")
 	}
 	if strings.Join(a.modelPicker.supported, ",") != "low,high" {
 		t.Errorf("supported set = %v, want [low high]", a.modelPicker.supported)
@@ -365,7 +365,7 @@ func TestModelPicker_EffortRefreshesPerHighlightedModel(t *testing.T) {
 	}
 }
 
-func TestModelPicker_RefreshSelectsFirstAdvertisedEffort(t *testing.T) {
+func TestModelPicker_RefreshSelectsNearestOfferedEffort(t *testing.T) {
 	a := New(nil)
 	cat := &providerModelCatalogFake{
 		provider: "openai",
@@ -384,8 +384,8 @@ func TestModelPicker_RefreshSelectsFirstAdvertisedEffort(t *testing.T) {
 	_, tbl := a.buildModelPicker(cat.rows, 0, "low", cat.target, cat)
 
 	tbl.Select(modelTableRow(tbl, 1), 0)
-	if a.modelPicker.effort != "high" {
-		t.Errorf("effort after move to gpt-5 = %q, want %q (first advertised)", a.modelPicker.effort, "high")
+	if a.modelPicker.effort != "medium" {
+		t.Errorf("effort after move to gpt-5 = %q, want %q (nearest offered to low, tie rounds up)", a.modelPicker.effort, "medium")
 	}
 }
 
@@ -413,17 +413,17 @@ func TestModelPicker_NoCapabilityModelSelectsNoReasoning(t *testing.T) {
 	}
 }
 
-func TestModelPicker_RetainsNoReasoningAcrossHighlight(t *testing.T) {
+func TestModelPicker_NoReasoningMovesToNearestOfferedEffort(t *testing.T) {
 	a := New(nil)
 	cat := selectedModelCatalog()
 	_, tbl := a.buildModelPicker(cat.rows, 0, effortNoReasoning, cat.target, cat)
 
-	if a.modelPicker.effort != effortNoReasoning {
-		t.Fatalf("initial picker effort = %q, want %q (sentinel retained)", a.modelPicker.effort, effortNoReasoning)
+	if a.modelPicker.effort != "minimal" {
+		t.Fatalf("initial picker effort = %q, want %q (nearest offered to no-reasoning)", a.modelPicker.effort, "minimal")
 	}
 	tbl.Select(modelTableRow(tbl, 1), 0)
-	if a.modelPicker.effort != effortNoReasoning {
-		t.Errorf("effort after move to gpt-5-mini = %q, want %q (sentinel retained)", a.modelPicker.effort, effortNoReasoning)
+	if a.modelPicker.effort != "low" {
+		t.Errorf("effort after move to gpt-5-mini = %q, want %q (nearest offered to minimal)", a.modelPicker.effort, "low")
 	}
 }
 
@@ -456,7 +456,7 @@ func TestModelPicker_LiteralDefaultIsAProviderToken(t *testing.T) {
 	}
 	tbl.Select(modelTableRow(tbl, 1), 0)
 	if a.modelPicker.effort != "default" {
-		t.Errorf("effort on gpt-5-mini = %q, want %q (first advertised)", a.modelPicker.effort, "default")
+		t.Errorf("effort on gpt-5-mini = %q, want %q (nearest offered to low)", a.modelPicker.effort, "default")
 	}
 }
 
@@ -481,8 +481,8 @@ func TestModelPicker_OpensWithoutInMemorySelection(t *testing.T) {
 	if !a.modelPickerOpen || !a.pages.HasPage(modelPickerPage) {
 		t.Fatal("model picker did not open without an in-memory selection")
 	}
-	if a.modelPicker.effort != "minimal" {
-		t.Errorf("seeded effort = %q, want %q (first advertised)", a.modelPicker.effort, "minimal")
+	if a.modelPicker.effort != "medium" {
+		t.Errorf("seeded effort = %q, want %q (empty previous effort treated as medium)", a.modelPicker.effort, "medium")
 	}
 }
 
@@ -1032,12 +1032,12 @@ func TestModelPicker_EffortStepsAfterFilter(t *testing.T) {
 	if strings.Join(a.modelPicker.supported, ",") != "low,high" {
 		t.Fatalf("supported after filter = %v, want [low high]", a.modelPicker.supported)
 	}
-	if a.modelPicker.effort != "low" {
-		t.Errorf("effort after filter = %q, want low (medium unsupported → default)", a.modelPicker.effort)
-	}
-	a.stepModelEffort(1)
 	if a.modelPicker.effort != "high" {
-		t.Errorf("effort after right step = %q, want high", a.modelPicker.effort)
+		t.Errorf("effort after filter = %q, want high (nearest offered to medium, tie rounds up)", a.modelPicker.effort)
+	}
+	a.stepModelEffort(-1)
+	if a.modelPicker.effort != "low" {
+		t.Errorf("effort after left step = %q, want low", a.modelPicker.effort)
 	}
 }
 
@@ -2953,4 +2953,205 @@ func TestModelPicker_DismissKeepsRefreshOffTheNotice(t *testing.T) {
 	if a.transcript.notice != "session write failed: disk full" {
 		t.Errorf("notice after late completion = %q, want it unchanged", a.transcript.notice)
 	}
+}
+
+func TestModelPickerEffortFor_NearestOffered(t *testing.T) {
+	cases := []struct {
+		name      string
+		prev      string
+		supported []string
+		want      string
+	}{
+		{"tie rounds up", "medium", []string{"xhigh", "high", "low", effortNoReasoning}, "high"},
+		{"one step down", "xhigh", []string{"high", "medium", "low", "minimal"}, "high"},
+		{"offered kept", "high", []string{"low", "high"}, "high"},
+		{"no-reasoning to nearest", effortNoReasoning, []string{"high", "xhigh"}, "high"},
+		{"empty as medium", "", []string{"xhigh", "low"}, "low"},
+		{"empty supported", "high", nil, ""},
+		{"same rank keeps first", effortNoReasoning, []string{"ultra", "max"}, "ultra"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := modelPickerEffortFor(tc.supported, tc.prev); got != tc.want {
+				t.Errorf("modelPickerEffortFor(%v, %q) = %q, want %q", tc.supported, tc.prev, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestModelPicker_EnterAppliesDisplayedEffortNotCarriedNoReasoning(t *testing.T) {
+	newCat := func() *providerModelCatalogFake {
+		return &providerModelCatalogFake{
+			provider: "openrouter",
+			modelID:  "inception/mercury-3",
+			effort:   effortNoReasoning,
+			selected: true,
+			rows:     []ProviderModel{{Provider: "openrouter", ModelID: "inception/mercury-3"}},
+			supported: map[string][]string{
+				"openrouter/inception/mercury-3": {"high", "xhigh"},
+			},
+		}
+	}
+
+	a := New(nil)
+	applier := &providerModelApplierFake{}
+	a.SetModelPickerDeps(ModelPickerDeps{Catalog: newCat(), Applier: applier})
+	a.openModelPicker()
+	if got := a.modelPicker.effortView.GetText(false); !strings.Contains(got, " high ") {
+		t.Fatalf("inline effort render = %q, want high shown", got)
+	}
+	a.confirmHighlightedModel()
+	if applier.calls != 1 || applier.gotID != "inception/mercury-3" || applier.gotEffort != "high" {
+		t.Fatalf("Apply calls=%d got (%q,%q), want 1 call with (inception/mercury-3,high)", applier.calls, applier.gotID, applier.gotEffort)
+	}
+
+	a = New(nil)
+	applier = &providerModelApplierFake{}
+	a.SetModelPickerDeps(ModelPickerDeps{Catalog: newCat(), Applier: applier})
+	a.openModelPicker()
+	a.modelPickerSharedKeys(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone))
+	if got := a.modelPicker.effortView.GetText(false); !strings.Contains(got, " xhigh ") {
+		t.Fatalf("inline effort render after step = %q, want xhigh shown", got)
+	}
+	a.confirmHighlightedModel()
+	if applier.gotEffort != "xhigh" {
+		t.Errorf("Apply effort after step = %q, want xhigh", applier.gotEffort)
+	}
+}
+
+func pressFocusedModelPickerEnter(t *testing.T, a *App) {
+	t.Helper()
+	focused := a.app.GetFocus()
+	if focused != a.modelPicker.field {
+		t.Fatalf("focused primitive = %T, want the model picker's filter field", focused)
+	}
+	ev := tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone)
+	if capture := a.modelPicker.field.GetInputCapture(); capture != nil {
+		ev = capture(ev)
+	}
+	if ev != nil {
+		a.modelPicker.field.InputHandler()(ev, func(tview.Primitive) {})
+	}
+}
+
+func TestModelPicker_StepperRunsLowToHighForAnyProviderOrder(t *testing.T) {
+	cases := []struct {
+		name      string
+		supported []string
+	}{
+		{"ascending", []string{"low", "medium", "high"}},
+		{"descending", []string{"high", "medium", "low"}},
+		{"mixed", []string{"medium", "high", "low"}},
+	}
+	left := tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModNone)
+	right := tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cat := &providerModelCatalogFake{
+				provider:  "p",
+				modelID:   "m",
+				effort:    "medium",
+				selected:  true,
+				rows:      []ProviderModel{{Provider: "p", ModelID: "m"}},
+				supported: map[string][]string{"p/m": slices.Clone(tc.supported)},
+			}
+			a := New(nil)
+			applier := &providerModelApplierFake{}
+			a.SetModelPickerDeps(ModelPickerDeps{Catalog: cat, Applier: applier})
+			a.openModelPicker()
+			view := func() string { return a.modelPicker.effortView.GetText(false) }
+
+			a.modelPickerSharedKeys(right)
+			a.modelPickerSharedKeys(right)
+			if got := view(); !strings.Contains(got, "[::r] high [::-]") || !strings.Contains(got, "◂") || strings.Contains(got, "▸") {
+				t.Errorf("after ▸ past the top: render = %q, want high with only ◂", got)
+			}
+			for range 3 {
+				a.modelPickerSharedKeys(left)
+			}
+			if got := view(); !strings.Contains(got, "[::r] low [::-]") || strings.Contains(got, "◂") || !strings.Contains(got, "▸") {
+				t.Errorf("after ◂ past the bottom: render = %q, want low with only ▸", got)
+			}
+			a.modelPickerSharedKeys(right)
+			if got := view(); !strings.Contains(got, "[::r] medium [::-]") {
+				t.Errorf("after one ▸ from low: render = %q, want medium", got)
+			}
+			if !equalStrings(a.modelPicker.supported, tc.supported) {
+				t.Errorf("sess.supported = %v, want provider order %v", a.modelPicker.supported, tc.supported)
+			}
+			pressFocusedModelPickerEnter(t, a)
+			if applier.gotEffort != "medium" {
+				t.Errorf("Apply effort = %q, want the displayed medium", applier.gotEffort)
+			}
+		})
+	}
+}
+
+func TestModelPicker_UnknownEffortsStartOnFirstProviderValueOnEveryPath(t *testing.T) {
+	quiet := ProviderModel{Provider: "p", ModelID: "quiet"}
+	wide := ProviderModel{Provider: "p", ModelID: "wide"}
+	newCat := func(active ProviderModel) *providerModelCatalogFake {
+		return &providerModelCatalogFake{
+			provider: active.Provider,
+			modelID:  active.ModelID,
+			effort:   effortNoReasoning,
+			selected: true,
+			rows:     []ProviderModel{quiet, wide},
+			supported: map[string][]string{
+				"p/quiet": {effortNoReasoning},
+				"p/wide":  {"ultra", "max"},
+			},
+		}
+	}
+	assertUltra := func(t *testing.T, a *App, cat *providerModelCatalogFake, applier *providerModelApplierFake) {
+		t.Helper()
+		if a.modelPicker.effort != "ultra" {
+			t.Errorf("effort = %q, want ultra", a.modelPicker.effort)
+		}
+		if got := a.modelPicker.effortView.GetText(false); !strings.Contains(got, "[::r] ultra [::-]") {
+			t.Errorf("render = %q, want ultra shown", got)
+		}
+		if !equalStrings(a.modelPicker.supported, []string{"ultra", "max"}) {
+			t.Errorf("sess.supported = %v, want [ultra max]", a.modelPicker.supported)
+		}
+		if !equalStrings(cat.supported["p/wide"], []string{"ultra", "max"}) {
+			t.Errorf("catalog slice = %v, want [ultra max]", cat.supported["p/wide"])
+		}
+		pressFocusedModelPickerEnter(t, a)
+		if applier.gotID != "wide" || applier.gotEffort != "ultra" {
+			t.Errorf("Apply got (%q,%q), want (wide,ultra)", applier.gotID, applier.gotEffort)
+		}
+	}
+	open := func(active ProviderModel) (*App, *providerModelCatalogFake, *providerModelApplierFake) {
+		a := New(nil)
+		cat := newCat(active)
+		applier := &providerModelApplierFake{}
+		a.SetModelPickerDeps(ModelPickerDeps{Catalog: cat, Applier: applier})
+		a.openModelPicker()
+		return a, cat, applier
+	}
+
+	t.Run("build", func(t *testing.T) {
+		a, cat, applier := open(wide)
+		assertUltra(t, a, cat, applier)
+	})
+	t.Run("highlight", func(t *testing.T) {
+		a, cat, applier := open(quiet)
+		if a.modelPicker.effort != effortNoReasoning {
+			t.Fatalf("effort on quiet = %q, want no-reasoning", a.modelPicker.effort)
+		}
+		a.modelPicker.table.Select(modelTableRow(a.modelPicker.table, 1), 0)
+		assertUltra(t, a, cat, applier)
+	})
+	t.Run("filter", func(t *testing.T) {
+		a, cat, applier := open(quiet)
+		a.onModelFilterChanged("wide")
+		assertUltra(t, a, cat, applier)
+	})
+	t.Run("catalog refresh", func(t *testing.T) {
+		a, cat, applier := open(quiet)
+		cat.rows = []ProviderModel{wide}
+		a.rebuildModelPickerFromCatalog()
+		assertUltra(t, a, cat, applier)
+	})
 }

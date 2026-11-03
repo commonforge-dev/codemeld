@@ -1,5 +1,5 @@
 // Tests for the production VCS detection-to-registry wiring (steps 4-6): embedded-base
-// template loading with overlay overrides, vcs.preferred cross-reference validation and source
+// template loading with overlay overrides, vcs.force cross-reference validation and source
 // attribution, hard-override vs auto-detect detection, the degraded no-repo path, and fresh/resume
 // parity feeding the tool-registry factory with real marker files.
 package bootstrap
@@ -166,7 +166,7 @@ func TestLoadVCSTemplates_EmbeddedBaseAndOverrides(t *testing.T) {
 		if got := git.Actions["status"].Argv; len(got) != 2 || got[1] != "GLOBAL-OVERRIDE" {
 			t.Fatalf("git status argv = %v, want the global override", got)
 		}
-		// The pristine built-in marker is still captured for the preferred walk.
+		// The pristine built-in marker is still captured for the force walk.
 		if payload.builtinDetect["git"] != ".git" {
 			t.Errorf("builtinDetect[git] = %q, want .git from the pristine built-in", payload.builtinDetect["git"])
 		}
@@ -252,32 +252,32 @@ func TestLoadVCSTemplates_ProjectOverrideDoesNotInheritGlobalTrust(t *testing.T)
 	assertVCSActionReadOnly(t, reg, "log", false)
 }
 
-// --- step 5: vcs.preferred cross-reference validation ------------------------
+// --- step 5: vcs.force cross-reference validation ------------------------
 
-func TestValidatePreferredVCS(t *testing.T) {
+func TestValidateForceVCS(t *testing.T) {
 	home := t.TempDir()
 	repo := t.TempDir()
 	payload := loadPayload(t, home, repo)
 
 	t.Run("empty disables override", func(t *testing.T) {
-		if err := validatePreferredVCS(map[string]any{}, payload); err != nil {
-			t.Fatalf("unset vcs.preferred should validate trivially: %v", err)
+		if err := validateForceVCS(map[string]any{}, payload); err != nil {
+			t.Fatalf("unset vcs.force should validate trivially: %v", err)
 		}
 	})
 
 	t.Run("built-in name passes", func(t *testing.T) {
-		composed := map[string]any{"vcs": map[string]any{"preferred": "git"}}
-		if err := validatePreferredVCS(composed, payload); err != nil {
-			t.Fatalf("built-in vcs.preferred should pass: %v", err)
+		composed := map[string]any{"vcs": map[string]any{"force": "git"}}
+		if err := validateForceVCS(composed, payload); err != nil {
+			t.Fatalf("built-in vcs.force should pass: %v", err)
 		}
 	})
 
 	t.Run("unknown name fails naming the global source and value", func(t *testing.T) {
 		// No project settings.yaml exists, so the effective override is attributed to the global file.
-		composed := map[string]any{"vcs": map[string]any{"preferred": "bogus"}}
-		err := validatePreferredVCS(composed, payload)
+		composed := map[string]any{"vcs": map[string]any{"force": "bogus"}}
+		err := validateForceVCS(composed, payload)
 		if err == nil {
-			t.Fatal("unknown vcs.preferred must be a load-time validation error")
+			t.Fatal("unknown vcs.force must be a load-time validation error")
 		}
 		if !strings.Contains(err.Error(), SettingsPath(home)) {
 			t.Errorf("error %q should name the global settings file %q", err, SettingsPath(home))
@@ -292,9 +292,9 @@ func TestValidatePreferredVCS(t *testing.T) {
 		repo := t.TempDir()
 		writeFullTemplate(t, filepath.Join(repo, ".codemeld", "vcs", "fossil.yaml"), "fossil", true, ".fossil", "status")
 		p := loadPayload(t, home, repo)
-		composed := map[string]any{"vcs": map[string]any{"preferred": "fossil"}}
-		if err := validatePreferredVCS(composed, p); err != nil {
-			t.Fatalf("loaded user template vcs.preferred should pass: %v", err)
+		composed := map[string]any{"vcs": map[string]any{"force": "fossil"}}
+		if err := validateForceVCS(composed, p); err != nil {
+			t.Fatalf("loaded user template vcs.force should pass: %v", err)
 		}
 	})
 }
@@ -381,52 +381,52 @@ func TestDetectVCS_ProjectRootWalkReconstructsRepoRoot(t *testing.T) {
 	}
 }
 
-// TestDetectVCS_PreferredHardOverride pins Done-when 6: a successful vcs.preferred bypasses priority
-// tie-breaking, and a preferred value that matches nowhere exits (errors) instead of falling back to
+// TestDetectVCS_ForceHardOverride pins Done-when 6: a successful vcs.force bypasses priority
+// tie-breaking, and a force value that matches nowhere exits (errors) instead of falling back to
 // auto-detect.
-func TestDetectVCS_PreferredHardOverride(t *testing.T) {
+func TestDetectVCS_ForceHardOverride(t *testing.T) {
 	t.Run("bypasses priority tie-break", func(t *testing.T) {
 		home := t.TempDir()
 		repo := t.TempDir()
 		mkVCSDir(t, filepath.Join(repo, ".git"))
 		mkVCSDir(t, filepath.Join(repo, ".hg"))
 		payload := loadPayload(t, home, repo)
-		composed := map[string]any{"vcs": map[string]any{"preferred": "hg"}}
+		composed := map[string]any{"vcs": map[string]any{"force": "hg"}}
 		raw, err := detectVCS(repo, composed, payload, io.Discard)
 		active := mustActive(t, raw, err)
 		if active.Template.Name != "hg" {
-			t.Fatalf("preferred winner = %q, want hg (override bypasses git-first priority)", active.Template.Name)
+			t.Fatalf("force winner = %q, want hg (override bypasses git-first priority)", active.Template.Name)
 		}
 	})
 
 	t.Run("miss exits instead of falling back", func(t *testing.T) {
 		home := t.TempDir()
 		repo := t.TempDir()
-		mkVCSDir(t, filepath.Join(repo, ".hg")) // hg present, but git is preferred
+		mkVCSDir(t, filepath.Join(repo, ".hg")) // hg present, but git is force
 		payload := loadPayload(t, home, repo)
-		composed := map[string]any{"vcs": map[string]any{"preferred": "git"}}
+		composed := map[string]any{"vcs": map[string]any{"force": "git"}}
 		active, err := detectVCS(repo, composed, payload, io.Discard)
 		if err == nil {
-			t.Fatalf("preferred git with no .git must exit, got active=%#v", active)
+			t.Fatalf("force git with no .git must exit, got active=%#v", active)
 		}
 		if active != nil {
-			t.Fatalf("active = %#v, want nil on preferred miss (no auto-detect fallback)", active)
+			t.Fatalf("active = %#v, want nil on force miss (no auto-detect fallback)", active)
 		}
 	})
 }
 
-// TestDetectVCS_PreferredSourceAttribution proves layering: the detect-fails error names the
-// per-project settings.yaml when it sets vcs.preferred, and the global settings.yaml otherwise.
-func TestDetectVCS_PreferredSourceAttribution(t *testing.T) {
+// TestDetectVCS_ForceSourceAttribution proves layering: the detect-fails error names the
+// per-project settings.yaml when it sets vcs.force, and the global settings.yaml otherwise.
+func TestDetectVCS_ForceSourceAttribution(t *testing.T) {
 	t.Run("project source", func(t *testing.T) {
 		home := t.TempDir()
-		repo := t.TempDir() // no .git → preferred git fails everywhere
-		writeVCSFile(t, projectSettingsPath(repo), "vcs:\n  preferred: git\n")
+		repo := t.TempDir() // no .git → force git fails everywhere
+		writeVCSFile(t, projectSettingsPath(repo), "vcs:\n  force: git\n")
 		payload := loadPayload(t, home, repo)
-		composed := map[string]any{"vcs": map[string]any{"preferred": "git"}}
+		composed := map[string]any{"vcs": map[string]any{"force": "git"}}
 		_, err := detectVCS(repo, composed, payload, io.Discard)
 		if err == nil {
-			t.Fatal("preferred git with no repo should error")
+			t.Fatal("force git with no repo should error")
 		}
 		if !strings.Contains(err.Error(), projectSettingsPath(repo)) {
 			t.Fatalf("error %q should name the project settings file %q", err, projectSettingsPath(repo))
@@ -437,10 +437,10 @@ func TestDetectVCS_PreferredSourceAttribution(t *testing.T) {
 		home := t.TempDir()
 		repo := t.TempDir()
 		payload := loadPayload(t, home, repo)
-		composed := map[string]any{"vcs": map[string]any{"preferred": "git"}}
+		composed := map[string]any{"vcs": map[string]any{"force": "git"}}
 		_, err := detectVCS(repo, composed, payload, io.Discard)
 		if err == nil {
-			t.Fatal("preferred git with no repo should error")
+			t.Fatal("force git with no repo should error")
 		}
 		if !strings.Contains(err.Error(), SettingsPath(home)) {
 			t.Fatalf("error %q should name the global settings file %q", err, SettingsPath(home))
@@ -456,7 +456,7 @@ func TestDetectVCS_PreferredSourceAttribution(t *testing.T) {
 // unconditionally.
 func TestDefaultFreshSteps_DetectVCS_RealMarkerRegistersActions(t *testing.T) {
 	s := DefaultFreshSteps(io.Discard, io.Discard)
-	assertProductionDetectsGit(t, s.LoadVCSTemplates, s.ValidatePreferredVCS, s.DetectVCS)
+	assertProductionDetectsGit(t, s.LoadVCSTemplates, s.ValidateForceVCS, s.DetectVCS)
 }
 
 // TestDefaultResumeSteps_DetectVCS_RealMarkerRegistersActions pins Done-when 2/4/7: the resume
@@ -464,7 +464,7 @@ func TestDefaultFreshSteps_DetectVCS_RealMarkerRegistersActions(t *testing.T) {
 // factory. It would fail if DetectVCS returned nil unconditionally.
 func TestDefaultResumeSteps_DetectVCS_RealMarkerRegistersActions(t *testing.T) {
 	s := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard)
-	assertProductionDetectsGit(t, s.LoadVCSTemplates, s.ValidatePreferredVCS, s.DetectVCS)
+	assertProductionDetectsGit(t, s.LoadVCSTemplates, s.ValidateForceVCS, s.DetectVCS)
 }
 
 func assertProductionDetectsGit(
@@ -484,7 +484,7 @@ func assertProductionDetectsGit(
 		t.Fatalf("LoadVCSTemplates: %v", err)
 	}
 	if err := validate(composed, payload); err != nil {
-		t.Fatalf("ValidatePreferredVCS: %v", err)
+		t.Fatalf("ValidateForceVCS: %v", err)
 	}
 	active, err := detect(repo, composed, payload)
 	if err != nil {
@@ -529,17 +529,17 @@ func mustActive(t *testing.T, active any, err error) *ActiveVCS {
 
 // Attribution must survive the settings file disappearing after step 3, which is only possible if
 // it reads the cached verified layer instead of the path.
-func TestPreferredOverride_AttributesFromTheVerifiedLayerWithoutASecondRead(t *testing.T) {
+func TestForceOverride_AttributesFromTheVerifiedLayerWithoutASecondRead(t *testing.T) {
 	home, repo := t.TempDir(), t.TempDir()
-	writeVCSFile(t, projectSettingsPath(repo), "vcs:\n  preferred: git\n")
+	writeVCSFile(t, projectSettingsPath(repo), "vcs:\n  force: git\n")
 	payload := loadPayload(t, home, repo)
 	if err := os.Remove(projectSettingsPath(repo)); err != nil {
 		t.Fatalf("remove project settings: %v", err)
 	}
 
-	value, source := preferredOverride(map[string]any{"vcs": map[string]any{"preferred": "git"}}, payload)
+	value, source := forceOverride(map[string]any{"vcs": map[string]any{"force": "git"}}, payload)
 	if value != "git" {
-		t.Fatalf("preferred = %q, want git", value)
+		t.Fatalf("force = %q, want git", value)
 	}
 	if source != projectSettingsPath(repo) {
 		t.Fatalf("source = %q, want the project settings file %q", source, projectSettingsPath(repo))
@@ -548,17 +548,17 @@ func TestPreferredOverride_AttributesFromTheVerifiedLayerWithoutASecondRead(t *t
 
 // A layer step 3 dropped must not be attributable to the project, even though the file is still on
 // disk declaring the key.
-func TestPreferredOverride_DroppedLayerAttributesToTheGlobalFile(t *testing.T) {
+func TestForceOverride_DroppedLayerAttributesToTheGlobalFile(t *testing.T) {
 	home, repo := t.TempDir(), t.TempDir()
-	writeVCSFile(t, projectSettingsPath(repo), "vcs:\n  preferred: git\n")
+	writeVCSFile(t, projectSettingsPath(repo), "vcs:\n  force: git\n")
 	raw, err := loadVCSTemplates(home, repo, nil, true)
 	if err != nil {
 		t.Fatalf("loadVCSTemplates: %v", err)
 	}
 
-	value, source := preferredOverride(map[string]any{"vcs": map[string]any{"preferred": "git"}}, raw.(*vcsLoaded))
+	value, source := forceOverride(map[string]any{"vcs": map[string]any{"force": "git"}}, raw.(*vcsLoaded))
 	if value != "git" {
-		t.Fatalf("preferred = %q, want git", value)
+		t.Fatalf("force = %q, want git", value)
 	}
 	if source != SettingsPath(home) {
 		t.Fatalf("source = %q, want the global settings file %q", source, SettingsPath(home))
@@ -632,7 +632,7 @@ func TestLoadVCSTemplates_TrustedExplicitClassesFollowTemplateOrigin(t *testing.
 		{"fossil", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			composed := map[string]any{"vcs": map[string]any{"preferred": tc.name}}
+			composed := map[string]any{"vcs": map[string]any{"force": tc.name}}
 			raw, err := detectVCS(repo, composed, payload, io.Discard)
 			active := mustActive(t, raw, err)
 			if active.TrustedExplicitClasses != tc.wantTrusted {

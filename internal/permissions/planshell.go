@@ -1765,12 +1765,19 @@ func bashNoExecOptions(args []string) int {
 	return 0
 }
 
-// commandLookupTokens accepts the one `command` grammar that classifies read-only: `command -v`
-// followed by exactly one operand spelled as a plain program name. `command -V`, a bare or
-// multi-operand `-v`, any other option, and `command <program> …` all fail closed, so no `command`
-// form outside the lookup can borrow the wrapper's route out of literal matching.
+// commandLookupTokens accepts the one `command` grammar that classifies read-only: `command -v`,
+// an optional `--`, then exactly one operand spelled as a plain program name. `command -V`, a bare
+// or multi-operand `-v`, any other option, and `command <program> …` all fail closed, so no
+// `command` form outside the lookup can borrow the wrapper's route out of literal matching.
 func commandLookupTokens(tokens []string) bool {
-	return len(tokens) == 3 && tokens[0] == "command" && tokens[1] == "-v" && plainProgramName(tokens[2])
+	if len(tokens) < 3 || tokens[0] != "command" || tokens[1] != "-v" {
+		return false
+	}
+	names := tokens[2:]
+	if names[0] == "--" {
+		names = names[1:]
+	}
+	return len(names) == 1 && plainProgramName(names[0])
 }
 
 func bareEnvTokens(tokens []string) bool {

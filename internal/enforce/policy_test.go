@@ -46,8 +46,10 @@ func TestPolicyFrameRoundTrips(t *testing.T) {
 	planSkills.ReadRoots = []string{"/home/u/.codemeld/skills"}
 	autoSkills := validAutoEdits()
 	autoSkills.ReadRoots = []string{"/home/u/.codemeld/skills"}
+	planTmp := plan
+	planTmp.TmpDir, planTmp.TmpDirDev, planTmp.TmpDirIno = "/tmp/codemeld-1", 66, 4242
 	cases := map[string]Policy{"auto_edits": validAutoEdits(), "plan": plan, "network": network,
-		"plan read roots": planSkills, "auto_edits read roots": autoSkills}
+		"plan read roots": planSkills, "auto_edits read roots": autoSkills, "plan tmp_dir": planTmp}
 	for name, p := range cases {
 		if got := roundTrip(t, p); !reflect.DeepEqual(got, p) {
 			t.Errorf("%s: round trip = %+v, want %+v", name, got, p)
@@ -126,8 +128,13 @@ func TestPolicyValidationRejects(t *testing.T) {
 		"mode build":                   func(p *Policy) { p.Mode = "build" },
 		"auto_edits empty tmp_dir":     func(p *Policy) { p.TmpDir = "" },
 		"auto_edits unknown authority": func(p *Policy) { p.ExceptionalAuthority = "delete" },
-		"plan with tmp_dir":            func(p *Policy) { *p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, TmpDir: "/t"} },
-		"plan with write_roots":        func(p *Policy) { *p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, WriteRoots: []string{"/w"}} },
+		"plan tmp_dir without inode":   func(p *Policy) { *p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, TmpDir: "/t", TmpDirDev: 1} },
+		"plan identity without tmp_dir": func(p *Policy) {
+			*p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, TmpDirDev: 1, TmpDirIno: 2}
+		},
+		"auto_edits with identity": func(p *Policy) { p.TmpDirDev, p.TmpDirIno = 1, 2 },
+		"auto_edits inode only":    func(p *Policy) { p.TmpDirIno = 2 },
+		"plan with write_roots":    func(p *Policy) { *p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, WriteRoots: []string{"/w"}} },
 		"plan with no_write_paths": func(p *Policy) {
 			*p = Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, NoWritePaths: []string{"/w"}}
 		},

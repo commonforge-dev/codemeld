@@ -4646,6 +4646,67 @@ func TestProductionAuthorizer_PermanentApprovalWritesTheLocalSettingsFile(t *tes
 	storeUnchanged()
 }
 
+func TestProductionAuthorizer_LocalGrantLockTimeoutKeepsTheGrantForTheSessionOnly(t *testing.T) {
+	cwd := mustCanonical(t, t.TempDir())
+	home := t.TempDir()
+	store := mkStore(t)
+	app := tui.New(nil)
+	app.SetActiveStore(store)
+	localPath := config.LocalSettingsPath(cwd)
+	seedGrantFile(t, localPath, permissions.PermissionEntry{Kind: "tool", Subject: "list_files", PathScope: cwd, GrantKind: "folder"})
+	sharedBytes := seedSharedProjectSettings(t, cwd, permissions.PermissionEntry{Kind: "tool", Subject: "grep", PathScope: cwd, GrantKind: "folder"})
+	localBytes := mustReadFile(t, localPath)
+
+	parent, err := os.Open(filepath.Dir(localPath))
+	if err != nil {
+		t.Fatalf("open the settings folder: %v", err)
+	}
+	t.Cleanup(func() { _ = parent.Close() })
+	release, _, err := locks.AcquireAt(parent, "settings.local.yaml.lock", 0)
+	if err != nil {
+		t.Fatalf("take the local settings lock: %v", err)
+	}
+	t.Cleanup(release)
+
+	show := func(tui.PromptRequest) (tui.PromptDecision, error) {
+		return tui.PromptDecision{Option: tui.OptionAllowFolder}, nil
+	}
+	auth := newProductionAuthorizer(app, emptyCache(t, cwd), permissions.NewTurnCache(), newPromptGateBuilder(show), home, cwd, mode.NewActiveState(mode.Build, mode.SourceDefault))
+	notices := &recordingNotices{}
+	auth.notices = notices
+
+	req := permissions.MatchRequest{Kind: "tool", Subject: "read_file", PathScope: cwd}
+	d, err := auth.Authorize(context.Background(), req, dispatch.PromptDisplay{Action: dispatch.ActionRunTool, Subject: "read_file"}, permissions.ModeContext{})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if d.PersistErr == nil {
+		t.Fatalf("Decision = %+v, want the lock timeout surfaced", d)
+	}
+	session := permissions.PermissionEntry{Kind: "tool", Subject: "read_file", PathScope: cwd, GrantKind: "session"}
+	if !slices.Contains(auth.grants.Permissions(), session) {
+		t.Fatalf("grants = %+v, want %+v in force", auth.grants.Permissions(), session)
+	}
+	wantNotice := "session-only — failed to persist to " + localPath + ": lock_timeout — "
+	if len(notices.texts) != 1 || !strings.HasPrefix(notices.texts[0], wantNotice) {
+		t.Fatalf("notices = %q, want one starting %q", notices.texts, wantNotice)
+	}
+	if err := (exitController{activeStore: app.ActiveStore, ctx: context.Background()}).FlushOnExit(); err != nil {
+		t.Fatalf("FlushOnExit: %v", err)
+	}
+	failed := decodeDiskEvents[events.PermissionPersistFailed](t, readSessionFile(t, store.Path()), events.KindPermissionPersistFailed)
+	if len(failed) != 1 {
+		t.Fatalf("durable permission_persist_failed events = %+v, want one", failed)
+	}
+	if p := failed[0]; p.TargetPath != localPath || p.Reason != "lock_timeout" || p.ErrorCategory != "" || p.GrantKind != "folder" {
+		t.Fatalf("durable event = %+v, want a folder lock_timeout with no error category against %s", p, localPath)
+	}
+	if got := mustReadFile(t, localPath); got != localBytes {
+		t.Fatalf("settings.local.yaml = %q, want it byte-identical %q", got, localBytes)
+	}
+	requireSharedProjectSettingsUnchanged(t, cwd, sharedBytes, "a timed-out local grant write")
+}
+
 func TestProductionAuthorizer_ExistingLocalSettingsFileAnnouncesNothing(t *testing.T) {
 	cwd := mustCanonical(t, t.TempDir())
 	home := t.TempDir()
@@ -5030,6 +5091,7 @@ func TestShareGrant_FailedLocalRemovalLeavesBothCopiesAndARerunFinishes(t *testi
 	if err := os.Mkdir(lock, 0o700); err != nil {
 		t.Fatalf("block the local lock with a directory: %v", err)
 	}
+	localBefore := mustReadFile(t, config.LocalSettingsPath(root))
 
 	res := auth.ShareGrant(localRow(root, entry))
 
@@ -5041,6 +5103,9 @@ func TestShareGrant_FailedLocalRemovalLeavesBothCopiesAndARerunFinishes(t *testi
 	}
 	requireFileGrants(t, projectSettingsPath(root), root, entry)
 	requireFileGrants(t, config.LocalSettingsPath(root), root, entry)
+	if got := mustReadFile(t, config.LocalSettingsPath(root)); got != localBefore {
+		t.Fatalf("settings.local.yaml changed by a failed removal: %q -> %q", localBefore, got)
+	}
 	if !cacheHasGrant(auth.grants.cache, entry.DedupKey()) {
 		t.Fatal("the grant stopped authorizing after a half-done share")
 	}
@@ -5120,6 +5185,25 @@ func TestRevokeRow_DeletesOnlyTheRowsOwnFile(t *testing.T) {
 	auth.grants.addRow(projectRow(root, entry))
 	notices := &recordingNotices{}
 
+	var composition ConfigComposition
+	var err error
+	if composition.ProjectLayer, composition.ProjectPresent, err = readAdmittedProjectSettingsLayer(root); err != nil {
+		t.Fatalf("read settings.yaml: %v", err)
+	}
+	if composition.LocalLayer, composition.LocalPresent, err = readAdmittedLocalSettingsLayer(root); err != nil {
+		t.Fatalf("read settings.local.yaml: %v", err)
+	}
+	launch, err := launchPermissionRows(settingsLayerSnapshots(home, root, nil, true, composition))
+	if err != nil {
+		t.Fatalf("launchPermissionRows: %v", err)
+	}
+	if len(launch) != 2 ||
+		launch[0].Layer != permissions.LayerProject || launch[0].Path != projectSettingsPath(root) || launch[0].Entry.DedupKey() != entry.DedupKey() ||
+		launch[1].Layer != permissions.LayerLocal || launch[1].Path != config.LocalSettingsPath(root) || launch[1].Entry.DedupKey() != entry.DedupKey() {
+		t.Fatalf("launch rows = %+v, want one shared and one local row for %+v", launch, entry)
+	}
+	requireRows(t, auth, localRow(root, entry), projectRow(root, entry))
+
 	auth.RevokeRow(localRow(root, entry), notices)
 
 	requireFileGrants(t, config.LocalSettingsPath(root), root)
@@ -5129,9 +5213,13 @@ func TestRevokeRow_DeletesOnlyTheRowsOwnFile(t *testing.T) {
 	}
 	requireRows(t, auth, projectRow(root, entry))
 	assertOneRevokeEvent(t, store, entry)
+	localBytes := mustReadFile(t, config.LocalSettingsPath(root))
 
 	auth.RevokeRow(projectRow(root, entry), notices)
 
+	if got := mustReadFile(t, config.LocalSettingsPath(root)); got != localBytes {
+		t.Fatalf("settings.local.yaml changed by a shared-row revoke: %q -> %q", localBytes, got)
+	}
 	requireFileGrants(t, projectSettingsPath(root), root)
 	if got := mustReadFile(t, projectSettingsPath(root)); !strings.HasPrefix(got, "# committed by the team\n") {
 		t.Fatalf("shared file lost its unrelated content: %q", got)
@@ -5579,45 +5667,73 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 	for _, tc := range []struct {
 		name, command, authority string
 		check                    func(tui.PromptRequest) bool
+		brokenOnly               bool
+		validSubject             string
 	}{
 		{"direct network", "curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "curl https://example.com" && pr.Pipeline == "" && !pr.WholeCommand
-		}},
+		}, false, ""},
 		{"direct history rewrite", "git rebase main", "VCS history rewrite", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "git rebase main" && pr.Pipeline == ""
-		}},
+		}, true, ""},
 		{"pipeline with a later exceptional stage", "sort data.txt | curl -d @- https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "curl -d @- https://example.com" && pr.Pipeline == "sort data.txt | curl -d @- https://example.com" && pr.BatchedStages == nil
-		}},
+		}, false, ""},
 		{"literal network", "sh -c 'curl https://example.com'", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "sh -c 'curl https://example.com'" && pr.WholeCommand
-		}},
+		}, false, ""},
 		{"literal history rewrite", "sh -c 'git rebase main'", "VCS history rewrite", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "sh -c 'git rebase main'" && pr.WholeCommand
-		}},
+		}, true, ""},
 		{"staged history rewrite then network", "git rebase main && curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "" && slices.Equal(pr.BatchedStages, []string{"git rebase main", "curl https://example.com"})
-		}},
+		}, true, "curl https://example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, home, cwd := exceptionalTestAuthorizer(t, mode.Build, false)
-			prompted := func(m mode.Mode, constrained bool, runs int) tui.PromptRequest {
+			settings := newRereadFixture(t)
+			settings.writeGlobal(t, "a")
+			broken := settings.blocked(t, true)
+			rewriteSettings(t, settings.global, "blocked_paths: [\n")
+			dispatched := func(m mode.Mode, constrained bool, blocked *permissions.BlockedPaths, runs int) []tui.PromptRequest {
 				t.Helper()
 				auth, shown := exceptionalAuthorizerAt(t, m, constrained, home, cwd)
+				if blocked != nil {
+					auth.blocked = blocked
+				}
 				for range runs {
 					if _, err := dispatch.DispatchShell(context.Background(), tc.command, home, cwd, auth, &fakeDispatchRunner{}); err != nil {
 						t.Fatalf("DispatchShell(%s, constrained %v): %v", m, constrained, err)
 					}
 				}
-				if len(*shown) != runs {
-					t.Fatalf("%s constrained %v showed %d prompts for %d runs, want one each", m, constrained, len(*shown), runs)
-				}
 				if grants := auth.grants.Permissions(); len(grants) != 0 {
 					t.Fatalf("allow once stored grants %+v", grants)
 				}
-				return (*shown)[0]
+				return *shown
 			}
-			marked := prompted(mode.AutoEdits, true, 2)
+			prompted := func(m mode.Mode, constrained bool, blocked *permissions.BlockedPaths, runs int) tui.PromptRequest {
+				t.Helper()
+				shown := dispatched(m, constrained, blocked, runs)
+				if len(shown) != runs {
+					t.Fatalf("%s constrained %v showed %d prompts for %d runs, want one each", m, constrained, len(shown), runs)
+				}
+				return shown[0]
+			}
+			var marked tui.PromptRequest
+			if tc.brokenOnly {
+				valid := dispatched(mode.AutoEdits, true, nil, 2)
+				if want := map[bool]int{false: 0, true: 2}[tc.validSubject != ""]; len(valid) != want {
+					t.Fatalf("valid-settings sandboxed Auto edits showed %d prompts %+v, want %d", len(valid), valid, want)
+				}
+				for _, pr := range valid {
+					if pr.Action != "Allow network access" || pr.ExceptionalAuthority != "network access" || pr.Subject != tc.validSubject || pr.BatchedStages != nil {
+						t.Fatalf("valid-settings prompt = %+v, want network access for %q alone", pr, tc.validSubject)
+					}
+				}
+				marked = prompted(mode.AutoEdits, true, broken, 2)
+			} else {
+				marked = prompted(mode.AutoEdits, true, nil, 2)
+			}
 			if marked.Action != "Allow "+tc.authority || marked.ExceptionalAuthority != tc.authority || marked.Body != "" || !tc.check(marked) {
 				t.Fatalf("prompt = %+v, want %q over the complete command", marked, "Allow "+tc.authority)
 			}
@@ -5625,7 +5741,7 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 				m           mode.Mode
 				constrained bool
 			}{{mode.AutoEdits, false}, {mode.Build, true}, {mode.Build, false}} {
-				ordinary := prompted(posture.m, posture.constrained, 1)
+				ordinary := prompted(posture.m, posture.constrained, nil, 1)
 				if ordinary.Action != dispatch.ActionRunCommand || ordinary.ExceptionalAuthority != "" {
 					t.Fatalf("%s constrained %v prompt = %+v, want today's action", posture.m, posture.constrained, ordinary)
 				}

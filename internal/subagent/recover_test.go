@@ -1533,8 +1533,8 @@ func TestRecover_RecordsACompletedPairAlreadyAtBothPreRunStatesAsUndone(t *testi
 	assertGone(t, j.Path())
 }
 
-// The four reasons a held move carries, quoted from internal/subagent/journal.go so a reason that
-// stops naming its cause fails the tests that stage that cause.
+// The four reasons a held move carries, quoted from the held-move reason values in package subagent
+// so a reason that stops naming its cause fails the tests that stage that cause.
 const (
 	outsideChangeCause        = "an endpoint was changed outside the child agent's journalled writes"
 	unresolvedMoveCause       = "a move the child agent started was never resolved"

@@ -221,12 +221,12 @@ func (c *costAccumulator) total() costTotal {
 	return t
 }
 
-func runSessionsSummary(args []string, asJSON bool, stdout io.Writer) error {
+func runSessionsSummary(args []string, asJSON bool, stdout, stderr io.Writer) error {
 	target, err := singleTarget(args, "summary")
 	if err != nil {
 		return err
 	}
-	path, sess, err := resolveSession(target)
+	path, sess, err := resolveSession(target, stderr)
 	if err != nil {
 		return err
 	}

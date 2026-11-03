@@ -81,10 +81,10 @@ func TestCompose(t *testing.T) {
 		},
 		{
 			name:    "map subkeys merge, inherited subkey kept",
-			global:  map[string]any{"vcs": map[string]any{"preferred": "git", "priority": []any{"git", "hg"}}},
+			global:  map[string]any{"vcs": map[string]any{"force": "git", "priority": []any{"git", "hg"}}},
 			project: map[string]any{"vcs": map[string]any{"priority": []any{"hg"}}},
-			// preferred inherited from global; priority list replaced wholesale.
-			want: map[string]any{"vcs": map[string]any{"preferred": "git", "priority": []any{"hg"}}},
+			// force inherited from global; priority list replaced wholesale.
+			want: map[string]any{"vcs": map[string]any{"force": "git", "priority": []any{"hg"}}},
 		},
 		{
 			name:    "list replace on vcs.priority (no concat)",

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,15 +20,35 @@ func TestEffortPickerInitialIndex(t *testing.T) {
 	}{
 		{"current in set", []string{"minimal", "low", "medium", "high"}, "medium", 2},
 		{"current first", []string{"minimal", "low", "medium", "high"}, "minimal", 0},
-		{"fallback to first row", []string{"low", "high"}, "medium", 0},
-		{"fallback with no earlier match", []string{"medium", "high"}, "minimal", 0},
+		{"fallback to sentinel", []string{"high", "low", "no-reasoning"}, "medium", 2},
+		{"fallback with no earlier match", []string{"high", "medium", "no-reasoning"}, "minimal", 2},
 		{"no-reasoning-only current sentinel", []string{"no-reasoning"}, "no-reasoning", 0},
-		{"empty current falls back", []string{"low", "medium"}, "", 0},
+		{"empty current falls back to sentinel", []string{"medium", "low", "no-reasoning"}, "", 2},
+		{"no match and no sentinel", []string{"low", "high"}, "medium", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := effortPickerInitialIndex(tc.rows, tc.current); got != tc.want {
 				t.Errorf("effortPickerInitialIndex(%v, %q) = %d, want %d", tc.rows, tc.current, got, tc.want)
+			}
+		})
+	}
+
+	realRows := []struct {
+		name      string
+		supported []string
+		current   string
+		want      string
+	}{
+		{"real rows: current present", []string{"minimal", "low", "medium", "high"}, "low", "low"},
+		{"real rows: absent current selects sentinel", []string{"minimal", "low", "medium", "high"}, "xhigh", effortNoReasoning},
+		{"real rows: empty current selects sentinel", []string{"minimal", "low", "medium", "high"}, "", effortNoReasoning},
+	}
+	for _, tc := range realRows {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := effortPickerRows(tc.supported)
+			if got := rows[effortPickerInitialIndex(rows, tc.current)]; got != tc.want {
+				t.Errorf("selected row for rows %v, current %q = %q, want %q", rows, tc.current, got, tc.want)
 			}
 		})
 	}
@@ -39,8 +60,9 @@ func TestEffortPickerRows(t *testing.T) {
 		supported []string
 		want      []string
 	}{
-		{"advertised order preserved", []string{"ultra", "max", "low"}, []string{"no-reasoning", "ultra", "max", "low"}},
-		{"literal default stays a separate row", []string{"default"}, []string{"no-reasoning", "default"}},
+		{"fixed order, sentinel last", []string{"ultra", "max", "low"}, []string{"low", "ultra", "max", "no-reasoning"}},
+		{"ascending input", []string{"minimal", "low", "medium", "high"}, []string{"high", "medium", "low", "minimal", "no-reasoning"}},
+		{"literal default stays a separate row", []string{"default"}, []string{"default", "no-reasoning"}},
 		{"no-capability model", []string{"no-reasoning"}, []string{"no-reasoning"}},
 	}
 	for _, tc := range cases {
@@ -52,12 +74,12 @@ func TestEffortPickerRows(t *testing.T) {
 	}
 }
 
-func TestEffortPicker_BuildListsAdvertisedSetInOrder(t *testing.T) {
+func TestEffortPicker_BuildListsAdvertisedSetHighToLow(t *testing.T) {
 	a := New(nil)
 	rows := effortPickerRows([]string{"minimal", "low", "medium", "high"})
 	_, list := a.buildEffortPicker(rows, effortPickerInitialIndex(rows, "medium"), "medium")
 
-	want := []string{"no-reasoning", "minimal", "low", "medium", "high"}
+	want := []string{"high", "medium", "low", "minimal", "no-reasoning"}
 	if got := list.GetItemCount(); got != len(want) {
 		t.Fatalf("list item count = %d, want %d", got, len(want))
 	}
@@ -66,8 +88,8 @@ func TestEffortPicker_BuildListsAdvertisedSetInOrder(t *testing.T) {
 			t.Errorf("row %d = %q, want %q", i, got, w)
 		}
 	}
-	if got := list.GetCurrentItem(); got != 3 {
-		t.Errorf("initial highlight = %d, want 3 (current effort medium)", got)
+	if got, _ := list.GetItemText(list.GetCurrentItem()); got != "medium" {
+		t.Errorf("initial highlight = %q, want medium (current effort)", got)
 	}
 }
 
@@ -128,15 +150,15 @@ func TestEffortPicker_NoCapabilityModelShowsOnlyNoReasoning(t *testing.T) {
 
 func TestEffortPicker_LiteralDefaultIsSeparateFromNoReasoning(t *testing.T) {
 	got := openedEffortPickerRows(t, []string{"default", "max"}, "default")
-	if !equalStrings(got, []string{"no-reasoning", "default", "max"}) {
-		t.Errorf("rows = %v, want [no-reasoning default max]", got)
+	if !equalStrings(got, []string{"default", "max", "no-reasoning"}) {
+		t.Errorf("rows = %v, want [default max no-reasoning]", got)
 	}
 }
 
-func TestEffortPicker_OpenPreservesAdvertisedOrder(t *testing.T) {
+func TestEffortPicker_OpenListsFixedOrder(t *testing.T) {
 	got := openedEffortPickerRows(t, []string{"ultra", "max", "low"}, "max")
-	if !equalStrings(got, []string{"no-reasoning", "ultra", "max", "low"}) {
-		t.Errorf("rows = %v, want the advertised order [ultra max low] after the sentinel", got)
+	if !equalStrings(got, []string{"low", "ultra", "max", "no-reasoning"}) {
+		t.Errorf("rows = %v, want [low ultra max no-reasoning]", got)
 	}
 }
 
@@ -403,7 +425,7 @@ func TestEffortPicker_CtrlEOpenEnterApplyEscDismiss(t *testing.T) {
 
 	screen.InjectKey(tcell.KeyCtrlE, 0, tcell.ModNone)
 	waitPicker(true)
-	screen.InjectKey(tcell.KeyDown, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyUp, 0, tcell.ModNone)
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 	waitPicker(false)
 
@@ -413,5 +435,47 @@ func TestEffortPicker_CtrlEOpenEnterApplyEscDismiss(t *testing.T) {
 	}
 	if applier.calls != 1 || applier.gotLvl != "high" {
 		t.Errorf("Apply calls=%d level=%q, want 1 call with %q", applier.calls, applier.gotLvl, "high")
+	}
+}
+
+func TestEffortRank(t *testing.T) {
+	cases := map[string]int{
+		"xhigh":           0,
+		"high":            1,
+		"medium":          2,
+		"low":             3,
+		"minimal":         4,
+		"default":         5,
+		"ultra":           6,
+		"none":            7,
+		effortNoReasoning: 8,
+	}
+	for effort, want := range cases {
+		if got := effortRank(effort); got != want {
+			t.Errorf("effortRank(%q) = %d, want %d", effort, got, want)
+		}
+	}
+}
+
+func TestEffortsHighToLow(t *testing.T) {
+	cases := []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{"ascending", []string{"minimal", "low", "medium", "high", "xhigh"}, []string{"xhigh", "high", "medium", "low", "minimal"}},
+		{"descending", []string{"xhigh", "high", "medium", "low"}, []string{"xhigh", "high", "medium", "low"}},
+		{"mixed with default, unknowns, none and sentinel", []string{"none", "max", "low", "no-reasoning", "default", "ultra", "high"}, []string{"high", "low", "default", "max", "ultra", "none", "no-reasoning"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := slices.Clone(tc.input)
+			if got := effortsHighToLow(input); !equalStrings(got, tc.want) {
+				t.Errorf("effortsHighToLow(%v) = %v, want %v", tc.input, got, tc.want)
+			}
+			if !equalStrings(input, tc.input) {
+				t.Errorf("input mutated to %v, want %v", input, tc.input)
+			}
+		})
 	}
 }

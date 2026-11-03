@@ -21,6 +21,7 @@ import (
 	"codemeld.dev/codemeld/internal/subagenttool"
 	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/vcs"
+	"codemeld.dev/codemeld/internal/vcs/builtin"
 )
 
 // fakeTool is a structured tool with no distinct execution directory: dispatch authorizes it against
@@ -225,6 +226,14 @@ func (f *fakeCmdRunner) Exec(_ context.Context, spec cmdrunner.RunSpec) (cmdrunn
 }
 
 func noopEmit(events.EventPayload) error { return nil }
+
+func mkdirFor(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 // registerGitStatus registers a single git "status" action under vcs_status in reg via the real
 // RegisterActions, so dispatch routes through a genuine *vcs.ActionTool. The output cap is the
@@ -2507,6 +2516,7 @@ func TestDispatchTool_GuardRefusesVCSActionBeforeAuthorizing(t *testing.T) {
 // The guard narrows nothing else: reads, staging, and committing approved bytes stay dispatchable.
 func TestDispatchTool_GuardLeavesUsableVCSActionsAlone(t *testing.T) {
 	f := newGuardFixture(t)
+	writeFile(t, mkdirFor(t, filepath.Join(f.projectRoot, "src", "main.go")), "x")
 	cases := []struct {
 		subject string
 		args    map[string]any
@@ -2538,6 +2548,7 @@ func TestDispatchTool_GuardLeavesUsableVCSActionsAlone(t *testing.T) {
 // caller that never configured protected state.
 func TestDispatchTool_UnguardedDispatchStillRunsVCSActions(t *testing.T) {
 	f := newGuardFixture(t)
+	writeFile(t, mkdirFor(t, filepath.Join(f.projectRoot, "x")), "x")
 	emitted := 0
 	run := &fakeCmdRunner{id: "0198f0ab-cdef-7000-8000-000000000003"}
 	reg := tools.NewRegistry()
@@ -2818,6 +2829,8 @@ func TestDispatchTool_BlockedEntryRefusesVCSRewriteBeforeAuthorizing(t *testing.
 
 func TestDispatchTool_BlockedEntryLeavesOtherVCSActionsAlone(t *testing.T) {
 	f := newGuardFixture(t)
+	writeFile(t, mkdirFor(t, filepath.Join(f.projectRoot, "src", "main.go")), "x")
+	writeFile(t, mkdirFor(t, filepath.Join(f.projectRoot, "secrets", "k")), "x")
 	secrets := filepath.Join(f.projectRoot, "secrets")
 	resolved := map[string]cmdrunner.RunResult{"git rev-parse --verify --quiet other^{commit}": {Stdout: []byte(headSHA + "\n")}}
 	cases := []struct {
@@ -3670,5 +3683,158 @@ func TestPrepareTool_GeneralAgentIsReadOnlyOnlyWhenItResolvesWithNoPath(t *testi
 				t.Fatalf("refusal = %v, want a valid read-only declaration", prepared.GeneralAgentRefusal())
 			}
 		})
+	}
+}
+
+type sandboxedAutoEditsAuthorizer struct {
+	root     string
+	outcomes []string
+}
+
+func (a *sandboxedAutoEditsAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ PromptDisplay, mc permissions.ModeContext) (permissions.Decision, error) {
+	mc.Mode = "auto_edits"
+	mc.ProjectRoot = a.root
+	mc.ExecutionConstrained = true
+	deps := permissions.AuthorizeDeps{
+		EmitMatched: func(_, _, _, _, _, outcome, source, _, _ string) error {
+			a.outcomes = append(a.outcomes, outcome+"/"+source)
+			return nil
+		},
+	}
+	return permissions.Authorize(ctx, req, mc, deps)
+}
+
+func loadVCSTemplateText(t *testing.T, name, content string) *vcs.Template {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, name+".yaml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmpls, err := vcs.LoadTemplates(dir)
+	if err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+	return tmpls[name]
+}
+
+func vcsTemplateVariants(t *testing.T, name string) (builtinTmpl, reference, customized *vcs.Template) {
+	t.Helper()
+	tmpls, err := vcs.LoadBuiltinTemplates()
+	if err != nil {
+		t.Fatalf("LoadBuiltinTemplates: %v", err)
+	}
+	text, ok := builtin.BuiltinTemplate(name)
+	if !ok {
+		t.Fatalf("no embedded %s template", name)
+	}
+	edited := strings.Replace(string(text), `"{message}"]`, `"{message}", --amend]`, 1)
+	if edited == string(text) {
+		t.Fatalf("%s template has no commit message placeholder to customize", name)
+	}
+	return tmpls[name], loadVCSTemplateText(t, name, string(text)), loadVCSTemplateText(t, name, edited)
+}
+
+func TestPrepareTool_RoutineVCSWriteReachesModeContext(t *testing.T) {
+	for _, name := range []string{"git", "hg", "jj"} {
+		builtinTmpl, reference, customized := vcsTemplateVariants(t, name)
+		for label, tc := range map[string]struct {
+			tmpl *vcs.Template
+			want bool
+		}{"built-in": {builtinTmpl, true}, "reference copy": {reference, true}, "customized": {customized, false}} {
+			t.Run(name+" "+label, func(t *testing.T) {
+				repo := t.TempDir()
+				reg := tools.NewRegistry()
+				if err := vcs.RegisterActions(reg, tc.tmpl, repo, &fakeCmdRunner{id: "inv-1"}, noopEmit, 65536); err != nil {
+					t.Fatalf("RegisterActions: %v", err)
+				}
+				prepared, err := PrepareTool(context.Background(), "vcs_commit", map[string]any{"message": "m"}, t.TempDir(), repo, reg)
+				if err != nil {
+					t.Fatalf("PrepareTool: %v", err)
+				}
+				if got := prepared.IndependentRequest().ModeCtx.RoutineVCSWrite; got != tc.want {
+					t.Fatalf("ModeContext.RoutineVCSWrite = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchTool_RoutineVCSWriteRunsWithoutAskingInSandboxedAutoEdits(t *testing.T) {
+	for _, name := range []string{"git", "hg", "jj"} {
+		builtinTmpl, reference, _ := vcsTemplateVariants(t, name)
+		for label, tmpl := range map[string]*vcs.Template{"built-in": builtinTmpl, "reference copy": reference} {
+			t.Run(name+" "+label, func(t *testing.T) {
+				repo := t.TempDir()
+				emitted := 0
+				run := &fakeCmdRunner{id: "0198f0ab-cdef-7000-8000-000000000011"}
+				reg := tools.NewRegistry()
+				if err := vcs.RegisterActions(reg, tmpl, repo, run, countingEmit(&emitted), 65536); err != nil {
+					t.Fatalf("RegisterActions: %v", err)
+				}
+				auth := &sandboxedAutoEditsAuthorizer{root: repo}
+
+				if _, err := DispatchTool(context.Background(), "vcs_commit", map[string]any{"message": "fix: two  words"}, t.TempDir(), repo, reg, auth); err != nil {
+					t.Fatalf("DispatchTool(vcs_commit) = %v", err)
+				}
+				if !slices.Equal(auth.outcomes, []string{"once/mode_auto"}) || run.calls != 1 || !slices.Contains(run.gotSpec.Argv, "fix: two  words") {
+					t.Fatalf("outcomes=%v exec=%d argv=%q, want one mode_auto allow and the message as one argv element", auth.outcomes, run.calls, run.gotSpec.Argv)
+				}
+
+				if err := os.WriteFile(filepath.Join(repo, "secret.txt"), []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				run.calls, emitted = 0, 0
+				for _, refused := range []struct {
+					subject string
+					args    map[string]any
+				}{
+					{"vcs_restore_file", map[string]any{"path": "--all"}},
+					{"vcs_restore_file", map[string]any{"path": "bad\x00/../secret.txt"}},
+					{"vcs_add", map[string]any{"path": "."}},
+					{"vcs_branch_switch", map[string]any{"branch": "--force"}},
+				} {
+					if _, err := DispatchTool(context.Background(), refused.subject, refused.args, t.TempDir(), repo, reg, auth); err == nil {
+						t.Errorf("DispatchTool(%s %v) ran, want a refusal", refused.subject, refused.args)
+					}
+				}
+				if run.calls != 0 || emitted != 0 {
+					t.Fatalf("exec=%d events=%d, want no launch for refused operands", run.calls, emitted)
+				}
+
+				run.result.Stdout = []byte("gone/a.go\ngone/b.go\n")
+				if _, err := DispatchTool(context.Background(), "vcs_restore_file", map[string]any{"path": "gone"}, t.TempDir(), repo, reg, auth); err == nil {
+					t.Error("DispatchTool(vcs_restore_file gone) ran, want a refusal for a deleted directory")
+				}
+				if argv := run.gotSpec.Argv; run.calls != 1 || len(argv) < 2 || argv[len(argv)-2] != "--" || emitted != 0 {
+					t.Fatalf("exec=%d last argv=%q events=%d, want only the tracked-file query", run.calls, run.gotSpec.Argv, emitted)
+				}
+				run.calls, run.result.Stdout = 0, []byte("gone.txt\n")
+				if _, err := DispatchTool(context.Background(), "vcs_restore_file", map[string]any{"path": "gone.txt"}, t.TempDir(), repo, reg, auth); err != nil {
+					t.Fatalf("DispatchTool(vcs_restore_file gone.txt) = %v, want the deleted file restored", err)
+				}
+				if run.calls != 2 || run.gotSpec.Argv[len(run.gotSpec.Argv)-1] != "gone.txt" || slices.Contains(run.gotSpec.Argv, "--") {
+					t.Fatalf("exec=%d last argv=%q, want the query then the restore of gone.txt", run.calls, run.gotSpec.Argv)
+				}
+
+				expr, switchArgv := map[string]string{"hg": "null", "jj": "main+"}[name], map[string][]string{"hg": {"hg", "update", "main"}, "jj": {"jj", "edit", "main"}}[name]
+				if expr == "" {
+					return
+				}
+				run.calls, emitted, run.result.Stdout = 0, 0, []byte("main\n")
+				if _, err := DispatchTool(context.Background(), "vcs_branch_switch", map[string]any{"branch": expr}, t.TempDir(), repo, reg, auth); err == nil {
+					t.Errorf("DispatchTool(vcs_branch_switch %q) ran, want a refusal for a revision expression", expr)
+				}
+				if slices.Contains(run.gotSpec.Argv, expr) || emitted != 0 {
+					t.Fatalf("last argv=%q events=%d, want no switch launched for %q", run.gotSpec.Argv, emitted, expr)
+				}
+				auth.outcomes = nil
+				if _, err := DispatchTool(context.Background(), "vcs_branch_switch", map[string]any{"branch": "main"}, t.TempDir(), repo, reg, auth); err != nil {
+					t.Fatalf("DispatchTool(vcs_branch_switch main) = %v", err)
+				}
+				if !slices.Equal(run.gotSpec.Argv, switchArgv) || !slices.Equal(auth.outcomes, []string{"once/mode_auto"}) {
+					t.Fatalf("last argv=%q outcomes=%v, want %q allowed by mode_auto", run.gotSpec.Argv, auth.outcomes, switchArgv)
+				}
+			})
+		}
 	}
 }

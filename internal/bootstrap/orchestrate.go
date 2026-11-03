@@ -111,7 +111,7 @@ type BootstrapResult struct {
 }
 
 // ConfigComposition is the step-3 result. ProjectLayer is the parsed project settings map
-// that actually contributed to Config, retained so vcs.preferred attribution reuses this
+// that actually contributed to Config, retained so vcs.force attribution reuses this
 // launch's one verified read instead of reopening the file.
 type ConfigComposition struct {
 	Config       map[string]any
@@ -147,7 +147,8 @@ type FreshSteps struct {
 	// layer to this run (step 2b), prompting and recording the answer on an interactive
 	// launch. It runs before the layer paths are published and before composition, so an
 	// untrusted repository's settings reach neither.
-	GateTrust func(home, projectRoot, launchDir string) trust.Decision
+	GateTrust        func(home, projectRoot, launchDir string) trust.Decision
+	AskVCSUserConfig func(home string, global map[string]any) (persisted bool)
 	// ScaffoldProjectIgnore scaffolds the commented <project-root>/.codemeld/codemeldignore
 	// template, creating it only when absent. It runs immediately after
 	// project-root resolution and before config/VCS/tool setup (step 2.5) so the project
@@ -164,11 +165,11 @@ type FreshSteps struct {
 	ComposeConfig func(global map[string]any, projectRoot string) (composition ConfigComposition, err error)
 	// LoadVCSTemplates loads built-in and project VCS templates (step 4). projectLayer is
 	// step 3's verified project settings map (nil when none was composed), carried here so
-	// vcs.preferred source attribution reuses it rather than reading the file again.
+	// vcs.force source attribution reuses it rather than reading the file again.
 	// approved is the launch's trust outcome; the step derives no trust of its own.
 	LoadVCSTemplates func(home, projectRoot string, projectLayer map[string]any, approved bool) (templates any, err error)
-	// ValidatePreferredVCS cross-reference-validates vcs.preferred (step 5).
-	ValidatePreferredVCS func(composed map[string]any, templates any) error
+	// ValidateForceVCS cross-reference-validates vcs.force (step 5).
+	ValidateForceVCS func(composed map[string]any, templates any) error
 	// DetectVCS runs auto-detection, returning the active template or nil (step 6).
 	DetectVCS func(cwd string, composed map[string]any, templates any) (active any, err error)
 	// BuildToolRegistry builds the tool registry (step 6c).
@@ -298,6 +299,11 @@ func runFreshCore(ctx context.Context, cwd string, steps FreshSteps) (res *Boots
 	// 2b — decide whether this repository is trusted before its settings can be published
 	// as a source or composed.
 	res.TrustDecision = steps.GateTrust(home, root, cwd)
+	if steps.AskVCSUserConfig != nil && steps.AskVCSUserConfig(home, global) {
+		if global, err = steps.LoadGlobalSettings(home); err != nil {
+			return nil, false, err
+		}
+	}
 	res.WithheldInputs = withheldInputs(root, res.TrustDecision.Trusted)
 	composeRoot := root
 	if !vcsTemplatesApproved(res.TrustDecision) {
@@ -337,8 +343,8 @@ func runFreshCore(ctx context.Context, cwd string, steps FreshSteps) (res *Boots
 		return nil, false, err
 	}
 
-	// 5 — cross-reference-validate vcs.preferred.
-	if err := steps.ValidatePreferredVCS(composed, templates); err != nil {
+	// 5 — cross-reference-validate vcs.force.
+	if err := steps.ValidateForceVCS(composed, templates); err != nil {
 		return nil, false, err
 	}
 
@@ -427,7 +433,7 @@ func runFreshCore(ctx context.Context, cwd string, steps FreshSteps) (res *Boots
 // DefaultFreshSteps returns the production step set. The steps owned by landed
 // tasks are wired: ResolveHome, step-0 first-run, global-settings load,
 // project-root resolution, config composition, the step-4 through step-6 VCS
-// detection chain (LoadVCSTemplates, ValidatePreferredVCS, DetectVCS), the
+// detection chain (LoadVCSTemplates, ValidateForceVCS, DetectVCS), the
 // step-6c registry factory, model determination, fresh-session
 // creation, the step-7b1 launch_began event, the step-7c AGENTS.md load, and the
 // step-8 production launch. stdout/stderr are threaded into the
@@ -447,15 +453,18 @@ func DefaultFreshSteps(stdout, stderr io.Writer) FreshSteps {
 			return defaultResolveProjectRoot(cwd, global, stderr)
 		},
 		GateTrust: interactiveTrustGate(os.Stdin, stderr),
+		AskVCSUserConfig: func(home string, global map[string]any) bool {
+			return askVCSUserConfig(home, global, os.Stdin, stderr)
+		},
 		ScaffoldProjectIgnore: func(projectRoot string) error {
 			return ScaffoldProjectCodemeldignore(projectRoot, stderr)
 		},
 		RecoverJournals: func(home, projectRoot string, global map[string]any, decision trust.Decision) {
 			recoverChildJournals(home, projectRoot, global, decision, os.Stdin, stderr, stdinIsTerminal(os.Stdin))
 		},
-		ComposeConfig:        defaultComposeConfig,
-		LoadVCSTemplates:     loadVCSTemplates,
-		ValidatePreferredVCS: validatePreferredVCS,
+		ComposeConfig:    defaultComposeConfig,
+		LoadVCSTemplates: loadVCSTemplates,
+		ValidateForceVCS: validateForceVCS,
 		DetectVCS: func(cwd string, composed map[string]any, templates any) (any, error) {
 			return detectVCS(cwd, composed, templates, stderr)
 		},

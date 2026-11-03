@@ -70,9 +70,9 @@ func recordingResumeSteps(order *[]string) ResumeSteps {
 			rec("4:LoadVCSTemplates")
 			return nil, nil
 		},
-		ValidatePreferredVCS: func(map[string]any, any) error { rec("5:ValidatePreferredVCS"); return nil },
-		DetectVCS:            func(string, map[string]any, any) (any, error) { rec("6:DetectVCS"); return nil, nil },
-		BuildToolRegistry:    func(any) (any, error) { rec("6c:BuildToolRegistry"); return nil, nil },
+		ValidateForceVCS:  func(map[string]any, any) error { rec("5:ValidateForceVCS"); return nil },
+		DetectVCS:         func(string, map[string]any, any) (any, error) { rec("6:DetectVCS"); return nil, nil },
+		BuildToolRegistry: func(any) (any, error) { rec("6c:BuildToolRegistry"); return nil, nil },
 		DetermineModel: func(map[string]any, map[string]any, string, []string, *sessions.Store) (any, bool, error) {
 			rec("7:DetermineModel")
 			return nil, false, nil
@@ -97,7 +97,7 @@ func subsequenceOrder() []string {
 		"R1:ResolveResume", "R2:AcquireLock", "R3:AppendLaunchBegan", "R4:RefreshUpdatedAt",
 		"2:ResolveProjectRoot", "2b:GateTrust", "2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals",
 		"3:ComposeConfig", "4:LoadVCSTemplates",
-		"5:ValidatePreferredVCS", "6:DetectVCS", "6c:BuildToolRegistry",
+		"5:ValidateForceVCS", "6:DetectVCS", "6c:BuildToolRegistry",
 		"7:DetermineModel", "7b2:InitMode", "7c:LoadAgentInstructions", "8:StartTUI",
 	}
 }
@@ -479,9 +479,9 @@ func TestRunResumeWithID_ShortCircuitsOnStepError(t *testing.T) {
 			s.LoadVCSTemplates = func(string, string, map[string]any, bool) (any, error) {
 				return nil, sentinel
 			}
-		}, "5:ValidatePreferredVCS"},
-		{"step5_ValidatePreferredVCS", func(s *ResumeSteps) {
-			s.ValidatePreferredVCS = func(map[string]any, any) error { return sentinel }
+		}, "5:ValidateForceVCS"},
+		{"step5_ValidateForceVCS", func(s *ResumeSteps) {
+			s.ValidateForceVCS = func(map[string]any, any) error { return sentinel }
 		}, "6:DetectVCS"},
 		{"step6_DetectVCS", func(s *ResumeSteps) {
 			s.DetectVCS = func(string, map[string]any, any) (any, error) { return nil, sentinel }
@@ -801,6 +801,64 @@ func TestDefaultResumeSteps_ResolveResumeRejectsSchemaInvalidPayload(t *testing.
 		"run codemeld --resume with no id to list resumable sessions for the current working directory."
 	if rerr.Error() != want {
 		t.Errorf("Error() = %q\nwant %q", rerr.Error(), want)
+	}
+}
+
+const unknownKindLine = ` {"kind":"from_newer_build",  "type":"event","id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a09",` +
+	`"timestamp":"2026-05-25T12:00:01.000Z","payload":{ "b": 2, "a": "<x>" },"newer_field":{"k":true}} `
+
+func writeUnknownKindSession(t *testing.T) (home, cwd, id, path string) {
+	t.Helper()
+	home = t.TempDir()
+	cwd = t.TempDir()
+	canonical, err := sessions.CanonicalizeFolder(cwd)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	store, err := sessions.EnsureSession(home, canonical, testStart, nil)
+	if err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	mustFlush(t, store)
+	id = store.SessionID()
+	doc := `{"type":"metadata","metadata":{"id":"` + id + `","folder":` + strconv.Quote(canonical) +
+		`,"started_at":"2026-05-25T12:00:00.000Z","updated_at":"2026-05-25T12:00:00.000Z","schema_version":1}}` + "\n" +
+		unknownKindLine + "\n"
+	if err := os.WriteFile(store.Path(), []byte(doc), 0o600); err != nil {
+		t.Fatalf("overwrite session file: %v", err)
+	}
+	return home, cwd, id, store.Path()
+}
+
+func TestRunResume_KeepsUnknownKindLineThroughLaunchAppendAndRefresh(t *testing.T) {
+	home, cwd, id, path := writeUnknownKindSession(t)
+	prod := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard)
+	var order []string
+	steps := recordingResumeSteps(&order)
+	steps.ResolveResume = prod.ResolveResume
+	steps.AcquireLock = prod.AcquireLock
+	steps.AppendLaunchBegan = prod.AppendLaunchBegan
+	steps.RefreshUpdatedAt = prod.RefreshUpdatedAt
+
+	res, err := runResumeWithID(context.Background(), home, cwd, id, steps)
+	if err != nil || res == nil {
+		t.Fatalf("runResumeWithID = (%v, %v), want a full launch", res, err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) < 3 || lines[1] != unknownKindLine {
+		t.Fatalf("disk lines = %q, want line 1 to stay byte-identical to %q", lines, unknownKindLine)
+	}
+	disk := readSessionFile(t, path)
+	if got, want := diskEventKinds(disk), []string{"from_newer_build", events.KindLaunchBegan}; !slices.Equal(got, want) {
+		t.Fatalf("disk event kinds = %v, want %v", got, want)
+	}
+	if !disk.Metadata.UpdatedAt.After(time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("updated_at = %s, want it refreshed", disk.Metadata.UpdatedAt)
 	}
 }
 
@@ -1934,5 +1992,71 @@ func TestRunResume_RecoveryHonorsAGlobalBlockedPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "a blocked path is involved: "+target) {
 		t.Fatalf("stderr = %q, want the blocked reason", stderr.String())
+	}
+}
+
+func TestRunResume_AsksAboutVCSUserConfigAfterTrustAndLaterStepsSeeTheSavedSettings(t *testing.T) {
+	forceStdinTerminal(t, true)
+	home := vcsQuestionHome(t, blockedYAML("~/.ssh", "~/.gitconfig", "~/.config/git/config"), ".gitconfig")
+	var order []string
+	rec := func(name string) { order = append(order, name) }
+	steps := recordingResumeSteps(&order)
+	steps.LoadGlobalSettings = func(h string) (map[string]any, error) {
+		rec("1:LoadGlobalSettings")
+		return defaultLoadGlobalSettings(h)
+	}
+	ask := DefaultResumeSteps(strings.NewReader("yes\n"), io.Discard, io.Discard).AskVCSUserConfig
+	steps.AskVCSUserConfig = func(h string, global map[string]any) bool {
+		rec("2c:AskVCSUserConfig")
+		return ask(h, global)
+	}
+	var recovered, composed map[string]any
+	steps.RecoverJournals = func(_, _ string, global map[string]any, _ trust.Decision) {
+		rec("2.6:RecoverJournals")
+		recovered = global
+	}
+	steps.ComposeConfig = func(global map[string]any, _ string) (ConfigComposition, error) {
+		rec("3:ComposeConfig")
+		composed = global
+		return ConfigComposition{}, nil
+	}
+
+	if _, err := runResumeWithID(context.Background(), home, "/cwd", "the-id", steps); err != nil {
+		t.Fatalf("runResumeWithID error: %v", err)
+	}
+
+	at := slices.Index(order, "2b:GateTrust")
+	want := []string{"2b:GateTrust", "2c:AskVCSUserConfig", "1:LoadGlobalSettings", "2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals", "3:ComposeConfig"}
+	if at < 0 || len(order) < at+len(want) || !slices.Equal(order[at:at+len(want)], want) {
+		t.Fatalf("order = %v, want %v in sequence", order, want)
+	}
+	requireVCSAllowed(t, "RecoverJournals", recovered, "~/.ssh")
+	requireVCSAllowed(t, "ComposeConfig", composed, "~/.ssh")
+}
+
+func TestRunResume_StopsWhenSettingsCannotBeReloadedAfterTheVCSQuestion(t *testing.T) {
+	forceStdinTerminal(t, true)
+	home := vcsQuestionHome(t, blockedYAML("~/.hgrc"), ".hgrc")
+	var order []string
+	steps := recordingResumeSteps(&order)
+	reloadErr := errors.New("settings no longer valid")
+	loads := 0
+	steps.LoadGlobalSettings = func(h string) (map[string]any, error) {
+		if loads++; loads > 1 {
+			return nil, reloadErr
+		}
+		return defaultLoadGlobalSettings(h)
+	}
+	steps.AskVCSUserConfig = DefaultResumeSteps(strings.NewReader("n\n"), io.Discard, io.Discard).AskVCSUserConfig
+
+	_, err := runResumeWithID(context.Background(), home, "/cwd", "the-id", steps)
+
+	if !errors.Is(err, reloadErr) {
+		t.Fatalf("runResumeWithID error = %v, want the reload failure", err)
+	}
+	for _, step := range []string{"2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals", "3:ComposeConfig"} {
+		if slices.Contains(order, step) {
+			t.Fatalf("%s ran after the reload failed; order = %v", step, order)
+		}
 	}
 }

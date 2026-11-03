@@ -92,7 +92,8 @@ type ResumeSteps struct {
 	// GateTrust decides whether the repository at projectRoot may contribute its settings
 	// layer (step 2b), mirroring the fresh path: it runs before the layer paths are
 	// published and before composition.
-	GateTrust func(home, projectRoot, launchDir string) trust.Decision
+	GateTrust        func(home, projectRoot, launchDir string) trust.Decision
+	AskVCSUserConfig func(home string, global map[string]any) (persisted bool)
 	// ScaffoldProjectIgnore scaffolds the commented <project-root>/.codemeld/codemeldignore
 	// template, creating it only when absent. It runs immediately after project-root
 	// resolution and before config/VCS/tool setup (step 2.5), mirroring the fresh path so a
@@ -110,8 +111,8 @@ type ResumeSteps struct {
 	// path: projectLayer is step 3's verified project settings map (nil when none was
 	// composed) and approved is the launch's trust outcome.
 	LoadVCSTemplates func(home, projectRoot string, projectLayer map[string]any, approved bool) (templates any, err error)
-	// ValidatePreferredVCS cross-reference-validates vcs.preferred (step 5).
-	ValidatePreferredVCS func(composed map[string]any, templates any) error
+	// ValidateForceVCS cross-reference-validates vcs.force (step 5).
+	ValidateForceVCS func(composed map[string]any, templates any) error
 	// DetectVCS runs auto-detection, returning the active template or nil (step 6).
 	DetectVCS func(cwd string, composed map[string]any, templates any) (active any, err error)
 	// BuildToolRegistry builds the tool registry (step 6c).
@@ -313,6 +314,11 @@ func runResumeSubsequence(ctx context.Context, home, cwd, id string, global map[
 	// Step 2b — the same trust gate the fresh path runs, before the layer paths are
 	// published and before composition.
 	res.TrustDecision = steps.GateTrust(home, root, cwd)
+	if steps.AskVCSUserConfig != nil && steps.AskVCSUserConfig(home, global) {
+		if global, err = steps.LoadGlobalSettings(home); err != nil {
+			return nil, err
+		}
+	}
 	res.WithheldInputs = withheldInputs(root, res.TrustDecision.Trusted)
 	composeRoot := root
 	if !vcsTemplatesApproved(res.TrustDecision) {
@@ -351,7 +357,7 @@ func runResumeSubsequence(ctx context.Context, home, cwd, id string, global map[
 		return nil, err
 	}
 
-	if err := steps.ValidatePreferredVCS(composed, templates); err != nil {
+	if err := steps.ValidateForceVCS(composed, templates); err != nil {
 		return nil, err
 	}
 
@@ -424,7 +430,7 @@ const defaultResumeRetentionDays = 30
 // (defaultRunFirstRun), global-settings load, the id
 // resolver, the per-session lock, project-root resolution, config
 // composition, the step-4 through step-6 VCS detection chain (LoadVCSTemplates,
-// ValidatePreferredVCS, DetectVCS) — wired to the same production functions the fresh
+// ValidateForceVCS, DetectVCS) — wired to the same production functions the fresh
 // path uses so a resumed run runs the same real steps 4-6 — the step-6c registry
 // factory and step-7/7a model bridge, the step-7c AGENTS.md replay
 // (wired to the same loadAgentInstructions adapter the fresh path uses), and the
@@ -469,15 +475,18 @@ func DefaultResumeSteps(stdin io.Reader, stdout, stderr io.Writer) ResumeSteps {
 			return defaultResolveProjectRoot(cwd, global, stderr)
 		},
 		GateTrust: interactiveTrustGate(stdin, stderr),
+		AskVCSUserConfig: func(home string, global map[string]any) bool {
+			return askVCSUserConfig(home, global, stdin, stderr)
+		},
 		ScaffoldProjectIgnore: func(projectRoot string) error {
 			return ScaffoldProjectCodemeldignore(projectRoot, stderr)
 		},
 		RecoverJournals: func(home, projectRoot string, global map[string]any, decision trust.Decision) {
 			recoverChildJournals(home, projectRoot, global, decision, stdin, stderr, stdinIsTerminal(stdin))
 		},
-		ComposeConfig:        defaultComposeConfig,
-		LoadVCSTemplates:     loadVCSTemplates,
-		ValidatePreferredVCS: validatePreferredVCS,
+		ComposeConfig:    defaultComposeConfig,
+		LoadVCSTemplates: loadVCSTemplates,
+		ValidateForceVCS: validateForceVCS,
 		DetectVCS: func(cwd string, composed map[string]any, templates any) (any, error) {
 			return detectVCS(cwd, composed, templates, stderr)
 		},

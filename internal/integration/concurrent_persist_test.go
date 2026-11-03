@@ -62,13 +62,11 @@ func folderEntry(subject, scope string) permissions.PermissionEntry {
 	return permissions.PermissionEntry{Kind: "direct", Subject: subject, PathScope: scope, GrantKind: "folder"}
 }
 
-// userPrefix is the leading comment block plus an unknown user-authored
-// top-level key that every write must preserve byte-for-byte. The root settings
-// schema sets no top-level additionalProperties:false, so an unknown key
-// validates (schemas/settings.schema.json).
+// userPrefix is the leading comment block plus a user-authored top-level key
+// that every write must preserve byte-for-byte.
 const userPrefix = "# user-authored settings; keep these bytes exactly\n" +
 	"# second comment line\n" +
-	"custom_top_key: kept-verbatim\n"
+	"declared_commands: [kept-verbatim]\n"
 
 // seedSettings writes a settings file with userPrefix followed by an initial
 // permission entry, creating the parent .codemeld directory. The seed stands in
@@ -140,7 +138,7 @@ func assertNoTempOrphans(t *testing.T, dir string) {
 // (>=3 per task) each appending a distinct permission via config.Persist to one
 // shared settings file. The sidecar advisory lock must serialize the
 // read-modify-write cycles so every append survives, the user-authored comment
-// and unknown key stay byte-for-byte, and no temp orphan is left behind (task
+// and top-level key stay byte-for-byte, and no temp orphan is left behind (task
 // steps 2 and 5; Done-when 1, 3, 4).
 func TestConcurrentPersist_GoroutineWriters_NoLostUpdate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ".codemeld")

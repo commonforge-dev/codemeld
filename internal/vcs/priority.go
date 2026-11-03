@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"codemeld.dev/codemeld/internal/fserrors"
+	"github.com/goccy/go-yaml"
 )
 
 // Rank returns the primary order bucket for name under priority. Lower ranks win. A name listed in
@@ -40,15 +41,22 @@ func TieBreak(matches []string, priority []string, builtinNames map[string]bool)
 	return winner
 }
 
-// AmbiguityWarning returns a single-line warning when more than one detector matched at the same depth and
-// no vcs.preferred override was applied; otherwise it returns an empty string. The warning names
-// the chosen winner and points the user at vcs.priority and vcs.preferred. It is side-effect-free: the
-// caller prints it. (The vcs.preferred override path bypasses tie-breaking and sets preferredApplied.)
-func AmbiguityWarning(matches []string, winner string, preferredApplied bool) string {
-	if preferredApplied || len(matches) <= 1 {
+func AmbiguityWarning(matches []string, winner string, forceApplied bool) string {
+	if forceApplied || len(matches) <= 1 {
 		return ""
 	}
-	return fserrors.CollapseControls(fmt.Sprintf(
-		"codemeld: multiple VCS detected (%s); using %q via vcs.priority. Set vcs.preferred to force a choice or reorder vcs.priority.",
-		strings.Join(matches, ", "), winner))
+	names := make([]string, len(matches))
+	example := ""
+	for i, m := range matches {
+		names[i] = fserrors.CollapseControls(m)
+		if example == "" && m != winner {
+			example = names[i]
+		}
+	}
+	if b, err := yaml.Marshal(example); err == nil {
+		example = strings.TrimSuffix(string(b), "\n")
+	}
+	return fmt.Sprintf(
+		"codemeld: multiple VCS detected (%s); using %q. Set vcs.force in the .codemeld/settings.yaml file to force a choice.\nExample:\n  vcs:\n    force: %s",
+		strings.Join(names, ", "), fserrors.CollapseControls(winner), example)
 }

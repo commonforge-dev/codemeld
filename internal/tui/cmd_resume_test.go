@@ -20,6 +20,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/fserrors"
+	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/locks"
 	"codemeld.dev/codemeld/internal/sessions"
 )
@@ -1456,6 +1457,100 @@ func TestResumeHandler_ActivateWarningIsTheLastNotice(t *testing.T) {
 		if len(host.notices) == 0 || host.notices[len(host.notices)-1] != warning {
 			t.Errorf("notices = %v, want %q last", host.notices, warning)
 		}
+	}
+}
+
+func loadUnknownKindTarget(t *testing.T) *sessions.Store {
+	t.Helper()
+	ts := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
+	data, err := sessions.Marshal(&sessions.Session{
+		Metadata: sessions.Metadata{ID: ids.NewV7(), Folder: "/some/folder", StartedAt: ts, UpdatedAt: ts, SchemaVersion: 1},
+		Records: []sessions.Record{
+			sessions.Event{ID: ids.NewV7(), Kind: "from_a_newer_build", Timestamp: ts, Payload: []byte(`{"note":"opaque"}`)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "target.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	sess, err := sessions.Unmarshal(raw)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := sessions.ValidateEventPayloads(sess.Records, events.ValidatePayload); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	return sessions.New(path, sess)
+}
+
+func TestResumeHandler_SkippedUnknownEventsNoticeNamesTarget(t *testing.T) {
+	for _, warning := range []string{"", "can't remove private temp folder /x: busy; codemeld retries when it exits"} {
+		host := newWritableHost(t)
+		fx := newResumeFixture(t)
+		fx.loader.target = loadUnknownKindTarget(t)
+		fx.sw.warning = warning
+		fx.lister.entries = twoEntries()
+		fx.picker.result = PickerResult{Selected: true, Index: 1}
+
+		if res := dispatchResume(t, fx, host); res.Err != nil {
+			t.Fatalf("dispatch err: %v", res.Err)
+		}
+		id := fx.target().SessionID()
+		want := "codemeld: session " + id + `: skipped 1 event records of unknown kinds ("from_a_newer_build"=1); a newer codemeld wrote them; inspect with: codemeld sessions show ` + id
+		if warning != "" {
+			want = warning + "; " + want
+		}
+		if len(host.notices) != 1 || host.notices[0] != want {
+			t.Errorf("notices = %q, want exactly [%q]", host.notices, want)
+		}
+	}
+}
+
+func TestResumeHandler_SkippedUnknownEventsNoticeSurvivesPostActivationFailure(t *testing.T) {
+	boom := errors.New("boom")
+	cases := []struct {
+		name    string
+		setup   func(fx *resumeFixture, cancel context.CancelFunc)
+		wantErr string
+	}{
+		{"refresh", func(fx *resumeFixture, _ context.CancelFunc) { fx.refresher.err = boom }, boom.Error()},
+		{"model", func(fx *resumeFixture, _ context.CancelFunc) { fx.model.err = boom }, boom.Error()},
+		{"agents", func(fx *resumeFixture, _ context.CancelFunc) { fx.agents.err = boom }, boom.Error()},
+		{"final flush", func(fx *resumeFixture, cancel context.CancelFunc) {
+			fx.deps.Agents = &cancellingReplayer{cancel: cancel}
+		}, context.Canceled.Error()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			host := newWritableHost(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			fx := newResumeFixture(t)
+			fx.deps.FlushCtx = ctx
+			fx.loader.target = loadUnknownKindTarget(t)
+			fx.lister.entries = twoEntries()
+			fx.picker.result = PickerResult{Selected: true, Index: 1}
+			tc.setup(fx, cancel)
+
+			if res := dispatchResume(t, fx, host); res.Err != nil {
+				t.Fatalf("dispatch err: %v", res.Err)
+			}
+			if fx.sw.activateCalls != 1 || fx.sw.activateTarget != fx.target() {
+				t.Fatalf("activate calls=%d target=%p, want 1 on the loaded session %p", fx.sw.activateCalls, fx.sw.activateTarget, fx.target())
+			}
+			id := fx.target().SessionID()
+			want := tc.wantErr + "; codemeld: session " + id + `: skipped 1 event records of unknown kinds ("from_a_newer_build"=1); a newer codemeld wrote them; inspect with: codemeld sessions show ` + id
+			if len(host.notices) != 1 || host.notices[0] != want {
+				t.Errorf("notices = %q, want exactly [%q]", host.notices, want)
+			}
+		})
 	}
 }
 

@@ -43,7 +43,8 @@ recorded in.
    the turn `doctor` named with `--turn <turn-id>`, or narrow it with `--kind` and `--last`,
    rather than reading a whole session; `--json` emits the same selection machine-readably.
 3. `codemeld sessions permissions <session-id|path>` — for anything about authorization: the
-   prompts a human was actually shown, each with its decision, the authorizations that never
+   requests that reached the approval step (which does not prove a prompt was displayed; see
+   `permission_prompt_shown` below), each with its decision, the authorizations that never
    prompted, and the explicit revocation requests.
 4. `codemeld sessions research <session-id|path>` — for a run that used the web: the searches,
    the sources fetched, and which of those addresses a later answer cited.
@@ -101,6 +102,26 @@ It is also absent on every direct prompt written before the field existed: that 
 tokens are **unknown**, not empty and not equal to `subject`. An absent value can never be treated
 as evidence that a stored grant covered the request.
 
+### `permission_prompt_shown`: what it proves and when it is saved
+
+The event is appended when a request reaches the approval step, just before the prompt call
+(`promptFlow` in `internal/permissions/orchestrate.go`). It records that the request reached that
+step, not that a prompt was displayed: requests wait for one shared prompt slot, so a request
+cancelled while queued behind another request's prompt has a `permission_prompt_shown` although
+it never displayed anything or read an answer.
+
+In `codemeld run --prompt-for-approval` the event is also flushed to disk right after it is
+appended, before the prompt call, so before the request waits for the prompt slot or for stdin
+(`headlessAuthorizer.promptShownEmitter` in `internal/bootstrap/headless.go`). A request still
+unanswered when the process is killed outright therefore keeps its `permission_prompt_shown` on
+disk, provided that flush succeeded. The flush is best-effort: a real write failure appends a
+`session_write_failed` record, prints the write-failure notice, and keeps the records in memory
+for the next flush; any other flush error is printed as a notice. Neither stops the prompt.
+
+Everywhere else the event is only appended in memory and becomes durable at the session's
+existing flush points: the interactive UI, an unattended `codemeld run` (no
+`--prompt-for-approval`), and child agents.
+
 ### `permission_prompt_wait`: how long a person was asked
 
 Each call that asks a person for approval appends one `permission_prompt_wait` after the call
@@ -135,9 +156,11 @@ and `permission_decision` are unchanged (`headlessAuthorizer.Authorize` in
 
 The record is appended in memory and becomes durable at the session's existing flush points,
 including the final flush after an interrupt. Nothing is written before the prompt call returns:
-a terminal read or TUI prompt that stays blocked after cancellation, a process that is killed
-outright, or a session switch that closed the store the prompt was recording into all leave no
-wait record.
+a TUI prompt that stays blocked after cancellation, a process that is killed outright, or a
+session switch that closed the store the prompt was recording into all leave no wait record. A
+`codemeld run --prompt-for-approval` prompt waiting on stdin returns when the run is cancelled
+(Ctrl-C or SIGTERM), so its wait record reaches the final flush; a prompt still waiting when
+`--time-limit` expires keeps waiting until it is answered or the run is cancelled.
 
 ### `permission_revoke_requested`: what a revocation record does and does not prove
 
@@ -484,6 +507,13 @@ how a run ended:
 ```sh
 codemeld sessions show <session-id|path> --kind tool_exec_end --last 5
 ```
+
+When a tool run inside the sandbox did not get an environment variable it expected, read the
+`execution_capability` record written when that codemeld process started
+(`--kind execution_capability`): when the launch self-test passed, it lists the names codemeld
+withheld from the environment it passes on to sandboxed commands, never their values. It does not
+show that any command ran sandboxed, and the records that `/clear`, `/resume`, fork and compact
+write do not repeat the list ([Approvals](approvals.md) has the details).
 
 To see which kinds a session actually contains, count the rendered event headers:
 

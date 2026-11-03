@@ -2,9 +2,7 @@ package bootstrap
 
 import (
 	"errors"
-	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,93 +11,24 @@ import (
 const sessionTempDirPrefix = "codemeld-confine-"
 
 var (
-	beforeSessionTempDirChmod func(created string)
-	afterSessionTempDirChmod  func(created string)
+	beforeSessionTempDirChmod   func(created string)
+	afterSessionTempDirChmod    func(created string)
+	duringSessionTempDirCleanup func(dir string)
+	beforeSessionTempDirUnlink  func(dir string)
+	afterStaleScanParentOpen    func(parent string)
 )
 
-func newSessionTempDir() (string, error) {
-	parent, err := filepath.Abs(os.TempDir())
-	if err != nil {
-		return "", err
+func (d *sessionTempDir) folder() string {
+	if d == nil {
+		return ""
 	}
-	parent, err = filepath.EvalSymlinks(parent)
-	if err != nil {
-		return "", err
-	}
-	dir, err := os.MkdirTemp(parent, fmt.Sprintf("%s%d-*", sessionTempDirPrefix, os.Getpid()))
-	if err != nil {
-		return "", err
-	}
-	if beforeSessionTempDirChmod != nil {
-		beforeSessionTempDirChmod(dir)
-	}
-	if err := chmodPrivateNoFollow(dir); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", err
-	}
-	if afterSessionTempDirChmod != nil {
-		afterSessionTempDirChmod(dir)
-	}
-	return dir, nil
+	return d.path
 }
 
-func removeSessionTempDir(path string) error {
-	if os.RemoveAll(path) == nil {
-		return nil
-	}
-	if info, err := os.Lstat(path); err != nil || !info.IsDir() {
-		return os.RemoveAll(path)
-	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		return err
-	}
-	root, err := os.OpenRoot(path)
-	if err != nil {
-		return err
-	}
-	restoreOwnerAccess(root, ".")
-	_ = root.Close()
-	return os.RemoveAll(path)
-}
-
-func restoreOwnerAccess(root *os.Root, name string) {
-	info, err := root.Lstat(name)
-	if err != nil || !info.IsDir() {
-		return
-	}
-	_ = root.Chmod(name, info.Mode().Perm()|0o700)
-	dir, err := root.Open(name)
-	if err != nil {
-		return
-	}
-	names, _ := dir.Readdirnames(-1)
-	_ = dir.Close()
-	for _, child := range names {
-		restoreOwnerAccess(root, filepath.Join(name, child))
-	}
-}
-
-func removeStaleSessionTempDirs() error {
-	dir := os.TempDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var errs []error
-	for _, entry := range entries {
-		pid, ok := sessionTempDirPID(entry.Name())
-		if !ok || pid == os.Getpid() {
-			continue
-		}
-		path := filepath.Join(dir, entry.Name())
-		if info, err := os.Lstat(path); err != nil || !info.IsDir() {
-			continue
-		}
-		if processGone(pid) {
-			errs = append(errs, removeSessionTempDir(path))
-		}
-	}
-	return errors.Join(errs...)
+func (d *sessionTempDir) removeAndRelease() error {
+	err := d.remove()
+	d.close()
+	return err
 }
 
 func sessionTempDirPID(name string) (int, bool) {

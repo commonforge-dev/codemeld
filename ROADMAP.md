@@ -1,14 +1,21 @@
 # codemeld Roadmap
 
 ## Future work
+### 2027
+- Mac - currently compiles, but not tested
+- Sandboxed commands can connect to local services you approve, such as a database or a test's own server
+
+### 2026
 - FreeBSD
 - Local models: Ollama on local machine or another, llama.cpp, and any OpenAI-compatible server added from the editor
 - MCP support
-- Mac - currently compiles, but not tested
 
 ## Ongoing
-
 ## Completed
+- **0.4.9 Beta — November 2026:**
+  - Sandboxed Auto edits: shell commands can't change version history, and codemeld's built-in commits run without asking
+  - Plan mode commands get their own temporary folder; project files stay read-only
+  - Sessions written by a newer codemeld open in an older one, which skips the records it doesn't recognise and says so
 - **0.4.8 Beta — October 2026:**
   - Fixes for the v0.4.7 known issues
   - OpenRouter: per-model quantization preference or requirement, and one table for every model's price caps

@@ -6146,7 +6146,8 @@ func wantModeAutoAllow(t *testing.T, req MatchRequest, mc ModeContext) {
 
 func TestModePostureConstrainedAutoShell(t *testing.T) {
 	for _, input := range []string{"bash build.sh", "make", "touch a", "python -m pip install x", "sudo rm x", "rg foo | head", "ls && pwd", `sh -c 'go build ./...'`,
-		"rm x", `sh -c 'if true; then curl x; fi'`} {
+		"rm x", `sh -c 'if true; then curl x; fi'`, "git rebase main", "hg --cwd /repo strip", "hg --config extensions.strip= strip",
+		"git -c x=y reset --hard", "git reset HEAD~1 --hard"} {
 		t.Run("confined "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
 			f := newFixture(neverPrompt, nil)
@@ -6158,8 +6159,7 @@ func TestModePostureConstrainedAutoShell(t *testing.T) {
 		})
 	}
 	for _, input := range []string{
-		`sh -c 'curl x'`, "curl x", "hg --cwd /repo strip", "hg --config extensions.strip= strip",
-		"git -c x=y reset --hard", "git reset HEAD~1 --hard", `ls && curl x`,
+		`sh -c 'curl x'`, "curl x", `ls && curl x`, "git push origin rebase",
 	} {
 		t.Run("unhandled "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
@@ -6281,8 +6281,6 @@ func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) 
 		{"curl x", directGrant("curl x", allPathsScope, grantKindGlobal)},
 		{`sh -c 'curl x'`, literalGrant(`sh -c 'curl x'`, allPathsScope, grantKindGlobal)},
 		{`ls && curl x`, literalGrant(`ls && curl x`, allPathsScope, grantKindGlobal)},
-		{`rm x && git rebase main`, literalGrant(`rm x && git rebase main`, allPathsScope, grantKindGlobal)},
-		{`rm x | hg strip .`, directGrant("rm x", allPathsScope, grantKindGlobal)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
@@ -6311,8 +6309,8 @@ func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) 
 			}
 		})
 	}
-	for _, input := range []string{`rm test/a 2>&1`, `rm x <<< y`} {
-		t.Run("deletion runs confined "+input, func(t *testing.T) {
+	for _, input := range []string{`rm test/a 2>&1`, `rm x <<< y`, `rm x && git rebase main`, `rm x | hg strip .`} {
+		t.Run("deletion and history rewrite run confined "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
 			f := newFixture(neverPrompt, nil)
 			f.grants.entries = []PermissionEntry{literalGrant(input, allPathsScope, grantKindGlobal)}
@@ -6525,6 +6523,7 @@ func TestAuthorizeConstrainedAutoDeletionAndUnsplittableRunConfined(t *testing.T
 	for _, input := range []string{
 		`rm -rf build`, `rm x && touch y`, `git clean -fdx`, `find . -delete`,
 		`which -a x; file "$(which x)"`, `env PATH="/d:$PATH" /abs/check.sh`, `bash -c 'rm x'`, `nice rm x`,
+		`rm x && git rebase main`, `git rebase main; rm x`, `rm x | hg strip .`, `rm x && git commit --amend`,
 	} {
 		t.Run(input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
@@ -6534,11 +6533,10 @@ func TestAuthorizeConstrainedAutoDeletionAndUnsplittableRunConfined(t *testing.T
 	}
 }
 
-func TestAuthorizeConstrainedAutoNetworkAndHistoryStagesStillAsk(t *testing.T) {
+func TestAuthorizeConstrainedAutoNetworkStagesStillAsk(t *testing.T) {
 	for _, input := range []string{
-		`rm x && git rebase main`, `git rebase main; rm x`, `rm x | hg strip .`, `rm x; curl y`,
-		`git reset --hard && git push`, `rm x && command git push`, `rm x && nice git push`,
-		`rm x | xargs git push`, `rm x; bash -c 'git push'`, `rm x && git commit --amend`,
+		`rm x; curl y`, `git reset --hard && git push`, `rm x && command git push`, `rm x && nice git push`,
+		`rm x | xargs git push`, `rm x; bash -c 'git push'`, `git push origin rebase`,
 	} {
 		t.Run(input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
@@ -6550,7 +6548,7 @@ func TestAuthorizeConstrainedAutoNetworkAndHistoryStagesStillAsk(t *testing.T) {
 }
 
 func TestAuthorizeDeletionAndUnsplittableStillAskOutsideSandboxedAutoEdits(t *testing.T) {
-	for _, input := range []string{`rm x`, `which -a x; file "$(which x)"`} {
+	for _, input := range []string{`rm x`, `which -a x; file "$(which x)"`, `git rebase main`} {
 		for name, set := range map[string]func(*ModeContext){
 			"no sandbox":      func(mc *ModeContext) { mc.ExecutionConstrained = false },
 			"build":           func(mc *ModeContext) { mc.Mode = "build" },
@@ -7819,6 +7817,365 @@ func TestAuthorize_NonHomeChooserSubjectKeepsItsBytes(t *testing.T) {
 
 			if len(f.cap.appends) != 1 || f.cap.appends[0].Subject != scope {
 				t.Fatalf("appended = %+v, want one grant storing %q", f.cap.appends, scope)
+			}
+		})
+	}
+}
+
+type storeLayout struct {
+	proj     string
+	writable []string
+}
+
+func writeFile(t *testing.T, path, body string, mode os.FileMode) {
+	t.Helper()
+	mkdirs(t, filepath.Dir(path))
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+}
+
+func dirStoreLayout(t *testing.T) storeLayout {
+	proj, outside := blockedTempDir(t), blockedTempDir(t)
+	mkdirs(t, filepath.Join(proj, ".git", "hooks"), filepath.Join(proj, ".hg"),
+		filepath.Join(proj, "repo", ".git"), filepath.Join(proj, "vendor", "dep", ".git"), filepath.Join(outside, ".git"))
+	writeFile(t, filepath.Join(proj, ".gitignore"), "bin/\n", 0o644)
+	writeFile(t, filepath.Join(proj, "docs", ".git"), "not a repository root\n", 0o644)
+	return storeLayout{proj: proj, writable: []string{filepath.Join(proj, "repo"), filepath.Join(proj, "vendor", "dep"), outside}}
+}
+
+func worktreeLayout(t *testing.T) storeLayout {
+	proj := blockedTempDir(t)
+	mkdirs(t, filepath.Join(proj, "wtstore"))
+	writeFile(t, filepath.Join(proj, ".git"), "gitdir: wtstore\n", 0o644)
+	return storeLayout{proj: proj}
+}
+
+func storeToolCtx(l storeLayout, tool string, sandboxed bool, paths ...string) (MatchRequest, ModeContext) {
+	req := MatchRequest{Kind: subjectKindTool, Subject: tool, PathScope: l.proj}
+	mc := ModeContext{Mode: modeAutoEdits, Class: ClassMutating, ToolName: tool, ProjectRoot: l.proj,
+		WritableFolders: l.writable, ExecutionConstrained: sandboxed}
+	if tool == toolNameMove {
+		mc.MoveSource, mc.MoveDestination = paths[0], paths[1]
+	} else {
+		mc.TargetPath = paths[0]
+	}
+	return req, mc
+}
+
+type storeWriteCase struct {
+	name   string
+	layout func(*testing.T) storeLayout
+	tool   string
+	paths  func(storeLayout) []string
+}
+
+func storeWriteCases() []storeWriteCase {
+	var cases []storeWriteCase
+	targets := []struct {
+		name   string
+		layout func(*testing.T) storeLayout
+		path   func(storeLayout) string
+	}{
+		{"git hook", dirStoreLayout, func(l storeLayout) string { return filepath.Join(l.proj, ".git", "hooks", "pre-commit") }},
+		{"git store folder", dirStoreLayout, func(l storeLayout) string { return filepath.Join(l.proj, ".git") }},
+		{"hgrc", dirStoreLayout, func(l storeLayout) string { return filepath.Join(l.proj, ".hg", "hgrc") }},
+		{"writable folder store", dirStoreLayout, func(l storeLayout) string { return filepath.Join(l.writable[2], ".git", "config") }},
+		{"worktree gitdir", worktreeLayout, func(l storeLayout) string { return filepath.Join(l.proj, "wtstore", "HEAD") }},
+		{"worktree pointer file", worktreeLayout, func(l storeLayout) string { return filepath.Join(l.proj, ".git") }},
+	}
+	for _, tool := range []string{toolNameEdit, toolNameCreate, toolNameMkdir, toolNameDelete} {
+		for _, tg := range targets {
+			path := tg.path
+			cases = append(cases, storeWriteCase{tool + " " + tg.name, tg.layout, tool, func(l storeLayout) []string { return []string{path(l)} }})
+		}
+	}
+	cases = append(cases,
+		storeWriteCase{"delete folder containing a writable folder store", dirStoreLayout, toolNameDelete,
+			func(l storeLayout) []string { return []string{filepath.Join(l.proj, "vendor")} }},
+		storeWriteCase{"move source in store", dirStoreLayout, toolNameMove,
+			func(l storeLayout) []string {
+				return []string{filepath.Join(l.proj, ".git", "hooks", "pre-commit"), filepath.Join(l.proj, "x")}
+			}},
+		storeWriteCase{"move destination in store", dirStoreLayout, toolNameMove,
+			func(l storeLayout) []string {
+				return []string{filepath.Join(l.proj, "x"), filepath.Join(l.proj, ".hg", "hgrc")}
+			}},
+		storeWriteCase{"move source containing a store", dirStoreLayout, toolNameMove,
+			func(l storeLayout) []string {
+				return []string{filepath.Join(l.proj, "repo"), filepath.Join(l.proj, "repo2")}
+			}},
+		storeWriteCase{"move away from worktree pointer file", worktreeLayout, toolNameMove,
+			func(l storeLayout) []string {
+				return []string{filepath.Join(l.proj, ".git"), filepath.Join(l.proj, "gitfile")}
+			}},
+		storeWriteCase{"move onto worktree pointer file", worktreeLayout, toolNameMove,
+			func(l storeLayout) []string {
+				return []string{filepath.Join(l.proj, "gitfile"), filepath.Join(l.proj, ".git")}
+			}},
+	)
+	return cases
+}
+
+func TestAuthorizeAutoEditsHistoryStoreWritePromptsPastGrantsAndCache(t *testing.T) {
+	approvals := []struct {
+		name  string
+		apply func(f *orchFixture, req MatchRequest, l storeLayout)
+	}{
+		{"no approval", func(*orchFixture, MatchRequest, storeLayout) {}},
+		{"session grant", func(f *orchFixture, req MatchRequest, l storeLayout) {
+			f.grants.entries = []PermissionEntry{toolGrant(req.Subject, l.proj, "session")}
+		}},
+		{"folder grant", func(f *orchFixture, req MatchRequest, l storeLayout) {
+			f.grants.entries = []PermissionEntry{toolGrant(req.Subject, l.proj, "folder")}
+		}},
+		{"global grant", func(f *orchFixture, req MatchRequest, l storeLayout) {
+			f.grants.entries = []PermissionEntry{toolGrant(req.Subject, "*", "global")}
+		}},
+		{"cached allow-once", func(f *orchFixture, req MatchRequest, l storeLayout) {
+			f.cache.hits[turnCacheKeyOf(req)] = "once"
+		}},
+	}
+	for _, tc := range storeWriteCases() {
+		for _, sandboxed := range []bool{true, false} {
+			for _, ap := range approvals {
+				t.Run(fmt.Sprintf("%s/sandboxed=%v/%s", tc.name, sandboxed, ap.name), func(t *testing.T) {
+					l := tc.layout(t)
+					req, mc := storeToolCtx(l, tc.tool, sandboxed, tc.paths(l)...)
+					f := newFixture(choose(PromptAllowOnce), nil)
+					ap.apply(f, req, l)
+
+					mustAuthorizeMode(t, req, mc, f.deps)
+
+					if f.cap.prompts != 1 {
+						t.Fatalf("prompts = %d, events = %+v; want the store write to reach the prompt", f.cap.prompts, f.cap.events)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAuthorizeAutoEditsUnreadableGitPointerPrompts(t *testing.T) {
+	proj := blockedTempDir(t)
+	pointer := filepath.Join(proj, ".git")
+	writeFile(t, pointer, "gitdir: wtstore\n", 0o000)
+	if _, err := os.ReadFile(pointer); err == nil {
+		t.Skip("a mode 000 file is readable by this user")
+	}
+	for _, sandboxed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("sandboxed=%v", sandboxed), func(t *testing.T) {
+			req, mc := storeToolCtx(storeLayout{proj: proj}, toolNameEdit, sandboxed, filepath.Join(proj, "src", "a.go"))
+			f := newFixture(choose(PromptAllowOnce), nil)
+			f.grants.entries = []PermissionEntry{toolGrant(toolNameEdit, proj, "session")}
+
+			mustAuthorizeMode(t, req, mc, f.deps)
+
+			if f.cap.prompts != 1 {
+				t.Fatalf("prompts = %d, want an ordinary project write to ask while the pointer is unreadable", f.cap.prompts)
+			}
+		})
+	}
+}
+
+func TestAuthorizeAutoEditsOutsideHistoryStoreKeepsBehavior(t *testing.T) {
+	type row struct {
+		name      string
+		tool      string
+		paths     func(storeLayout) []string
+		sandboxed bool
+		wantAuto  bool
+	}
+	var rows []row
+	for _, target := range []struct {
+		name string
+		path func(storeLayout) string
+	}{
+		{"ordinary file", func(l storeLayout) string { return filepath.Join(l.proj, "src", "main.go") }},
+		{".gitignore", func(l storeLayout) string { return filepath.Join(l.proj, ".gitignore") }},
+		{"docs/.git file", func(l storeLayout) string { return filepath.Join(l.proj, "docs", ".git") }},
+	} {
+		path := target.path
+		paths := func(l storeLayout) []string { return []string{path(l)} }
+		for _, sandboxed := range []bool{true, false} {
+			for _, tool := range []string{toolNameEdit, toolNameCreate, toolNameMkdir} {
+				rows = append(rows, row{target.name + " " + tool, tool, paths, sandboxed, true})
+			}
+			rows = append(rows, row{target.name + " delete", toolNameDelete, paths, sandboxed, sandboxed})
+			rows = append(rows, row{target.name + " move", toolNameMove,
+				func(l storeLayout) []string { return []string{path(l), filepath.Join(l.proj, "moved")} }, sandboxed, true})
+		}
+	}
+	for _, tc := range rows {
+		t.Run(fmt.Sprintf("%s/sandboxed=%v", tc.name, tc.sandboxed), func(t *testing.T) {
+			l := dirStoreLayout(t)
+			req, mc := storeToolCtx(l, tc.tool, tc.sandboxed, tc.paths(l)...)
+			f := newFixture(choose(PromptAllowOnce), nil)
+
+			d := mustAuthorizeMode(t, req, mc, f.deps)
+
+			if !tc.wantAuto {
+				if f.cap.prompts != 1 {
+					t.Fatalf("prompts = %d, want the unsandboxed delete to ask", f.cap.prompts)
+				}
+				return
+			}
+			if f.cap.prompts != 0 || d.Outcome != "once" || len(f.cap.events) != 1 || f.cap.events[0].outcomeSource != "mode_auto" {
+				t.Fatalf("decision = %+v prompts = %d events = %+v, want a mode_auto once", d, f.cap.prompts, f.cap.events)
+			}
+		})
+	}
+}
+
+func TestAuthorizeBatchAndIndependentHistoryStoreWritePromptsPastGrantAndCache(t *testing.T) {
+	setup := func(t *testing.T) (*orchFixture, []BatchRequest) {
+		l := dirStoreLayout(t)
+		req, mc := storeToolCtx(l, toolNameEdit, true, filepath.Join(l.proj, ".git", "hooks", "pre-commit"))
+		f := newFixture(neverPrompt, nil)
+		f.grants.entries = []PermissionEntry{toolGrant(toolNameEdit, l.proj, "session")}
+		f.cache.hits[turnCacheKeyOf(req)] = "once"
+		return f, []BatchRequest{{Req: req, ModeCtx: mc}}
+	}
+	t.Run("AuthorizeBatch", func(t *testing.T) {
+		f, reqs := setup(t)
+		calls := 0
+		f.deps.PromptBatch = chooseBatch(&calls, PromptAllowOnce)
+		if _, err := AuthorizeBatch(context.Background(), reqs, f.deps); err != nil {
+			t.Fatalf("AuthorizeBatch: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("batch prompts = %d, want 1", calls)
+		}
+	})
+	t.Run("AuthorizeIndependent", func(t *testing.T) {
+		f, reqs := setup(t)
+		calls := 0
+		f.deps.PromptIndependent = fixedIndependentPrompt(&calls, PromptAllowOnce)
+		if _, err := AuthorizeIndependent(context.Background(), reqs, f.deps); err != nil {
+			t.Fatalf("AuthorizeIndependent: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("independent prompts = %d, want 1", calls)
+		}
+	})
+}
+
+func TestAuthorizeAutoEditsHistoryStoreRepeatAfterApprovalPromptsAgain(t *testing.T) {
+	for _, choice := range []PromptChoice{PromptAllowOnce, PromptAllowSession} {
+		t.Run(fmt.Sprint(choice), func(t *testing.T) {
+			l := dirStoreLayout(t)
+			req, mc := storeToolCtx(l, toolNameEdit, true, filepath.Join(l.proj, ".git", "hooks", "pre-commit"))
+			f := newFixture(choose(choice), nil)
+			f.deps.Cache = NewTurnCache()
+
+			mustAuthorizeMode(t, req, mc, f.deps)
+			mustAuthorizeMode(t, req, mc, f.deps)
+
+			if f.cap.prompts != 2 {
+				t.Fatalf("prompts = %d, want the repeated store write to ask again", f.cap.prompts)
+			}
+		})
+	}
+}
+
+func TestAuthorizeAutoEditsHistoryStoreDiscoveryIsFresh(t *testing.T) {
+	proj := blockedTempDir(t)
+	req, mc := storeToolCtx(storeLayout{proj: proj}, toolNameEdit, true, filepath.Join(proj, ".git", "hooks", "pre-commit"))
+	f := newFixture(choose(PromptAllowOnce), nil)
+	f.deps.Cache = NewTurnCache()
+
+	mustAuthorizeMode(t, req, mc, f.deps)
+	if f.cap.prompts != 0 {
+		t.Fatalf("prompts = %d before any repository exists, want 0", f.cap.prompts)
+	}
+	mkdirs(t, filepath.Join(proj, ".git"))
+	mustAuthorizeMode(t, req, mc, f.deps)
+	if f.cap.prompts != 1 {
+		t.Fatalf("prompts = %d after .git appeared, want 1", f.cap.prompts)
+	}
+	if err := os.RemoveAll(filepath.Join(proj, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	mustAuthorizeMode(t, req, mc, f.deps)
+	if f.cap.prompts != 1 {
+		t.Fatalf("prompts = %d after .git was removed, want still 1", f.cap.prompts)
+	}
+}
+
+func TestAuthorizeHistoryStoreGateLeavesReadsAndBuildAlone(t *testing.T) {
+	l := dirStoreLayout(t)
+	hook := filepath.Join(l.proj, ".git", "hooks", "pre-commit")
+
+	t.Run("read-only tool auto-allows", func(t *testing.T) {
+		req, mc := storeToolCtx(l, "read", true, hook)
+		mc.Class = ClassReadOnly
+		f := newFixture(neverPrompt, nil)
+		if d := mustAuthorizeMode(t, req, mc, f.deps); d.Outcome != "once" || !d.ReadOnlyAuto {
+			t.Fatalf("decision = %+v, want a read-only mode-auto once", d)
+		}
+	})
+	t.Run("build grant still matches", func(t *testing.T) {
+		req, mc := storeToolCtx(l, toolNameEdit, true, hook)
+		mc.Mode = "build"
+		f := newFixture(neverPrompt, nil)
+		f.grants.entries = []PermissionEntry{toolGrant(toolNameEdit, l.proj, "session")}
+		if d := mustAuthorizeMode(t, req, mc, f.deps); d.Outcome != "session_grant" || d.Grant == nil {
+			t.Fatalf("decision = %+v, want the Build grant to resolve the store write", d)
+		}
+	})
+}
+
+func TestAuthorizeRoutineVCSWritePosture(t *testing.T) {
+	cases := []struct {
+		name        string
+		mode        string
+		marked      bool
+		constrained bool
+		broken      bool
+		want        string
+	}{
+		{"auto edits sandboxed valid settings", modeAutoEdits, true, true, false, "auto"},
+		{"auto edits without the sandbox", modeAutoEdits, true, false, false, "ask"},
+		{"auto edits with a broken settings file", modeAutoEdits, true, true, true, "ask"},
+		{"build", "build", true, true, false, "ask"},
+		{"unmarked in auto edits", modeAutoEdits, false, true, false, "ask"},
+		{"unmarked in build", "build", false, true, false, "ask"},
+		{"plan", modePlan, true, true, false, "deny"},
+		{"unmarked in plan", modePlan, false, true, false, "deny"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := ModeContext{Mode: tc.mode, ToolName: "vcs_commit", Class: ClassMutating, ProjectRoot: scopeProj,
+				RoutineVCSWrite: tc.marked, ExecutionConstrained: tc.constrained, SettingsBroken: tc.broken}
+			prompt := neverPrompt
+			if tc.want == "ask" {
+				prompt = choose(PromptAllowOnce)
+			}
+			f := newFixture(prompt, nil)
+
+			d := mustAuthorizeMode(t, toolReq(), mc, f.deps)
+
+			switch tc.want {
+			case "auto":
+				if d.Outcome != outcomeOnce || d.Grant != nil || f.cap.prompts != 0 {
+					t.Fatalf("decision = %+v prompts=%d, want a once allow with no prompt", d, f.cap.prompts)
+				}
+				wantKinds(t, f.cap.kinds(), []string{"permission_matched"})
+				if ev := f.cap.events[0]; ev.outcome != outcomeOnce || ev.outcomeSource != outcomeSourceModeAuto {
+					t.Fatalf("event = %+v, want mode_auto once", ev)
+				}
+			case "ask":
+				if f.cap.prompts != 1 {
+					t.Fatalf("prompts = %d, want 1", f.cap.prompts)
+				}
+			case "deny":
+				if d.Outcome != outcomeDeny || f.cap.prompts != 0 || !IsModeDenyEnvelope(d.DenyEnvelope) {
+					t.Fatalf("decision = %+v prompts=%d, want a mode denial without a prompt", d, f.cap.prompts)
+				}
+				wantKinds(t, f.cap.kinds(), []string{"permission_matched"})
+				if ev := f.cap.events[0]; ev.outcome != outcomeDeny || ev.outcomeSource != outcomeSourceModeAuto {
+					t.Fatalf("event = %+v, want mode_auto deny", ev)
+				}
 			}
 		})
 	}

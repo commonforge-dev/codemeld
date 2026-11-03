@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/vcs/builtin"
 )
 
@@ -109,15 +110,57 @@ func TestRankBuckets(t *testing.T) {
 }
 
 func TestAmbiguityWarning(t *testing.T) {
-	// Emitted only when more than one detector matched and no preferred override applied.
-	if w := AmbiguityWarning([]string{"git", "hg"}, "git", false); w == "" {
-		t.Fatal("expected warning for ambiguous detection, got empty")
-	} else {
-		if !strings.Contains(w, "using \"git\" via vcs.priority") || !strings.Contains(w, "vcs.preferred") {
-			t.Errorf("warning %q missing selected-winner phrase or config-key references", w)
+	wantGit := "codemeld: multiple VCS detected (git, hg); using \"git\". Set vcs.force in the .codemeld/settings.yaml file to force a choice.\n" +
+		"Example:\n" +
+		"  vcs:\n" +
+		"    force: hg"
+	if w := AmbiguityWarning([]string{"git", "hg"}, "git", false); w != wantGit {
+		t.Errorf("git winner warning:\n got %q\nwant %q", w, wantGit)
+	}
+
+	wantHg := "codemeld: multiple VCS detected (git, hg); using \"hg\". Set vcs.force in the .codemeld/settings.yaml file to force a choice.\n" +
+		"Example:\n" +
+		"  vcs:\n" +
+		"    force: git"
+	if w := AmbiguityWarning([]string{"git", "hg"}, "hg", false); w != wantHg {
+		t.Errorf("hg winner warning:\n got %q\nwant %q", w, wantHg)
+	}
+
+	for _, winner := range []string{"git", "hg"} {
+		w := AmbiguityWarning([]string{"git", "hg"}, winner, false)
+		if strings.Contains(w, "vcs.priority") || strings.Contains(w, "vcs.preferred") {
+			t.Errorf("warning names an old setting: %q", w)
 		}
-		if strings.Contains(w, "\n") {
-			t.Errorf("warning is not single-line: %q", w)
+	}
+
+	w := AmbiguityWarning([]string{"git", "evil\nname"}, "git", false)
+	if got := strings.Count(w, "\n"); got != 3 {
+		t.Errorf("newline in a matched name changed the line count to %d: %q", got+1, w)
+	}
+	if !strings.Contains(w, "(git, evil name)") || !strings.HasSuffix(w, "force: evil name") {
+		t.Errorf("collapsed name missing from warning: %q", w)
+	}
+
+	for _, name := range []string{"true", "false", "null", "yes", "no", "on", "off", "y", "n"} {
+		if !filenameRe.MatchString(name + ".yaml") {
+			t.Fatalf("%q is not a valid custom template name", name)
+		}
+		w := AmbiguityWarning([]string{"git", name}, "git", false)
+		_, example, ok := strings.Cut(w, "\nExample:\n")
+		if !ok {
+			t.Fatalf("warning has no example block: %q", w)
+		}
+		raw, _, err := config.ValidateProjectSettingsBytes([]byte(example+"\n"), "project/.codemeld/settings.yaml")
+		if err != nil {
+			t.Fatalf("example for %q does not load: %v\n%s", name, err, example)
+		}
+		vcsMap, _ := raw["vcs"].(map[string]any)
+		got, isString := vcsMap["force"].(string)
+		if !isString || got != name {
+			t.Fatalf("example for %q loads vcs.force as %#v", name, vcsMap["force"])
+		}
+		if err := ValidateForce(got, builtin.BuiltinNames(), []string{name}, "project/.codemeld/settings.yaml"); err != nil {
+			t.Fatalf("example for %q does not resolve its template: %v", name, err)
 		}
 	}
 
@@ -129,8 +172,8 @@ func TestAmbiguityWarning(t *testing.T) {
 	if w := AmbiguityWarning(nil, "", false); w != "" {
 		t.Errorf("expected no warning for no matches, got %q", w)
 	}
-	// preferred applied bypasses tie-breaking, so no ambiguity warning.
+	// force applied bypasses tie-breaking, so no ambiguity warning.
 	if w := AmbiguityWarning([]string{"git", "hg"}, "hg", true); w != "" {
-		t.Errorf("expected no warning when vcs.preferred applied, got %q", w)
+		t.Errorf("expected no warning when vcs.force applied, got %q", w)
 	}
 }

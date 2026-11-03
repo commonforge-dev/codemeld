@@ -15,9 +15,9 @@ checks. Switch with `/mode <plan|build|auto-edits>` or shift+tab.
 
 | Mode | Reads | Changes through codemeld's own tools | Shell commands |
 |---|---|---|---|
-| **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (writes and network fail); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
+| **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (your files are never changed and network fails; commands may write a private temp folder that is deleted when the session ends); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
 | **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Never sandboxed; asked unless read-only or already approved |
-| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder; everything else is asked | Sandboxed where available, and then run without asking unless recognized as network access or a history rewrite, or while a settings file is broken; elsewhere as in Build, plus the project's `declared_commands` |
+| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; everything else is asked | Sandboxed where available, and then run without asking unless recognized as network access, or while a settings file is broken; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
 
 - Auto edits approves only a target that is inside the project after symlinks are resolved, apart
   from the declared folders in [Writing outside the project](#writing-outside-the-project). A move
@@ -194,7 +194,7 @@ can be approved stage by stage, see [Approving a request](#approving-a-request))
 sandbox in Auto edits and
 valid settings. There,
 every command codemeld accepts runs in the sandbox without asking unless one of its stages is
-recognized as network access or a history rewrite (`SandboxedAutoEditsAuthority`,
+recognized as network access (`SandboxedAutoEditsAuthority`,
 `internal/permissions/exceptional.go`). To find those stages codemeld splits the command itself,
 after removing redirections to a fixed file name (one with no `$`, backtick, `~` or wildcard), and
 judges each stage that is a plain command, a plain command after leading `VAR=value` assignments
@@ -214,13 +214,15 @@ these shell and wrapper forms:
   accepts only its own option list (`wrapperOptionArgs`, `xargsOptionArgs`) and `--`. `xargs` with
   no command runs `echo`. Up to three wrappers may be nested; a fourth is not split.
 - `command -v`, `command -V` and `type` (optionally with `-a`, `-f`, `-p`, `-P` or `-t`) followed
-  by one or more names only print where each name resolves.
+  by one or more names only print where each name resolves. `command -v` may also have one `--`
+  before the names (`command -v -- jq`); `command -V` and `type` may not (`lookupWrapperStage`).
 
-Every stage is checked, so a deletion anywhere in the chain does not hide the others:
-`rm x && git rebase main` and `rm x | hg strip .` ask for a history rewrite, and `rm x; curl y`
-asks for network access. File deletion itself (`rm`, `git clean`, `find . -delete`) runs without
-asking. A command codemeld cannot split also runs in the sandbox without asking, as an unrecognized
-script does. That covers a program name holding a `$` (`$X -rf .`), `env` with assignments or
+Every stage is checked, so a deletion or history rewrite anywhere in the chain does not hide
+network access: `rm x; curl y` and `git push origin rebase` ask for network access. File deletion
+(`rm`, `git clean`, `find . -delete`) and history rewrites (`git rebase main`,
+`rm x && git rebase main`, `rm x | hg strip .`) run without asking. A command codemeld cannot
+split also runs in the sandbox without asking, as an unrecognized script does. That covers a
+program name holding a `$` (`$X -rf .`), `env` with assignments or
 `-i`, assignments before `env`, `bash`, `sh` or a wrapper, a `-c` body holding another `bash -c` or
 `sh -c` stage, `bash`, `sh` or `env` run by a wrapper, a shell or wrapper named by a path
 (`/bin/bash`), a shell option bundle holding `o` or `O` (`bash -co pipefail`) or `+c`, an option
@@ -250,7 +252,11 @@ judges and runs the rest of the command with that folder as its scope.
 
 **The Linux sandbox.** On a Linux amd64 or arm64 host that passes codemeld's startup self-test,
 Plan and Auto edits commands run inside a sandbox, and the sandbox, not a prompt, is what allows
-them. Plan commands cannot write files or reach the network. Auto edits commands may write the
+them. Plan commands never change your files and cannot reach the network. They may write only a
+private temp folder for the session (their `TMPDIR`, which also holds Go's build cache), deleted
+when the session ends, so temporary build and test files work while project outputs, module
+downloads and `go.mod`/`go.sum` updates still fail. If that folder is moved or replaced during the
+session, Plan commands run without it and print a line saying so. Auto edits commands may write the
 project (except its `.codemeld` folder), a private temp folder for the session, and the folders
 listed in `writable_folders`. Each command reads that list when it starts, so a folder added or
 removed mid-session applies from the next command without a restart; a command already running
@@ -260,7 +266,31 @@ after the settings are fixed gets them back. git stops on a global config file i
 while `blocked_paths` covers `~/.gitconfig` or `~/.config/git/config`, sandboxed commands get
 `GIT_CONFIG_GLOBAL=/dev/null` and git ignores both of those files (`confinement.prepare` in
 `internal/bootstrap/confinedrunner.go`). Unblocking only one of them is not enough: git reads them
-again only when neither path is covered.
+again only when neither path is covered. `~/.hgrc`, `~/.config/hg/hgrc`, `~/.gitconfig` and
+`~/.config/git/config` are in the default `blocked_paths` because they can hold passwords
+(`internal/bootstrap/blockeddefaults.go`), so sandboxed hg and git ignore your settings in them. At
+an interactive launch codemeld asks once about them when one of them exists, its own entry is in the
+global settings file's `blocked_paths`, and `confinement.vcs_user_config` is not set
+(`askVCSUserConfig` in `internal/bootstrap/vcsconfig_question.go`). The question names each such
+file and warns that allowing it lets every command and the model read it, so any password in it
+becomes visible. Answering `y` removes those entries from the global file, and both git entries when
+a git file is named, then records `confinement.vcs_user_config: allow`; any other answer changes
+nothing and records `block`. An entry in a project settings file, or a blocked folder above the
+file, is left alone and still blocks it. Headless runs and launches without a terminal never ask.
+Deleting the key brings the question back only while one of these files exists and still has its
+own entry in the global file. If a settings write fails, codemeld prints the settings file and the
+reason and continues the launch; entries already removed stay removed, the answer may not be
+recorded, and a later launch asks again only if an entry is left to remove.
+
+<a id="history-stores"></a>Auto edits shell commands cannot write the Git or Mercurial history
+store of a repository at the project root or at a declared `writable_folders` root, including a
+worktree's or submodule's `.git` pointer file (`permissions.HistoryStores`, `withHistoryStores` in
+`internal/bootstrap/confinedrunner.go`). A history rewrite or a shell `git commit` that writes one
+of those stores fails in the sandbox. Only stores present when a command starts are protected for
+that command, and a repository nested below one of those roots stays writable, so a rewrite there,
+such as `git -C sub rebase main`, runs without asking and can succeed. The version-control tools'
+own commands keep write access to the stores (`storesWritable` on the runner
+`internal/bootstrap/tooldispatch.go` builds for them).
 
 Sandboxed commands get the environment codemeld was started with, so a tool that finds its files
 through a variable, such as mise with `MISE_DATA_DIR`, keeps working. codemeld reads it once, at
@@ -278,30 +308,46 @@ connection itself, but such a secret can still leave through the command's outpu
 the transcript and the model provider), through a network command you approve, or through a
 program outside the sandbox that watches a folder the command can write. Build mode runs approved
 commands with codemeld's full environment (`commandEnv` in `internal/runner/descendants_linux.go`).
+When the launch self-test passed, the `execution_capability` record written when codemeld starts
+lists the names withheld from this inherited environment, never their values. A fixed-table name
+such as `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` or `LC_ALL` can appear
+there although the value a command sees for it comes from the fixed table, which sets `TMPDIR`
+and `GOCACHE` only when codemeld created a temp folder for the session. The list does not show
+that any command ran sandboxed. The records written by an in-process `/clear`, `/resume`, fork or
+compact do not repeat it, because those do not take a new snapshot of the process environment;
+for those, read the record written when that codemeld process started.
 
 In Auto edits with valid settings, a sandboxed command that codemeld recognizes as network access
-or a version-control history rewrite (such as `curl`, `git push`, `git reset --hard`, `hg strip`)
-still asks, with allow once or deny only, and runs inside the sandbox when approved; only an
-approved network command runs with network access (`confinement.policy`,
+(such as `curl`, `git push`) still asks, with allow once or deny only, and runs inside the sandbox
+when approved; only an approved network command runs with network access (`confinement.policy`,
 `internal/bootstrap/confinedrunner.go`). A saved approval never answers it (`resolveWithoutPrompt`,
 `internal/permissions/orchestrate.go`). Every other command runs in the sandbox without asking
-(`autoEditsPosture`): file deletion such as `rm`, a command codemeld cannot split, and a script or
-program it does not recognize, so any of them can delete or rewrite files inside the writable
-folders. Version control brings back committed content only: a deleted file loses its uncommitted
-edits, and an untracked or ignored file is gone, the same loss an overwrite causes. If a settings
+(`autoEditsPosture`): file deletion such as `rm`, a history rewrite such as `git reset --hard` or
+`hg strip`, a command codemeld cannot split, and a script or program it does not recognize, so any
+of them can delete or rewrite files inside the writable folders. Version control brings back
+committed content only: a deleted file loses its uncommitted edits, and an untracked or ignored
+file is gone, the same loss an overwrite causes. If a settings
 file breaks after the self-test passed, every sandboxed command asks until it is fixed, and a
-recognized file deletion is again asked with allow once or deny only (`exceptionalAuthority`,
-`internal/bootstrap/promptgate.go`).
+recognized file deletion or history rewrite is again asked with allow once or deny only
+(`exceptionalAuthority`, `internal/bootstrap/promptgate.go`).
 
 **Without the sandbox** (Build mode, or a host where the self-test did not pass) a command runs with
 your account's full authority once it is allowed. Plan refuses every command that is not proven
 read-only, unless the opt-in [System One check](system-one.md) allows that one run (`planPosture`,
 `internal/permissions/orchestrate.go`).
 
-**Version-control tools.** codemeld's structured version-control actions run without asking only
+**Version-control tools.** codemeld's structured version-control actions run without asking
 when they are read-only and come from a source codemeld trusts: its built-in templates, an
 unchanged copy of them, or a global template that runs exactly the built-in read-only command. A
 repository's own `.codemeld/vcs` templates can never mark an action read-only.
+
+<a id="vcs-write-actions"></a>In Auto edits with the sandbox on and no settings file broken, the
+version-control write actions (add, commit, restore a file, create or switch a branch, stash and
+stash pop) also run without asking when their template is product-authored: codemeld's embedded
+built-in or a byte-identical first-run reference copy, running the built-in command
+(`ActionTool.routineWrite` in `internal/vcs/tool.go`, `sandboxedVCSWrite` in
+`internal/permissions/orchestrate.go`). A customized global or project template gets no such
+approval: its write actions still ask unless a saved approval covers them.
 
 ## Web access
 

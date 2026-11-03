@@ -112,6 +112,67 @@ func TestLoadYAML(t *testing.T) {
 	}
 }
 
+func TestFormatLoadError_UnknownSettings(t *testing.T) {
+	tests := []struct {
+		name, content, what, fix string
+	}{
+		{
+			"renamed key",
+			"vcs:\n  preferred: hg\n",
+			"unknown setting vcs.preferred",
+			"rename vcs.preferred to vcs.force, its new name, then start codemeld again",
+		},
+		{
+			"unknown key with no rename",
+			"vcs:\n  bogus: hg\n",
+			"unknown setting vcs.bogus",
+			"remove vcs.bogus or correct its name, then start codemeld again",
+		},
+		{
+			"unknown top-level key",
+			"bogus: true\n",
+			"unknown setting bogus",
+			"remove bogus or correct its name, then start codemeld again",
+		},
+		{
+			"unknown nested keys",
+			"confinement:\n  program_lookup: strict\n  extra_paths: /opt/bin\nvcs:\n  preferred: hg\n",
+			"unknown settings confinement.extra_paths, vcs.preferred",
+			"remove confinement.extra_paths or correct its name; rename vcs.preferred to vcs.force, its new name, then start codemeld again",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeFile(t, tt.content, 0o600)
+			_, _, cat, err := LoadYAML(path)
+			if cat != SchemaValidationError {
+				t.Fatalf("cat = %q, want %q (err=%v)", cat, SchemaValidationError, err)
+			}
+			msg := FormatLoadError(path, cat, err, LaunchAborted)
+			for _, part := range []string{"\n  what happened: " + tt.what + "\n", "\n  to fix: " + tt.fix} {
+				if !strings.Contains(msg, part) {
+					t.Fatalf("message %q missing %q", msg, part)
+				}
+			}
+			if strings.Contains(msg, "jsonschema") {
+				t.Fatalf("message %q carries the schema library's text", msg)
+			}
+		})
+	}
+}
+
+func TestFormatLoadError_UnknownAndWrongTypeNamesBoth(t *testing.T) {
+	path := writeFile(t, "vcs:\n  preferred: hg\nagent:\n  max_concurrency: \"three\"\n", 0o600)
+	_, _, cat, err := LoadYAML(path)
+	if cat != SchemaValidationError {
+		t.Fatalf("cat = %q, want %q (err=%v)", cat, SchemaValidationError, err)
+	}
+	msg := FormatLoadError(path, cat, err, LaunchAborted)
+	if !strings.Contains(msg, "schema validation failed at agent.max_concurrency, vcs.preferred: ") {
+		t.Fatalf("message %q does not name both keys", msg)
+	}
+}
+
 func TestFormatLoadError_SchemaShape(t *testing.T) {
 	path := writeFile(t, "agent:\n  max_concurrency: \"three\"\n", 0o600)
 	_, _, cat, err := LoadYAML(path)

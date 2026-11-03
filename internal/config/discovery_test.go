@@ -483,3 +483,55 @@ func TestLocateProjectRoot_InvalidCandidateMarkerStopsTheWalk(t *testing.T) {
 		}
 	})
 }
+
+func TestLocateProjectRoot_LocalOnlyFolderIsNotAMarker(t *testing.T) {
+	mkLocalOnly := func(t *testing.T, dir string) {
+		t.Helper()
+		mkDirs(t, filepath.Join(dir, ".codemeld"))
+		if err := os.WriteFile(filepath.Join(dir, ".codemeld", "settings.local.yaml"), []byte("model:\n  active: m\n"), 0o600); err != nil {
+			t.Fatalf("write local file: %v", err)
+		}
+	}
+	cases := []struct {
+		name        string
+		mode        string
+		outerMarker bool
+		wantRoot    func(base, cwd string) string
+	}{
+		{"project-root walks past it to the outer marker", "project-root", true, func(base, _ string) string { return base }},
+		{"project-root falls back to the launch dir", "project-root", false, func(_, cwd string) string { return cwd }},
+		{"launch-dir-only keeps the launch dir", "launch-dir-only", true, func(_, cwd string) string { return cwd }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			setHome(t, filepath.Join(base, "no-such-home"))
+			var outer string
+			if tc.outerMarker {
+				outer = mkMarker(t, base)
+			}
+			mid := filepath.Join(base, "a")
+			cwd := filepath.Join(mid, "b")
+			mkDirs(t, cwd)
+
+			wantRoot, wantLay, _, err := LocateProjectRoot(cwd, tc.mode)
+			if err != nil {
+				t.Fatalf("baseline err = %v", err)
+			}
+
+			mkLocalOnly(t, mid)
+			mkLocalOnly(t, cwd)
+			root, layers, _, err := LocateProjectRoot(cwd, tc.mode)
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if want := tc.wantRoot(base, cwd); root != want || wantRoot != want {
+				t.Fatalf("root = %q (without local files %q), want %q", root, wantRoot, want)
+			}
+			wantLayers(t, layers, wantLay)
+			if tc.outerMarker && tc.mode == "project-root" {
+				wantLayers(t, layers, []string{outer})
+			}
+		})
+	}
+}

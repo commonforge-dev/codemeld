@@ -847,7 +847,9 @@ func (a *App) stepModelEffort(delta int) {
 	if mp == nil || len(mp.supported) <= 1 {
 		return
 	}
-	i := slices.Index(mp.supported, mp.effort)
+	order := effortsHighToLow(mp.supported)
+	slices.Reverse(order)
+	i := slices.Index(order, mp.effort)
 	if i < 0 {
 		i = 0
 	}
@@ -855,10 +857,10 @@ func (a *App) stepModelEffort(delta int) {
 	if i < 0 {
 		i = 0
 	}
-	if i >= len(mp.supported) {
-		i = len(mp.supported) - 1
+	if i >= len(order) {
+		i = len(order) - 1
 	}
-	mp.effort = mp.supported[i]
+	mp.effort = order[i]
 	a.renderModelEffort()
 }
 
@@ -887,6 +889,8 @@ func renderInlineEffort(supported []string, selected string) string {
 	if len(supported) == 1 {
 		return "effort: " + supported[0]
 	}
+	supported = effortsHighToLow(supported)
+	slices.Reverse(supported)
 	i := slices.Index(supported, selected)
 	if i < 0 {
 		i = 0
@@ -952,10 +956,30 @@ func (a *App) dismissModelPicker() {
 }
 
 func modelPickerEffortFor(supported []string, prev string) string {
-	if effortValid(prev, supported) {
+	if len(supported) == 0 {
+		return ""
+	}
+	if slices.Contains(supported, prev) {
 		return prev
 	}
-	return modelSelectionEffortFallback(supported)
+	if prev == "" {
+		prev = "medium"
+	}
+	target := effortRank(prev)
+	dist := func(e string) int {
+		d := effortRank(e) - target
+		if d < 0 {
+			return -d
+		}
+		return d
+	}
+	best := supported[0]
+	for _, e := range supported[1:] {
+		if d, bd := dist(e), dist(best); d < bd || d == bd && effortRank(e) < effortRank(best) {
+			best = e
+		}
+	}
+	return best
 }
 
 // providerHeaderLabel returns the presentation-only group-header text for a row:

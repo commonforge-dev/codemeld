@@ -29,6 +29,16 @@ func TestExecutionCapability_RoundTripsThroughSessionFile(t *testing.T) {
 				{Name: "read_inside_root", Observed: "allowed"},
 			},
 		},
+		{
+			Capability:          "constrained",
+			Legs:                []ExecutionCapabilityLeg{{Name: "write_outside_root", Observed: "denied"}},
+			WithheldEnvironment: []string{"AWS_SECRET_ACCESS_KEY", "GIT_DIR", "PATH"},
+		},
+		{
+			Capability:          "refused",
+			Reason:              "settings file is broken",
+			WithheldEnvironment: []string{"HOME"},
+		},
 	}
 	path := filepath.Join(t.TempDir(), "session.json")
 	store := sessions.New(path, newSession())
@@ -82,6 +92,10 @@ func TestExecutionCapability_RejectsInvalidRecords(t *testing.T) {
 		{"constrained without legs", ExecutionCapability{Capability: "constrained"}},
 		{"leg without name", ExecutionCapability{Capability: "constrained", Legs: []ExecutionCapabilityLeg{{Observed: "denied"}}}},
 		{"leg with unknown observation", ExecutionCapability{Capability: "refused", Reason: "why", Legs: []ExecutionCapabilityLeg{{Name: "write_outside_root", Observed: "maybe"}}}},
+		{"empty withheld name", ExecutionCapability{Capability: "constrained", Legs: leg, WithheldEnvironment: []string{""}}},
+		{"withheld assignment", ExecutionCapability{Capability: "constrained", Legs: leg, WithheldEnvironment: []string{"TOKEN=abc"}}},
+		{"unsorted withheld names", ExecutionCapability{Capability: "constrained", Legs: leg, WithheldEnvironment: []string{"PATH", "HOME"}}},
+		{"duplicate withheld names", ExecutionCapability{Capability: "constrained", Legs: leg, WithheldEnvironment: []string{"HOME", "HOME"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,5 +114,15 @@ func TestExecutionCapability_RejectsInvalidRecords(t *testing.T) {
 				t.Fatalf("ValidatePayload(%s) accepted an invalid record", raw)
 			}
 		})
+	}
+}
+
+func TestExecutionCapability_AcceptsEmptyWithheldEnvironment(t *testing.T) {
+	p := ExecutionCapability{Capability: "refused", Reason: "why", WithheldEnvironment: []string{}}
+	if _, err := Append(newStore(), p); err != nil {
+		t.Fatalf("Append(%+v) error = %v", p, err)
+	}
+	if err := ValidatePayload(KindExecutionCapability, []byte(`{"capability":"refused","reason":"why","withheld_environment":[]}`)); err != nil {
+		t.Fatalf("ValidatePayload(empty withheld_environment) error = %v", err)
 	}
 }

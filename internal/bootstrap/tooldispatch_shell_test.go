@@ -628,7 +628,7 @@ func TestConfinedShellRunner_EventsKeepTheAsWrittenSubject(t *testing.T) {
 	inner := &confineInner{}
 	r := &confinedShellRunner{
 		events: &shellEventRunner{inner: inner, active: func() *sessions.Store { return store }, cap: 64},
-		conf:   &confinement{constrained: true, mode: fixedMode("plan"), lookupPath: lookup, blocked: testBlocked(t)},
+		conf:   withSessionTemp(t, &confinement{constrained: true, mode: fixedMode("plan"), lookupPath: lookup, blocked: testBlocked(t)}),
 	}
 
 	if _, err := r.Exec(context.Background(), confinedSpec(cwd, "ls", "-la")); err != nil {
@@ -650,7 +650,7 @@ func TestConfinedShellRunner_PipeGroupRunsAsFramedStages(t *testing.T) {
 	lookup := programDir(t, "ls", "head")
 	inner := &confineInner{stdout: []byte("STAGE-OUT")}
 	d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()})
-	d.confinement = &confinement{constrained: true, mode: fixedMode("plan"), lookupPath: lookup, blocked: testBlocked(t)}
+	d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode("plan"), lookupPath: lookup, blocked: testBlocked(t)})
 
 	if _, err := d.Dispatch(context.Background(), bashCall("c1", "ls | head")); err != nil {
 		t.Fatalf("Dispatch: %v", err)
@@ -675,7 +675,7 @@ func TestConfinedShellRunner_PreparationRefusalEmitsNothing(t *testing.T) {
 	inner := &confineInner{}
 	r := &confinedShellRunner{
 		events: &shellEventRunner{inner: inner, active: func() *sessions.Store { return store }, cap: 64},
-		conf:   &confinement{constrained: true, mode: fixedMode("plan"), lookupPath: t.TempDir(), blocked: testBlocked(t)},
+		conf:   withSessionTemp(t, &confinement{constrained: true, mode: fixedMode("plan"), lookupPath: t.TempDir(), blocked: testBlocked(t)}),
 	}
 	if _, err := r.Exec(context.Background(), confinedSpec(cwd, "ls")); err == nil {
 		t.Fatal("Exec error = nil, want the program lookup refusal")
@@ -785,8 +785,8 @@ func newPinShellHarness(t *testing.T, active *mode.ActiveState, decide func(tui.
 	inner := &confineInner{}
 	store := mkStore(t)
 	d := newProductionToolDispatcher(tools.NewRegistry(), inner, spy, home, cwd, func() *sessions.Store { return store }, 65536, securitystate.Policy{})
-	d.confinement = &confinement{constrained: true, mode: liveMode(active), lookupPath: programDir(t, programs...),
-		blocked: testBlocked(t), projectRoot: cwd, tmpDir: t.TempDir()}
+	d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: liveMode(active), lookupPath: programDir(t, programs...),
+		blocked: testBlocked(t), projectRoot: cwd})
 	return pinShellHarness{d: d, spy: spy, inner: inner, shown: shown}
 }
 
@@ -846,16 +846,16 @@ func TestProductionDispatcher_SwitchWhileThePromptIsOpenKeepsTheCapturedMode(t *
 			h := newPinShellHarness(t, active, func(tui.PromptRequest) tui.PromptDecision {
 				active.ApplyUserCommand(mode.Build)
 				return tui.PromptDecision{Option: tui.OptionAllowOnce}
-			}, "git")
+			}, "curl")
 			h.inner.exitCode = exitCode
-			h.inner.stderr = []byte("git: denied\n")
+			h.inner.stderr = []byte("curl: denied\n")
 
-			res, err := h.d.Dispatch(context.Background(), bashCall("c1", "git rebase main"))
+			res, err := h.d.Dispatch(context.Background(), bashCall("c1", "curl https://example.com"))
 			if err != nil {
 				t.Fatalf("Dispatch: %v", err)
 			}
-			if len(*h.shown) != 1 || (*h.shown)[0].ExceptionalAuthority != "VCS history rewrite" {
-				t.Fatalf("prompts = %+v, want the one exceptional Auto history-rewrite prompt and no reauthorization", *h.shown)
+			if len(*h.shown) != 1 || (*h.shown)[0].ExceptionalAuthority != "network access" {
+				t.Fatalf("prompts = %+v, want the one exceptional Auto network prompt and no reauthorization", *h.shown)
 			}
 			if live, _ := active.Current(); live != mode.Build {
 				t.Fatalf("live mode = %q, want the switch made while the prompt was open", live)
@@ -1085,7 +1085,7 @@ func TestProductionDispatcher_ConfinedTimeoutKeepsBothNotesWithinTheCap(t *testi
 			inner := &confineInner{exitCode: -1, stderr: bytes.Repeat([]byte("e"), size), onBounded: func(cmdrunner.RunSpec) { time.Sleep(limit + 100*time.Millisecond) }}
 			d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()})
 			d.outputCap = cap
-			d.confinement = &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: programDir(t, "ls"), blocked: testBlocked(t)}
+			d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: programDir(t, "ls"), blocked: testBlocked(t)})
 
 			res, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "ls", int(limit.Milliseconds())))
 			if err != nil {

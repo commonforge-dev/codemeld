@@ -1396,8 +1396,25 @@ func TestRunHeadless_PromptApprovalProjectGrantPersists(t *testing.T) {
 // The prompter is built and filled by HeadlessDriver.Run, so this proves the withholding
 // through the production assembly rather than through a flag the test set itself.
 func TestRunHeadless_UntrustedProjectWithholdsTheProjectChoice(t *testing.T) {
+	for _, answer := range []string{"4", "project", "p"} {
+		for _, shipsLocal := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/local=%v", answer, shipsLocal), func(t *testing.T) {
+				runUntrustedProjectChoice(t, answer, shipsLocal)
+			})
+		}
+	}
+}
+
+func runUntrustedProjectChoice(t *testing.T, answer string, shipsLocal bool) {
 	dir := trustProject(t, "model: {}\n")
 	sharedBefore := mustReadFile(t, projectSettingsPath(dir))
+	localPath := config.LocalSettingsPath(dir)
+	const localBefore = "model:\n  active:\n    provider: openai\n    id: local\n"
+	if shipsLocal {
+		if err := os.WriteFile(localPath, []byte(localBefore), 0o600); err != nil {
+			t.Fatalf("seed local settings: %v", err)
+		}
+	}
 	target := filepath.Join(dir, "notes.txt")
 	if err := os.WriteFile(target, []byte("keep\n"), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -1408,7 +1425,7 @@ func TestRunHeadless_UntrustedProjectWithholdsTheProjectChoice(t *testing.T) {
 
 	var stderr bytes.Buffer
 	driver := NewHeadlessDriver("clean up", &bytes.Buffer{}, &stderr)
-	driver.EnablePromptForApproval(strings.NewReader("4\n"))
+	driver.EnablePromptForApproval(strings.NewReader(answer + "\n1\n"))
 	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
 	// The decision the real headless gate reaches for a covered project with no record.
 	result.TrustDecision = HeadlessFreshSteps(&bytes.Buffer{}, nil, "").GateTrust(result.Home, dir, dir)
@@ -1440,7 +1457,13 @@ func TestRunHeadless_UntrustedProjectWithholdsTheProjectChoice(t *testing.T) {
 	}
 	trustStoreAbsent(t, result.Home)
 	requireSharedProjectSettingsUnchanged(t, dir, sharedBefore, "an untrusted headless run")
-	mustNotExist(t, config.LocalSettingsPath(dir), "an untrusted headless run must not write a project grant")
+	if shipsLocal {
+		if got := mustReadFile(t, localPath); got != localBefore {
+			t.Fatalf("settings.local.yaml = %q, want it byte-identical after an untrusted headless run", got)
+		}
+	} else {
+		mustNotExist(t, localPath, "an untrusted headless run must not write a project grant")
+	}
 
 	var next bytes.Buffer
 	if again := gateTrust(result.Home, dir, dir, strings.NewReader(""), &next, true); again.Trusted || !strings.Contains(next.String(), approvePrompt) {
@@ -1535,7 +1558,7 @@ func TestRunHeadless_SecondLaunchHonorsALocalGrantWithoutAPrompt(t *testing.T) {
 		steps.ResolveProjectRoot = func(string, map[string]any) (string, []string, error) { return dir, nil, nil }
 		steps.RecoverJournals = hermetic.RecoverJournals
 		steps.LoadVCSTemplates = hermetic.LoadVCSTemplates
-		steps.ValidatePreferredVCS = hermetic.ValidatePreferredVCS
+		steps.ValidateForceVCS = hermetic.ValidateForceVCS
 		steps.DetectVCS = hermetic.DetectVCS
 		steps.BuildToolRegistry = func(any) (any, error) { return &toolRegistryFactory{active: nil}, nil }
 		steps.DetermineModel = func(map[string]any, map[string]any, string, []string) (any, bool, error) {
@@ -4577,7 +4600,7 @@ permissions:
 		return projectRoot, []string{projectSettingsPath(projectRoot)}, nil
 	}
 	steps.LoadVCSTemplates = hermetic.LoadVCSTemplates
-	steps.ValidatePreferredVCS = hermetic.ValidatePreferredVCS
+	steps.ValidateForceVCS = hermetic.ValidateForceVCS
 	steps.DetectVCS = hermetic.DetectVCS
 	steps.BuildToolRegistry = func(any) (any, error) { return &toolRegistryFactory{active: nil}, nil }
 	steps.DetermineModel = func(c, _ map[string]any, _ string, paths []string) (any, bool, error) {
@@ -5759,7 +5782,44 @@ func runHeadlessCapturingDispatcher(t *testing.T, result *BootstrapResult) (*pro
 	return captured, stderr.String()
 }
 
+func TestRunHeadless_AnAncestorSwapCannotRedirectExitCleanup(t *testing.T) {
+	s := newAncestorSwap(t)
+	var created string
+	setHook(t, &beforeSessionTempDirChmod, func(path string) { created = path })
+	swapResolveExecutionCapability(t, constrainedLaunch)
+	result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Build, mode.SourceDefault))
+	client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	defer swapToolLoop(func(deps turn.Deps, d turn.ToolDispatcher, n int) *turn.ToolLoop {
+		s.swap(t)
+		return turn.NewToolLoop(deps, d, n)
+	})()
+
+	var stdout, stderr bytes.Buffer
+	if err := NewHeadlessDriver("hi", &stdout, &stderr).Run(context.Background(), result); err != nil {
+		t.Fatalf("driver.Run: %v; stderr %q", err, stderr.String())
+	}
+	s.requireHeld(t, []string{created}, nil)
+}
+
+func TestRunHeadless_AFailedCreationRollbackIsRetriedAtExit(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	f := failCreationRollback(t)
+	swapResolveExecutionCapability(t, constrainedLaunch)
+	result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Build, mode.SourceDefault))
+
+	var stdout, stderr bytes.Buffer
+	err := NewHeadlessDriver("hi", &stdout, &stderr).Run(context.Background(), result)
+	f.requireCreationAndRollbackErrors(t, err)
+	f.requireRetriedAndReleased(t)
+}
+
 func TestRunHeadless_PrintsTheInjectedLabelAndRecordsTheCapability(t *testing.T) {
+	const sentinel = "headless-sentinel-value-9c1d"
+	t.Setenv("SENTINEL_API_TOKEN", sentinel)
+	t.Setenv("PATH", os.Getenv("PATH"))
 	resolution := injectedResolution
 	resolution.SelfTestPassed = true
 	calls := swapResolveExecutionCapability(t, resolution)
@@ -5776,8 +5836,18 @@ func TestRunHeadless_PrintsTheInjectedLabelAndRecordsTheCapability(t *testing.T)
 		t.Fatalf("stderr = %q, want the injected label exactly once", stderr)
 	}
 	caps := decodeDiskEvents[events.ExecutionCapability](t, readSessionFile(t, result.Session.Path()), events.KindExecutionCapability)
-	if len(caps) != 1 || !reflect.DeepEqual(caps[0], injectedCapability) {
-		t.Fatalf("execution_capability on disk = %+v, want exactly %+v", caps, injectedCapability)
+	if want := launchCapability(injectedCapability); len(caps) != 1 || !reflect.DeepEqual(caps[0], want) {
+		t.Fatalf("execution_capability on disk = %+v, want exactly %+v", caps, want)
+	}
+	if names := caps[0].WithheldEnvironment; !slices.Contains(names, "SENTINEL_API_TOKEN") || !slices.Contains(names, "PATH") {
+		t.Fatalf("withheld_environment = %v, want SENTINEL_API_TOKEN and PATH", names)
+	}
+	raw, err := os.ReadFile(result.Session.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), sentinel) {
+		t.Fatal("the session file holds the withheld variable's value")
 	}
 }
 
@@ -5819,6 +5889,7 @@ func TestRunHeadless_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 		t.Fatalf("tmpDir %q stat = %v, want a folder removed when the run returned", conf.tmpDir, err)
 	}
 
+	withSessionTemp(t, conf)
 	conf.lookupPath = programDir(t, "git")
 	if _, err := d.Dispatch(context.Background(), structuredCall("c1", "vcs_status", map[string]any{})); err != nil {
 		t.Fatalf("Dispatch error = %v", err)
@@ -6227,7 +6298,7 @@ func TestRunHeadless_ConfinedPlanShellThroughTheRealHelper(t *testing.T) {
 	}{
 		{"socket", "python3", `python3 -c 'import socket; socket.socket()'`, "PermissionError"},
 		{"write outside", "sh", "sh -c 'echo hi > " + probe + "'", "Permission denied"},
-		{"write TMPDIR", "sh", `sh -c 'echo hi > "$TMPDIR/x"'`, "Permission denied"},
+		{"write TMPDIR", "sh", `sh -c 'echo hi > "$TMPDIR/x" && cat "$TMPDIR/x" && printf %s "$TMPDIR"'`, ""},
 		{"read home settings", "sh", "sh -c 'cat " + fixture + "; touch read-probe'", fixture + ": Permission denied"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -6248,7 +6319,18 @@ func TestRunHeadless_ConfinedPlanShellThroughTheRealHelper(t *testing.T) {
 			}
 			disk := readSessionFile(t, result.Session.Path())
 			ends := decodeDiskEvents[events.ToolExecEnd](t, disk, events.KindToolExecEnd)
-			if len(ends) != 1 || ends[0].ExitCode == 0 || !strings.Contains(ends[0].Stdout+ends[0].Stderr, tc.wantErr) {
+			if len(ends) != 1 {
+				t.Fatalf("tool_exec_end = %+v, want one", ends)
+			}
+			if tc.wantErr == "" {
+				private, wrote := strings.CutPrefix(ends[0].Stdout, "hi\n")
+				if ends[0].ExitCode != 0 || !wrote || !strings.HasPrefix(filepath.Base(private), sessionTempDirPrefix) {
+					t.Fatalf("tool_exec_end = %+v, want one zero exit that read back the write in the private temp folder", ends)
+				}
+				if _, err := os.Lstat(private); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("stat %s = %v, want the private temp folder removed at session cleanup", private, err)
+				}
+			} else if ends[0].ExitCode == 0 || !strings.Contains(ends[0].Stdout+ends[0].Stderr, tc.wantErr) {
 				t.Fatalf("tool_exec_end = %+v, want one non-zero exit showing %q", ends, tc.wantErr)
 			}
 			var permission []string
@@ -6427,7 +6509,7 @@ func TestRunHeadless_BrokenSettingsFileRecordsAndPrintsEachCapabilityChange(t *t
 				t.Fatalf("driver.Run: %v", err)
 			}
 
-			requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability, constrainedCapability)
+			requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability, constrainedCapability)
 			want := []string{tc.healthy, brokenLaunchLabel, tc.healthy}
 			if got := capabilityLines(stderr.String()); !slices.Equal(got, want) {
 				t.Fatalf("capability lines = %q, want %q\n--- stderr ---\n%s", got, want, stderr.String())
@@ -6473,7 +6555,7 @@ func TestRunHeadless_SettingsFileBrokenBeforeTheFirstRecordStartsRefused(t *test
 		t.Fatalf("driver.Run: %v", err)
 	}
 
-	requireDiskCapabilities(t, result.Session, brokenCapability)
+	requireDiskCapabilities(t, result.Session, launchCapability(brokenCapability))
 	if got := capabilityLines(stderr.String()); !slices.Equal(got, []string{brokenLaunchLabel}) {
 		t.Fatalf("capability lines = %q, want only %q", got, brokenLaunchLabel)
 	}
@@ -6514,7 +6596,7 @@ func TestRunHeadless_QueuedCapabilityChangeIsDrainedBeforeTheFinalFlush(t *testi
 			hold := newRecordHold(t)
 			var records atomic.Int32
 			orig := recordExecutionCapability
-			recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
+			recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
 				switch records.Add(1) {
 				case 2:
 					hold.block()
@@ -6522,7 +6604,7 @@ func TestRunHeadless_QueuedCapabilityChangeIsDrainedBeforeTheFinalFlush(t *testi
 					if err := sessionDir.block(); err != nil {
 						t.Errorf("block session writes: %v", err)
 					}
-					err := orig(ctx, store, resolution, notices)
+					err := orig(ctx, store, resolution, withheld, notices)
 					if recovers {
 						if uerr := sessionDir.unblock(); uerr != nil {
 							t.Errorf("unblock session writes: %v", uerr)
@@ -6530,7 +6612,7 @@ func TestRunHeadless_QueuedCapabilityChangeIsDrainedBeforeTheFinalFlush(t *testi
 					}
 					return err
 				}
-				return orig(ctx, store, resolution, notices)
+				return orig(ctx, store, resolution, withheld, notices)
 			}
 			t.Cleanup(func() { recordExecutionCapability = orig })
 
@@ -6583,14 +6665,14 @@ func TestRunHeadless_QueuedCapabilityChangeIsDrainedBeforeTheFinalFlush(t *testi
 			if err != nil {
 				t.Fatalf("driver.Run: %v", err)
 			}
-			requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability, constrainedCapability)
+			requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability, constrainedCapability)
 
 			rewriteSettings(t, settings, brokenSettings)
 			refreshWithin(t, driver.authorizer.blocked)
 			if n := records.Load(); n != 3 {
 				t.Fatalf("capability records = %d after Run returned, want 3: the callback must be cleared", n)
 			}
-			requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability, constrainedCapability)
+			requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability, constrainedCapability)
 		})
 	}
 }
@@ -6647,6 +6729,9 @@ func TestRunHeadless_CapabilityLinesStayWholeBesideConcurrentStderr(t *testing.T
 	}
 	for i := range caps {
 		wantCap, wantLine := constrainedCapability, constrainedBuildLabel
+		if i == 0 {
+			wantCap = launchCapability(constrainedCapability)
+		}
 		if i%2 == 1 {
 			wantCap, wantLine = brokenCapability, brokenLaunchLabel
 		}
@@ -6699,7 +6784,7 @@ func TestRunHeadless_CapabilityChangeIsDeliveredWhileATerminalPromptWaits(t *tes
 		t.Fatalf("driver.Run: %v", err)
 	}
 
-	requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability)
+	requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability)
 }
 
 func TestHeadlessStderr_LineStartsBelowAnUnterminatedPrompt(t *testing.T) {
@@ -6752,7 +6837,7 @@ func TestRunHeadless_InitialCapabilityFlushFailureDoesNotStopTheRun(t *testing.T
 		sessionDir := newSessionDirSwitch(t)
 		result.Session = storeAt(t, filepath.Join(sessionDir.dir, "session.json"), "01890000-0000-7000-8000-0000000000ab", dir)
 		orig := recordExecutionCapability
-		recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
+		recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
 			if err := sessionDir.block(); err != nil {
 				t.Errorf("block session writes: %v", err)
 			}
@@ -6761,7 +6846,7 @@ func TestRunHeadless_InitialCapabilityFlushFailureDoesNotStopTheRun(t *testing.T
 					t.Errorf("unblock session writes: %v", err)
 				}
 			}()
-			return orig(ctx, store, resolution, notices)
+			return orig(ctx, store, resolution, withheld, notices)
 		}
 		t.Cleanup(func() { recordExecutionCapability = orig })
 		client := doneClient()
@@ -6953,7 +7038,7 @@ func TestRunHeadless_WritableFolderEditFollowsBrokenSettingsUntilFixed(t *testin
 	)
 	driver, stderr := runWritableHeadless(t, result, client)
 
-	requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability, constrainedCapability)
+	requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability, constrainedCapability)
 	if got, want := capabilityLines(stderr), []string{"sandbox: on", brokenLaunchLabel, "sandbox: on"}; !slices.Equal(got, want) {
 		t.Fatalf("capability lines = %q, want %q", got, want)
 	}
@@ -7018,9 +7103,24 @@ func TestRunHeadless_SavedAllowGrantsOnlyThePrivateTempFolder(t *testing.T) {
 	maps.Copy(result.Config, savedGlobalConfig(t, result.Home))
 	before := settingsBytes(t, global)
 
-	d, _ := runHeadlessCapturingDispatcher(t, result)
-
-	requirePrivateTempOnly(t, d.confinement, project, launchTmp)
+	client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	inspected := false
+	defer swapToolLoop(func(deps turn.Deps, d turn.ToolDispatcher, n int) *turn.ToolLoop {
+		if pd, ok := d.(*productionToolDispatcher); ok {
+			requirePrivateTempOnly(t, pd.confinement, project, launchTmp)
+			inspected = true
+		}
+		return turn.NewToolLoop(deps, d, n)
+	})()
+	if err := NewHeadlessDriver("hi", &bytes.Buffer{}, &bytes.Buffer{}).Run(context.Background(), result); err != nil {
+		t.Fatalf("driver.Run: %v", err)
+	}
+	if !inspected {
+		t.Fatal("the launch confinement was never inspected")
+	}
 	if got := settingsBytes(t, global); got != before {
 		t.Fatalf("global settings = %q, want %q unchanged", got, before)
 	}
@@ -7501,5 +7601,338 @@ func TestHeadlessAuthorizer_UnattendedDenyRecordsNoWait(t *testing.T) {
 				t.Fatalf("event stream = %v, want prompt_shown and decision with no prompt wait", kinds)
 			}
 		})
+	}
+}
+
+func diskEventCount(path, kind string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	sess, err := sessions.Unmarshal(data)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, r := range sess.Records {
+		if ev, ok := r.(sessions.Event); ok && ev.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+func waitForDiskEvents(t *testing.T, path, kind string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for diskEventCount(path, kind) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("session file %s never held %d %s events", path, n, kind)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForStderr(t *testing.T, stderr *lockedBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stderr.String(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stderr never carried %q:\n%s", want, stderr.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRunHeadless_CancelAtAWaitingPromptSavesTheShownEventAndTheCancelledTurn(t *testing.T) {
+	dir := t.TempDir()
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("keep\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	client := toolThenContentClient(nil, "bash", `{"command":"rm notes.txt"}`, "ok")
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() { _ = stdinWriter.Close() })
+	stderr := &lockedBuffer{}
+	driver := NewHeadlessDriver("delete my notes", &bytes.Buffer{}, stderr)
+	driver.EnablePromptForApproval(stdin)
+	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- driver.Run(ctx, result) }()
+
+	waitForStderr(t, stderr, "choose 1-4")
+	if n := diskEventCount(result.Session.Path(), events.KindPermissionPromptShown); n != 1 {
+		t.Fatalf("permission_prompt_shown on disk while the prompt waits = %d, want 1", n)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("driver.Run: %v, want a clean cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("driver.Run stayed blocked at the prompt after cancellation")
+	}
+	sess := readSessionFile(t, result.Session.Path())
+	if shown := decodeDiskEvents[events.PermissionPromptShown](t, sess, events.KindPermissionPromptShown); len(shown) != 1 {
+		t.Fatalf("persisted permission_prompt_shown = %+v, want one", shown)
+	}
+	terminals := decodeDiskEvents[events.TurnTerminal](t, sess, events.KindTurnTerminal)
+	if len(terminals) != 1 || terminals[0].Outcome != events.TurnOutcomeCancelled {
+		t.Fatalf("persisted turn_terminal = %+v, want one cancelled round", terminals)
+	}
+	if _, err := os.Stat(notes); err != nil {
+		t.Fatalf("notes.txt changed by a cancelled prompt: %v", err)
+	}
+}
+
+func TestRunHeadless_TimeLimitAtAWaitingPromptEndsWithTheToolLessWrapUp(t *testing.T) {
+	var loop *turn.ToolLoop
+	t.Cleanup(swapToolLoop(func(deps turn.Deps, d turn.ToolDispatcher, n int) *turn.ToolLoop {
+		loop = turn.NewToolLoop(deps, d, n)
+		return loop
+	}))
+	dir := t.TempDir()
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("keep\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	script := &timeLimitScript{rounds: []func(context.Context) provider.Response{
+		func(context.Context) provider.Response {
+			return provider.Response{Stream: newStream(toolCallsChunk(toolFrag(0, "call_1", "bash", `{"command":"rm notes.txt"}`)))}
+		},
+		timeLimitAnswer("final answer"),
+	}}
+	script.install(t)
+	var stdout bytes.Buffer
+	stderr := &lockedBuffer{}
+	driver := NewHeadlessDriver("delete my notes", &stdout, stderr)
+	driver.SetTimeLimit(time.Now().Add(time.Hour), 28*time.Minute)
+	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
+	var asked atomic.Bool
+	driver.EnablePromptForApproval(readerFunc(func(p []byte) (int, error) {
+		if asked.Swap(true) {
+			return 0, io.EOF
+		}
+		loop.Expire()
+		deadline := time.Now().Add(100 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if countPermissionEvents(result.Session, events.KindPermissionPromptWait) != 0 {
+				t.Error("the time limit closed a prompt already waiting for an answer")
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return copy(p, "1\n"), nil
+	}))
+
+	if err := driver.Run(context.Background(), result); err != nil {
+		t.Fatalf("driver.Run: %v", err)
+	}
+	if len(script.requests) != 2 || len(script.requests[1].Tools) != 0 {
+		t.Fatalf("requests = %d, want the tool round then one tool-less final request", len(script.requests))
+	}
+	if stdout.String() != "final answer\n" {
+		t.Fatalf("stdout = %q, want only the final answer", stdout.String())
+	}
+	if !strings.HasSuffix(stderr.String(), timeLimitNotice) {
+		t.Fatalf("stderr = %q, want it to end with the time-limit notice", stderr.String())
+	}
+	if _, err := os.Stat(notes); err != nil {
+		t.Fatalf("notes.txt removed by an answer given after the time limit: %v", err)
+	}
+	tools := messagesByRole(reloadStore(t, result.Session), "tool")
+	if len(tools) != 1 || !strings.HasPrefix(tools[0].Content.Text(), "tool call cancelled: the run's time limit") {
+		t.Fatalf("durable tool results = %+v, want the cancelled tool outcome", tools)
+	}
+}
+
+func TestHeadlessAuthorizer_PromptShownSaveIgnoresAuthorizationCancellation(t *testing.T) {
+	dir := t.TempDir()
+	store := mkStore(t)
+	notices := &recordingNotices{}
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), newTerminalPrompter(strings.NewReader(""), &bytes.Buffer{}), notices)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := auth.promptShownEmitter(ctx, store)("tool", filetools.EditToolName, filepath.Join(dir, "a.txt"), nil, permissions.DirectIdentity{}); err != nil {
+		t.Fatalf("emit prompt shown: %v", err)
+	}
+	if n := diskEventCount(store.Path(), events.KindPermissionPromptShown); n != 1 {
+		t.Fatalf("permission_prompt_shown on disk = %d, want 1 despite the cancelled authorization; notices = %v", n, notices.texts)
+	}
+}
+
+func TestHeadlessAuthorizer_PromptShownWriteFailureIsReportedAndRetried(t *testing.T) {
+	dir := t.TempDir()
+	sessionDir := filepath.Join(t.TempDir(), "sessions")
+	if err := os.WriteFile(sessionDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	store := storeAt(t, filepath.Join(sessionDir, "session.json"), "01890000-0000-7000-8000-0000000000d1", dir)
+	notices := &recordingNotices{}
+	var reached atomic.Bool
+	stdin := readerFunc(func(p []byte) (int, error) {
+		if reached.Swap(true) {
+			return 0, io.EOF
+		}
+		if n := countPermissionEvents(store, events.KindSessionWriteFailed); n != 1 {
+			t.Errorf("session_write_failed at the prompt = %d, want 1", n)
+		}
+		if err := os.Remove(sessionDir); err != nil {
+			t.Errorf("remove: %v", err)
+		}
+		if err := os.Mkdir(sessionDir, 0o755); err != nil {
+			t.Errorf("mkdir: %v", err)
+		}
+		return copy(p, "2\n"), nil
+	})
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), newTerminalPrompter(stdin, &bytes.Buffer{}), notices)
+
+	dec, err := editAuthorize(context.Background(), auth, filepath.Join(dir, "a.txt"))
+	if err != nil || dec.DenyEnvelope == "" || !reached.Load() {
+		t.Fatalf("Authorize = %+v / %v (prompt reached %v), want the prompt reached and its deny applied", dec, err, reached.Load())
+	}
+	failures := decodeStoreEvents[events.SessionWriteFailed](t, store, events.KindSessionWriteFailed)
+	if len(failures) != 1 || failures[0].TargetPath != store.Path() {
+		t.Fatalf("session_write_failed = %+v, want one for %s", failures, store.Path())
+	}
+	if len(notices.texts) != 1 || !strings.Contains(notices.texts[0], store.Path()) {
+		t.Fatalf("notices = %q, want one write-failure notice naming the session file", notices.texts)
+	}
+	if _, _, err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("later flush: %v", err)
+	}
+	if n := diskEventCount(store.Path(), events.KindPermissionPromptShown); n != 1 {
+		t.Fatalf("permission_prompt_shown on disk after the later flush = %d, want the retained event", n)
+	}
+	if n := diskEventCount(store.Path(), events.KindSessionWriteFailed); n != 1 {
+		t.Fatalf("session_write_failed on disk after the later flush = %d, want 1", n)
+	}
+}
+
+func TestHeadlessAuthorizer_PromptShownNonWriteFlushErrorIsOnlyANotice(t *testing.T) {
+	dir := t.TempDir()
+	store := mkStore(t)
+	store.Append(sessions.Event{ID: "01890000-0000-7000-8000-0000000000d2", Kind: "unencodable", Timestamp: testStart, Payload: json.RawMessage("{")})
+	notices := &recordingNotices{}
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), newTerminalPrompter(strings.NewReader("2\n"), &bytes.Buffer{}), notices)
+
+	dec, err := editAuthorize(context.Background(), auth, filepath.Join(dir, "a.txt"))
+	if err != nil || dec.DenyEnvelope == "" {
+		t.Fatalf("Authorize = %+v / %v, want the prompt reached and its deny applied", dec, err)
+	}
+	if n := countPermissionEvents(store, events.KindSessionWriteFailed); n != 0 {
+		t.Fatalf("session_write_failed = %d, want none for a flush error with no write reason", n)
+	}
+	if len(notices.texts) != 1 || !strings.Contains(notices.texts[0], "marshal session") || strings.Contains(notices.texts[0], "cannot be encoded") {
+		t.Fatalf("notices = %q, want one notice carrying the flush error itself", notices.texts)
+	}
+}
+
+func TestHeadlessAuthorizer_DefaultDenyDoesNotFlushThePromptShownEvent(t *testing.T) {
+	dir := t.TempDir()
+	store := mkStore(t)
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), nil, &recordingNotices{})
+
+	dec, err := editAuthorize(context.Background(), auth, filepath.Join(dir, "a.txt"))
+	if err != nil || dec.DenyEnvelope == "" {
+		t.Fatalf("Authorize = %+v / %v, want an unattended deny", dec, err)
+	}
+	if n := countPermissionEvents(store, events.KindPermissionPromptShown); n != 1 {
+		t.Fatalf("permission_prompt_shown in memory = %d, want 1", n)
+	}
+	if _, err := os.Stat(store.Path()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("session file stat err = %v, want no file: a default-deny authorization must not flush", err)
+	}
+}
+
+func TestHeadlessAuthorizer_QueuedPromptShownIsDurableBeforeTheGate(t *testing.T) {
+	dir := t.TempDir()
+	store := mkStore(t)
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() { _ = stdinWriter.Close() })
+	var out bytes.Buffer
+	auth := newHeadlessAuthorizer(emptyCache(t, dir), func() *sessions.Store { return store },
+		mode.NewActiveState(mode.Build, mode.SourceDefault), newTerminalPrompter(stdin, &out), &recordingNotices{})
+
+	type result struct {
+		dec permissions.Decision
+		err error
+	}
+	authorize := func(ctx context.Context, name string) <-chan result {
+		done := make(chan result, 1)
+		go func() {
+			dec, err := editAuthorize(ctx, auth, filepath.Join(dir, name))
+			done <- result{dec, err}
+		}()
+		return done
+	}
+
+	first := authorize(context.Background(), "a.txt")
+	waitForOutput(t, auth.terminal, &out, "choose 1-4")
+	queuedCtx, cancelQueued := context.WithCancel(context.Background())
+	defer cancelQueued()
+	queued := authorize(queuedCtx, "b.txt")
+	waitForDiskEvents(t, store.Path(), events.KindPermissionPromptShown, 2)
+
+	cancelQueued()
+	select {
+	case r := <-queued:
+		if !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("queued request = %+v / %v, want context.Canceled", r.dec, r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the queued request stayed blocked after its cancellation")
+	}
+	if n := strings.Count(promptOutput(auth.terminal, &out), "approval required"); n != 1 {
+		t.Fatalf("%d prompts rendered, want only the gate holder's", n)
+	}
+	if n := diskEventCount(store.Path(), events.KindPermissionPromptShown); n != 2 {
+		t.Fatalf("permission_prompt_shown on disk after the queued cancel = %d, want 2", n)
+	}
+
+	if _, err := io.WriteString(stdinWriter, "2\n"); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	if r := <-first; r.err != nil || r.dec.DenyEnvelope == "" {
+		t.Fatalf("gate holder = %+v / %v, want its own answer applied", r.dec, r.err)
+	}
+}
+
+func TestHeadlessFreshSteps_NeverAsksAboutVCSUserConfig(t *testing.T) {
+	forceStdinTerminal(t, true)
+	home := vcsQuestionHome(t, blockedYAML("~/.hgrc", "~/.gitconfig"), ".hgrc", ".gitconfig")
+	before := settingsBytes(t, SettingsPath(home))
+	stdin := stageOSStdin(t, "y\n")
+	var stderr bytes.Buffer
+	steps := HeadlessFreshSteps(&stderr, nil, "")
+	steps.ResolveHome = func() (string, error) { return home, nil }
+	steps.RunFirstRun = func(string) (bool, error) { return false, nil }
+	steps.ResolveProjectRoot = func(string, map[string]any) (string, []string, error) { return "", nil, nil }
+	stop := errors.New("stop after the launch questions")
+	steps.ComposeConfig = func(map[string]any, string) (ConfigComposition, error) { return ConfigComposition{}, stop }
+
+	if _, _, err := runFreshCore(context.Background(), home, steps); !errors.Is(err, stop) {
+		t.Fatalf("runFreshCore error = %v, want it to reach composition", err)
+	}
+	if rest, err := io.ReadAll(stdin); err != nil || string(rest) != "y\n" {
+		t.Fatalf("stdin left = %q (err=%v), want a headless launch to read none of it", rest, err)
+	}
+	if strings.Contains(stderr.String(), "Allow? [y/N]") {
+		t.Fatalf("stderr = %q, want no question on a headless launch", stderr.String())
+	}
+	if got := settingsBytes(t, SettingsPath(home)); got != before {
+		t.Fatalf("settings = %q, want %q unchanged", got, before)
 	}
 }

@@ -4,6 +4,9 @@ package sessions
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -167,5 +170,113 @@ func TestValidateRecordStream_Valid(t *testing.T) {
 				t.Fatalf("ValidateRecordStream() = %v, want nil", err)
 			}
 		})
+	}
+}
+
+const unknownEventLine = ` { "type": "event",  "kind":"from_newer_build","id":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a09", ` +
+	`"timestamp":"2026-05-25T12:00:04.000Z", "payload": {"b": 2,  "a":"<x>"}, "extra_field": [1, 2] } `
+
+func unknownKindValidator(kind string, payload json.RawMessage) error {
+	switch kind {
+	case "launch_began":
+		return nil
+	case "stream_interrupted":
+		var p map[string]any
+		if err := json.Unmarshal(payload, &p); err != nil || p["content_chars"] == nil {
+			return errors.New("stream_interrupted.content_chars: required field is absent")
+		}
+		return nil
+	}
+	return fmt.Errorf("%w %q", ErrUnknownEventKind, kind)
+}
+
+func eventOf(kind string) Event {
+	return Event{Kind: kind, Payload: json.RawMessage(`{}`)}
+}
+
+func skippedFlags(records []Record) []bool {
+	var out []bool
+	for _, rec := range records {
+		if ev, ok := rec.(Event); ok {
+			out = append(out, ev.skipped)
+		}
+	}
+	return out
+}
+
+func TestValidateEventPayloads_SkipsAndMarksUnknownKinds(t *testing.T) {
+	records := []Record{eventOf("from_newer_build"), plainUser(), eventOf("launch_began")}
+	if err := ValidateEventPayloads(records, unknownKindValidator); err != nil {
+		t.Fatalf("ValidateEventPayloads() = %v, want nil", err)
+	}
+	if got, want := skippedFlags(records), []bool{true, false}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("skipped flags = %v, want %v", got, want)
+	}
+	if err := ValidateEventPayloads(records, unknownKindValidator); err != nil {
+		t.Fatalf("second ValidateEventPayloads() = %v, want nil", err)
+	}
+	if got, want := SkippedEventKinds(records), []SkippedKind{{Kind: "from_newer_build", Count: 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after revalidation SkippedEventKinds = %v, want %v", got, want)
+	}
+}
+
+func TestValidateEventPayloads_SuccessfulRevalidationClearsMarker(t *testing.T) {
+	records := []Record{eventOf("from_newer_build")}
+	if err := ValidateEventPayloads(records, unknownKindValidator); err != nil {
+		t.Fatalf("ValidateEventPayloads() = %v", err)
+	}
+	if err := ValidateEventPayloads(records, nil); err != nil {
+		t.Fatalf("nil validator = %v", err)
+	}
+	if got := skippedFlags(records); !reflect.DeepEqual(got, []bool{true}) {
+		t.Fatalf("after nil validator skipped flags = %v, want [true]", got)
+	}
+	if err := ValidateEventPayloads(records, func(string, json.RawMessage) error { return nil }); err != nil {
+		t.Fatalf("accepting validator = %v", err)
+	}
+	if got := skippedFlags(records); !reflect.DeepEqual(got, []bool{false}) {
+		t.Fatalf("after successful revalidation skipped flags = %v, want [false]", got)
+	}
+	if got := SkippedEventKinds(records); got != nil {
+		t.Fatalf("SkippedEventKinds = %v, want nil", got)
+	}
+}
+
+func TestValidateEventPayloads_InvalidKnownPayloadKeepsItsIndex(t *testing.T) {
+	records := []Record{
+		eventOf("from_newer_build"),
+		eventOf("also_unknown"),
+		Event{Kind: "stream_interrupted", Payload: json.RawMessage(`{"source":"esc"}`)},
+	}
+	err := ValidateEventPayloads(records, unknownKindValidator)
+	want := "records[2].payload: stream_interrupted.content_chars: required field is absent"
+	if err == nil || err.Error() != want {
+		t.Fatalf("ValidateEventPayloads() = %v, want %q", err, want)
+	}
+}
+
+func TestSkippedEventKinds_SortedCounts(t *testing.T) {
+	records := []Record{eventOf("zeta"), eventOf("launch_began"), eventOf("alpha"), plainUser(), eventOf("zeta")}
+	if err := ValidateEventPayloads(records, unknownKindValidator); err != nil {
+		t.Fatalf("ValidateEventPayloads() = %v", err)
+	}
+	want := []SkippedKind{{Kind: "alpha", Count: 1}, {Kind: "zeta", Count: 2}}
+	if got := SkippedEventKinds(records); !reflect.DeepEqual(got, want) {
+		t.Fatalf("SkippedEventKinds = %v, want %v", got, want)
+	}
+	if got := SkippedEventKinds([]Record{eventOf("never_validated"), plainUser()}); got != nil {
+		t.Fatalf("SkippedEventKinds without marked events = %v, want nil", got)
+	}
+}
+
+func TestSkippedEventsNotice(t *testing.T) {
+	got := SkippedEventsNotice("S1", []SkippedKind{{Kind: "alpha", Count: 1}, {Kind: "bad\nkind", Count: 2}})
+	want := `codemeld: session S1: skipped 3 event records of unknown kinds ("alpha"=1, "bad\nkind"=2); ` +
+		`a newer codemeld wrote them; inspect with: codemeld sessions show S1`
+	if got != want {
+		t.Fatalf("notice =\n%q\nwant\n%q", got, want)
+	}
+	if got := SkippedEventsNotice("S1", nil); got != "" {
+		t.Fatalf("empty report notice = %q, want empty", got)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"codemeld.dev/codemeld/internal/bootstrap"
@@ -76,8 +77,10 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"approval, or is refused in a non-prompting headless run. An unknown or degraded\n" +
 			"blocked-path list makes a command ineligible for that check.\n\n" +
 			"The run creates a normal session, so it is resumable with 'codemeld --resume <id>'\n" +
-			"and listed by 'codemeld sessions'. Ctrl-C cancels the turn and still persists the\n" +
-			"session durably.\n\n" +
+			"and listed by 'codemeld sessions'. Ctrl-C or SIGTERM cancels the run, including while\n" +
+			"a terminal approval prompt is waiting for your answer: the waiting prompt closes\n" +
+			"without authorizing the call, and the session is still saved. A run cancelled this\n" +
+			"way exits 0 once that final save succeeds; if the final save fails, it exits 1.\n\n" +
 			"With --title <name> that session is named, so the '/resume' picker lists the name\n" +
 			"instead of the start of the prompt. The name is kept as you typed it apart from runs\n" +
 			"of whitespace (including newlines) being collapsed to single spaces and a cut at 80\n" +
@@ -170,11 +173,13 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"recorded as cancelled. That final round is not bounded by --time-limit, so a caller that\n" +
 			"also wraps the run in its own timeout should set it a few minutes higher. A terminal\n" +
 			"approval prompt already waiting for your answer is not interrupted, but an answer given\n" +
-			"after the limit authorizes nothing. Time spent waiting on permission prompts counts\n" +
+			"after the limit authorizes nothing; only Ctrl-C or SIGTERM closes a waiting prompt.\n" +
+			"Time spent waiting on permission prompts counts\n" +
 			"against the limit, and 'codemeld sessions summary' reports it.\n" +
 			"Without --time-limit the run has no time limit.\n\n" +
 			"Exit codes: 0 on a completed run, including one ended by --time-limit with a final\n" +
-			"answer; 2 for a usage error (empty prompt, a malformed,\n" +
+			"answer, and on a run cancelled by Ctrl-C or SIGTERM whose session was saved;\n" +
+			"2 for a usage error (empty prompt, a malformed,\n" +
 			"missing, or uncatalogued model, an effort without a model or one the model does not\n" +
 			"advertise, an invalid mode, a blank --title, an empty, malformed, zero, or negative\n" +
 			"--time-limit, --prompt-for-approval without a terminal on stdin, an empty or relative\n" +
@@ -269,10 +274,10 @@ func runHeadless(ctx context.Context, c *ucli.Command, stdout, stderr io.Writer)
 		return ucli.Exit(fmt.Sprintf("codemeld: cannot determine working directory: %s", err), 1)
 	}
 
-	// Ctrl-C cancels the headless turn (Step 7). signal.NotifyContext lives here, in the
-	// run Action, so the interactive launch/resume paths are untouched; the bootstrap's
-	// final flush uses context.WithoutCancel so a cancel still persists the session.
-	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	// signal.NotifyContext lives here, in the run Action, so the interactive launch/resume
+	// paths are untouched; the bootstrap's final flush uses context.WithoutCancel so a cancel
+	// still persists the session.
+	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	steps := bootstrap.HeadlessFreshSteps(stderr, modelOverride, modeKey)

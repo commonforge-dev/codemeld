@@ -793,6 +793,48 @@ func TestStartTUI_ColdResumeReplaysPriorTranscriptAfterBanner(t *testing.T) {
 	}
 }
 
+func TestStartTUI_ColdResumeShowsSkippedUnknownKindsNotice(t *testing.T) {
+	var ran *tui.App
+	defer swapRunApp(func(a *tui.App) error { ran = a; return nil })()
+
+	home, cwd, id, _ := writeUnknownKindSession(t)
+	path, sess, err := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard).ResolveResume(id, cwd, home)
+	if err != nil {
+		t.Fatalf("ResolveResume: %v", err)
+	}
+	result := &BootstrapResult{Home: home, LaunchDir: cwd, Session: sessions.New(path, sess), Model: selectedState(), ResumeReplay: true}
+	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+	if ran == nil {
+		t.Fatal("StartTUI did not run the event loop (runApp not invoked)")
+	}
+	want := "codemeld: session " + id + `: skipped 1 event records of unknown kinds ("from_newer_build"=1); ` +
+		"a newer codemeld wrote them; inspect with: codemeld sessions show " + id
+	if got := ran.NoticeText(); got != want {
+		t.Fatalf("notice = %q, want %q", got, want)
+	}
+	if got := ran.NoticeSeq(); got != 1 {
+		t.Fatalf("notices shown = %d, want 1", got)
+	}
+}
+
+func TestStartTUI_ColdResumeWithoutUnknownKindsShowsNoNotice(t *testing.T) {
+	var ran *tui.App
+	defer swapRunApp(func(a *tui.App) error { ran = a; return nil })()
+
+	result := &BootstrapResult{Home: t.TempDir(), LaunchDir: "/launch", Session: resumeStoreWithHistory(t), Model: selectedState(), ResumeReplay: true}
+	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+	if ran == nil {
+		t.Fatal("StartTUI did not run the event loop (runApp not invoked)")
+	}
+	if got := ran.NoticeSeq(); got != 0 {
+		t.Fatalf("notices shown = %d (%q), want none", got, ran.NoticeText())
+	}
+}
+
 // TestStartTUI_FreshLaunchDoesNotReplay is the contrast: with ResumeReplay false the
 // loaded records are not re-rendered, so fresh-launch transcript behavior (banner only)
 // is unchanged even if the session somehow carries records.
@@ -5645,6 +5687,7 @@ func finishedPID(t *testing.T) int {
 }
 
 func TestStartTUI_RecordsTheInjectedCapabilityOnceAfterLaunchBegan(t *testing.T) {
+	t.Setenv("SENTINEL_API_TOKEN", "failed-self-test-sentinel")
 	calls := swapResolveExecutionCapability(t, injectedResolution)
 	store := mkStore(t)
 	if _, err := events.Append(store, events.LaunchBegan{Source: "fresh"}); err != nil {
@@ -5667,6 +5710,32 @@ func TestStartTUI_RecordsTheInjectedCapabilityOnceAfterLaunchBegan(t *testing.T)
 	caps := decodeDiskEvents[events.ExecutionCapability](t, disk, events.KindExecutionCapability)
 	if len(caps) != 1 || !reflect.DeepEqual(caps[0], injectedCapability) {
 		t.Fatalf("execution_capability on disk = %+v, want exactly %+v", caps, injectedCapability)
+	}
+}
+
+func TestStartTUI_LaunchRecordListsTheWithheldNamesWithoutValues(t *testing.T) {
+	const sentinel = "launch-sentinel-value-7f3a"
+	t.Setenv("SENTINEL_API_TOKEN", sentinel)
+	t.Setenv("PATH", os.Getenv("PATH"))
+	t.Setenv("TMPDIR", t.TempDir())
+	swapResolveExecutionCapability(t, constrainedLaunch)
+	store := mkStore(t)
+	defer swapRunApp(func(*tui.App) error { return nil })()
+
+	if err := StartTUI(context.Background(), &BootstrapResult{Home: t.TempDir(), LaunchDir: "/launch", Session: store}, io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+	requireDiskCapabilities(t, store, launchCapability(constrainedCapability))
+	names := decodeDiskEvents[events.ExecutionCapability](t, readSessionFile(t, store.Path()), events.KindExecutionCapability)[0].WithheldEnvironment
+	if !slices.Contains(names, "SENTINEL_API_TOKEN") || !slices.Contains(names, "PATH") {
+		t.Fatalf("withheld_environment = %v, want SENTINEL_API_TOKEN and PATH", names)
+	}
+	raw, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), sentinel) {
+		t.Fatal("the session file holds the withheld variable's value")
 	}
 }
 
@@ -5876,6 +5945,7 @@ func TestStartTUI_LaunchConfinementIsSharedWithTheVCSRunners(t *testing.T) {
 		t.Fatalf("inherited = %q, want the launch MISE_DATA_DIR and no GITHUB_TOKEN", conf.inherited)
 	}
 
+	withSessionTemp(t, conf)
 	conf.lookupPath = programDir(t, "git")
 	if _, err := d.Dispatch(context.Background(), structuredCall("c1", "vcs_status", map[string]any{})); err != nil {
 		t.Fatalf("Dispatch error = %v", err)
@@ -5912,6 +5982,57 @@ func TestStartTUI_TempFolderFailureAbortsWithoutRecordingCapability(t *testing.T
 	if got := kindEvents(t, store, events.KindExecutionCapability); len(got) != 0 {
 		t.Fatalf("execution_capability events = %d, want none", len(got))
 	}
+}
+
+func TestStartTUI_AnAncestorSwapCannotRedirectExitCleanup(t *testing.T) {
+	for _, tc := range []string{"failure before the confinement", "exit"} {
+		t.Run(tc, func(t *testing.T) {
+			s := newAncestorSwap(t)
+			var created string
+			setHook(t, &beforeSessionTempDirChmod, func(path string) { created = path })
+			resolution := injectedResolution
+			resolution.SelfTestPassed = true
+			swapResolveExecutionCapability(t, resolution)
+			forced := errors.New("forced capability record failure")
+			if tc != "exit" {
+				orig := recordExecutionCapability
+				recordExecutionCapability = func(context.Context, *sessions.Store, enforce.Resolution, []string, tui.NoticeRenderer) error {
+					s.swap(t)
+					return forced
+				}
+				t.Cleanup(func() { recordExecutionCapability = orig })
+			}
+			ran := false
+			defer swapRunApp(func(*tui.App) error {
+				ran = true
+				s.swap(t)
+				return nil
+			})()
+
+			err := StartTUI(context.Background(), &BootstrapResult{Home: t.TempDir(), LaunchDir: "/launch", Session: mkStore(t)}, io.Discard)
+			if tc == "exit" && (err != nil || !ran) || tc != "exit" && (!errors.Is(err, forced) || ran) {
+				t.Fatalf("StartTUI error = %v, ran = %v", err, ran)
+			}
+			s.requireHeld(t, []string{created}, nil)
+		})
+	}
+}
+
+func TestStartTUI_AFailedCreationRollbackIsRetriedAtExit(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	f := failCreationRollback(t)
+	resolution := injectedResolution
+	resolution.SelfTestPassed = true
+	swapResolveExecutionCapability(t, resolution)
+	ran := false
+	defer swapRunApp(func(*tui.App) error { ran = true; return nil })()
+
+	err := StartTUI(context.Background(), &BootstrapResult{Home: t.TempDir(), LaunchDir: "/launch", Session: mkStore(t)}, io.Discard)
+	f.requireCreationAndRollbackErrors(t, err)
+	if ran {
+		t.Fatal("the TUI ran after the temp folder creation failed")
+	}
+	f.requireRetriedAndReleased(t)
 }
 
 func TestStartTUI_SwitchesReuseTheLaunchCapabilityAndCleanUpEveryFolder(t *testing.T) {
@@ -5989,8 +6110,8 @@ func TestStartTUI_CompactPreparedButNeverDeliveredIsDiscardedOnExit(t *testing.T
 	var childPath atomic.Value
 	latched := make(chan struct{})
 	orig := recordExecutionCapability
-	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
-		err := orig(ctx, store, resolution, notices)
+	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
+		err := orig(ctx, store, resolution, withheld, notices)
 		if store != prior {
 			childPath.Store(store.Path())
 			appRef.Load().BeginShutdown()
@@ -6256,8 +6377,8 @@ func swapRecordedCapabilities(t *testing.T) <-chan enforce.Resolution {
 	t.Helper()
 	recorded := make(chan enforce.Resolution, 8)
 	orig := recordExecutionCapability
-	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
-		err := orig(ctx, store, resolution, notices)
+	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
+		err := orig(ctx, store, resolution, withheld, notices)
 		recorded <- resolution
 		return err
 	}
@@ -6292,6 +6413,11 @@ func waitForStatusLine(t *testing.T, app *tui.App, want string) {
 	}
 }
 
+func launchCapability(c events.ExecutionCapability) events.ExecutionCapability {
+	_, c.WithheldEnvironment = runner.InheritedEnvironment(os.Environ())
+	return c
+}
+
 func requireDiskCapabilities(t *testing.T, store *sessions.Store, want ...events.ExecutionCapability) {
 	t.Helper()
 	caps := decodeDiskEvents[events.ExecutionCapability](t, readSessionFile(t, store.Path()), events.KindExecutionCapability)
@@ -6301,6 +6427,7 @@ func requireDiskCapabilities(t *testing.T, store *sessions.Store, want ...events
 }
 
 func TestStartTUI_BrokenSettingsFileRefusesAndRecordsUntilFixed(t *testing.T) {
+	t.Setenv("SENTINEL_API_TOKEN", "transition-sentinel")
 	swapResolveExecutionCapability(t, constrainedLaunch)
 	result, f := settingsFileLaunch(t)
 	recorded := swapRecordedCapabilities(t)
@@ -6320,7 +6447,7 @@ func TestStartTUI_BrokenSettingsFileRefusesAndRecordsUntilFixed(t *testing.T) {
 		}
 		requireRecordedCapability(t, recorded, enforce.Refused)
 		waitForStatusLine(t, app, "sandbox: unavailable")
-		requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability)
+		requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability)
 
 		f.editGlobal(t, "a")
 		onEventLoop(t, app, func() { app.SubmitInput("/blocked") })
@@ -6331,7 +6458,7 @@ func TestStartTUI_BrokenSettingsFileRefusesAndRecordsUntilFixed(t *testing.T) {
 	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
 		t.Fatalf("StartTUI error: %v", err)
 	}
-	requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability, constrainedCapability)
+	requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability, constrainedCapability)
 }
 
 func TestStartTUI_RefusedLaunchKeepsItsReasonWhileTheSettingsFileIsBroken(t *testing.T) {
@@ -6380,7 +6507,7 @@ func TestStartTUI_SettingsFileBrokenBeforeTheFirstRecordStartsRefused(t *testing
 	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
 		t.Fatalf("StartTUI error: %v", err)
 	}
-	requireDiskCapabilities(t, result.Session, brokenCapability)
+	requireDiskCapabilities(t, result.Session, launchCapability(brokenCapability))
 }
 
 func TestStartTUI_SessionStaysOwnedUntilTheDeliveryWorkerRecords(t *testing.T) {
@@ -6394,12 +6521,12 @@ func TestStartTUI_SessionStaysOwnedUntilTheDeliveryWorkerRecords(t *testing.T) {
 			liveBlocked := captureLiveBlocked(t)
 			hold := newRecordHold(t)
 			orig := recordExecutionCapability
-			recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
+			recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
 				if resolution.Capability == enforce.Refused {
 					hold.block()
 					releasedBeforeWrite.Store(released.Load())
 				}
-				return orig(ctx, store, resolution, notices)
+				return orig(ctx, store, resolution, withheld, notices)
 			}
 			t.Cleanup(func() { recordExecutionCapability = orig })
 
@@ -6425,7 +6552,7 @@ func TestStartTUI_SessionStaysOwnedUntilTheDeliveryWorkerRecords(t *testing.T) {
 			if releasedBeforeWrite.Load() {
 				t.Fatal("the session lock was released before the delivery worker recorded the transition")
 			}
-			requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability)
+			requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability)
 			if !released.Load() {
 				t.Fatal("the session lock was not released after StartTUI returned")
 			}
@@ -6479,8 +6606,8 @@ func watchCapabilityRecords(t *testing.T, after func(store *sessions.Store)) <-c
 	t.Helper()
 	records := make(chan storedCapability, 32)
 	orig := recordExecutionCapability
-	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
-		err := orig(ctx, store, resolution, notices)
+	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
+		err := orig(ctx, store, resolution, withheld, notices)
 		records <- storedCapability{store: store, resolution: resolution}
 		after(store)
 		return err
@@ -6674,7 +6801,7 @@ func TestStartTUI_ClearSwitchRefreshesBeforeWaitingOnTheRecordingMutex(t *testin
 	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
 		t.Fatalf("StartTUI error: %v", err)
 	}
-	requireDiskCapabilities(t, result.Session, constrainedCapability, brokenCapability)
+	requireDiskCapabilities(t, result.Session, launchCapability(constrainedCapability), brokenCapability)
 	requireDiskCapabilities(t, fresh, constrainedCapability, constrainedCapability)
 }
 

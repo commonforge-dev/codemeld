@@ -45,11 +45,21 @@ func TestBlockedPathsFromLayers(t *testing.T) {
 	home := t.TempDir()
 	outside := t.TempDir()
 	globalPath := SettingsPath(home)
-	projectPath := projectSettingsPath(t.TempDir())
+	localOutside := t.TempDir()
+	projectRoot := t.TempDir()
+	projectPath := projectSettingsPath(projectRoot)
+	localPath := config.LocalSettingsPath(projectRoot)
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(localPath, []byte(blockedYAML(localOutside)), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 	layers := func(projectIgnored bool) []securitystate.LayerSnapshot {
 		return []securitystate.LayerSnapshot{
 			{Kind: securitystate.LayerGlobal, Path: globalPath, Present: true, Raw: map[string]any{"blocked_paths": []any{"~/.ssh"}}},
 			{Kind: securitystate.LayerProject, Path: projectPath, Present: true, Ignored: projectIgnored, Raw: map[string]any{"blocked_paths": []any{outside}}},
+			{Kind: securitystate.LayerLocal, Path: localPath, Present: true, Ignored: projectIgnored, Raw: map[string]any{"blocked_paths": []any{localOutside}}},
 		}
 	}
 
@@ -61,6 +71,7 @@ func TestBlockedPathsFromLayers(t *testing.T) {
 		for target, source := range map[string]string{
 			filepath.Join(home, ".ssh", "id_rsa"): globalPath,
 			filepath.Join(outside, "file"):        projectPath,
+			filepath.Join(localOutside, "file"):   localPath,
 		} {
 			if entry, ok := blocked.Blocking(target); !ok || entry.Source != source {
 				t.Fatalf("Blocking(%q) = %+v, %v; want an entry from %q", target, entry, ok, source)
@@ -68,13 +79,18 @@ func TestBlockedPathsFromLayers(t *testing.T) {
 		}
 	})
 
-	t.Run("ignored project layer", func(t *testing.T) {
+	t.Run("ignored project and local layers", func(t *testing.T) {
 		blocked, err := blockedPathsFromLayers(home, "", layers(true))
 		if err != nil {
 			t.Fatalf("blockedPathsFromLayers: %v", err)
 		}
-		if entry, ok := blocked.Blocking(filepath.Join(outside, "file")); ok {
-			t.Fatalf("Blocking = %+v, want the ignored project layer to contribute nothing", entry)
+		for _, target := range []string{filepath.Join(outside, "file"), filepath.Join(localOutside, "file")} {
+			if entry, ok := blocked.Blocking(target); ok {
+				t.Fatalf("Blocking(%q) = %+v, want the ignored layers to contribute nothing", target, entry)
+			}
+		}
+		if entry, ok := blocked.Blocking(filepath.Join(home, ".ssh", "id_rsa")); !ok || entry.Source != globalPath {
+			t.Fatalf("Blocking(~/.ssh/id_rsa) = %+v, %v; want the global entry still in force", entry, ok)
 		}
 	})
 

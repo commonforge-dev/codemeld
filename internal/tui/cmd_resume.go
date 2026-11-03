@@ -459,30 +459,45 @@ func runResumeSwitch(cmdCtx CommandContext, deps ResumeDeps, prior *sessions.Sto
 		deps.Transcript.ResetTranscript()
 		deps.Transcript.ReplaySessionRecords(target.Records())
 	}
+	notice := sessions.SkippedEventsNotice(target.SessionID(), sessions.SkippedEventKinds(target.Records()))
+	withNotice := func(err error) error {
+		if err == nil || notice == "" {
+			return err
+		}
+		return fmt.Errorf("%w; %s", err, notice)
+	}
 
 	// Refresh updated_at after the launch anchor and before model recovery.
 	if rerr := deps.Refresh.Refresh(ctx, target); rerr != nil {
-		return "", rerr
+		return "", withNotice(rerr)
 	}
 
 	// (step 1) Recover the model selection from the loaded record stream after
 	// the updated_at refresh and before replaying agent instructions.
 	if merr := deps.Model.Recover(target); merr != nil {
-		return "", merr
+		return "", withNotice(merr)
 	}
 
 	// (7c) Replay the in-memory AGENTS.md load record into the loaded session
 	// as fresh agent_instructions_loaded events, after the launch anchor.
 	if aerr := deps.Agents.Replay(target); aerr != nil {
-		return "", aerr
+		return "", withNotice(aerr)
 	}
 
 	// Flush the replayed agent-instruction (and any model-recovery)
 	// records so they are durable before control returns to the TUI. The switch has
 	// committed, so an atomic-write failure here is a per-turn failure routed through
 	// the sink; a non-write failure surfaces.
-	_, ferr := deps.flushStore(ctx, target)
-	return warning, ferr
+	if _, ferr := deps.flushStore(ctx, target); ferr != nil {
+		return "", withNotice(ferr)
+	}
+	if notice != "" {
+		if warning != "" {
+			warning += "; "
+		}
+		warning += notice
+	}
+	return warning, nil
 }
 
 // resumeEnumerateNotice renders the step-3 enumeration-failure line

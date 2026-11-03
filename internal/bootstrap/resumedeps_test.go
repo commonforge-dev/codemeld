@@ -1366,8 +1366,8 @@ func TestResumeSwitch_ReplacesThePrivateTempFolder(t *testing.T) {
 			t.Fatalf("Activate error = %v, want the switch to stand", err)
 		}
 		assertTempDirReplaced(t, conf, old)
-		if !slices.Equal(conf.retryPaths, []string{old}) {
-			t.Fatalf("retry = %v, want [%s]", conf.retryPaths, old)
+		if retry := retainedTempDirs(conf); !slices.Equal(retry, []string{old}) {
+			t.Fatalf("retry = %v, want [%s]", retry, old)
 		}
 		if !strings.HasPrefix(warning, "can't remove private temp folder "+old+": ") {
 			t.Fatalf("warning = %q, want the cleanup notice for %s", warning, old)
@@ -1385,7 +1385,43 @@ func TestResumeSwitch_ReplacesThePrivateTempFolder(t *testing.T) {
 	})
 }
 
+func TestResumeSwitch_AnAncestorSwapCannotRedirectCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorder enforce.Resolution
+	}{
+		{"replacement commit", injectedResolution},
+		{"creation rollback", enforce.Resolution{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf, s := ancestorSwapTempDir(t)
+			old := conf.tmpDir
+			var replacement string
+			setHook(t, &beforeSessionTempDirChmod, func(created string) { replacement = created })
+			app, prior, target := resumeStores(t)
+			sw := &resumeSwitch{app: app, ctx: context.Background(), recorder: fixedRecorder(tc.recorder), holder: &resumeLockHolder{}, conf: conf}
+			if err := sw.Switch(target, prior); err != nil {
+				t.Fatalf("Switch: %v", err)
+			}
+			_, err := sw.Activate(target)
+			if tc.name == "replacement commit" {
+				if err != nil || conf.tmpDir != replacement {
+					t.Fatalf("Activate error = %v, tmpDir %q; want the switch to %q", err, conf.tmpDir, replacement)
+				}
+				s.requireHeld(t, []string{old}, []string{replacement})
+				return
+			}
+			sw.Abort()
+			if err == nil || conf.tmpDir != old || len(retainedTempDirs(conf)) != 0 {
+				t.Fatalf("Activate error = %v, tmpDir %q, retained %v; want a failure keeping %q", err, conf.tmpDir, retainedTempDirs(conf), old)
+			}
+			s.requireHeld(t, []string{replacement}, []string{old})
+		})
+	}
+}
+
 func TestResume_RecordsTheLiveCapabilityAfterASettingsChange(t *testing.T) {
+	t.Setenv("SENTINEL_API_TOKEN", "resume-sentinel")
 	for _, tc := range liveCapabilityCases {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder, f := liveSettingsRecorder(t, tc.launch)

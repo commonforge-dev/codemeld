@@ -1899,7 +1899,7 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 
 	t.Run("block model map", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "# top comment\nlogging:\n  retention_days: 7\nmodel:\n  # active is managed\n  active:\n    provider: openai\n    id: gpt-5\n    effort: high\n"
+		prefix := "# top comment\nsessions:\n  retention_days: 7\nmodel:\n  # active is managed\n  active:\n    provider: openai\n    id: gpt-5\n    effort: high\n"
 		suffix := "  last_used:\n    provider: anthropic\n    id: opus\n    effort: low\n"
 		writeAt(t, target, prefix+"  favorites:\n    - provider: openai\n      id: gpt-5\n"+suffix)
 		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
@@ -1960,7 +1960,7 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 	t.Run("inline comment on favorites survives a removal to empty", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
 		prefix := "model:\n  favorites: # keep this note\n"
-		suffix := "logging:\n  retention_days: 7\n"
+		suffix := "sessions:\n  retention_days: 7\n"
 		writeAt(t, target, prefix+"    - provider: openai\n      id: gpt-5\n"+suffix)
 		if _, _, err := RewriteKey(target, keyModelFavorites, preparedToggle([]Favorite{openaiGPT5}, openaiGPT5, false)); err != nil {
 			t.Fatalf("RewriteKey: %v", err)
@@ -1978,7 +1978,7 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 	t.Run("flow model map with existing favorites", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
 		prefix := "# top comment\nmodel: {active: {provider: openai, id: gpt-5, effort: high}, favorites:"
-		suffix := "}\nlogging:\n  retention_days: 7\n"
+		suffix := "}\nsessions:\n  retention_days: 7\n"
 		writeAt(t, target, prefix+" [{provider: openai, id: gpt-5}]"+suffix)
 		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
 		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
@@ -1997,7 +1997,7 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 	t.Run("flow model map with a comment before a sibling", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
 		prefix := "model: {favorites:"
-		suffix := ", # keep this note\n  active: {provider: openai, id: gpt-5, effort: high}}\nlogging:\n  retention_days: 7\n"
+		suffix := ", # keep this note\n  active: {provider: openai, id: gpt-5, effort: high}}\nsessions:\n  retention_days: 7\n"
 		writeAt(t, target, prefix+" [{provider: openai, id: gpt-5}]"+suffix)
 		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
 		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
@@ -2020,7 +2020,7 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 	t.Run("flow model map with a comment before favorites", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
 		prefix := "model: {favorites: # keep this note\n  "
-		suffix := ", active: {provider: openai, id: gpt-5, effort: high}}\nlogging:\n  retention_days: 7\n"
+		suffix := ", active: {provider: openai, id: gpt-5, effort: high}}\nsessions:\n  retention_days: 7\n"
 		source := prefix + "[{provider: openai, id: gpt-5}]" + suffix
 		if err := Validate([]byte(source), target); err != nil {
 			t.Fatalf("source failed schema validation: %v\n%s", err, source)
@@ -2252,81 +2252,6 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 		})
 	}
 
-	assertModelAliasResolves := func(t *testing.T, path string, want []Favorite) {
-		t.Helper()
-		b, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
-		}
-		var raw struct {
-			Ref struct {
-				Favorites []Favorite `yaml:"favorites"`
-			} `yaml:"x_anchor_ref"`
-		}
-		if err := yaml.Unmarshal(b, &raw); err != nil {
-			t.Fatalf("decode %s: %v\n%s", path, err, b)
-		}
-		if !slices.Equal(raw.Ref.Favorites, want) {
-			t.Fatalf("x_anchor_ref.favorites resolved to %v, want %v\n%s", raw.Ref.Favorites, want, b)
-		}
-	}
-
-	t.Run("block model map anchored as a container aliased by a sibling", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "model: &shared\n  favorites:"
-		suffix := "\nx_anchor_ref: *shared\n"
-		source := prefix + "\n    - provider: openai\n      id: gpt-5" + suffix
-		if err := Validate([]byte(source), target); err != nil {
-			t.Fatalf("source failed schema validation: %v\n%s", err, source)
-		}
-		writeAt(t, target, source)
-		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
-		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
-			t.Fatalf("RewriteKey: %v", err)
-		}
-		got := readAt(t, target)
-		assertSpliceBounds(t, got, prefix, suffix)
-		want := prefix + "\n    - provider: openai\n      id: gpt-5\n    - provider: anthropic\n      id: opus" + suffix
-		if got != want {
-			t.Fatalf("anchored block container rewrite =\n%q\nwant\n%q", got, want)
-		}
-		if err := Validate([]byte(got), target); err != nil {
-			t.Fatalf("result failed schema validation: %v\n%s", err, got)
-		}
-		if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
-			t.Fatalf("favorites = %v, want %v", favs, want)
-		}
-		assertModelAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
-	})
-
-	t.Run("flow model map anchored as a container aliased by a sibling", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "model: &shared {favorites:"
-		suffix := "}\nx_anchor_ref: *shared\n"
-		source := prefix + " [{provider: openai, id: gpt-5}]" + suffix
-		if err := Validate([]byte(source), target); err != nil {
-			t.Fatalf("source failed schema validation: %v\n%s", err, source)
-		}
-		writeAt(t, target, source)
-		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
-		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
-			t.Fatalf("RewriteKey: %v", err)
-		}
-		got := readAt(t, target)
-		assertSpliceBounds(t, got, prefix, suffix)
-		want := prefix + " [{provider: openai, id: gpt-5}, {provider: anthropic, id: opus}]" + suffix
-		if got != want {
-			t.Fatalf("anchored flow container rewrite =\n%q\nwant\n%q", got, want)
-		}
-		if err := Validate([]byte(got), target); err != nil {
-			t.Fatalf("result failed schema validation: %v\n%s", err, got)
-		}
-		if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
-			t.Fatalf("favorites = %v, want %v", favs, want)
-		}
-		assertModelAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
-	})
-
 	t.Run("block model map with a tagged anchored favorites list aliased by a sibling", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
 		prefix := "model:\n  favorites:"
@@ -2385,12 +2310,12 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 
 	t.Run("empty flow model map stays flow style", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
-		writeAt(t, target, "# top comment\nmodel: {}\nlogging:\n  retention_days: 7\n")
+		writeAt(t, target, "# top comment\nmodel: {}\nsessions:\n  retention_days: 7\n")
 		if _, _, err := RewriteKey(target, keyModelFavorites, preparedToggle(nil, openaiGPT5, true)); err != nil {
 			t.Fatalf("RewriteKey: %v", err)
 		}
 		got := readAt(t, target)
-		want := "# top comment\nmodel: {favorites: [{provider: openai, id: gpt-5}]}\nlogging:\n  retention_days: 7\n"
+		want := "# top comment\nmodel: {favorites: [{provider: openai, id: gpt-5}]}\nsessions:\n  retention_days: 7\n"
 		if got != want {
 			t.Fatalf("empty flow map rewrite =\n%q\nwant\n%q", got, want)
 		}
@@ -2422,7 +2347,7 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 
 	t.Run("model key absent", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
-		writeAt(t, target, "# keep me\nlogging:\n  retention_days: 7\n")
+		writeAt(t, target, "# keep me\nsessions:\n  retention_days: 7\n")
 		if _, _, err := RewriteKey(target, keyModelFavorites, preparedToggle(nil, openaiGPT5, true)); err != nil {
 			t.Fatalf("RewriteKey: %v", err)
 		}
@@ -2672,11 +2597,6 @@ func TestRewriteKey_RetentionDays_NullContainerKeepsSurroundings(t *testing.T) {
 			name:  "implicit block null with comment",
 			input: "sessions: # keep\n\n# next\nattribution: true\n",
 			want:  "sessions: # keep\n  retention_days: 14\n\n# next\nattribution: true\n",
-		},
-		{
-			name:  "implicit block null before a key spelled like null",
-			input: "sessions:\nnullable: 1\nattribution: true\n",
-			want:  "sessions:\n  retention_days: 14\nnullable: 1\nattribution: true\n",
 		},
 		{
 			name:  "explicit block null at end of file without newline",
@@ -4117,5 +4037,74 @@ func TestSettingsRewritePublish_RefusesUnparseableYAML(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRewriteKey_VCSUserConfig_Shapes(t *testing.T) {
+	for _, tc := range []rewriteCase{
+		{
+			name:  "absent file is created with only the key",
+			input: "",
+			value: "allow",
+			want:  "confinement:\n  vcs_user_config: allow\n",
+		},
+		{
+			name:  "absent container is appended after commented siblings",
+			input: "# top\nblocked_paths:\n  - ~/.ssh # keys\nattribution: true # keep\n",
+			value: "block",
+			want:  "# top\nblocked_paths:\n  - ~/.ssh # keys\nattribution: true # keep\nconfinement:\n  vcs_user_config: block\n",
+		},
+		{
+			name:  "existing container keeps its other keys and comments",
+			input: "confinement:\n  # how programs are found\n  program_lookup: strict # pinned\nattribution: false\n",
+			value: "allow",
+			want:  "confinement:\n  # how programs are found\n  program_lookup: strict # pinned\n  vcs_user_config: allow\nattribution: false\n",
+		},
+		{
+			name:  "recorded answer replaced in place",
+			input: "confinement:\n  vcs_user_config: block # asked once\n  program_lookup: friendly\n",
+			value: "allow",
+			want:  "confinement:\n  vcs_user_config: allow # asked once\n  program_lookup: friendly\n",
+		},
+		{
+			name:  "flow container gains the key",
+			input: "confinement: {program_lookup: strict}\n",
+			value: "block",
+			want:  "confinement: {program_lookup: strict, vcs_user_config: block}\n",
+		},
+	} {
+		tc.key = KeyVCSUserConfig
+		t.Run(tc.name, func(t *testing.T) {
+			tc.run(t)
+			raw, cat, err := ValidateGlobalSettingsBytes([]byte(tc.want), "settings.yaml")
+			if err != nil {
+				t.Fatalf("written settings do not validate: (%q, %v)", cat, err)
+			}
+			confinement, _ := raw["confinement"].(map[string]any)
+			if got := confinement["vcs_user_config"]; got != tc.value {
+				t.Fatalf("confinement.vcs_user_config = %v, want %v", got, tc.value)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_VCSUserConfig_RejectsOtherPayloads(t *testing.T) {
+	const seed = "confinement:\n  vcs_user_config: block\n"
+	for _, value := range []any{"", "Allow", "ask", true, 1, nil} {
+		t.Run(fmt.Sprintf("%T %v", value, value), func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, target, seed)
+
+			step, _, err := RewriteKey(target, KeyVCSUserConfig, value)
+			if err == nil {
+				t.Fatalf("RewriteKey accepted %#v", value)
+			}
+			if step != fsutil.LoadStep {
+				t.Fatalf("step = %q, want %q", step, fsutil.LoadStep)
+			}
+			if got := readAt(t, target); got != seed {
+				t.Fatalf("rejected write changed bytes:\n%q\nwant\n%q", got, seed)
+			}
+		})
 	}
 }

@@ -195,12 +195,56 @@ func withReadRoots(p Policy, roots ...string) Policy {
 }
 
 func TestLandlockRules(t *testing.T) {
+	const planTmp = "/tmp/codemeld-confine-7-1"
+	held := heldTmp{fdPath: "/proc/self/fd/7", name: planTmp}
+	planWithTmp := func(name string, blocked ...string) Policy {
+		p := planPolicy(blocked...)
+		p.TmpDir, p.TmpDirDev, p.TmpDirIno = name, 66, 4242
+		return p
+	}
 	cases := []struct {
 		name   string
 		extra  []string
 		policy Policy
+		held   heldTmp
 		want   []string
 	}{
+		{
+			name:   "plan private temp folder through its held handle",
+			extra:  []string{planTmp + "/", "/proc/self/fd/7/"},
+			policy: planWithTmp(planTmp),
+			held:   held,
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/proc:R", "/tmp:R", "/dev/null:N", "/proc/self/fd/7:RW"},
+		},
+		{
+			name: "plan blocked path inside the private temp folder",
+			extra: []string{planTmp + "/keep/", planTmp + "/secret", planTmp + "/alias -> /home/v",
+				"/proc/self/fd/7/keep/", "/proc/self/fd/7/secret", "/proc/self/fd/7/alias -> /home/v"},
+			policy: planWithTmp(planTmp, planTmp+"/secret"),
+			held:   held,
+			want: []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/proc:R",
+				"/tmp:D", planTmp + ":D", planTmp + "/keep:R", "/dev/null:N", "/proc/self/fd/7/keep:RW"},
+		},
+		{
+			name:   "plan private temp folder strictly beneath /dev/shm",
+			extra:  []string{"/dev/shm/t/codemeld-confine-7-1/", "/proc/self/fd/7/"},
+			policy: planWithTmp("/dev/shm/t/codemeld-confine-7-1"),
+			held:   heldTmp{fdPath: "/proc/self/fd/7", name: "/dev/shm/t/codemeld-confine-7-1"},
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/proc:R", "/tmp:R", "/dev/null:N", "/proc/self/fd/7:RW"},
+		},
+		{
+			name:   "plan temp folder handle naming /dev/shm itself",
+			extra:  []string{"/proc/self/fd/7/"},
+			policy: planWithTmp("/dev/shm"),
+			held:   heldTmp{fdPath: "/proc/self/fd/7", name: "/dev/shm"},
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/proc:R", "/tmp:R", "/dev/null:N"},
+		},
+		{
+			name:   "plan temp folder whose identity check failed",
+			extra:  []string{planTmp + "/"},
+			policy: planWithTmp(planTmp),
+			want:   []string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N"},
+		},
 		{
 			name:   "blocked folder with every ancestor read-dir only",
 			policy: planPolicy(),
@@ -412,7 +456,7 @@ func TestLandlockRules(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rules, err := landlockRules(c.policy, newFakeFS(append(append([]string{}, baseTree...), c.extra...)...))
+			rules, err := landlockRules(c.policy, newFakeFS(append(append([]string{}, baseTree...), c.extra...)...), c.held)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -427,9 +471,39 @@ func TestLandlockRules(t *testing.T) {
 				if r.Path == "/dev/null" {
 					allowed |= wantN
 				}
+				if c.held.fdPath != "" && within(r.Path, c.held.fdPath) {
+					allowed |= wantW
+				}
 				if c.policy.Mode == ModePlan && r.Access&^allowed != 0 {
 					t.Errorf("plan rule %s carries %v", r.Path, r.Access)
 				}
+			}
+		})
+	}
+}
+
+func TestLandlockRulesPrivateTempFolderBeneathDevShm(t *testing.T) {
+	const private = "/dev/shm/t/codemeld-confine-7-1"
+	tree := append(append([]string{}, baseTree...), private+"/", "/dev/shm/t/other", "/dev/shm/t/alias -> /home/v/out",
+		"/home/v/out/codemeld-confine-7-1/")
+	for _, c := range []struct {
+		name  string
+		roots []string
+		want  []string
+	}{
+		{"/dev/shm as a write root", []string{"/dev/shm"},
+			[]string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:N", private + ":RW"}},
+		{"write root above /dev/shm", []string{"/dev"},
+			[]string{"/:D", "/dev:R", "/etc:R", "/home:D", "/home/u:D", "/home/u/notes:Rf", "/home/v:R", "/tmp:R", "/dev/null:RWf", private + ":RW"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			policy := Policy{Mode: ModeAutoEdits, BlockedPaths: []string{floor}, WriteRoots: c.roots, TmpDir: private}
+			rules, err := landlockRules(policy, newFakeFS(tree...), heldTmp{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := ruleLabels(rules); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("rules\n got %q\nwant %q", got, c.want)
 			}
 		})
 	}
@@ -504,11 +578,11 @@ func TestLandlockRulesOuterWriteRoot(t *testing.T) {
 			blocked := append([]string{floor}, c.blocked...)
 			declared := Policy{Mode: ModeAutoEdits, BlockedPaths: blocked, NoWritePaths: c.noWrite, TmpDir: "/s/private", WriteRoots: []string{c.root}}
 			asTmp := Policy{Mode: ModeAutoEdits, BlockedPaths: blocked, NoWritePaths: c.noWrite, TmpDir: c.root, WriteRoots: []string{"/s/private"}}
-			got, err := landlockRules(declared, newFakeFS(append(tree, c.extra...)...))
+			got, err := landlockRules(declared, newFakeFS(append(tree, c.extra...)...), heldTmp{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			want, err := landlockRules(asTmp, newFakeFS(append(tree, c.extra...)...))
+			want, err := landlockRules(asTmp, newFakeFS(append(tree, c.extra...)...), heldTmp{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -621,7 +695,7 @@ func TestLandlockRulesCarveMissingNoWriteDestinations(t *testing.T) {
 				}
 				p := Policy{Mode: ModeAutoEdits, BlockedPaths: []string{floor}, WriteRoots: roots,
 					NoWritePaths: []string{filepath.Join(root, c.noWrite)}, TmpDir: filepath.Join(root, "session")}
-				rules, err := landlockRules(p, view)
+				rules, err := landlockRules(p, view, heldTmp{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -647,7 +721,7 @@ func TestLandlockRulesReturnsNonMissingErrors(t *testing.T) {
 	for _, key := range []string{"readdir /home", "eval /home/u/link", "stat /home/u/real", "eval /tmp"} {
 		f := newFakeFS(append(append([]string{}, baseTree...), "/home/u/link -> /home/u/real", "/home/u/real/")...)
 		f.fail[key] = &fs.PathError{Op: "x", Path: key, Err: syscall.EACCES}
-		if _, err := landlockRules(autoPolicy(nil, nil), f); !errors.Is(err, syscall.EACCES) {
+		if _, err := landlockRules(autoPolicy(nil, nil), f, heldTmp{}); !errors.Is(err, syscall.EACCES) {
 			t.Errorf("%s: err = %v, want EACCES", key, err)
 		}
 	}
@@ -690,7 +764,7 @@ func TestApplyLandlockReportsProbeError(t *testing.T) {
 
 func TestLandlockRulesCarveResolvedBlockedPaths(t *testing.T) {
 	f := newFakeFS("/dev/null", "/home/link -> /home/real", "/home/real/u/.codemeld/", "/home/real/u/notes", "/home/other/")
-	rules, err := landlockRules(Policy{Mode: ModePlan, BlockedPaths: []string{"/home/link/u/.codemeld"}}, f)
+	rules, err := landlockRules(Policy{Mode: ModePlan, BlockedPaths: []string{"/home/link/u/.codemeld"}}, f, heldTmp{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,7 +779,7 @@ func TestLandlockRulesCarveResolvedBlockedPaths(t *testing.T) {
 		t.Errorf("rules %v lost the readable sibling", ruleLabels(rules))
 	}
 	loop := newFakeFS("/home/a -> /home/b", "/home/b -> /home/a")
-	if _, err := landlockRules(Policy{Mode: ModePlan, BlockedPaths: []string{"/home/a/x"}}, loop); !errors.Is(err, syscall.ELOOP) {
+	if _, err := landlockRules(Policy{Mode: ModePlan, BlockedPaths: []string{"/home/a/x"}}, loop, heldTmp{}); !errors.Is(err, syscall.ELOOP) {
 		t.Errorf("symlink loop: err = %v, want ELOOP", err)
 	}
 }

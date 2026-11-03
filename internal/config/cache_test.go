@@ -28,7 +28,7 @@ func fullComposed() map[string]any {
 		"agent":              map[string]any{"max_concurrency": 7},
 		"agent_instructions": map[string]any{"max_file_bytes": 4096},
 		"sessions":           map[string]any{"retention_days": 90, "max_tool_output_bytes": 2048},
-		"vcs":                map[string]any{"priority": []any{"hg", "git", "jj"}, "preferred": "hg"},
+		"vcs":                map[string]any{"priority": []any{"hg", "git", "jj"}, "force": "hg"},
 		"mode":               map[string]any{"default": "plan"},
 		"attribution":        false,
 		"provider": map[string]any{
@@ -101,8 +101,8 @@ func TestCacheAccessors(t *testing.T) {
 	if got := c.VCSPriority(); !reflect.DeepEqual(got, []string{"hg", "git", "jj"}) {
 		t.Errorf("VCSPriority() = %v, want [hg git jj]", got)
 	}
-	if got := c.VCSPreferred(); got != "hg" {
-		t.Errorf("VCSPreferred() = %q, want hg", got)
+	if got := c.VCSForce(); got != "hg" {
+		t.Errorf("VCSForce() = %q, want hg", got)
 	}
 	if mode, configured := c.ModeDefault(); mode != "plan" || !configured {
 		t.Errorf("ModeDefault() = (%q, %v), want (plan, true)", mode, configured)
@@ -183,8 +183,8 @@ func TestCacheDefaults(t *testing.T) {
 	if got := c.VCSPriority(); !reflect.DeepEqual(got, []string{"git", "hg", "jj"}) {
 		t.Errorf("VCSPriority() default = %v, want [git hg jj]", got)
 	}
-	if got := c.VCSPreferred(); got != "" {
-		t.Errorf("VCSPreferred() default = %q, want empty", got)
+	if got := c.VCSForce(); got != "" {
+		t.Errorf("VCSForce() default = %q, want empty", got)
 	}
 	if mode, configured := c.ModeDefault(); mode != "build" || configured {
 		t.Errorf("ModeDefault() default = (%q, %v), want (build, false)", mode, configured)
@@ -465,7 +465,7 @@ func TestCacheExternalEditsInvisible(t *testing.T) {
 
 	composed["agent"].(map[string]any)["max_concurrency"] = 99
 	composed["vcs"].(map[string]any)["priority"] = []any{"jj"}
-	composed["vcs"].(map[string]any)["preferred"] = "git"
+	composed["vcs"].(map[string]any)["force"] = "git"
 	composed["model"].(map[string]any)["active"].(map[string]any)["model"] = "tampered"
 	composed["provider"].(map[string]any)["openai"].(map[string]any)["api_key"] = "leaked"
 	composed["web_research"].(map[string]any)["enabled"] = false
@@ -482,8 +482,8 @@ func TestCacheExternalEditsInvisible(t *testing.T) {
 	if got := c.VCSPriority(); !reflect.DeepEqual(got, []string{"hg", "git", "jj"}) {
 		t.Errorf("VCSPriority() = %v (source edit leaked)", got)
 	}
-	if got := c.VCSPreferred(); got != "hg" {
-		t.Errorf("VCSPreferred() = %q (source edit leaked)", got)
+	if got := c.VCSForce(); got != "hg" {
+		t.Errorf("VCSForce() = %q (source edit leaked)", got)
 	}
 	if openai, _ := c.Provider("openai"); openai.APIKey != "sk-test" {
 		t.Errorf("Provider(openai).APIKey = %q (source edit leaked)", openai.APIKey)
@@ -1577,7 +1577,7 @@ func TestCacheSetRetentionDays_WritesGlobalLayerAndPublishesToSession(t *testing
 	project := filepath.Join(dir, "project-settings.yaml")
 	local := filepath.Join(dir, "local-settings.yaml")
 	writeAt(t, project, "attribution: false\n")
-	writeAt(t, local, "vcs:\n  preferred: hg\n")
+	writeAt(t, local, "vcs:\n  force: hg\n")
 
 	c := newCacheOrFatal(t, map[string]any{}, "/r", []string{global, project, local})
 
@@ -1593,7 +1593,7 @@ func TestCacheSetRetentionDays_WritesGlobalLayerAndPublishesToSession(t *testing
 	if got := readAt(t, project); got != "attribution: false\n" {
 		t.Errorf("project layer changed by a global-only write: %q", got)
 	}
-	if got := readAt(t, local); got != "vcs:\n  preferred: hg\n" {
+	if got := readAt(t, local); got != "vcs:\n  force: hg\n" {
 		t.Errorf("local layer changed by a global-only write: %q", got)
 	}
 }

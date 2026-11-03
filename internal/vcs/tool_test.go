@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"codemeld.dev/codemeld/internal/ids"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/tools"
+	"codemeld.dev/codemeld/internal/vcs/builtin"
 )
 
 func gitTemplate() *Template {
@@ -1455,5 +1457,440 @@ func TestActionTool_ProtectedStateRiskJJTerminal(t *testing.T) {
 	}
 	if !terminalRisk(t, "jj", "restore-file", root, map[string]any{"path": "secrets/k"}, fixedProtected(secrets)) {
 		t.Fatal("restore of a file inside a protected folder was allowed while the working copy holds a change under it")
+	}
+}
+
+func loadTemplateText(t *testing.T, name, content string) *Template {
+	t.Helper()
+	loaded, err := loadOne(t, name+".yaml", content)
+	if err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+	tmpl, ok := loaded[name]
+	if !ok {
+		t.Fatalf("template %s not loaded", name)
+	}
+	return tmpl
+}
+
+func builtinText(t *testing.T, name string) string {
+	t.Helper()
+	b, ok := builtin.BuiltinTemplate(name)
+	if !ok {
+		t.Fatalf("no embedded %s template", name)
+	}
+	return string(b)
+}
+
+func referenceCopy(t *testing.T, name string) *Template {
+	t.Helper()
+	tmpl := loadTemplateText(t, name, builtinText(t, name))
+	if !tmpl.BuiltinReferenceCopy {
+		t.Fatalf("%s copy of the embedded bytes is not a reference copy", name)
+	}
+	return tmpl
+}
+
+func customizedCommit(t *testing.T, name string) *Template {
+	t.Helper()
+	text := builtinText(t, name)
+	edited := strings.Replace(text, `"{message}"]`, `"{message}", --amend]`, 1)
+	if edited == text {
+		t.Fatalf("%s template has no commit message placeholder to customize", name)
+	}
+	tmpl := loadTemplateText(t, name, edited)
+	if tmpl.BuiltinReferenceCopy {
+		t.Fatalf("customized %s template still reads as a reference copy", name)
+	}
+	return tmpl
+}
+
+func routineWrites(reg *tools.Registry) map[string]bool {
+	got := map[string]bool{}
+	for _, tool := range reg.List() {
+		if tool.Advertise().RoutineVCSWrite {
+			got[tool.Name()] = true
+		}
+	}
+	return got
+}
+
+func TestActionTool_RoutineVCSWriteMarksOnlyProductWrites(t *testing.T) {
+	want := map[string]bool{
+		"vcs_add": true, "vcs_commit": true, "vcs_branch_create": true, "vcs_branch_switch": true,
+		"vcs_restore_file": true, "vcs_stash": true, "vcs_stash_pop": true,
+	}
+	for _, name := range []string{"git", "hg", "jj"} {
+		cases := []struct {
+			label   string
+			tmpl    *Template
+			trusted bool
+			want    map[string]bool
+		}{
+			{"built-in", mustLoadBuiltin(t, name), false, want},
+			{"global reference copy", referenceCopy(t, name), true, want},
+			{"project reference copy", referenceCopy(t, name), false, want},
+			{"global customized", customizedCommit(t, name), true, map[string]bool{}},
+			{"project customized", customizedCommit(t, name), false, map[string]bool{}},
+		}
+		for _, tc := range cases {
+			t.Run(name+" "+tc.label, func(t *testing.T) {
+				if got := routineWrites(registerActionsForTest(t, tc.tmpl, tc.trusted)); !maps.Equal(got, tc.want) {
+					t.Errorf("marked = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func newOperandRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	outside := t.TempDir()
+	for _, dir := range []string{"dir", "dir/sub"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{"file with space.txt", "dir/a.go", "secret.txt"} {
+		if err := os.WriteFile(filepath.Join(root, file), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outside, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{"out": outside, "dirlink": filepath.Join(root, "dir"), "rootlink": root} {
+		if err := os.Symlink(target, filepath.Join(root, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func registeredOperandTools(t *testing.T, root string, run cmdrunner.Runner) map[string]*tools.Registry {
+	t.Helper()
+	out := map[string]*tools.Registry{}
+	for _, name := range []string{"git", "hg", "jj"} {
+		for label, tmpl := range map[string]*Template{"built-in": mustLoadBuiltin(t, name), "reference copy": referenceCopy(t, name)} {
+			reg := tools.NewRegistry()
+			if err := RegisterActionsWithTrustedClasses(reg, tmpl, root, run, newCapture().appendEvent, 64); err != nil {
+				t.Fatalf("RegisterActions: %v", err)
+			}
+			out[name+" "+label] = reg
+		}
+	}
+	return out
+}
+
+type invocation struct {
+	err  error
+	argv []string
+}
+
+type operandRunner struct {
+	fakeRunner
+	tracked  map[string]string
+	branches []string
+	queries  int
+}
+
+func newOperandRunner(tracked map[string][]string) *operandRunner {
+	listed := map[string]string{}
+	for rel, files := range tracked {
+		out := strings.Join(files, "\n") + "\n"
+		listed[rel], listed[hgPath(rel)], listed[jjFileset(rel)] = out, out, out
+	}
+	return &operandRunner{fakeRunner: fakeRunner{id: ids.NewV7()}, tracked: listed}
+}
+
+func (r *operandRunner) Exec(ctx context.Context, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
+	if argv := spec.Argv; len(argv) > 2 && (argv[1] == "branches" || argv[1] == "bookmarks" || argv[1] == "bookmark" && argv[2] == "list") {
+		r.queries++
+		return cmdrunner.RunResult{InvocationID: spec.InvocationID, Stdout: []byte(strings.Join(r.branches, "\n") + "\n")}, nil
+	}
+	if n := len(spec.Argv); n > 1 && spec.Argv[n-2] == "--" {
+		r.queries++
+		return cmdrunner.RunResult{InvocationID: spec.InvocationID, Stdout: []byte(r.tracked[spec.Argv[n-1]])}, nil
+	}
+	return r.fakeRunner.Exec(ctx, spec)
+}
+
+func invokeBothWays(t *testing.T, reg *tools.Registry, run *operandRunner, action string, args map[string]any) []invocation {
+	t.Helper()
+	tool, ok := reg.Lookup(toolName(action))
+	if !ok {
+		t.Fatalf("%s not registered", toolName(action))
+	}
+	at := tool.(*ActionTool)
+	if at.ProtectedStateRisk(context.Background(), args, fixedProtected()) {
+		t.Fatalf("%s %v: ProtectedStateRisk with no protected candidates = true", toolName(action), args)
+	}
+	var out []invocation
+	run.gotSpec = cmdrunner.RunSpec{}
+	_, err := at.Invoke(context.Background(), args)
+	out = append(out, invocation{err, run.gotSpec.Argv})
+	run.gotSpec = cmdrunner.RunSpec{}
+	cwd, cwdErr := at.EffectiveCWD()
+	_, err = at.InvokeWithEffectiveCWD(context.Background(), args, cwd, cwdErr)
+	return append(out, invocation{err, run.gotSpec.Argv})
+}
+
+func TestActionTool_ProductWriteRefusesNonLiteralOperands(t *testing.T) {
+	root := newOperandRepo(t)
+	paths := []string{
+		"--all", "-I", "", "a\x00b", filepath.Join(root, "secret.txt"), "/etc/passwd",
+		"../x", "dir/../../x", "out/f", ".", "./", "dir/..", "dir", "dir/sub", "dirlink", "rootlink", "rootlink/dir",
+		"*.go", "dir/?.go", "[ab].go", "{a,b}", "glob:*.go", "path:secret.txt", "set:all()", "a|b", "a&b", "~a", "(a)", "it's",
+		"a\"b", "a\\b", "a\nb", "bad\x00/../secret.txt", "bad\n/../secret.txt", "gone", "gone/", "untracked.txt",
+	}
+	branches := []string{
+		"-f", "--force", "", "a\x00b", "a*", "a?", "[a]", "{a}", "x:y", "a|b", "a&b", "~a", "all()", "it's",
+		"@", "@-", "main@{1}", "HEAD^", "main~1", "$x", "rev(1)",
+	}
+	switches := map[string][]string{
+		"hg": {"null", "tip", ".", "0", "1a2b", "other"},
+		"jj": {"main+", "my branch", "abc", "other", "main-", "root"},
+	}
+	run := newOperandRunner(map[string][]string{"gone": {"gone/a.go", "gone/b.go"}})
+	run.branches = []string{"main", "main+", "my branch", "main-"}
+	for label, reg := range registeredOperandTools(t, root, run) {
+		for _, branch := range switches[strings.Fields(label)[0]] {
+			for _, inv := range invokeBothWays(t, reg, run, "branch-switch", map[string]any{"branch": branch}) {
+				if !errors.Is(inv.err, errOperand) {
+					t.Errorf("%s vcs_branch_switch branch %q: err = %v, want a refusal for a non-branch revision", label, branch, inv.err)
+				}
+			}
+		}
+		for _, action := range []string{"add", "restore-file"} {
+			for _, path := range paths {
+				run.queries = 0
+				for _, inv := range invokeBothWays(t, reg, run, action, map[string]any{"path": path}) {
+					if !errors.Is(inv.err, errOperand) {
+						t.Errorf("%s %s path %q: err = %v, want a literal-operand refusal", label, toolName(action), path, inv.err)
+					}
+				}
+				if absent := path == "gone" || path == "gone/" || path == "untracked.txt"; !absent && run.queries != 0 {
+					t.Errorf("%s %s path %q: %d tracked-file queries, want none", label, toolName(action), path, run.queries)
+				}
+			}
+		}
+		for _, action := range []string{"branch-create", "branch-switch"} {
+			for _, branch := range branches {
+				for _, inv := range invokeBothWays(t, reg, run, action, map[string]any{"branch": branch}) {
+					if !errors.Is(inv.err, errOperand) {
+						t.Errorf("%s %s branch %q: err = %v, want a literal-operand refusal", label, toolName(action), branch, inv.err)
+					}
+				}
+			}
+		}
+	}
+	if run.execCalls != 0 {
+		t.Fatalf("runner launched %d times for refused operands, last argv %v", run.execCalls, run.gotSpec.Argv)
+	}
+}
+
+func TestActionTool_RestoreFileRefusesADeletedDirectoryThroughTheRealBackend(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(t.TempDir(), "gitsystem"))
+	t.Setenv("GIT_AUTHOR_NAME", "codemeld")
+	t.Setenv("GIT_AUTHOR_EMAIL", "codemeld@example.test")
+	t.Setenv("GIT_COMMITTER_NAME", "codemeld")
+	t.Setenv("GIT_COMMITTER_EMAIL", "codemeld@example.test")
+	t.Setenv("HGRCPATH", filepath.Join(t.TempDir(), "hgrc"))
+	t.Setenv("HGUSER", "codemeld <codemeld@example.test>")
+	jjConfig := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(jjConfig, []byte("[user]\nname = \"codemeld\"\nemail = \"codemeld@example.test\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JJ_CONFIG", jjConfig)
+	for name, setup := range map[string][][]string{
+		"git": {{"git", "init", "-b", "main"}, {"git", "add", "."}, {"git", "commit", "-m", "base"}},
+		"hg":  {{"hg", "init"}, {"hg", "add"}, {"hg", "commit", "-m", "base"}},
+		"jj":  {{"jj", "git", "init"}, {"jj", "new"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			requireBinary(t, name)
+			requireBinary(t, "git")
+			root := t.TempDir()
+			for _, file := range []string{"gone/a.go", "gone/b.go", "single.txt"} {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(root, file)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, file), []byte("x\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, argv := range setup {
+				runIn(t, root, argv...)
+			}
+			tool := builtinAction(t, name, "restore-file", root, cmdrunner.DirectExecRunner{})
+			invoke := map[string]func(map[string]any) error{
+				"Invoke": func(args map[string]any) error { _, err := tool.Invoke(context.Background(), args); return err },
+				"InvokeWithEffectiveCWD": func(args map[string]any) error {
+					cwd, cwdErr := tool.EffectiveCWD()
+					_, err := tool.InvokeWithEffectiveCWD(context.Background(), args, cwd, cwdErr)
+					return err
+				},
+			}
+			for method, call := range invoke {
+				for _, path := range []string{filepath.Join(root, "gone"), filepath.Join(root, "single.txt")} {
+					if err := os.RemoveAll(path); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := call(map[string]any{"path": "gone"}); !errors.Is(err, errOperand) {
+					t.Fatalf("%s gone: err = %v, want a literal-operand refusal", method, err)
+				}
+				if _, err := os.Lstat(filepath.Join(root, "gone")); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("%s: stat gone = %v, want the deleted directory left deleted", method, err)
+				}
+				if err := call(map[string]any{"path": "single.txt"}); err != nil {
+					t.Fatalf("%s single.txt: %v", method, err)
+				}
+				if b, err := os.ReadFile(filepath.Join(root, "single.txt")); err != nil || string(b) != "x\n" {
+					t.Fatalf("%s: single.txt = %q, %v; want it restored", method, b, err)
+				}
+			}
+		})
+	}
+}
+
+func TestActionTool_BranchSwitchRefusesRevisionExpressionsThroughTheRealBackend(t *testing.T) {
+	t.Setenv("HGRCPATH", filepath.Join(t.TempDir(), "hgrc"))
+	t.Setenv("HGUSER", "codemeld <codemeld@example.test>")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(t.TempDir(), "gitsystem"))
+	jjConfig := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(jjConfig, []byte("[user]\nname = \"codemeld\"\nemail = \"codemeld@example.test\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JJ_CONFIG", jjConfig)
+	for _, tc := range []struct {
+		name     string
+		setup    [][]string
+		current  []string
+		refused  []string
+		switches map[string]string
+	}{
+		{"hg", [][]string{{"hg", "init"}, {"hg", "add"}, {"hg", "commit", "-m", "base"}, {"hg", "bookmark", "-i", "mark"},
+			{"hg", "branch", "my branch"}, {"hg", "commit", "-m", "second"}},
+			[]string{"hg", "log", "-r", ".", "-T", "{rev}"}, []string{"null", "tip", "0", "other"},
+			map[string]string{"mark": "0", "my branch": "1", "default": "0"}},
+		{"jj", [][]string{{"jj", "git", "init"}, {"jj", "bookmark", "create", "main", "-r", "@"}, {"jj", "new"}, {"jj", "bookmark", "create", "side", "-r", "@"}, {"jj", "new"}},
+			[]string{"jj", "log", "--no-graph", "-r", "@", "-T", "bookmarks"}, []string{"main+", "side-", "root", "other"},
+			map[string]string{"main": "main", "side": "side"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireBinary(t, tc.name)
+			requireBinary(t, "git")
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, argv := range tc.setup {
+				runIn(t, root, argv...)
+			}
+			current := func() string {
+				t.Helper()
+				cmd := exec.Command(tc.current[0], tc.current[1:]...)
+				cmd.Dir = root
+				out, err := cmd.Output()
+				if err != nil {
+					t.Fatalf("%v: %v", tc.current, err)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			tool := builtinAction(t, tc.name, "branch-switch", root, cmdrunner.DirectExecRunner{})
+			invoke := map[string]func(map[string]any) error{
+				"Invoke": func(args map[string]any) error { _, err := tool.Invoke(context.Background(), args); return err },
+				"InvokeWithEffectiveCWD": func(args map[string]any) error {
+					cwd, cwdErr := tool.EffectiveCWD()
+					_, err := tool.InvokeWithEffectiveCWD(context.Background(), args, cwd, cwdErr)
+					return err
+				},
+			}
+			for method, call := range invoke {
+				for _, branch := range tc.refused {
+					before := current()
+					if err := call(map[string]any{"branch": branch}); !errors.Is(err, errOperand) {
+						t.Fatalf("%s %q: err = %v, want a literal-operand refusal", method, branch, err)
+					}
+					if after := current(); after != before {
+						t.Fatalf("%s %q: working copy moved from %q to %q", method, branch, before, after)
+					}
+				}
+				for branch, want := range tc.switches {
+					if err := call(map[string]any{"branch": branch}); err != nil {
+						t.Fatalf("%s %q: %v", method, branch, err)
+					}
+					if got := current(); got != want {
+						t.Fatalf("%s %q: working copy at %q, want %q", method, branch, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestActionTool_ProductWriteKeepsLiteralOperandsWhole(t *testing.T) {
+	root := newOperandRepo(t)
+	cases := []struct {
+		action string
+		key    string
+		value  string
+	}{
+		{"add", "path", "file with space.txt"},
+		{"add", "path", "dir/a.go"},
+		{"restore-file", "path", "deleted.txt"},
+		{"restore-file", "path", "dir/new file.go"},
+		{"restore-file", "path", "dirlink/a.go"},
+		{"restore-file", "path", "gone/a.go"},
+		{"branch-create", "branch", "feature-x"},
+		{"branch-switch", "branch", "my branch"},
+		{"branch-switch", "branch", "release/1.2"},
+		{"commit", "message", "fix: handle --all\n\nbody with  spaces"},
+		{"commit", "message", "--amend"},
+	}
+	run := newOperandRunner(map[string][]string{"deleted.txt": {"deleted.txt"}, "dir/new file.go": {"dir/new file.go"}, "gone/a.go": {"gone/a.go"}})
+	run.branches = []string{"main", "my branch", "release/1.2"}
+	for label, reg := range registeredOperandTools(t, root, run) {
+		for _, tc := range cases {
+			if tc.value == "my branch" && strings.HasPrefix(label, "jj") {
+				continue
+			}
+			for i, inv := range invokeBothWays(t, reg, run, tc.action, map[string]any{tc.key: tc.value}) {
+				if inv.err != nil {
+					t.Errorf("%s %s %q (method %d): %v", label, toolName(tc.action), tc.value, i, inv.err)
+					continue
+				}
+				if !slices.Contains(inv.argv, tc.value) {
+					t.Errorf("%s %s argv = %q (method %d), want %q as one element", label, toolName(tc.action), inv.argv, i, tc.value)
+				}
+			}
+		}
+	}
+}
+
+func TestActionTool_CustomizedWriteKeepsOperandInterpretation(t *testing.T) {
+	root := newOperandRepo(t)
+	run := &fakeRunner{id: ids.NewV7()}
+	tmpl := loadTemplateText(t, "hg", strings.Replace(builtinText(t, "hg"), "argv: [hg, status]\n", "argv: [hg, status, -q]\n", 1))
+	if tmpl.BuiltinReferenceCopy {
+		t.Fatal("customized hg template still reads as a reference copy")
+	}
+	reg := tools.NewRegistry()
+	if err := RegisterActions(reg, tmpl, root, run, newCapture().appendEvent, 64); err != nil {
+		t.Fatalf("RegisterActions: %v", err)
+	}
+	tool, _ := reg.Lookup("vcs_restore_file")
+	if tool.Advertise().RoutineVCSWrite {
+		t.Fatal("customized vcs_restore_file is marked as a routine write")
+	}
+	if _, err := tool.Invoke(context.Background(), map[string]any{"path": "--all"}); err != nil {
+		t.Fatalf("customized vcs_restore_file refused --all: %v", err)
+	}
+	if want := []string{"hg", "revert", "--all"}; !slices.Equal(run.gotSpec.Argv, want) {
+		t.Fatalf("argv = %q, want %q", run.gotSpec.Argv, want)
 	}
 }

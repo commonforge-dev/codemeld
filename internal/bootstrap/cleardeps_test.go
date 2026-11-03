@@ -498,14 +498,22 @@ func TestClear_PreSwitchFlushFailure_LeavesActiveStoreUnchanged(t *testing.T) {
 	}
 }
 
-func injectedTempDir(t *testing.T) *confinement {
+func ownedTempDir(t *testing.T) *confinement {
 	t.Helper()
-	t.Setenv("TMPDIR", t.TempDir())
-	old, err := newSessionTempDir()
+	dir, err := newSessionTempDir()
 	if err != nil {
 		t.Fatalf("create injected temp folder: %v", err)
 	}
-	return &confinement{tmpDir: old}
+	conf := &confinement{tmpDir: dir.path}
+	conf.own(dir)
+	t.Cleanup(func() { _ = conf.cleanupAll() })
+	return conf
+}
+
+func injectedTempDir(t *testing.T) *confinement {
+	t.Helper()
+	t.Setenv("TMPDIR", t.TempDir())
+	return ownedTempDir(t)
 }
 
 func stuckTempDir(t *testing.T) *confinement {
@@ -513,17 +521,92 @@ func stuckTempDir(t *testing.T) *confinement {
 	if os.Geteuid() == 0 {
 		t.Skip("root can remove a folder from a read-only parent")
 	}
-	t.Setenv("TMPDIR", t.TempDir())
 	parent := t.TempDir()
-	old := filepath.Join(parent, "old")
-	if err := os.Mkdir(old, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("TMPDIR", parent)
+	conf := ownedTempDir(t)
+	t.Setenv("TMPDIR", t.TempDir())
 	if err := os.Chmod(parent, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
-	return &confinement{tmpDir: old}
+	return conf
+}
+
+type ancestorSwap struct {
+	ancestor, outside string
+	swapped           bool
+	kept              []keptTarget
+}
+
+func newAncestorSwap(t *testing.T) *ancestorSwap {
+	t.Helper()
+	s := &ancestorSwap{ancestor: filepath.Join(canonicalTempDir(t), "a"), outside: canonicalTempDir(t)}
+	tmp := filepath.Join(s.ancestor, "tmp")
+	mkdirMode(t, tmp, 0o700)
+	t.Setenv("TMPDIR", tmp)
+	return s
+}
+
+func ancestorSwapTempDir(t *testing.T) (*confinement, *ancestorSwap) {
+	t.Helper()
+	s := newAncestorSwap(t)
+	conf := ownedTempDir(t)
+	setHook(t, &afterSessionTempDirChmod, func(string) {
+		if !s.swapped {
+			s.swap(t)
+		}
+	})
+	return conf, s
+}
+
+func (s *ancestorSwap) swap(t *testing.T) {
+	t.Helper()
+	s.swapped = true
+	entries, err := os.ReadDir(filepath.Join(s.ancestor, "tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(s.ancestor, s.ancestor+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(s.outside, s.ancestor); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		s.kept = append(s.kept, newKeptTarget(t, filepath.Join(s.outside, "tmp", e.Name())))
+	}
+}
+
+func (s *ancestorSwap) requireHeld(t *testing.T, removed, kept []string) {
+	t.Helper()
+	if !s.swapped || len(s.kept) == 0 {
+		t.Fatal("the ancestor was never swapped")
+	}
+	for _, k := range s.kept {
+		k.requireUnchanged(t)
+	}
+	moved := func(path string) string { return strings.Replace(path, s.ancestor, s.ancestor+".moved", 1) }
+	for _, path := range removed {
+		requireGone(t, moved(path))
+	}
+	for _, path := range kept {
+		if _, err := os.Lstat(moved(path)); err != nil {
+			t.Fatalf("%s: %v, want it kept", moved(path), err)
+		}
+	}
+}
+
+func retainedTempDirs(conf *confinement) []string {
+	var paths []string
+	if conf.owned != nil {
+		for path := range conf.owned.dirs {
+			if path != conf.tmpDir {
+				paths = append(paths, path)
+			}
+		}
+	}
+	slices.Sort(paths)
+	return paths
 }
 
 func assertTempDirReplaced(t *testing.T, conf *confinement, old string) {
@@ -649,8 +732,8 @@ func TestClearSessionSwapper_ReplacesThePrivateTempFolder(t *testing.T) {
 			t.Fatalf("old folder stat = %v, want it removed", err)
 		}
 		assertTempDirReplaced(t, conf, old)
-		if len(conf.retryPaths) != 0 || conf.takeCleanupWarning() != "" {
-			t.Fatalf("retry = %v, want none and no warning", conf.retryPaths)
+		if retry := retainedTempDirs(conf); len(retry) != 0 || conf.takeCleanupWarning() != "" {
+			t.Fatalf("retry = %v, want none and no warning", retry)
 		}
 	})
 
@@ -679,8 +762,8 @@ func TestClearSessionSwapper_ReplacesThePrivateTempFolder(t *testing.T) {
 			t.Fatalf("Fresh = (%p, %v), want the switch to stand", fresh, err)
 		}
 		assertTempDirReplaced(t, conf, old)
-		if !slices.Equal(conf.retryPaths, []string{old}) {
-			t.Fatalf("retry = %v, want [%s]", conf.retryPaths, old)
+		if retry := retainedTempDirs(conf); !slices.Equal(retry, []string{old}) {
+			t.Fatalf("retry = %v, want [%s]", retry, old)
 		}
 		if w := conf.takeCleanupWarning(); !strings.HasPrefix(w, "can't remove private temp folder "+old+": ") || !strings.HasSuffix(w, "; codemeld retries when it exits") {
 			t.Fatalf("warning = %q", w)
@@ -696,6 +779,68 @@ func TestClearSessionSwapper_ReplacesThePrivateTempFolder(t *testing.T) {
 		if conf.tmpDir != "" {
 			t.Fatalf("tmpDir = %q, want it to stay empty", conf.tmpDir)
 		}
+	})
+}
+
+func TestClearSessionSwapper_AnAncestorSwapCannotRedirectCleanup(t *testing.T) {
+	newSwapper := func(t *testing.T, conf *confinement) *clearSessionSwapper {
+		app, _ := clearApp(t)
+		return &clearSessionSwapper{app: app, ctx: context.Background(), home: t.TempDir(), recorder: fixedRecorder(injectedResolution), conf: conf}
+	}
+
+	t.Run("replacement commit", func(t *testing.T) {
+		conf, s := ancestorSwapTempDir(t)
+		old := conf.tmpDir
+		if _, err := newSwapper(t, conf).Fresh(); err != nil {
+			t.Fatalf("Fresh: %v", err)
+		}
+		s.requireHeld(t, []string{old}, []string{conf.tmpDir})
+	})
+
+	t.Run("creation rollback", func(t *testing.T) {
+		conf, s := ancestorSwapTempDir(t)
+		old := conf.tmpDir
+		var replacement string
+		setHook(t, &beforeSessionTempDirChmod, func(created string) { replacement = created })
+		sw := newSwapper(t, conf)
+		forced := errors.New("forced emit failure")
+		sw.emit = func(*sessions.Store) error { return forced }
+		if _, err := sw.Fresh(); !errors.Is(err, forced) {
+			t.Fatalf("Fresh error = %v, want the emit failure", err)
+		}
+		if conf.tmpDir != old || replacement == "" || len(retainedTempDirs(conf)) != 0 {
+			t.Fatalf("tmpDir = %q, replacement %q, retained %v; want %q kept and the replacement rolled back", conf.tmpDir, replacement, retainedTempDirs(conf), old)
+		}
+		s.requireHeld(t, []string{replacement}, []string{old})
+	})
+
+	t.Run("failed cleanup retried at exit", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root can remove a folder from a read-only parent")
+		}
+		conf, s := ancestorSwapTempDir(t)
+		old := conf.tmpDir
+		tmp := filepath.Dir(old)
+		setHook(t, &afterSessionTempDirChmod, func(string) {
+			if err := os.Chmod(tmp, 0o500); err != nil {
+				t.Error(err)
+			}
+		})
+		t.Cleanup(func() { _ = os.Chmod(tmp, 0o700) })
+		if _, err := newSwapper(t, conf).Fresh(); err != nil {
+			t.Fatalf("Fresh: %v", err)
+		}
+		if retry := retainedTempDirs(conf); !slices.Equal(retry, []string{old}) {
+			t.Fatalf("retry = %v, want [%s]", retry, old)
+		}
+		if err := os.Chmod(tmp, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		s.swap(t)
+		if err := conf.cleanupAll(); err != nil {
+			t.Fatalf("cleanupAll: %v", err)
+		}
+		s.requireHeld(t, []string{old, conf.tmpDir}, nil)
 	})
 }
 
@@ -730,6 +875,7 @@ var liveCapabilityCases = []struct {
 }
 
 func TestClear_RecordsTheLiveCapabilityAfterASettingsChange(t *testing.T) {
+	t.Setenv("SENTINEL_API_TOKEN", "clear-sentinel")
 	for _, tc := range liveCapabilityCases {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder, f := liveSettingsRecorder(t, tc.launch)

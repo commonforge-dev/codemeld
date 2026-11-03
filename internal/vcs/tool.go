@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -57,11 +59,16 @@ func (t *ActionTool) SubjectKind() string { return "tool" }
 // noncredential — a template author cannot declare that classification for itself.
 func (t *ActionTool) Advertise() tools.Metadata {
 	return tools.Metadata{
-		Description:   t.description(),
-		Parameters:    actionParamSchema(t.actionName),
-		ReadOnly:      t.readOnly,
-		Noncredential: t.readOnly,
+		Description:     t.description(),
+		Parameters:      actionParamSchema(t.actionName),
+		ReadOnly:        t.readOnly,
+		Noncredential:   t.readOnly,
+		RoutineVCSWrite: t.routineWrite(),
 	}
+}
+
+func (t *ActionTool) routineWrite() bool {
+	return !builtinReadOnlyActions[t.actionName] && t.productArgv()
 }
 
 // description selects the advertised text for this action. A Jujutsu override describes the
@@ -198,7 +205,7 @@ func actionParamSchema(actionName string) map[string]any {
 
 // Invoke decodes args into the action's placeholder params and runs the action.
 func (t *ActionTool) Invoke(ctx context.Context, args map[string]any) (tools.Result, error) {
-	params, err := decodeParams(t.actionName, args)
+	params, err := t.decodeOperands(ctx, args)
 	if err != nil {
 		return tools.Result{}, err
 	}
@@ -209,7 +216,7 @@ func (t *ActionTool) Invoke(ctx context.Context, args map[string]any) (tools.Res
 // EffectiveCWD. Structured dispatch uses this after authorizing that same cwd so authorization and
 // execution cannot drift if symlinks change between the two steps.
 func (t *ActionTool) InvokeWithEffectiveCWD(ctx context.Context, args map[string]any, resolvedCwd string, cwdErr error) (tools.Result, error) {
-	params, err := decodeParams(t.actionName, args)
+	params, err := t.decodeOperands(ctx, args)
 	if err != nil {
 		return tools.Result{}, err
 	}
@@ -243,6 +250,130 @@ func decodeParams(actionName string, args map[string]any) (map[string]string, er
 		return nil, fmt.Errorf("%s: argument %q must be a string", toolName(actionName), key)
 	}
 	return map[string]string{key: s}, nil
+}
+
+var errOperand = errors.New("argument is not a single literal operand")
+
+func (t *ActionTool) decodeOperands(ctx context.Context, args map[string]any) (map[string]string, error) {
+	params, err := decodeParams(t.actionName, args)
+	if err != nil || !t.routineWrite() {
+		return params, err
+	}
+	if path, ok := params["path"]; ok {
+		rel, absent, ok := literalPath(t.repoRoot, path)
+		if ok && absent {
+			ok = t.singleTrackedFile(ctx, rel)
+		}
+		if !ok {
+			return nil, fmt.Errorf("%s: path %q: %w", toolName(t.actionName), path, errOperand)
+		}
+	}
+	if branch, ok := params["branch"]; ok {
+		ok = literalBranch(branch)
+		if ok && t.actionName == "branch-switch" {
+			ok = t.namedBranch(ctx, branch)
+		}
+		if !ok {
+			return nil, fmt.Errorf("%s: branch %q: %w", toolName(t.actionName), branch, errOperand)
+		}
+	}
+	return params, nil
+}
+
+func literalBranch(branch string) bool {
+	return branch != "" && !strings.HasPrefix(branch, "-") && !strings.ContainsAny(branch, "\x00*?[]{}:|&~()'@^$")
+}
+
+// hg update and jj edit read their operand as a revision expression (hg's `null`, jj's `main+`), so
+// a switch runs only to a name that already exists; git switch accepts nothing but a branch name.
+var branchNameQueries = map[string][][]string{
+	"hg": {{"hg", "branches", "--closed", "-T", "{branch}\n"}, {"hg", "bookmarks", "-T", "{bookmark}\n"}},
+	"jj": {{"jj", "bookmark", "list", "-T", `if(remote, "", name ++ "\n")`}},
+}
+
+var jjSymbol = regexp.MustCompile(`^[A-Za-z0-9_/]+(?:[.-][A-Za-z0-9_/]+)*$`)
+
+func (t *ActionTool) namedBranch(ctx context.Context, branch string) bool {
+	if t.vcsName == "git" {
+		return true
+	}
+	if t.vcsName == "jj" && !jjSymbol.MatchString(branch) {
+		return false
+	}
+	for _, query := range branchNameQueries[t.vcsName] {
+		res, err := t.execProtectQuery(ctx, query)
+		if err != nil || res.ExitCode != 0 {
+			return false
+		}
+		if slices.Contains(strings.Split(string(res.Stdout), "\n"), branch) {
+			return true
+		}
+	}
+	return false
+}
+
+func literalPath(repoRoot, path string) (rel string, absent, ok bool) {
+	if path == "" || strings.HasPrefix(path, "-") || filepath.IsAbs(path) || strings.ContainsAny(path, "*?[]{}:|&~()'\"\\\n\r\x00") {
+		return "", false, false
+	}
+	root, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return "", false, false
+	}
+	abs := filepath.Join(root, path)
+	if rel, err = repoRelative(root, abs); err != nil {
+		return "", false, false
+	}
+	resolved, ok := resolveExistingPrefix(abs)
+	if !ok {
+		return "", false, false
+	}
+	if _, err := repoRelative(root, resolved); err != nil {
+		return "", false, false
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return rel, true, errors.Is(err, fs.ErrNotExist)
+	}
+	return rel, false, !info.IsDir()
+}
+
+// trackedFileQueries list the tracked files an operand selects in the state each backend restores
+// from, so a deleted directory lists its children rather than itself.
+var trackedFileQueries = map[string]func(rel string) []string{
+	"git": func(rel string) []string {
+		return []string{"git", "-c", "core.quotePath=false", "--literal-pathspecs", "ls-files", "--", rel}
+	},
+	"hg": func(rel string) []string { return []string{"hg", "files", "-r", ".", "--", hgPath(rel)} },
+	"jj": func(rel string) []string { return []string{"jj", "file", "list", "-r", "@-", "--", jjFileset(rel)} },
+}
+
+func (t *ActionTool) singleTrackedFile(ctx context.Context, rel string) bool {
+	query, ok := trackedFileQueries[t.vcsName]
+	if !ok {
+		return false
+	}
+	res, err := t.execProtectQuery(ctx, query(rel))
+	return err == nil && res.ExitCode == 0 && string(res.Stdout) == rel+"\n"
+}
+
+func resolveExistingPrefix(path string) (string, bool) {
+	prefix, rest := path, ""
+	for {
+		resolved, err := filepath.EvalSymlinks(prefix)
+		if err == nil {
+			return filepath.Join(resolved, rest), true
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", false
+		}
+		parent, base := filepath.Split(strings.TrimRight(prefix, string(filepath.Separator)))
+		if base == "" {
+			return "", false
+		}
+		rest = filepath.Join(base, rest)
+		prefix = parent
+	}
 }
 
 // RegisterActions registers one ActionTool per non-detect action of tmpl in reg under its

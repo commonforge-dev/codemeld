@@ -69,6 +69,7 @@ const maxRefusalsPerCall = 5
 func HeadlessFreshSteps(stderr io.Writer, modelOverride *model.Selection, modeKey string) FreshSteps {
 	steps := DefaultFreshSteps(stderr, stderr)
 	steps.GateTrust = headlessTrustGate(stderr)
+	steps.AskVCSUserConfig = nil
 	steps.RecoverJournals = func(home, projectRoot string, global map[string]any, decision trust.Decision) {
 		recoverChildJournals(home, projectRoot, global, decision, nil, stderr, false)
 	}
@@ -340,12 +341,12 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 		return fmt.Errorf("bootstrap: headless build config cache: %w", err)
 	}
 	execution := resolveExecutionCapability(enforce.ResolveInput{Home: result.Home})
-	tmpDir, err := startExecutionCapability(execution, stderrNoticeRenderer{w: stderr})
+	owned, err := startExecutionCapability(execution, stderrNoticeRenderer{w: stderr})
+	if owned != nil {
+		defer func() { retErr = errors.Join(retErr, owned.removeAndRelease()) }()
+	}
 	if err != nil {
 		return fmt.Errorf("bootstrap: headless create confinement temp folder: %w", err)
-	}
-	if tmpDir != "" {
-		defer func() { retErr = errors.Join(retErr, removeSessionTempDir(tmpDir)) }()
 	}
 
 	// The active store never swaps in a headless run (no /clear or /resume), so the
@@ -368,14 +369,18 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 		return fmt.Errorf("bootstrap: headless build blocked paths: %w", err)
 	}
 	initial := (&capabilityRecorder{launch: execution, blocked: guard.Blocked}).current()
-	_ = recordExecutionCapability(ctx, session, initial, stderrNoticeRenderer{w: stderr})
+	inherited, withheld := runner.InheritedEnvironment(os.Environ())
+	if !execution.SelfTestPassed {
+		withheld = nil
+	}
+	_ = recordExecutionCapability(ctx, session, initial, withheld, stderrNoticeRenderer{w: stderr})
 	launchMode, _ := modeActive.Current()
 	stderr.line(initial.SandboxLabel(string(launchMode)))
 	stopDelivery := func() {}
 	if execution.Capability == enforce.Constrained {
 		stopDelivery = deliverCapabilityChanges(guard.Blocked, func(degraded bool) {
 			live := liveExecutionCapability(execution, degraded)
-			_ = recordExecutionCapability(ctx, session, live, stderrNoticeRenderer{w: stderr})
+			_ = recordExecutionCapability(ctx, session, live, nil, stderrNoticeRenderer{w: stderr})
 			m, _ := modeActive.Current()
 			stderr.line(live.SandboxLabel(string(m)))
 		})
@@ -387,8 +392,8 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	for _, line := range skillLines {
 		stderr.line(line)
 	}
-	inherited, _ := runner.InheritedEnvironment(os.Environ())
-	conf := launchConfinement(execution, tmpDir, modeActive, cache, result.Home, guard, inherited)
+	conf := launchConfinement(execution, owned.folder(), modeActive, cache, result.Home, guard, inherited)
+	conf.own(owned)
 	systemOne := newSystemOneCheck(cache, guard.Blocked)
 	registry, err := realizeToolRegistry(result.ToolRegistry, cache, storeAccessor, result.Home, result.LaunchDir, guard,
 		generalAgentBinding{parent: generalAgentParent, notices: stderrNoticeRenderer{w: stderr}, confinement: conf, systemOne: systemOne})
@@ -405,6 +410,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 		terminal.disclosure = resolveTerminalDisclosure(cache, result.LaunchDir)
 		terminal.projectUntrusted = !result.TrustDecision.Trusted
 		terminal.home = result.Home
+		terminal.runCtx = ctx
 	}
 	authorizer := newHeadlessAuthorizer(cache, storeAccessor, modeActive, terminal, stderrNoticeRenderer{w: stderr})
 	authorizer.declaredWrite = declaredWrite
@@ -937,9 +943,7 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 		Prompt:         prompt,
 		PersistGrant:   a.persistGrant(store, req.PathScope),
 		PrePromptCheck: a.systemOne.bind(store, texts),
-		EmitPromptShown: func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
-			return events.EmitPromptShownAttributed(store, subjectKind, subject, pathScope, directTokens, id.CommandSubject, id.RequestSubject, a.childInvocationID)
-		},
+		EmitPromptShown: a.promptShownEmitter(ctx, store),
 		EmitDecision: func(subjectKind, subject, pathScope, outcome, grantKind, grantPathScope string, id permissions.DirectIdentity) error {
 			return events.EmitDecisionAttributed(store, subjectKind, subject, pathScope, outcome, grantKind, grantPathScope, id.CommandSubject, id.RequestSubject, a.childInvocationID)
 		},
@@ -1034,6 +1038,28 @@ func (a *headlessAuthorizer) promptFor(req permissions.MatchRequest, disp dispat
 		return a.terminal.build(req, disp)
 	}
 	return a.denyPrompt
+}
+
+func (a *headlessAuthorizer) promptShownEmitter(ctx context.Context, store *sessions.Store) func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
+	return func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
+		if err := events.EmitPromptShownAttributed(store, subjectKind, subject, pathScope, directTokens, id.CommandSubject, id.RequestSubject, a.childInvocationID); err != nil {
+			return err
+		}
+		if a.terminal == nil {
+			return nil
+		}
+		cat, reason, err := store.Flush(context.WithoutCancel(ctx))
+		if err == nil {
+			return nil
+		}
+		if reason != sessions.ReasonNone {
+			err = sessionfailures.HandleWriteFailure(reason, cat, store.Path(), err, store, a.notices)
+		}
+		if err != nil {
+			a.notices.Notice(fmt.Sprintf("codemeld: could not save the approval prompt record: %v", err))
+		}
+		return nil
+	}
 }
 
 func (a *headlessAuthorizer) persistGrant(store *sessions.Store, requestPath string) func(permissions.PermissionEntry) (permissions.PermissionEntry, error) {

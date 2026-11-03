@@ -4,6 +4,7 @@
   "title": "codemeld settings.yaml",
   "description": "Canonical shape of ~/.codemeld/global/settings.yaml and per-project .codemeld/settings.yaml. Every key with a runtime hard-coded default is optional, so an empty document {} validates. The built-in provider id openai-chatgpt is reserved (a user-defined provider.openai-chatgpt entry is rejected) and auth.openai-chatgpt holds the codemeld-owned ChatGPT session; auth is global-only.",
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "discovery": {
       "type": "object",
@@ -39,7 +40,7 @@
       "additionalProperties": false,
       "properties": {
         "priority": { "type": "array", "items": { "type": "string" } },
-        "preferred": { "type": "string" }
+        "force": { "type": "string" }
       }
     },
     "attribution": {
@@ -118,10 +119,11 @@
     "confinement": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Global-only confinement settings: any occurrence in a per-project settings file is rejected at load. program_lookup chooses where confined programs are found (friendly, the default, uses the PATH codemeld launched with; strict uses only the fixed system PATH). shared_temp_folders is kept for compatibility: allow and deny remain valid but the key has no effect.",
+      "description": "Global-only confinement settings: any occurrence in a per-project settings file is rejected at load. program_lookup chooses where confined programs are found (friendly, the default, uses the PATH codemeld launched with; strict uses only the fixed system PATH). shared_temp_folders is kept for compatibility: allow and deny remain valid but the key has no effect. vcs_user_config records the answer to the launch question about the user's own hg and git config files (allow or block); while it is set the question is not asked, and any other string also counts as answered and changes nothing.",
       "properties": {
         "program_lookup": { "enum": ["friendly", "strict"] },
-        "shared_temp_folders": { "enum": ["allow", "deny"] }
+        "shared_temp_folders": { "enum": ["allow", "deny"] },
+        "vcs_user_config": { "type": "string" }
       }
     }
   },

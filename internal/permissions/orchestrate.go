@@ -227,6 +227,8 @@ type ModeContext struct {
 	ExecutionConstrained bool
 	SettingsBroken       bool
 	WritableFolders      []string
+	RoutineVCSWrite      bool
+	inHistoryStore       bool
 }
 
 type Decision struct {
@@ -303,8 +305,12 @@ func resolveWithoutPrompt(ctx context.Context, req MatchRequest, modeCtx ModeCon
 		return Decision{}, false, nil
 	}
 
+	modeCtx.inHistoryStore = historyStoreWrite(req, modeCtx)
 	if dec, handled, err := modePosture(ctx, req, modeCtx, deps); handled {
 		return dec, true, err
+	}
+	if modeCtx.inHistoryStore {
+		return Decision{}, false, nil
 	}
 
 	if modeCtx.Mode == modeAutoEdits && confinedShell(req, modeCtx) {
@@ -1033,7 +1039,7 @@ func hasShellLoop(command string) bool {
 }
 
 func autoEditsPosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Decision, bool, error) {
-	if isInScopeFileTool(req, mc) || inWritableFolder(req, mc) || sandboxedDelete(req, mc) {
+	if !mc.inHistoryStore && (isInScopeFileTool(req, mc) || inWritableFolder(req, mc) || sandboxedDelete(req, mc) || sandboxedVCSWrite(req, mc)) {
 		if err := emitModeAuto(req, deps, outcomeOnce); err != nil {
 			return Decision{}, true, err
 		}
@@ -1059,6 +1065,10 @@ func inWritableFolder(req MatchRequest, mc ModeContext) bool {
 		return false
 	}
 	return slices.ContainsFunc(mc.WritableFolders, func(root string) bool { return isInProject(mc.TargetPath, root) })
+}
+
+func sandboxedVCSWrite(req MatchRequest, mc ModeContext) bool {
+	return mc.RoutineVCSWrite && mc.ExecutionConstrained && !mc.SettingsBroken && req.Kind == subjectKindTool && mc.Class == ClassMutating
 }
 
 func sandboxedDelete(req MatchRequest, mc ModeContext) bool {
@@ -1105,6 +1115,38 @@ func isInScopeFileTool(req MatchRequest, mc ModeContext) bool {
 		return isInProject(mc.MoveSource, mc.ProjectRoot) && isInProject(mc.MoveDestination, mc.ProjectRoot)
 	}
 	return isInProject(mc.TargetPath, mc.ProjectRoot)
+}
+
+// A discovery error counts as a store write: a broken marker's store is unknown and may lie under any root.
+func historyStoreWrite(req MatchRequest, mc ModeContext) bool {
+	if mc.Mode != modeAutoEdits || req.Kind != subjectKindTool {
+		return false
+	}
+	inside, containing := []string{mc.TargetPath}, ""
+	switch mc.ToolName {
+	case toolNameEdit, toolNameCreate, toolNameMkdir:
+	case toolNameDelete:
+		containing = mc.TargetPath
+	case toolNameMove:
+		inside, containing = []string{mc.MoveSource, mc.MoveDestination}, mc.MoveSource
+	default:
+		return false
+	}
+	var stores []string
+	for _, root := range append([]string{mc.ProjectRoot}, mc.WritableFolders...) {
+		if root == "" {
+			continue
+		}
+		found, err := HistoryStores(root)
+		if err != nil {
+			return true
+		}
+		stores = append(stores, found...)
+	}
+	return slices.ContainsFunc(stores, func(store string) bool {
+		return slices.ContainsFunc(inside, func(path string) bool { return isInProject(path, store) }) ||
+			(containing != "" && IsDescendantOrEqual(store, containing))
+	})
 }
 
 func isInProject(path, root string) bool {

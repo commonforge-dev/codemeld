@@ -1284,8 +1284,7 @@ func TestBuildBatchPromptRequest_ExceptionalBatchNamesThePrecedenceAuthority(t *
 	}{
 		{"network after deletion", []string{"rm -f out.txt", "curl https://example.com"}, "network access"},
 		{"network before deletion", []string{"curl https://example.com", "rm -f out.txt"}, "network access"},
-		{"exceptional stage not first", []string{"sort data.txt", "hg strip tip", "rm -f out.txt"}, "VCS history rewrite"},
-		{"history rewrite only", []string{"sort data.txt", "hg strip tip"}, "VCS history rewrite"},
+		{"exceptional stage not first", []string{"sort data.txt", "curl https://example.com", "rm -f out.txt"}, "network access"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			prompts, displays, modeCtxs := constrainedAutoBatch(tc.stages...)
@@ -1311,13 +1310,15 @@ func TestBuildBatchPromptRequest_ExceptionalBatchNamesThePrecedenceAuthority(t *
 		t.Fatalf("one-stage batch = %+v, want the single-request shape naming network access", pr)
 	}
 
-	prompts, displays, modeCtxs = constrainedAutoBatch("sort data.txt", "tee out.txt")
-	pr, err = buildBatchPromptRequest(prompts, displays, modeCtxs)
-	if err != nil {
-		t.Fatalf("buildBatchPromptRequest: %v", err)
-	}
-	if pr.Action != dispatch.ActionRunCommand || pr.ExceptionalAuthority != "" {
-		t.Fatalf("ordinary batch = %+v, want today's action and no marker", pr)
+	for _, stages := range [][]string{{"sort data.txt", "tee out.txt"}, {"sort data.txt", "hg strip tip"}} {
+		prompts, displays, modeCtxs = constrainedAutoBatch(stages...)
+		pr, err = buildBatchPromptRequest(prompts, displays, modeCtxs)
+		if err != nil {
+			t.Fatalf("buildBatchPromptRequest: %v", err)
+		}
+		if pr.Action != dispatch.ActionRunCommand || pr.ExceptionalAuthority != "" {
+			t.Fatalf("ordinary batch %q = %+v, want today's action and no marker", stages, pr)
+		}
 	}
 }
 
@@ -1417,16 +1418,17 @@ func TestExceptionalAuthority_SandboxedAutoEditsNamesWhatStillAsks(t *testing.T)
 		{`rm -rf build`, "", deletion},
 		{`git clean -fdx`, "", deletion},
 		{`which -a x; file "$(which x)"`, "", ""},
-		{`rm x && git rebase main`, history, deletion},
-		{`git rebase main; rm x`, history, deletion},
-		{`rm x | hg strip .`, history, deletion},
+		{`git rebase main`, "", history},
+		{`rm x && git rebase main`, "", deletion},
+		{`git rebase main; rm x`, "", deletion},
+		{`rm x | hg strip .`, "", deletion},
 		{`rm x; curl y`, network, network},
 		{`git reset --hard && git push`, network, network},
 		{`rm x && command git push`, network, network},
 		{`rm x && nice git push`, network, network},
 		{`rm x | xargs git push`, network, network},
 		{`rm x; bash -c 'git push'`, network, network},
-		{`rm x && git commit --amend`, history, deletion},
+		{`rm x && git commit --amend`, "", deletion},
 	} {
 		for _, broken := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/broken=%v", tc.command, broken), func(t *testing.T) {
@@ -1566,8 +1568,10 @@ func TestDispatchShell_SandboxedAutoEditsRunsAutomaticCommandsAndAsksTheRest(t *
 	}{
 		{`rm -rf build`, "", 1, ""},
 		{`which -a ls; file "$(which ls)"`, "", 1, ""},
-		{`rm x && git rebase main`, "VCS history rewrite", 2, ""},
-		{`rm x | hg strip .`, "VCS history rewrite", 2, ""},
+		{`git rebase main`, "", 1, ""},
+		{`sh -c 'git rebase main'`, "", 1, ""},
+		{`rm x && git rebase main`, "", 2, ""},
+		{`rm x | hg strip .`, "", 2, ""},
 		{`rm x; curl https://example.com`, network, 2, "curl"},
 	} {
 		for _, approve := range []bool{true, false} {
@@ -1613,10 +1617,18 @@ func TestDispatchShell_SandboxedAutoEditsRunsAutomaticCommandsAndAsksTheRest(t *
 				if len(run.specs) != tc.stages {
 					t.Fatalf("executed %d specs %+v, want %d", len(run.specs), run.specs, tc.stages)
 				}
+				conf := &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), tmpDir: t.TempDir(), projectRoot: f.project, blocked: testBlocked(t)}
 				for _, spec := range run.specs {
 					wantNetwork := tc.networkProgram != "" && filepath.Base(spec.Argv[0]) == tc.networkProgram
 					if (spec.ExceptionalAuthority == network) != wantNetwork {
 						t.Fatalf("spec %q authority = %q, want network authority only on %q", spec.Argv, spec.ExceptionalAuthority, tc.networkProgram)
+					}
+					policy, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, spec.ExceptionalAuthority, conf.blocked.Current(), false)
+					if err != nil {
+						t.Fatalf("policy: %v", err)
+					}
+					if (policy.ExceptionalAuthority == network) != wantNetwork || !wantNetwork && policy.ExceptionalAuthority != "" {
+						t.Fatalf("spec %q confinement authority = %q, want network authority only on %q", spec.Argv, policy.ExceptionalAuthority, tc.networkProgram)
 					}
 				}
 				if got := f.server.requests(); len(got) != 0 {

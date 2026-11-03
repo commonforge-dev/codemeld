@@ -509,13 +509,13 @@ func clCapabilityEvents(sess *sessions.Session) []sessions.Event {
 func clReadOnlyChildCapability(t *testing.T, parent *sessions.Store) {
 	t.Helper()
 	orig := recordExecutionCapability
-	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, notices tui.NoticeRenderer) error {
+	recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {
 		if store != parent {
 			if err := os.Chmod(store.Path(), 0o400); err != nil {
 				return err
 			}
 		}
-		return orig(ctx, store, resolution, notices)
+		return orig(ctx, store, resolution, withheld, notices)
 	}
 	t.Cleanup(func() { recordExecutionCapability = orig })
 }
@@ -532,7 +532,11 @@ func TestChildLifecycle_RecordsTheLaunchCapabilityInTheChild(t *testing.T) {
 		t.Run(via, func(t *testing.T) {
 			parent := clParentStore(t, t.TempDir(), "/proj/child-capability")
 			f := newCLFixture(t, t.TempDir(), parent)
-			if err := recordExecutionCapability(context.Background(), parent, injectedResolution, f.app); err != nil {
+			t.Setenv("SENTINEL_API_TOKEN", "child-mirror-sentinel")
+			launchResolution := injectedResolution
+			launchResolution.SelfTestPassed = true
+			f.lc.recorder = fixedRecorder(launchResolution)
+			if err := recordExecutionCapability(context.Background(), parent, launchResolution, []string{"PATH", "SENTINEL_API_TOKEN"}, f.app); err != nil {
 				t.Fatalf("record the launch capability: %v", err)
 			}
 			launchDisk := readSessionFile(t, parent.Path())
@@ -541,6 +545,11 @@ func TestChildLifecycle_RecordsTheLaunchCapabilityInTheChild(t *testing.T) {
 				t.Fatalf("launch capability events = %+v, want one", launch)
 			}
 			launchCaps := decodeDiskEvents[events.ExecutionCapability](t, launchDisk, events.KindExecutionCapability)
+			if !slices.Equal(launchCaps[0].WithheldEnvironment, []string{"PATH", "SENTINEL_API_TOKEN"}) {
+				t.Fatalf("launch withheld_environment = %v, want the recorded names", launchCaps[0].WithheldEnvironment)
+			}
+			mirror := launchCaps[0]
+			mirror.WithheldEnvironment = nil
 			time.Sleep(2 * time.Millisecond)
 
 			child, _, err := clSwitch(t, f, parent, via)
@@ -560,8 +569,8 @@ func TestChildLifecycle_RecordsTheLaunchCapabilityInTheChild(t *testing.T) {
 				t.Fatalf("child record after launch_began = %+v, want execution_capability", disk.Records[began+1])
 			}
 			caps := decodeDiskEvents[events.ExecutionCapability](t, disk, events.KindExecutionCapability)
-			if len(caps) != 1 || !reflect.DeepEqual(caps[0], launchCaps[0]) {
-				t.Fatalf("child execution_capability = %+v, want exactly the launch session's %+v", caps, launchCaps[0])
+			if len(caps) != 1 || !reflect.DeepEqual(caps[0], mirror) {
+				t.Fatalf("child execution_capability = %+v, want the launch session's capability, reason and legs without the environment diagnostic: %+v", caps, mirror)
 			}
 			if got.ID == "" || got.ID == launch[0].ID || !got.Timestamp.After(launch[0].Timestamp) {
 				t.Fatalf("child capability event %+v, want its own ID and a timestamp after the launch event %+v", got, launch[0])
@@ -641,6 +650,47 @@ func TestChildLifecycle_ReplacementRemovalFailureIsJoinedAfterThePrimaryError(t 
 	if conf.tmpDir != old || f.app.ActiveStore() != parent {
 		t.Fatalf("tmpDir = %q active = %p, want %q and the parent", conf.tmpDir, f.app.ActiveStore(), old)
 	}
+	retained := retainedTempDirs(conf)
+	if len(retained) != 1 {
+		t.Fatalf("retained = %v, want the replacement kept for the exit retry", retained)
+	}
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := conf.cleanupAll(); err != nil {
+		t.Fatalf("cleanupAll: %v", err)
+	}
+	requireGone(t, retained[0])
+	requireGone(t, old)
+}
+
+func TestChildLifecycle_AnAncestorSwapCannotRedirectCleanup(t *testing.T) {
+	for _, via := range []string{"fork", "compact", "creation rollback"} {
+		t.Run(via, func(t *testing.T) {
+			conf, s := ancestorSwapTempDir(t)
+			old := conf.tmpDir
+			var replacement string
+			setHook(t, &beforeSessionTempDirChmod, func(created string) { replacement = created })
+			parent := clParentStore(t, t.TempDir(), "/proj/child-swap")
+			f := newCLFixture(t, t.TempDir(), parent)
+			f.lc.conf = conf
+			if via == "creation rollback" {
+				f.lc.recorder = fixedRecorder(enforce.Resolution{})
+				if _, err := f.lc.Prepare(parent, "child title", clChildRecords(), nil, &recordingHost{}); err == nil {
+					t.Fatal("Prepare succeeded, want the capability record failure")
+				}
+				if conf.tmpDir != old || len(retainedTempDirs(conf)) != 0 {
+					t.Fatalf("tmpDir = %q, retained %v; want %q kept and the replacement rolled back", conf.tmpDir, retainedTempDirs(conf), old)
+				}
+				s.requireHeld(t, []string{replacement}, []string{old})
+				return
+			}
+			if _, warning, err := clSwitch(t, f, parent, via); err != nil || warning != "" || conf.tmpDir != replacement {
+				t.Fatalf("switch = (%q, %v), tmpDir %q; want a clean switch to %q", warning, err, conf.tmpDir, replacement)
+			}
+			s.requireHeld(t, []string{old}, []string{replacement})
+		})
+	}
 }
 
 func TestChildLifecycle_CapabilityWriteFailureNoticeSurface(t *testing.T) {
@@ -701,8 +751,8 @@ func TestChildLifecycle_ReplacesThePrivateTempFolder(t *testing.T) {
 				t.Fatalf("switch error = %v, want the switch to stand", err)
 			}
 			assertTempDirReplaced(t, conf, old)
-			if !slices.Equal(conf.retryPaths, []string{old}) {
-				t.Fatalf("retry = %v, want [%s]", conf.retryPaths, old)
+			if retry := retainedTempDirs(conf); !slices.Equal(retry, []string{old}) {
+				t.Fatalf("retry = %v, want [%s]", retry, old)
 			}
 			if !strings.HasPrefix(warning, "can't remove private temp folder "+old+": ") || !strings.HasSuffix(warning, "; codemeld retries when it exits") {
 				t.Fatalf("warning = %q", warning)
@@ -807,6 +857,7 @@ func TestChildLifecycle_ActivationRecordsAChangeSincePreparation(t *testing.T) {
 			for _, recovers := range []bool{false, true} {
 				name := fmt.Sprintf("%s afterFinalization=%v recovers=%v", via, afterFinalization, recovers)
 				t.Run(name, func(t *testing.T) {
+					t.Setenv("SENTINEL_API_TOKEN", "child-reconcile-sentinel")
 					recorder, f := liveSettingsRecorder(t, constrainedLaunch)
 					setSettingsBroken(t, f, recovers)
 					recorder.blocked.Current()
@@ -920,7 +971,7 @@ func TestChildLifecycle_ActivationCorrectionFailureKeepsTheSwitch(t *testing.T) 
 		fx, _, prepared := prepare(t)
 		forced := errors.New("forced unreported failure")
 		orig := recordExecutionCapability
-		recordExecutionCapability = func(context.Context, *sessions.Store, enforce.Resolution, tui.NoticeRenderer) error { return forced }
+		recordExecutionCapability = func(context.Context, *sessions.Store, enforce.Resolution, []string, tui.NoticeRenderer) error { return forced }
 		t.Cleanup(func() { recordExecutionCapability = orig })
 
 		warning := fx.lc.Activate(prepared)

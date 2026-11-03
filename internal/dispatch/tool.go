@@ -351,9 +351,10 @@ func prepareTool(ctx context.Context, name string, args map[string]any, home str
 		tool: tool,
 		args: args,
 		modeCtx: permissions.ModeContext{
-			Class:         toolOperationClass(tool),
-			ToolName:      name,
-			NetworkEgress: isNetworkEgressTool(name),
+			Class:           toolOperationClass(tool),
+			RoutineVCSWrite: tool.Advertise().RoutineVCSWrite,
+			ToolName:        name,
+			NetworkEgress:   isNetworkEgressTool(name),
 		},
 		home:       home,
 		processCWD: processCWD,

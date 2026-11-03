@@ -37,13 +37,24 @@ safely.
   - **Self-test passed (Linux amd64/arm64 only).** Plan and Auto edits shell
     commands, including those of the version-control tools and child agents,
     run inside a mandatory boundary with no ordinary prompt, and no setting
-    turns it off. Plan may write only `/dev/null` and has no network. Auto
+    turns it off. Plan never changes your files: it may write only `/dev/null`
+    and a private temp folder for the session, deleted when the session ends,
+    and has no network. Auto
     edits may write the project's top-level files and folders (not
     `.codemeld`), a private temp folder for the session, and each folder
     declared in `writable_folders`. There, a command with a recognized network
-    or history-rewrite stage asks (allow once or deny), wherever a deletion
+    stage asks (allow once or deny), wherever a deletion or history rewrite
     sits in the chain; every other command runs confined without asking,
-    including file deletion such as `rm`. The status bar shows `sandbox: on`.
+    including file deletion such as `rm` and history rewrites such as
+    `git rebase`. Shell commands cannot write the Git or Mercurial history
+    store of a repository at the project root or at a declared
+    `writable_folders` root, including a worktree's `.git` pointer file, so a
+    rewrite of those stores fails; a nested repository below those roots
+    stays writable, and a repository created after a command starts is not
+    protected for that command. The version-control tools' write actions
+    (such as commit, add and stash) also run without asking when their
+    templates are codemeld's built-ins or byte-identical reference copies;
+    customized templates still ask. The status bar shows `sandbox: on`.
   - <a id="broken-settings"></a>**Self-test passed, then a settings file's blocked-path list breaks.** Plan and
     Auto edits commands stay confined, but every shell command asks until the
     file is fixed, except one you already denied this turn, and a recognized

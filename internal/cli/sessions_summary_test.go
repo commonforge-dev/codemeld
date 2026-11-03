@@ -747,3 +747,26 @@ func TestSessionsSummary_ApprovalWaitAtTheRangeLimitIsExact(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionsSummary_UnknownEventKindWarnsOnStderr(t *testing.T) {
+	id := unknownKindSession(t)
+	want := "codemeld: session " + id + `: skipped 1 event records of unknown kinds ("from_a_newer_build"=1); a newer codemeld wrote them; inspect with: codemeld sessions show ` + id + "\n"
+	for _, extra := range [][]string{nil, {"--json"}} {
+		out, errOut := runSessionsCmd(t, append([]string{"summary", id}, extra...)...)
+		if errOut != want {
+			t.Fatalf("summary %v stderr = %q, want %q", extra, errOut, want)
+		}
+		if extra != nil && !json.Valid([]byte(out)) {
+			t.Fatalf("summary --json stdout is not valid JSON:\n%s", out)
+		}
+	}
+}
+
+func TestSessionsSummary_KnownKindsWriteNothingToStderr(t *testing.T) {
+	id := writeSessionByID(t, []sessions.Record{textMsg("user", "hello")})
+	for _, extra := range [][]string{nil, {"--json"}} {
+		if _, errOut := runSessionsCmd(t, append([]string{"summary", id}, extra...)...); errOut != "" {
+			t.Fatalf("summary %v stderr = %q, want empty", extra, errOut)
+		}
+	}
+}

@@ -1,5 +1,5 @@
 // Production VCS detection-to-registry wiring for bootstrap steps 4-6:
-// load templates, cross-reference-validate vcs.preferred, and run
+// load templates, cross-reference-validate vcs.force, and run
 // detection into the *ActiveVCS handoff the tool-registry factory (step 6c) consumes.
 package bootstrap
 
@@ -16,11 +16,11 @@ import (
 	"codemeld.dev/codemeld/internal/vcs/builtin"
 )
 
-// vcsLoaded is the production step-4 payload LoadVCSTemplates hands to ValidatePreferredVCS (step 5)
+// vcsLoaded is the production step-4 payload LoadVCSTemplates hands to ValidateForceVCS (step 5)
 // and DetectVCS (step 6). The generic step seams carry only (composed, templates), so the
 // bootstrap-local context the later steps need rides here: the merged template map (built-in base
 // overlaid by the global then per-project directories), the pristine built-in detect
-// markers used by the preferred walk regardless of any built-in-name override,
+// markers used by the force walk regardless of any built-in-name override,
 // the home and project roots used for source attribution and the detection walk, and step 3's
 // verified project settings layer, so attribution reuses the launch's one admitted read.
 type vcsLoaded struct {
@@ -114,26 +114,26 @@ func overlayProjectTemplates(base map[string]*vcs.Template, projectRoot string, 
 	return nil
 }
 
-// validatePreferredVCS is the production step-5 ValidatePreferredVCS (step 5). It
-// resolves the effective vcs.preferred value and the settings file that set it, then cross-reference-
+// validateForceVCS is the production step-5 ValidateForceVCS (step 5). It
+// resolves the effective vcs.force value and the settings file that set it, then cross-reference-
 // validates the value against the union of the built-in names and the loaded user template names. An
 // unset/empty value disables the override and validates trivially. A rejection names the
 // exact source file so the CLI renders it the way it renders schema-validation failures and exits
 // before the TUI.
-func validatePreferredVCS(composed map[string]any, templates any) error {
+func validateForceVCS(composed map[string]any, templates any) error {
 	payload, ok := templates.(*vcsLoaded)
 	if !ok || payload == nil {
 		return nil
 	}
-	preferred, source := preferredOverride(composed, payload)
-	if preferred == "" {
+	force, source := forceOverride(composed, payload)
+	if force == "" {
 		return nil
 	}
-	return vcs.ValidatePreferred(preferred, builtin.BuiltinNames(), userTemplateNames(payload), source)
+	return vcs.ValidateForce(force, builtin.BuiltinNames(), userTemplateNames(payload), source)
 }
 
 // detectVCS is the production step-6 DetectVCS (step 6). With an effective
-// vcs.preferred it runs the hard-override walk, skipping vcs.priority tie-breaking and
+// vcs.force it runs the hard-override walk, skipping vcs.priority tie-breaking and
 // returning an error when the named VCS is found nowhere rather than falling back to auto-detect.
 // Otherwise it auto-detects, tie-breaks same-depth matches by vcs.priority, and
 // warns on ambiguity. It returns the *ActiveVCS handoff the tool-registry factory consumes — the
@@ -148,12 +148,12 @@ func detectVCS(cwd string, composed map[string]any, templates any, stderr io.Wri
 	}
 	boundary := discoveryBoundary(composed)
 
-	if preferred, source := preferredOverride(composed, payload); preferred != "" {
-		repoRoot, err := vcs.RunPreferred(preferred, cwd, boundary, payload.projectRoot, source, payload.builtinDetect, payload.templates)
+	if force, source := forceOverride(composed, payload); force != "" {
+		repoRoot, err := vcs.RunForce(force, cwd, boundary, payload.projectRoot, source, payload.builtinDetect, payload.templates)
 		if err != nil {
 			return nil, vcsDetectError(err)
 		}
-		tmpl := payload.templates[preferred]
+		tmpl := payload.templates[force]
 		return &ActiveVCS{Template: tmpl, RepoRoot: repoRoot, TrustedExplicitClasses: payload.trustedClass[tmpl]}, nil
 	}
 
@@ -175,40 +175,40 @@ func detectVCS(cwd string, composed map[string]any, templates any, stderr io.Wri
 	return &ActiveVCS{Template: tmpl, RepoRoot: ancestorAt(cwd, depth), TrustedExplicitClasses: payload.trustedClass[tmpl]}, nil
 }
 
-// preferredOverride resolves the effective vcs.preferred value and the settings file that supplied
+// forceOverride resolves the effective vcs.force value and the settings file that supplied
 // it (layering: the per-project layer wins over the global layer). The step seam delivers
 // only the composed config, which holds the effective value but no per-layer source metadata, so the
 // source is recovered by checking whether the per-project settings.yaml declares the key — the
 // smallest bootstrap-local tracking that keeps errors naming the exact file. An empty
 // effective value means no override is in effect.
-func preferredOverride(composed map[string]any, payload *vcsLoaded) (value, source string) {
-	value = nestedString(composed, "vcs", "preferred")
+func forceOverride(composed map[string]any, payload *vcsLoaded) (value, source string) {
+	value = nestedString(composed, "vcs", "force")
 	if value == "" {
 		return "", ""
 	}
-	if projectLayerSetsPreferred(payload.projectLayer) {
+	if projectLayerSetsForce(payload.projectLayer) {
 		return value, projectSettingsPath(payload.projectRoot)
 	}
 	return value, SettingsPath(payload.home)
 }
 
-// projectLayerSetsPreferred reports whether the per-project settings.yaml declares vcs.preferred,
+// projectLayerSetsForce reports whether the per-project settings.yaml declares vcs.force,
 // which decides whether the effective override is attributed to the project file or the global file.
 // project is step 3's verified layer: reopening the file here would let settings replaced after
 // the gate attribute an override to a layer composition already dropped.
-func projectLayerSetsPreferred(project map[string]any) bool {
+func projectLayerSetsForce(project map[string]any) bool {
 	sub, ok := project["vcs"].(map[string]any)
 	if !ok {
 		return false
 	}
-	_, present := sub["preferred"]
+	_, present := sub["force"]
 	return present
 }
 
 // vcsDetectError maps an unreadable walk-anchor failure from the VCS detection walk to the OP_FAIL
 // stderr line, mirroring the project-root walk's handling (defaultResolveProjectRoot) so the
 // same anchor failure reads identically wherever it surfaces. Every other detection error — an
-// invalid discovery.boundary, or a preferred-detect-fails-everywhere exit — already carries
+// invalid discovery.boundary, or a force-detect-fails-everywhere exit — already carries
 // its user-facing text and is returned unchanged.
 func vcsDetectError(err error) error {
 	var anchorErr *vcs.AnchorReadError
@@ -219,7 +219,7 @@ func vcsDetectError(err error) error {
 }
 
 // userTemplateNames returns the loaded user-defined template names — the merged map minus the
-// built-in names — for the vcs.preferred cross-reference check's user-template set (b).
+// built-in names — for the vcs.force cross-reference check's user-template set (b).
 func userTemplateNames(payload *vcsLoaded) []string {
 	builtins := builtinNameSet()
 	names := make([]string, 0, len(payload.templates))

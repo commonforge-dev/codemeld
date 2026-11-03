@@ -25,6 +25,7 @@ import (
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/fsutil"
+	"codemeld.dev/codemeld/internal/locks"
 	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/provider"
 	"codemeld.dev/codemeld/internal/trust"
@@ -697,38 +698,90 @@ func TestProviderModelApplier_FirstPick_NoPriorOmitsPriorFields(t *testing.T) {
 // model_persist_failed, the global mirror is skipped, and the source becomes
 // picker_degraded — mirroring the effort applier's degradation.
 func TestProviderModelApplier_ActiveWriteFailure_DegradesSkipsMirror(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	// A regular file as the project root makes <root>/.codemeld uncreatable, so the
-	// per-project model.active write fails deterministically.
-	projectRoot := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(projectRoot, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store := storeAt(t, filepath.Join(t.TempDir(), "s.json"), "id-deg", "/proj")
-	app := tui.New(nil)
-	app.SetActiveStore(store)
-	active := selectedState()
+	for _, tc := range []struct {
+		name       string
+		root       func(t *testing.T) string
+		wantReason string
+		wantDetail string
+	}{
+		{"project root is not a folder", func(t *testing.T) string {
+			projectRoot := filepath.Join(t.TempDir(), "not-a-dir")
+			if err := os.WriteFile(projectRoot, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return projectRoot
+		}, "parent_dir_error", ""},
+		{"local settings lock is held", func(t *testing.T) string {
+			projectRoot := t.TempDir()
+			dir := filepath.Join(projectRoot, ".codemeld")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			parent, err := os.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = parent.Close() })
+			release, _, err := locks.AcquireAt(parent, "settings.local.yaml.lock", 0)
+			if err != nil {
+				t.Fatalf("take the local settings lock: %v", err)
+			}
+			t.Cleanup(release)
+			return projectRoot
+		}, "lock_timeout", "lock acquisition timed out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			home := t.TempDir()
+			projectRoot := tc.root(t)
+			store := mkStore(t)
+			app := tui.New(nil)
+			app.SetActiveStore(store)
+			active := selectedState()
 
-	deps := newModelPickerDeps(ctx, app, providerCache(t, projectRoot), active, nil, home, "/launch")
+			deps := newModelPickerDeps(ctx, app, providerCache(t, projectRoot), active, nil, home, "/launch")
 
-	if _, err := deps.Applier.ApplyProviderModel("anthropic", "claude-x", "default"); err != nil {
-		t.Fatalf("ApplyProviderModel error: %v (a persistence degrade is not an internal error)", err)
-	}
+			if _, err := deps.Applier.ApplyProviderModel("anthropic", "claude-x", "default"); err != nil {
+				t.Fatalf("ApplyProviderModel error: %v (a persistence degrade is not an internal error)", err)
+			}
 
-	kinds := eventKinds(store.Records())
-	ci, pi := slices.Index(kinds, events.KindModelChanged), slices.Index(kinds, events.KindModelPersistFailed)
-	if ci < 0 || pi < 0 || ci > pi {
-		t.Fatalf("event kinds = %v, want model_changed before model_persist_failed", kinds)
-	}
-	if n := len(kindEvents(t, store, events.KindModelGlobalMirrorFailed)); n != 0 {
-		t.Fatalf("model_global_mirror_failed = %d, want 0 (mirror skipped on active-write failure)", n)
-	}
-	if _, err := os.Stat(filepath.Join(home, ".codemeld", "global", "settings.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("model.last_used must be absent on active-write failure; stat err = %v", err)
-	}
-	if _, src, _ := active.Current(); src != model.SourcePickerDegraded {
-		t.Fatalf("active source = %q, want picker_degraded", src)
+			kinds := eventKinds(store.Records())
+			ci, pi := slices.Index(kinds, events.KindModelChanged), slices.Index(kinds, events.KindModelPersistFailed)
+			if ci < 0 || pi < 0 || ci > pi {
+				t.Fatalf("event kinds = %v, want model_changed before model_persist_failed", kinds)
+			}
+			if n := len(kindEvents(t, store, events.KindModelGlobalMirrorFailed)); n != 0 {
+				t.Fatalf("model_global_mirror_failed = %d, want 0 (mirror skipped on active-write failure)", n)
+			}
+			if _, err := os.Stat(filepath.Join(home, ".codemeld", "global", "settings.yaml")); !os.IsNotExist(err) {
+				t.Fatalf("model.last_used must be absent on active-write failure; stat err = %v", err)
+			}
+			if sel, src, _ := active.Current(); src != model.SourcePickerDegraded || sel.Provider != "anthropic" || sel.ID != "claude-x" {
+				t.Fatalf("active = %+v (%q), want claude-x applied as picker_degraded", sel, src)
+			}
+
+			localPath := filepath.Join(projectRoot, ".codemeld", "settings.local.yaml")
+			if err := (exitController{activeStore: app.ActiveStore, ctx: ctx}).FlushOnExit(); err != nil {
+				t.Fatalf("FlushOnExit: %v", err)
+			}
+			failed := decodeDiskEvents[events.ModelPersistFailed](t, readSessionFile(t, store.Path()), events.KindModelPersistFailed)
+			if len(failed) != 1 {
+				t.Fatalf("durable model_persist_failed events = %+v, want one", failed)
+			}
+			p := failed[0]
+			if p.TargetPath != localPath || p.Reason != tc.wantReason {
+				t.Fatalf("model_persist_failed = %+v, want reason %q against %s", p, tc.wantReason, localPath)
+			}
+			if tc.wantDetail != "" && (p.ErrorDetail != tc.wantDetail || p.ErrorCategory != "") {
+				t.Fatalf("model_persist_failed = %+v, want detail %q and no error category", p, tc.wantDetail)
+			}
+			if tc.wantDetail == "" && p.ErrorCategory == "" {
+				t.Fatalf("model_persist_failed = %+v, want an error category", p)
+			}
+			if want := "failed to persist to " + localPath + ": " + tc.wantReason + " — "; !strings.Contains(app.NoticeText(), want) {
+				t.Fatalf("notice = %q, want it to contain %q", app.NoticeText(), want)
+			}
+		})
 	}
 }
 

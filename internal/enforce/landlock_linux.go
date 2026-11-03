@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -60,7 +62,17 @@ func applyLandlock(p Policy) error {
 	if abi < 3 {
 		return fmt.Errorf("landlock ABI %d < 3; sandbox needs Landlock ABI 3 or newer, first shipped in Linux 6.2", abi)
 	}
-	rules, err := landlockRules(p, osFS{})
+	var held heldTmp
+	if p.Mode == ModePlan && p.TmpDir != "" {
+		fd, h, err := openHeldTmp(p)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, tmpReplacedNote)
+		} else {
+			defer func() { _ = unix.Close(fd) }()
+			held = h
+		}
+	}
+	rules, err := landlockRules(p, osFS{}, held)
 	if err != nil {
 		return err
 	}
@@ -69,6 +81,34 @@ func applyLandlock(p Policy) error {
 		opts[i] = landlock.PathAccess(r.Access, r.Path)
 	}
 	return restrictPaths(opts...)
+}
+
+const tmpReplacedNote = "codemeld: the session's private temp folder was moved or replaced since codemeld created it; Plan commands run without it. Restart codemeld to get a new one."
+
+type heldTmp struct {
+	fdPath string
+	name   string
+}
+
+func openHeldTmp(p Policy) (int, heldTmp, error) {
+	fd, err := unix.Open(p.TmpDir, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, heldTmp{}, err
+	}
+	var st unix.Stat_t
+	err = unix.Fstat(fd, &st)
+	if err == nil && (uint64(st.Dev) != p.TmpDirDev || st.Ino != p.TmpDirIno) {
+		err = errors.New("temp folder identity changed")
+	}
+	h := heldTmp{fdPath: "/proc/self/fd/" + strconv.Itoa(fd)}
+	if err == nil {
+		h.name, err = os.Readlink(h.fdPath)
+	}
+	if err != nil {
+		_ = unix.Close(fd)
+		return -1, heldTmp{}, err
+	}
+	return fd, h, nil
 }
 
 type ruleBuilder struct {
@@ -81,7 +121,7 @@ type ruleBuilder struct {
 	seen    map[string]bool
 }
 
-func landlockRules(p Policy, view fsView) ([]pathRule, error) {
+func landlockRules(p Policy, view fsView, held heldTmp) ([]pathRule, error) {
 	b := &ruleBuilder{fs: view, index: map[string]int{}, seen: map[string]bool{}}
 	var err error
 	if b.blocked, err = b.withResolved(p.BlockedPaths); err != nil {
@@ -107,7 +147,8 @@ func landlockRules(p Policy, view fsView) ([]pathRule, error) {
 		}
 		b.add(t, accessRead, true)
 	}
-	if p.Mode != ModeAutoEdits {
+	plan := p.Mode == ModePlan && held.fdPath != ""
+	if p.Mode != ModeAutoEdits && !plan {
 		return b.rules, nil
 	}
 	if b.noWrite, err = b.withResolved(p.NoWritePaths); err != nil {
@@ -115,6 +156,12 @@ func landlockRules(p Policy, view fsView) ([]pathRule, error) {
 	}
 	if b.shm, err = b.withResolved([]string{devShm}); err != nil {
 		return nil, err
+	}
+	if plan {
+		if b.noWriteGrant(held.name) {
+			return b.rules, nil
+		}
+		return b.rules, b.walkWrite(held.fdPath, held.fdPath, held.name, true, map[string]bool{})
 	}
 	for _, root := range b.outerRoots(append(append([]string{}, p.WriteRoots...), p.TmpDir)) {
 		t, isDir, ok, err := b.resolve(root)
@@ -124,7 +171,7 @@ func landlockRules(p Policy, view fsView) ([]pathRule, error) {
 		if !ok || b.noWriteGrant(t) {
 			continue
 		}
-		if err := b.walkWrite(t, t, isDir, map[string]bool{}); err != nil {
+		if err := b.walkWrite(t, t, t, isDir, map[string]bool{}); err != nil {
 			return nil, err
 		}
 	}
@@ -191,9 +238,9 @@ func (b *ruleBuilder) walkRead(dir string) error {
 	return nil
 }
 
-func (b *ruleBuilder) walkWrite(t, root string, isDir bool, seen map[string]bool) error {
+func (b *ruleBuilder) walkWrite(t, root, rootName string, isDir bool, seen map[string]bool) error {
 	carve := append(append(append([]string{}, b.blocked...), b.noWrite...), b.shm...)
-	if !isDir || !containsAny(t, carve) {
+	if !isDir || !containsAny(rootName+strings.TrimPrefix(t, root), carve) {
 		b.add(t, accessRead|accessWrite, isDir)
 		return nil
 	}
@@ -213,10 +260,10 @@ func (b *ruleBuilder) walkWrite(t, root string, isDir bool, seen map[string]bool
 		if err != nil {
 			return err
 		}
-		if !ok || !within(child, root) || b.noWriteGrant(child) {
+		if !ok || !within(child, root) || b.noWriteGrant(rootName+strings.TrimPrefix(child, root)) {
 			continue
 		}
-		if err := b.walkWrite(child, root, childDir, seen); err != nil {
+		if err := b.walkWrite(child, root, rootName, childDir, seen); err != nil {
 			return err
 		}
 	}

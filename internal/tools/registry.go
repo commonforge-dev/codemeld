@@ -42,10 +42,11 @@ type Result struct {
 // for a credential-named path. Its zero value is credential-handling, so a tool that does not
 // advertise the classification cannot join an authorization batch.
 type Metadata struct {
-	Description   string
-	Parameters    map[string]any
-	ReadOnly      bool
-	Noncredential bool
+	Description     string
+	Parameters      map[string]any
+	ReadOnly        bool
+	Noncredential   bool
+	RoutineVCSWrite bool
 }
 
 // Tool is a structured tool dispatched by exact name.
