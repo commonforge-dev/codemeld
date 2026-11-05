@@ -68,7 +68,9 @@ filter, then becomes the command. Everything the command starts inherits the res
 none can be removed. The command sees codemeld's launch environment minus withheld-authority
 names, secret-looking names and values carrying a URL credential (`runner.InheritedEnvironment`),
 then the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` and
-`LC_ALL`, then the command's own assignments (`confinement.prepare`).
+`LC_ALL`, then the command's own assignments (`confinement.prepare`). An inherited value that
+resolves to the same folder as codemeld's own temp folder (`os.TempDir()`) is replaced with the
+session temp folder (`namesFolder`).
 
 - **Files.** Reads are allowed everywhere except the blocked paths, which always include
   `~/.codemeld`; the one exception is `~/.codemeld/skills`, readable under the conditions in
@@ -120,7 +122,7 @@ agents. Build is never sandboxed.
 
 | Startup self-test | Settings file | Recorded capability | Shell commands in Plan and Auto edits |
 |---|---|---|---|
-| passed | valid | `constrained` | sandboxed, no ordinary prompt; in Auto edits, a command with a recognized network stage asks (`SandboxedAutoEditsAuthority`), and file deletion, history rewrites and commands codemeld cannot split run without asking; a rewrite cannot write the history stores under **Version history** above, and a version-control tool write action from a product-authored template runs without asking while a customized template's does not (`sandboxedVCSWrite`) |
+| passed | valid | `constrained` | sandboxed, no ordinary prompt; in Auto edits, a command with a recognized network stage asks (`SandboxedAutoEditsAuthority`), and file deletion, history rewrites and commands codemeld cannot split run without asking; a rewrite cannot write the history stores under **Version history** above, and a version-control tool write action from a product-authored template runs without asking (`sandboxedVCSWrite`), while customized templates get no routine-write auto-approval; a matching saved grant or turn approval can still cover them (`resolveWithoutPrompt`) |
 | passed | broken | `refused` (broken settings) | still sandboxed, every command asks |
 | failed or unsupported | any | `refused` with its reason | unsandboxed, ordinary prompts and Plan refusals |
 

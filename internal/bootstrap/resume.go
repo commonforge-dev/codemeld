@@ -257,12 +257,10 @@ func runResumeSubsequence(ctx context.Context, home, cwd, id string, global map[
 	// Resolve <id> + folder-file check + CWD-match. This
 	// fires before the record stream is available; a failure is stderr-only and
 	// emits no event (the typed error's text is the stderr line the CLI prints).
-	sessionPath, sess, err := steps.ResolveResume(id, cwd, home)
+	sessionPath, _, err := steps.ResolveResume(id, cwd, home)
 	if err != nil {
 		return nil, err
 	}
-	store := sessions.New(sessionPath, sess)
-	res.Session = store
 
 	// Sub-step 1 — acquire the per-session advisory lock. Also pre-stream
 	// and stderr-only on failure. The release is held for the lifetime of the run:
@@ -279,6 +277,18 @@ func runResumeSubsequence(ctx context.Context, home, cwd, id string, global map[
 			releaseLock()
 		}
 	}()
+
+	// The first read happened before the lock, so another owner may have written since;
+	// the Store must be built from a read taken while the lock is held.
+	lockedPath, sess, err := steps.ResolveResume(id, cwd, home)
+	if err != nil {
+		return nil, err
+	}
+	if lockedPath != sessionPath {
+		return nil, fmt.Errorf("resume: session %s moved from %s to %s while taking its lock", id, sessionPath, lockedPath)
+	}
+	store := sessions.New(lockedPath, sess)
+	res.Session = store
 	res.ResumeLockRelease = func() {
 		if releaseLock == nil {
 			return

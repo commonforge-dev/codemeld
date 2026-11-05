@@ -1,6 +1,6 @@
 # Development setup
 
-_Last updated: 2026-10-29_
+_Last updated: 2026-11-03_
 
 This page is the whole "get building" story: the toolchain, the commands, and how to run the
 binary. The dependency list itself is [`go.mod`](../go.mod).
@@ -40,6 +40,7 @@ full task list lives in [`docs/tech-stack.md`](../docs/tech-stack.md) → "Build
 |---------|-----------|
 | `mise run build` | Produce the `./codemeld` binary (static, no CGO). |
 | `mise run test-fast` | Run the whole suite without the race detector. |
+| `mise run test-pkg <packages>` | Test only the packages given (no race detector), for example `./internal/sessions/...`. |
 | `mise run test` | Run the whole suite with the race detector. |
 | `mise run vet` | Static checks (`mise run lint` already includes them). |
 | `mise run lint` | Linting, using the checked-in [`.golangci.yml`](../.golangci.yml). |

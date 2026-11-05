@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"codemeld.dev/codemeld/internal/enforce"
 )
@@ -165,10 +167,70 @@ func finishedProcessPID(t *testing.T) int {
 	return finished.ProcessState.Pid()
 }
 
+func sessionTempRecords() string {
+	return filepath.Join(os.Getenv("HOME"), ".codemeld", "confine-tmp")
+}
+
+func readRecordFields(t *testing.T, record string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&fields); err != nil {
+		t.Fatalf("record %s = %q: %v", record, data, err)
+	}
+	return fields
+}
+
+func writeRecordFields(t *testing.T, record string, fields map[string]any) {
+	t.Helper()
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, record, string(data))
+}
+
+func recordedTempDir(t *testing.T, name string) (path, record string) {
+	t.Helper()
+	dir := newOwnedTempDir(t)
+	if err := dir.recordFailure(); err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+	path = filepath.Join(filepath.Dir(dir.path), name)
+	if err := os.Rename(dir.path, path); err != nil {
+		t.Fatal(err)
+	}
+	created := filepath.Join(sessionTempRecords(), filepath.Base(dir.path))
+	fields := readRecordFields(t, created)
+	fields["path"] = path
+	record = filepath.Join(sessionTempRecords(), name)
+	writeRecordFields(t, record, fields)
+	if err := os.Remove(created); err != nil {
+		t.Fatal(err)
+	}
+	dir.close()
+	return path, record
+}
+
+func requirePresent(t *testing.T, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("%q was removed: %v", path, err)
+		}
+	}
+}
+
 func TestRemoveStaleSessionTempDirs_RemovesOnlyFinishedProcessFolders(t *testing.T) {
 	skipUnlessLinuxTempDirs(t)
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
+	t.Setenv("HOME", t.TempDir())
 	deadPID := finishedProcessPID(t)
 
 	running := exec.Command("sleep", "60")
@@ -180,55 +242,458 @@ func TestRemoveStaleSessionTempDirs_RemovesOnlyFinishedProcessFolders(t *testing
 		_ = running.Wait()
 	})
 
-	mkdir := func(name string) string {
-		path := filepath.Join(tmp, name)
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			t.Fatalf("mkdir %q: %v", path, err)
-		}
-		return path
-	}
-
-	staleName := fmt.Sprintf("codemeld-confine-%d-stale", deadPID)
-	stale := filepath.Join(tmp, staleName)
-	cache := mkdir(filepath.Join(staleName, "gocache"))
+	stale, staleRecord := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-stale", deadPID))
+	cache := filepath.Join(stale, "gocache")
+	mkdirMode(t, cache, 0o700)
 	mustWrite(t, filepath.Join(cache, "entry"), "x")
 	if err := os.Chmod(cache, 0); err != nil {
 		t.Fatal(err)
 	}
 
-	kept := []string{
-		mkdir(fmt.Sprintf("codemeld-confine-%d-self", os.Getpid())),
-		mkdir(fmt.Sprintf("codemeld-confine-%d-live", running.Process.Pid)),
-		mkdir("codemeld-confine-abc-x"),
-		mkdir("codemeld-confine-007-x"),
-		mkdir("codemeld-confine-"),
-		mkdir("unrelated"),
-		mkdir(fmt.Sprintf("codemeld-confine-0%d-x", deadPID)),
-		mkdir(fmt.Sprintf("codemeld-confine-+%d-x", deadPID)),
-		mkdir(fmt.Sprintf("codemeld-confine-%d-", deadPID)),
-		mkdir(fmt.Sprintf("codemeld-confine-%d-x", int64(deadPID)+1<<32)),
+	var kept []string
+	for _, name := range []string{
+		fmt.Sprintf("codemeld-confine-%d-self", os.Getpid()),
+		fmt.Sprintf("codemeld-confine-%d-live", running.Process.Pid),
+		"codemeld-confine-abc-x",
+		"codemeld-confine-007-x",
+		fmt.Sprintf("codemeld-confine-0%d-x", deadPID),
+		fmt.Sprintf("codemeld-confine-+%d-x", deadPID),
+		fmt.Sprintf("codemeld-confine-%d-x", int64(deadPID)+1<<32),
+	} {
+		path, record := recordedTempDir(t, name)
+		kept = append(kept, path, record)
 	}
-
-	regularFile := filepath.Join(tmp, fmt.Sprintf("codemeld-confine-%d-file", deadPID))
-	mustWrite(t, regularFile, "x")
-	target := t.TempDir()
-	targetFile := filepath.Join(target, "keep")
-	mustWrite(t, targetFile, "x")
-	link := filepath.Join(tmp, fmt.Sprintf("codemeld-confine-%d-link", deadPID))
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-	kept = append(kept, regularFile, link, target, targetFile)
 
 	if err := removeStaleSessionTempDirs(); err != nil {
 		t.Fatalf("removeStaleSessionTempDirs: %v", err)
 	}
 
 	requireGone(t, stale)
-	for _, path := range kept {
-		if _, err := os.Lstat(path); err != nil {
-			t.Errorf("%q was removed: %v", path, err)
+	requireGone(t, staleRecord)
+	requirePresent(t, kept...)
+}
+
+func TestRemoveStaleSessionTempDirs_AFolderWithoutARecordIsKept(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("HOME", t.TempDir())
+	mkdirMode(t, sessionTempRecords(), 0o700)
+	unrecorded := filepath.Join(tmp, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+	mkdirMode(t, unrecorded, 0o700)
+	mustWrite(t, filepath.Join(unrecorded, "keep"), "keep")
+
+	if err := removeStaleSessionTempDirs(); err != nil {
+		t.Fatalf("removeStaleSessionTempDirs: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(unrecorded, "keep")); err != nil || string(data) != "keep" {
+		t.Fatalf("unrecorded folder's file = %q, %v; want it kept", data, err)
+	}
+}
+
+func TestRemoveStaleSessionTempDirs_ARecordWhoseFolderIsGoneIsDropped(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeStaleSessionTempDirs(); err != nil {
+		t.Fatalf("removeStaleSessionTempDirs: %v", err)
+	}
+	requireGone(t, record)
+}
+
+func TestRemoveStaleSessionTempDirs_ADifferentEntryAtARecordedPathIsKeptAndReported(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	for _, replacement := range []string{"directory", "symlink"} {
+		t.Run(replacement, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+			if err := os.Rename(path, path+".moved"); err != nil {
+				t.Fatal(err)
+			}
+			kept := newKeptTarget(t, filepath.Join(t.TempDir(), "other"))
+			if replacement == "directory" {
+				if err := os.Rename(kept.dir, path); err != nil {
+					t.Fatal(err)
+				}
+				kept.dir, kept.file = path, filepath.Join(path, "keep")
+			} else if err := os.Symlink(kept.dir, path); err != nil {
+				t.Fatal(err)
+			}
+
+			err := removeStaleSessionTempDirs()
+			if err == nil || !strings.Contains(err.Error(), path) {
+				t.Fatalf("removeStaleSessionTempDirs = %v, want an error naming %s", err, path)
+			}
+			kept.requireUnchanged(t)
+			requireGone(t, record)
+		})
+	}
+}
+
+func TestRemoveStaleSessionTempDirs_AReusedInodeWithADifferentBirthTimeIsKept(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+	mustWrite(t, filepath.Join(path, "keep"), "keep")
+	fields := readRecordFields(t, record)
+	btime, ok := fields["btime_ns"].(json.Number)
+	if !ok {
+		t.Skip("the temp filesystem reports no birth time")
+	}
+	ns, err := btime.Int64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields["btime_ns"] = ns - 1
+	writeRecordFields(t, record, fields)
+
+	if err := removeStaleSessionTempDirs(); err == nil {
+		t.Fatal("removeStaleSessionTempDirs = nil, want the mismatch reported")
+	}
+	if data, err := os.ReadFile(filepath.Join(path, "keep")); err != nil || string(data) != "keep" {
+		t.Fatalf("file in the reused folder = %q, %v; want it kept", data, err)
+	}
+}
+
+func TestRemoveStaleSessionTempDirs_ARecordWithoutABirthTimeKeepsTheFolderAndIsDropped(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+	fields := readRecordFields(t, record)
+	delete(fields, "btime_ns")
+	writeRecordFields(t, record, fields)
+
+	if err := removeStaleSessionTempDirs(); err == nil {
+		t.Fatal("removeStaleSessionTempDirs = nil, want the unprovable folder reported")
+	}
+	requirePresent(t, path)
+	requireGone(t, record)
+}
+
+func TestRemoveStaleSessionTempDirs_AMalformedRecordKeepsTheFolderAndRecord(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	pid := finishedProcessPID(t)
+	without := func(field string) func(string, map[string]any) string {
+		return func(_ string, f map[string]any) string {
+			delete(f, field)
+			b, _ := json.Marshal(f)
+			return string(b)
 		}
+	}
+	null := func(field string) func(string, map[string]any) string {
+		return func(_ string, f map[string]any) string {
+			f[field] = nil
+			b, _ := json.Marshal(f)
+			return string(b)
+		}
+	}
+	for name, content := range map[string]func(valid string, fields map[string]any) string{
+		"truncated":         func(string, map[string]any) string { return "{" },
+		"trailing bytes":    func(v string, _ map[string]any) string { return v + "\n{" },
+		"trailing brace":    func(v string, _ map[string]any) string { return v + "}" },
+		"second JSON value": func(v string, _ map[string]any) string { return v + "\n" + v },
+		"missing dev":       without("dev"),
+		"missing ino":       without("ino"),
+		"missing path":      without("path"),
+		"null dev":          null("dev"),
+		"null ino":          null("ino"),
+		"null path":         null("path"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", pid))
+			sentinel := filepath.Join(path, "sentinel")
+			mustWrite(t, sentinel, "x")
+			valid, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, record, content(string(valid), readRecordFields(t, record)))
+
+			if err := removeStaleSessionTempDirs(); err == nil {
+				t.Fatal("removeStaleSessionTempDirs = nil, want the malformed record reported")
+			}
+			requirePresent(t, path, record, sentinel)
+		})
+	}
+	t.Run("trailing whitespace is accepted", func(t *testing.T) {
+		t.Setenv("TMPDIR", t.TempDir())
+		t.Setenv("HOME", t.TempDir())
+		path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", pid))
+		valid, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, record, string(valid)+" \n\t\n")
+
+		if err := removeStaleSessionTempDirs(); err != nil {
+			t.Fatalf("removeStaleSessionTempDirs: %v", err)
+		}
+		requireGone(t, path)
+		requireGone(t, record)
+	})
+}
+
+func TestRemoveStaleSessionTempDirs_AnotherCleanerRemovingTheFolderFirstIsNotAnError(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	for name, hook := range map[string]*func(string){"during traversal": &duringSessionTempDirCleanup, "before the final unlink": &beforeSessionTempDirUnlink} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+			mkdirMode(t, filepath.Join(path, "sub"), 0o700)
+			mustWrite(t, filepath.Join(path, "f"), "x")
+			fired := false
+			setHook(t, hook, func(dir string) {
+				if dir != path || fired {
+					return
+				}
+				fired = true
+				if err := os.RemoveAll(path); err != nil {
+					t.Errorf("remove: %v", err)
+				}
+			})
+
+			if err := removeStaleSessionTempDirs(); err != nil {
+				t.Fatalf("removeStaleSessionTempDirs: %v", err)
+			}
+			if !fired {
+				t.Fatal("the other cleaner's hook did not fire")
+			}
+			requireGone(t, record)
+		})
+	}
+}
+
+func TestRemoveStaleSessionTempDirs_AFIFORecordIsReportedWithoutBlocking(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+	sentinel := filepath.Join(path, "sentinel")
+	mustWrite(t, sentinel, "x")
+	if err := os.Remove(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- removeStaleSessionTempDirs() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("removeStaleSessionTempDirs = nil, want the FIFO record reported")
+		}
+	case <-time.After(10 * time.Second):
+		if w, err := os.OpenFile(record, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = w.Close()
+		}
+		t.Fatal("removeStaleSessionTempDirs blocked opening a FIFO record")
+	}
+	requirePresent(t, path, record, sentinel)
+}
+
+func TestRemoveStaleSessionTempDirs_ARecordAnotherCleanerRemovedAfterTheScanIsNotAnError(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("HOME", t.TempDir())
+	pid := finishedProcessPID(t)
+	type recorded struct{ path, record string }
+	byParent := map[string]recorded{}
+	for _, suffix := range []string{"a", "b"} {
+		t.Setenv("TMPDIR", t.TempDir())
+		path, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-%s", pid, suffix))
+		byParent[filepath.Dir(path)] = recorded{path, record}
+	}
+	unrelated := filepath.Join(sessionTempRecords(), "unrelated")
+	mustWrite(t, unrelated, "x")
+	fired := false
+	setHook(t, &afterStaleScanParentOpen, func(parent string) {
+		if fired {
+			return
+		}
+		fired = true
+		for p, other := range byParent {
+			if p == parent {
+				continue
+			}
+			if err := os.RemoveAll(other.path); err != nil {
+				t.Error(err)
+			}
+			if err := os.Remove(other.record); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+
+	if err := removeStaleSessionTempDirs(); err != nil {
+		t.Fatalf("removeStaleSessionTempDirs: %v", err)
+	}
+	if !fired {
+		t.Fatal("the other cleaner's hook did not fire")
+	}
+	for _, r := range byParent {
+		requireGone(t, r.path)
+		requireGone(t, r.record)
+	}
+	requirePresent(t, unrelated)
+}
+
+func TestSessionTempRecords_AnUnsafeRecordsFolderIsNeitherWrittenNorTrusted(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	for _, unsafe := range []string{"symlink", "mode 0755"} {
+		t.Run(unsafe, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			stale, record := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-x", finishedProcessPID(t)))
+			records := sessionTempRecords()
+			target := records
+			if unsafe == "symlink" {
+				target = filepath.Join(t.TempDir(), "elsewhere")
+				if err := os.Rename(records, target); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, records); err != nil {
+					t.Fatal(err)
+				}
+				record = filepath.Join(target, filepath.Base(record))
+			} else if err := os.Chmod(records, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadDir(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dir, err := newSessionTempDir()
+			if err != nil {
+				t.Fatalf("newSessionTempDir: %v", err)
+			}
+			t.Cleanup(dir.close)
+			if dir.recordFailure() == nil {
+				t.Fatal("record failure = nil, want the unsafe records folder reported")
+			}
+			requirePresent(t, dir.path)
+			if err := removeStaleSessionTempDirs(); err == nil {
+				t.Fatal("removeStaleSessionTempDirs = nil, want the unsafe records folder reported")
+			}
+			requirePresent(t, stale, record)
+			after, err := os.ReadDir(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(after) != len(before) || len(after) != 1 || after[0].Name() != before[0].Name() {
+				t.Fatalf("records folder holds %v, want only %v", after, before)
+			}
+			if info, err := os.Stat(target); err != nil || (unsafe == "mode 0755" && info.Mode().Perm() != 0o755) {
+				t.Fatalf("records folder %s: %v, %v; want it left as it was", target, info, err)
+			}
+		})
+	}
+}
+
+func TestStartExecutionCapability_AFailedRecordKeepsTheFolderAndShowsOneNotice(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root can create a folder in a read-only parent")
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mkdirMode(t, filepath.Join(home, ".codemeld"), 0o500)
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(home, ".codemeld"), 0o700) })
+
+	var notices bytes.Buffer
+	dir, err := startExecutionCapability(enforce.Resolution{SelfTestPassed: true}, stderrNoticeRenderer{w: &notices})
+	if err != nil || dir == nil {
+		t.Fatalf("startExecutionCapability = (%v, %v), want a folder and no error", dir, err)
+	}
+	t.Cleanup(dir.close)
+	requirePresent(t, dir.path)
+	requireGone(t, filepath.Join(sessionTempRecords(), filepath.Base(dir.path)))
+	got := notices.String()
+	if strings.Count(got, "\n") != 1 || !strings.Contains(got, "left behind") || !strings.Contains(got, dir.path) {
+		t.Fatalf("notices = %q, want one notice that a crash would leave %s behind", got, dir.path)
+	}
+}
+
+func TestNewSessionTempDir_RecordsTheFolderBeforeReturning(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	dir := newOwnedTempDir(t)
+	fields := readRecordFields(t, filepath.Join(sessionTempRecords(), filepath.Base(dir.path)))
+	info, err := os.Stat(dir.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := info.Sys().(*syscall.Stat_t)
+	if fields["path"] != dir.path || fields["dev"] != json.Number(fmt.Sprint(st.Dev)) || fields["ino"] != json.Number(fmt.Sprint(st.Ino)) {
+		t.Fatalf("record = %v, want path %s, dev %d, ino %d", fields, dir.path, st.Dev, st.Ino)
+	}
+}
+
+func TestSessionTempDir_AFailedRemovalKeepsTheRecord(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root can remove a folder from a read-only parent")
+	}
+	parent := t.TempDir()
+	t.Setenv("TMPDIR", parent)
+	t.Setenv("HOME", t.TempDir())
+	dir := newOwnedTempDir(t)
+	record := filepath.Join(sessionTempRecords(), filepath.Base(dir.path))
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	err := dir.remove()
+	_ = os.Chmod(parent, 0o700)
+	if err == nil {
+		t.Fatal("remove from a read-only parent = nil, want an error")
+	}
+	requirePresent(t, dir.path, record)
+}
+
+func TestSessionTempDir_RemovalAndReleaseDropTheRecord(t *testing.T) {
+	skipUnlessLinuxTempDirs(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	record := func(path string) string { return filepath.Join(sessionTempRecords(), filepath.Base(path)) }
+
+	dir := newOwnedTempDir(t)
+	requirePresent(t, record(dir.path))
+	if err := dir.removeAndRelease(); err != nil {
+		t.Fatalf("removeAndRelease: %v", err)
+	}
+	requireGone(t, dir.path)
+	requireGone(t, record(dir.path))
+
+	first := newOwnedTempDir(t)
+	conf := &confinement{tmpDir: first.path}
+	conf.own(first)
+	replacement, _, err := conf.prepareReplacement()
+	if err != nil {
+		t.Fatalf("prepareReplacement: %v", err)
+	}
+	conf.commitReplacement(replacement)
+	if warning := conf.takeCleanupWarning(); warning != "" {
+		t.Fatalf("cleanup warning %q", warning)
+	}
+	requireGone(t, first.path)
+	requireGone(t, record(first.path))
+	requirePresent(t, replacement, record(replacement))
+	if err := conf.cleanupAll(); err != nil {
+		t.Fatalf("cleanupAll: %v", err)
 	}
 }
 
@@ -236,8 +701,11 @@ func TestRemoveStaleSessionTempDirs_AParentSwapAfterTheScanOpensCannotRedirectIt
 	skipUnlessLinuxTempDirs(t)
 	base, outside := canonicalTempDir(t), canonicalTempDir(t)
 	tmp := filepath.Join(base, "tmp")
+	mkdirMode(t, tmp, 0o700)
 	t.Setenv("TMPDIR", tmp)
+	t.Setenv("HOME", t.TempDir())
 	name := fmt.Sprintf("codemeld-confine-%d-stale", finishedProcessPID(t))
+	recordedTempDir(t, name)
 	mkdirMode(t, filepath.Join(tmp, name, "cache"), 0)
 	kept := newKeptTarget(t, filepath.Join(outside, name))
 	setHook(t, &afterStaleScanParentOpen, func(string) {
@@ -260,7 +728,8 @@ func TestRemoveStaleSessionTempDirs_ASwappedCandidateIsLeftAndReportedAtStartup(
 	skipUnlessLinuxTempDirs(t)
 	tmp, outside := canonicalTempDir(t), canonicalTempDir(t)
 	t.Setenv("TMPDIR", tmp)
-	stale := filepath.Join(tmp, fmt.Sprintf("codemeld-confine-%d-stale", finishedProcessPID(t)))
+	t.Setenv("HOME", t.TempDir())
+	stale, _ := recordedTempDir(t, fmt.Sprintf("codemeld-confine-%d-stale", finishedProcessPID(t)))
 	sub := filepath.Join(stale, "sub")
 	mkdirMode(t, sub, 0)
 	kept := newKeptTarget(t, filepath.Join(outside, "target"))

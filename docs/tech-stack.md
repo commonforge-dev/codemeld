@@ -53,6 +53,7 @@ Use the mise tasks, not raw `go`/`golangci-lint` invocations — they encode the
 - `mise run build` — builds `./cmd/codemeld` into a `./codemeld` static binary at the repo root (`CGO_ENABLED=0`)
 - `mise run test` — `go test -race ./...` (race detector; cgo defaults on, which `-race` requires)
 - `mise run test-fast` — `go test ./...` (no race detector; faster, reuses the normal build cache)
+- `mise run test-pkg <packages> [go test flags]` — `go test` on only the packages given, e.g. `mise run test-pkg ./internal/ids -run TestNewV7`; fails without a package. For testing one package while other work is in progress, not a gate
 - `mise run fuzz-slash` — `go test ./internal/tui -run=^$ -fuzz=FuzzSlashParse -fuzztime=30s` (local slash-parser fuzz run; future hosted CI should call this task once an external CI runner is chosen)
 - `mise run vet` — `go vet ./...`
 - `mise run lint` — `golangci-lint run` (includes the `govet` analyzers, so it subsumes `mise run vet`)

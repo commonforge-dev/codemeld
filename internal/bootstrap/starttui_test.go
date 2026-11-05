@@ -5804,11 +5804,10 @@ func TestStartTUI_SessionTempFolderFollowsTheSelfTest(t *testing.T) {
 		t.Run(fmt.Sprintf("self-test passed %v", passed), func(t *testing.T) {
 			tmp := t.TempDir()
 			t.Setenv("TMPDIR", tmp)
+			t.Setenv("HOME", t.TempDir())
 			stale := filepath.Join(tmp, fmt.Sprintf("codemeld-confine-%d-x", finishedPID(t)))
 			if runtime.GOOS == "linux" {
-				if err := os.Mkdir(stale, 0o700); err != nil {
-					t.Fatal(err)
-				}
+				stale, _ = recordedTempDir(t, filepath.Base(stale))
 			}
 			resolution := injectedResolution
 			resolution.SelfTestPassed = passed

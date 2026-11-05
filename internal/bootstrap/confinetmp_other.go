@@ -5,7 +5,8 @@ package bootstrap
 import "errors"
 
 type sessionTempDir struct {
-	path string
+	path      string
+	recordErr error
 }
 
 var errSessionTempDirUnsupported = errors.New("bootstrap: private temp folders are created only on linux")

@@ -58,7 +58,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.9"
+var codemeldVersion = "Beta 0.4.10"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -1498,7 +1498,11 @@ func startExecutionCapability(resolution enforce.Resolution, notices tui.NoticeR
 	if !resolution.SelfTestPassed {
 		return nil, nil
 	}
-	return newSessionTempDir()
+	dir, err := newSessionTempDir()
+	if recordErr := dir.recordFailure(); recordErr != nil {
+		notices.Notice(fmt.Sprintf("codemeld: could not record this session's confinement temp folder %s: %v; if codemeld crashes, the folder will be left behind", dir.folder(), recordErr))
+	}
+	return dir, err
 }
 
 var recordExecutionCapability = func(ctx context.Context, store *sessions.Store, resolution enforce.Resolution, withheld []string, notices tui.NoticeRenderer) error {

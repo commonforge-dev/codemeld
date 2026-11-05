@@ -25,6 +25,13 @@ func (d *sessionTempDir) folder() string {
 	return d.path
 }
 
+func (d *sessionTempDir) recordFailure() error {
+	if d == nil {
+		return nil
+	}
+	return d.recordErr
+}
+
 func (d *sessionTempDir) removeAndRelease() error {
 	err := d.remove()
 	d.close()

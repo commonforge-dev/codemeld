@@ -72,6 +72,10 @@ run = "go test -race ./..."
 description = "Tests without the race detector (faster; reuses the normal build cache)"
 run = "go test ./..."
 
+[tasks.test-pkg]
+description = "Tests only the packages given (no race detector), e.g. mise run test-pkg ./internal/ids -run TestNewV7"
+run = 'f() { [ $# -gt 0 ] || { echo "test-pkg: a package is required, e.g. mise run test-pkg ./internal/ids" >&2; exit 1; }; go test "$@"; }; f'
+
 [tasks.vet]
 description = "Runs go vet across all packages"
 run = "go vet ./..."

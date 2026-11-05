@@ -54,7 +54,8 @@ safely.
     protected for that command. The version-control tools' write actions
     (such as commit, add and stash) also run without asking when their
     templates are codemeld's built-ins or byte-identical reference copies;
-    customized templates still ask. The status bar shows `sandbox: on`.
+    customized templates get no routine-write auto-approval; a matching saved
+    grant or turn approval can still cover them. The status bar shows `sandbox: on`.
   - <a id="broken-settings"></a>**Self-test passed, then a settings file's blocked-path list breaks.** Plan and
     Auto edits commands stay confined, but every shell command asks until the
     file is fixed, except one you already denied this turn, and a recognized

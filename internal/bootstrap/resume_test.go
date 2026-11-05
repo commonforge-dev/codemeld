@@ -4,6 +4,7 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -94,7 +95,7 @@ func recordingResumeSteps(order *[]string) ResumeSteps {
 // identical for `--resume <id>` and the no-id picker.
 func subsequenceOrder() []string {
 	return []string{
-		"R1:ResolveResume", "R2:AcquireLock", "R3:AppendLaunchBegan", "R4:RefreshUpdatedAt",
+		"R1:ResolveResume", "R2:AcquireLock", "R1:ResolveResume", "R3:AppendLaunchBegan", "R4:RefreshUpdatedAt",
 		"2:ResolveProjectRoot", "2b:GateTrust", "2.5:ScaffoldProjectIgnore", "2.6:RecoverJournals",
 		"3:ComposeConfig", "4:LoadVCSTemplates",
 		"5:ValidateForceVCS", "6:DetectVCS", "6c:BuildToolRegistry",
@@ -859,6 +860,169 @@ func TestRunResume_KeepsUnknownKindLineThroughLaunchAppendAndRefresh(t *testing.
 	}
 	if !disk.Metadata.UpdatedAt.After(time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)) {
 		t.Fatalf("updated_at = %s, want it refreshed", disk.Metadata.UpdatedAt)
+	}
+}
+
+func TestRunResume_KeepsAnotherOwnersEventWrittenBeforeTheLock(t *testing.T) {
+	home, cwd, id, path := writeUnknownKindSession(t)
+	prod := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard)
+	var order []string
+	steps := recordingResumeSteps(&order)
+	steps.ResolveResume = prod.ResolveResume
+	steps.AppendLaunchBegan = prod.AppendLaunchBegan
+	steps.RefreshUpdatedAt = prod.RefreshUpdatedAt
+	steps.AcquireLock = func(sessionPath, lockID string) (func(), error) {
+		otherPath, otherSess, err := prod.ResolveResume(id, cwd, home)
+		if err != nil {
+			t.Fatalf("other owner resolve: %v", err)
+		}
+		otherRelease, err := prod.AcquireLock(otherPath, id)
+		if err != nil {
+			t.Fatalf("other owner lock: %v", err)
+		}
+		if err := events.EmitLaunchBegan(context.Background(), sessions.New(otherPath, otherSess), "fork", nil); err != nil {
+			t.Fatalf("other owner append: %v", err)
+		}
+		otherRelease()
+		return prod.AcquireLock(sessionPath, lockID)
+	}
+
+	res, err := runResumeWithID(context.Background(), home, cwd, id, steps)
+	if err != nil || res == nil {
+		t.Fatalf("runResumeWithID = (%v, %v), want a full launch", res, err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Split(string(data), "\n"); len(lines) < 4 || lines[1] != unknownKindLine {
+		t.Fatalf("disk lines = %q, want line 1 to stay byte-identical to %q", lines, unknownKindLine)
+	}
+	disk := readSessionFile(t, path)
+	if got, want := diskEventKinds(disk), []string{"from_newer_build", events.KindLaunchBegan, events.KindLaunchBegan}; !slices.Equal(got, want) {
+		t.Fatalf("disk event kinds = %v, want %v", got, want)
+	}
+	var sources []string
+	for _, r := range disk.Records {
+		if ev, ok := r.(sessions.Event); ok && ev.Kind == events.KindLaunchBegan {
+			var p events.LaunchBegan
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Fatalf("decode launch_began: %v", err)
+			}
+			sources = append(sources, p.Source)
+		}
+	}
+	if want := []string{"fork", "resume"}; !slices.Equal(sources, want) {
+		t.Fatalf("launch_began sources = %v, want %v", sources, want)
+	}
+	if !disk.Metadata.UpdatedAt.After(time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("updated_at = %s, want it refreshed", disk.Metadata.UpdatedAt)
+	}
+}
+
+func TestRunResume_SecondResolveFailureReleasesTheLockAndWritesNothing(t *testing.T) {
+	home, cwd, id, path := writeUnknownKindSession(t)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prod := DefaultResumeSteps(strings.NewReader(""), io.Discard, io.Discard)
+	sentinel := errors.New("locked reload failed")
+	var order []string
+	steps := recordingResumeSteps(&order)
+	resolves := 0
+	steps.ResolveResume = func(id, cwd, home string) (string, *sessions.Session, error) {
+		order = append(order, "R1:ResolveResume")
+		resolves++
+		if resolves == 2 {
+			return "", nil, sentinel
+		}
+		return prod.ResolveResume(id, cwd, home)
+	}
+	releases := 0
+	steps.AcquireLock = func(sessionPath, lockID string) (func(), error) {
+		order = append(order, "R2:AcquireLock")
+		release, err := prod.AcquireLock(sessionPath, lockID)
+		if err != nil {
+			return nil, err
+		}
+		return func() { releases++; release() }, nil
+	}
+
+	res, err := runResumeWithID(context.Background(), home, cwd, id, steps)
+	if !errors.Is(err, sentinel) || res != nil {
+		t.Fatalf("runResumeWithID = (%v, %v), want (nil, sentinel)", res, err)
+	}
+	if want := []string{"0:RunFirstRun", "1:LoadGlobalSettings", "R1:ResolveResume", "R2:AcquireLock", "R1:ResolveResume"}; !slices.Equal(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+	if releases != 1 {
+		t.Fatalf("release called %d times, want 1", releases)
+	}
+	if resumeLockHeld(t, path) {
+		t.Fatal("sidecar lock still held after the failed locked reload")
+	}
+	if after, err := os.ReadFile(path); err != nil || string(after) != string(before) {
+		t.Fatalf("session bytes changed (err=%v):\nbefore %q\nafter  %q", err, before, after)
+	}
+}
+
+func TestRunResume_SecondResolveOnAnotherPathIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	original, alternate := filepath.Join(dir, "original.json"), filepath.Join(dir, "alternate.json")
+	for _, p := range []string{original, alternate} {
+		if err := os.WriteFile(p, []byte(p+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var order []string
+	steps := recordingResumeSteps(&order)
+	resolves := 0
+	steps.ResolveResume = func(string, string, string) (string, *sessions.Session, error) {
+		order = append(order, "R1:ResolveResume")
+		resolves++
+		if resolves == 2 {
+			return alternate, &sessions.Session{}, nil
+		}
+		return original, &sessions.Session{}, nil
+	}
+	releases := 0
+	steps.AcquireLock = func(string, string) (func(), error) {
+		order = append(order, "R2:AcquireLock")
+		return func() { releases++ }, nil
+	}
+
+	res, err := runResumeWithID(context.Background(), "/home/u", "/cwd", "the-id", steps)
+	if err == nil || res != nil {
+		t.Fatalf("runResumeWithID = (%v, %v), want a path-change error", res, err)
+	}
+	if want := []string{"0:RunFirstRun", "1:LoadGlobalSettings", "R1:ResolveResume", "R2:AcquireLock", "R1:ResolveResume"}; !slices.Equal(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+	if releases != 1 {
+		t.Fatalf("release called %d times, want 1", releases)
+	}
+	for _, p := range []string{original, alternate} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != p+"\n" {
+			t.Fatalf("%s = %q (err=%v), want it unchanged", p, got, err)
+		}
+	}
+}
+
+func TestRunResumeWithID_LockFailureSkipsTheSecondResolve(t *testing.T) {
+	var order []string
+	steps := recordingResumeSteps(&order)
+	steps.AcquireLock = func(string, string) (func(), error) {
+		order = append(order, "R2:AcquireLock")
+		return nil, errors.New("held")
+	}
+
+	if _, err := runResumeWithID(context.Background(), "/home/u", "/cwd", "the-id", steps); err == nil {
+		t.Fatal("runResumeWithID succeeded, want the lock error")
+	}
+	if want := []string{"0:RunFirstRun", "1:LoadGlobalSettings", "R1:ResolveResume", "R2:AcquireLock"}; !slices.Equal(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
 	}
 }
 

@@ -11,11 +11,17 @@
 - MCP support
 
 ## Ongoing
+
 ## Completed
+- **0.4.10 Beta — November 2026:**
+  - Fix for the v0.4.9 known issue
+  - Sandboxed commands build and lint when the launch environment points other temp variables at codemeld's temp folder
+  - Two resumes of the same session can no longer overwrite each other
+  - Documentation corrections found by the v0.4.9 release review
 - **0.4.9 Beta — November 2026:**
-  - Sandboxed Auto edits: shell commands can't change version history, and codemeld's built-in commits run without asking
+  - Sandboxed Auto edits: shell commands can't write the existing Git or Mercurial history at the project and declared writable folders (nested and newly created repositories stay writable), and codemeld's built-in version-control writes from its own templates run without asking while settings are valid
   - Plan mode commands get their own temporary folder; project files stay read-only
-  - Sessions written by a newer codemeld open in an older one, which skips the records it doesn't recognise and says so
+  - Sessions from a newer codemeld with the same schema version open in an older one, which skips the record kinds it doesn't recognise and says so; a newer schema version is still refused
 - **0.4.8 Beta — October 2026:**
   - Fixes for the v0.4.7 known issues
   - OpenRouter: per-model quantization preference or requirement, and one table for every model's price caps

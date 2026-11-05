@@ -580,6 +580,206 @@ func TestConfinedRunner_ParallelPreparationsKeepTheLaunchSnapshot(t *testing.T) 
 	}
 }
 
+func TestConfinedRunner_InheritedLaunchTempFolderBecomesTheSessionTemp(t *testing.T) {
+	type setup struct {
+		value, cwd  string
+		noSession   bool
+		assignments []string
+	}
+	launchTemp := func(t *testing.T) string {
+		dir := t.TempDir()
+		t.Setenv("TMPDIR", dir)
+		return dir
+	}
+	symlink := func(t *testing.T, target, link string) {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkUp := func(t *testing.T) (base, other string) {
+		base, other = t.TempDir(), t.TempDir()
+		child := filepath.Join(other, "child")
+		if err := os.Mkdir(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		symlink(t, child, filepath.Join(base, "link"))
+		return base, other
+	}
+	upThrough := func(t *testing.T, searchable bool) (temp, through string) {
+		base := t.TempDir()
+		temp = filepath.Join(base, "temp")
+		dir := filepath.Join(base, "dir")
+		for _, d := range []string{temp, dir} {
+			if err := os.Mkdir(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		through = dir + "/../temp"
+		if searchable {
+			return temp, through
+		}
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses search permission")
+		}
+		if err := os.Chmod(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+		if _, err := os.Stat(through); !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("Stat(%s) error = %v, want permission denied", through, err)
+		}
+		return temp, through
+	}
+	for name, tc := range map[string]struct {
+		setup   func(t *testing.T) setup
+		rewrite bool
+	}{
+		"exact match":    {func(t *testing.T) setup { d := launchTemp(t); return setup{value: d} }, true},
+		"trailing slash": {func(t *testing.T) setup { d := launchTemp(t); return setup{value: d + "/"} }, true},
+		"symlink to the temp folder": {func(t *testing.T) setup {
+			d := launchTemp(t)
+			link := filepath.Join(t.TempDir(), "link")
+			symlink(t, d, link)
+			return setup{value: link}
+		}, true},
+		"TMPDIR unset matches /tmp": {func(t *testing.T) setup {
+			t.Setenv("TMPDIR", "")
+			return setup{value: "/tmp"}
+		}, true},
+		"subfolder": {func(t *testing.T) setup {
+			d := launchTemp(t)
+			sub := filepath.Join(d, "sub")
+			if err := os.Mkdir(sub, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return setup{value: sub}
+		}, false},
+		"unrelated folder": {func(t *testing.T) setup { launchTemp(t); return setup{value: t.TempDir()} }, false},
+		"non-path value":   {func(t *testing.T) setup { launchTemp(t); return setup{value: "local"} }, false},
+		"path list containing the temp folder": {func(t *testing.T) setup {
+			d := launchTemp(t)
+			return setup{value: d + ":" + t.TempDir()}
+		}, false},
+		"no session temp folder": {func(t *testing.T) setup {
+			d := launchTemp(t)
+			return setup{value: d, noSession: true}
+		}, false},
+		"command assignment": {func(t *testing.T) setup {
+			d := launchTemp(t)
+			return setup{value: d, assignments: []string{"GOTMPDIR=" + d}}
+		}, false},
+		"relative value through spec.Cwd": {func(t *testing.T) setup {
+			base := t.TempDir()
+			d := filepath.Join(base, "launch")
+			if err := os.Mkdir(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TMPDIR", d)
+			t.Chdir(t.TempDir())
+			return setup{value: "launch", cwd: base}
+		}, true},
+		"relative launch TMPDIR, absolute value": {func(t *testing.T) setup {
+			base := t.TempDir()
+			cwd := t.TempDir()
+			d := filepath.Join(base, "launch-tmp")
+			if err := os.Mkdir(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(base)
+			t.Setenv("TMPDIR", "launch-tmp")
+			return setup{value: d, cwd: cwd}
+		}, true},
+		"unresolvable value": {func(t *testing.T) setup {
+			d := launchTemp(t)
+			symlink(t, "loop", filepath.Join(d, "loop"))
+			return setup{value: d + "/loop/.."}
+		}, false},
+		"absolute launch TMPDIR through link/.., resolved folder": {func(t *testing.T) setup {
+			base, other := linkUp(t)
+			t.Setenv("TMPDIR", base+"/link/..")
+			return setup{value: other}
+		}, true},
+		"absolute launch TMPDIR through link/.., lexical folder": {func(t *testing.T) setup {
+			base, _ := linkUp(t)
+			t.Setenv("TMPDIR", base+"/link/..")
+			return setup{value: base}
+		}, false},
+		"relative launch TMPDIR through link/.., resolved folder": {func(t *testing.T) setup {
+			base, other := linkUp(t)
+			t.Chdir(base)
+			t.Setenv("TMPDIR", "link/..")
+			return setup{value: other}
+		}, true},
+		"relative launch TMPDIR through link/.., lexical folder": {func(t *testing.T) setup {
+			base, _ := linkUp(t)
+			t.Chdir(base)
+			t.Setenv("TMPDIR", "link/..")
+			return setup{value: base}
+		}, false},
+		"launch TMPDIR through a missing folder and ..": {func(t *testing.T) setup {
+			base := t.TempDir()
+			t.Setenv("TMPDIR", base+"/missing/..")
+			return setup{value: base}
+		}, false},
+		"launch TMPDIR through a symlink loop and ..": {func(t *testing.T) setup {
+			base := t.TempDir()
+			symlink(t, "loop", filepath.Join(base, "loop"))
+			t.Setenv("TMPDIR", base+"/loop/..")
+			return setup{value: base}
+		}, false},
+		"value through a non-searchable folder and ..": {func(t *testing.T) setup {
+			temp, through := upThrough(t, false)
+			t.Setenv("TMPDIR", temp)
+			return setup{value: through}
+		}, false},
+		"value through a searchable folder and ..": {func(t *testing.T) setup {
+			temp, through := upThrough(t, true)
+			t.Setenv("TMPDIR", temp)
+			return setup{value: through}
+		}, true},
+		"launch TMPDIR through a non-searchable folder and ..": {func(t *testing.T) setup {
+			temp, through := upThrough(t, false)
+			t.Setenv("TMPDIR", through)
+			return setup{value: temp}
+		}, false},
+		"launch TMPDIR through a searchable folder and ..": {func(t *testing.T) setup {
+			temp, through := upThrough(t, true)
+			t.Setenv("TMPDIR", through)
+			return setup{value: temp}
+		}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := tc.setup(t)
+			cwd := s.cwd
+			if cwd == "" {
+				cwd = t.TempDir()
+			}
+			session := t.TempDir()
+			if s.noSession {
+				session = ""
+			}
+			conf := &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), home: t.TempDir(), lookupPath: programDir(t, "go"),
+				blocked: testBlocked(t), inherited: launchSnapshot("GOTMPDIR=" + s.value)}
+			spec := confinedSpec(cwd, "go", "build")
+			spec.Assignments = s.assignments
+			prepared, err := conf.prepare(spec, session, conf.blocked.Current())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "GOTMPDIR=" + s.value
+			if s.assignments != nil {
+				want = s.assignments[0]
+			}
+			if tc.rewrite {
+				want = "GOTMPDIR=" + session
+			}
+			if got := envNamed(prepared.Env, "GOTMPDIR"); !slices.Equal(got, []string{want}) {
+				t.Fatalf("GOTMPDIR entries = %q, want exactly %s", got, want)
+			}
+		})
+	}
+}
+
 const wantGitNeutralizer = "GIT_CONFIG_GLOBAL=/dev/null"
 
 func helperLaunchEnv(t *testing.T, target []string) []string {

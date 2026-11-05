@@ -173,9 +173,18 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permi
 		name, _, _ := strings.Cut(e, "=")
 		set[name] = true
 	}
+	var launchTemp string
+	if tmpDir != "" {
+		if abs, err := unresolvedAbs(os.TempDir()); err == nil {
+			launchTemp, _ = reachableDir(abs)
+		}
+	}
 	merged := make([]string, 0, len(c.inherited)+len(env)+1)
 	for _, e := range c.inherited {
-		if name, _, _ := strings.Cut(e, "="); !set[name] {
+		if name, value, _ := strings.Cut(e, "="); !set[name] {
+			if launchTemp != "" && namesFolder(value, spec.Cwd, launchTemp) {
+				e = name + "=" + tmpDir
+			}
 			merged = append(merged, e)
 		}
 	}
@@ -191,6 +200,49 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permi
 		}
 	}
 	return prepared, nil
+}
+
+func namesFolder(value, cwd, folder string) bool {
+	if value == "" {
+		return false
+	}
+	if !filepath.IsAbs(value) {
+		if !filepath.IsAbs(cwd) {
+			return false
+		}
+		// filepath.Join would clean "link/.." lexically before the link is resolved.
+		value = cwd + string(filepath.Separator) + value
+	}
+	resolved, ok := reachableDir(value)
+	return ok && resolved == folder
+}
+
+// EvalSymlinks can drop "dir/.." as text without the search permission the kernel needs on dir.
+func reachableDir(path string) (string, bool) {
+	original, err := os.Stat(path)
+	if err != nil || !original.IsDir() {
+		return "", false
+	}
+	resolved, isDir, err := resolvedDir(path)
+	if err != nil || !isDir {
+		return "", false
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !os.SameFile(original, info) {
+		return "", false
+	}
+	return resolved, true
+}
+
+func unresolvedAbs(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return wd + string(filepath.Separator) + path, nil
 }
 
 func gitGlobalConfigBlocked(home string, blocked *permissions.BlockedPaths) bool {

@@ -5758,7 +5758,18 @@ const launchLabelLine = "sandbox: unavailable (test: resolver stubbed)\n"
 
 func TestMain(m *testing.M) {
 	resolveExecutionCapability = func(enforce.ResolveInput) enforce.Resolution { return testExecutionResolution }
-	os.Exit(m.Run())
+	home, err := os.MkdirTemp("", "bootstrap-home-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("HOME", home); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 func runHeadlessCapturingDispatcher(t *testing.T, result *BootstrapResult) (*productionToolDispatcher, string) {

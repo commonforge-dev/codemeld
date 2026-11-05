@@ -17,12 +17,20 @@ checks. Switch with `/mode <plan|build|auto-edits>` or shift+tab.
 |---|---|---|---|
 | **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (your files are never changed and network fails; commands may write a private temp folder that is deleted when the session ends); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
 | **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Never sandboxed; asked unless read-only or already approved |
-| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; everything else is asked | Sandboxed where available, and then run without asking unless recognized as network access, or while a settings file is broken; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
+| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking unless recognized as network access, or while a settings file is broken; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
 
 - Auto edits approves only a target that is inside the project after symlinks are resolved, apart
   from the declared folders in [Writing outside the project](#writing-outside-the-project). A move
   needs both ends inside the project. A delete of the project folder or a declared folder itself is
   asked.
+- Declared file scopes resolve first. Otherwise, in Auto edits, an `edit`, `create`, `mkdir`,
+  `delete` or `move` call asks even when a saved grant or a turn approval would cover it if its
+  target is inside a [protected history store](#history-stores) at the project root or a declared
+  `writable_folders` root (including selector files such as `.git/config` and `.hg/hgrc`), either
+  end of a move is inside one, it deletes or moves a folder that contains one, or discovering those
+  stores fails (`historyStoreWrite` in `internal/permissions/orchestrate.go`). Without an approver,
+  the call cannot proceed. Reads, shell commands and version-control tool actions are not covered
+  by this rule.
 - Auto edits' approvals are made per call and are not saved, so switching back to Build takes
   effect from the next tool call.
 - A tool call keeps the mode it started with until it finishes, including every stage of a shell
@@ -252,8 +260,8 @@ judges and runs the rest of the command with that folder as its scope.
 
 **The Linux sandbox.** On a Linux amd64 or arm64 host that passes codemeld's startup self-test,
 Plan and Auto edits commands run inside a sandbox, and the sandbox, not a prompt, is what allows
-them. Plan commands never change your files and cannot reach the network. They may write only a
-private temp folder for the session (their `TMPDIR`, which also holds Go's build cache), deleted
+them. Plan commands never change your files and cannot reach the network. They may write only
+`/dev/null` and a private temp folder for the session (their `TMPDIR`, which also holds Go's build cache), deleted
 when the session ends, so temporary build and test files work while project outputs, module
 downloads and `go.mod`/`go.sum` updates still fail. If that folder is moved or replaced during the
 session, Plan commands run without it and print a line saying so. Auto edits commands may write the
@@ -273,7 +281,7 @@ an interactive launch codemeld asks once about them when one of them exists, its
 global settings file's `blocked_paths`, and `confinement.vcs_user_config` is not set
 (`askVCSUserConfig` in `internal/bootstrap/vcsconfig_question.go`). The question names each such
 file and warns that allowing it lets every command and the model read it, so any password in it
-becomes visible. Answering `y` removes those entries from the global file, and both git entries when
+becomes visible. Answering `y` or `yes`, in any letter case, removes those entries from the global file, and both git entries when
 a git file is named, then records `confinement.vcs_user_config: allow`; any other answer changes
 nothing and records `block`. An entry in a project settings file, or a blocked folder above the
 file, is left alone and still blocks it. Headless runs and launches without a terminal never ask.
@@ -302,8 +310,13 @@ similar, ending in `_KEY`, `_PASS` or `_PW`, or starting with `AWS_`, `GITHUB_`,
 similar), and values holding a URL with a username and password (`scheme://user:password@`).
 `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` and `LC_ALL` always come from
 codemeld's fixed table, and a command's own `VAR=value` assignment replaces an inherited value
-(`confinement.prepare`). Name matching cannot catch every secret: one stored under an unusual name,
-such as `MYAPP_PW2`, reaches sandboxed commands. A sandboxed command cannot open a network
+(`confinement.prepare`). When each command is prepared in Plan or Auto edits, an inherited value that
+names the same folder as codemeld's own temp folder (`os.TempDir()`, after resolving symlinks and a
+relative value against the command's working folder) becomes the session temp folder, since the
+sandbox never lets the command write codemeld's temp folder; a subfolder, a path list or a value that
+does not resolve keeps its inherited value (`namesFolder` in `internal/bootstrap/confinedrunner.go`).
+Name matching cannot catch every secret: one stored under an unusual name, such as `MYAPP_PW2`,
+reaches sandboxed commands. A sandboxed command cannot open a network
 connection itself, but such a secret can still leave through the command's output (which reaches
 the transcript and the model provider), through a network command you approve, or through a
 program outside the sandbox that watches a folder the command can write. Build mode runs approved
