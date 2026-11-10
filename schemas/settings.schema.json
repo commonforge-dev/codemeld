@@ -100,6 +100,19 @@
       "items": { "type": "string", "minLength": 1, "pattern": "^(~$|~[\\\\/]|/|[A-Za-z]:[\\\\/])" },
       "description": "Files and folders codemeld's tools and confined commands may neither read nor write. Each entry is an absolute path or a ~-relative path. Accepted in both the global and the project settings file; entries from every file are combined, so no file can remove another file's entries."
     },
+    "domain_grants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "port"],
+        "properties": {
+          "host": { "type": "string", "minLength": 1 },
+          "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        }
+      },
+      "description": "Domains the session proxy reaches without asking, each one exact host and port. Read only from the global settings file and the project's settings.local.yaml; a list in the project's committed settings.yaml is ignored. Lists from both files are combined."
+    },
     "writable_folders": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },

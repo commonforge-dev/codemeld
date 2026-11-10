@@ -15,6 +15,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"codemeld.dev/codemeld/internal/fsutil"
 )
 
 // newMoveToolIn builds a move tool whose project root and relative-path base are root, with a separate
@@ -681,4 +683,290 @@ func TestMoveTool_AJournalRefusalLeavesBothEndpoints(t *testing.T) {
 	if _, statErr := os.Lstat(dst); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("destination exists after a refused move: %v", statErr)
 	}
+}
+
+type authorizedMoveFixture struct {
+	root, outside  string
+	srcDir, dstDir string
+	src, dst       string
+	resolved       ResolvedMove
+	srcID, dstID   ScopeIdentity
+	journal        *fakeJournal
+	tool           *MoveTool
+}
+
+func newAuthorizedMoveFixture(t *testing.T, sameFolder bool) *authorizedMoveFixture {
+	t.Helper()
+	f := &authorizedMoveFixture{root: eval(t, t.TempDir()), outside: eval(t, t.TempDir())}
+	f.srcDir = filepath.Join(f.root, "a", "src")
+	f.dstDir = filepath.Join(f.root, "b", "dst")
+	if sameFolder {
+		f.dstDir = f.srcDir
+	}
+	for _, dir := range []string{f.srcDir, f.dstDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+	}
+	f.src = filepath.Join(f.srcDir, "f.txt")
+	f.dst = filepath.Join(f.dstDir, "g.txt")
+	writeFile(t, f.src, "PAYLOAD\n")
+	f.tool = newMoveToolIn(t, f.root)
+	var err error
+	if f.resolved, err = f.tool.ResolveEndpoints(map[string]any{"source": f.src, "destination": f.dst}); err != nil {
+		t.Fatalf("ResolveEndpoints: %v", err)
+	}
+	if f.srcID, err = CaptureScopeIdentity(f.resolved.SourceScope); err != nil {
+		t.Fatalf("CaptureScopeIdentity: %v", err)
+	}
+	if f.dstID, err = CaptureScopeIdentity(f.resolved.DestinationScope); err != nil {
+		t.Fatalf("CaptureScopeIdentity: %v", err)
+	}
+	f.journal = newFakeJournal(f.src, f.dst)
+	return f
+}
+
+func (f *authorizedMoveFixture) invoke(t *testing.T) string {
+	t.Helper()
+	res, err := f.tool.InvokeWithAuthorizedMove(WithWriteJournal(context.Background(), f.journal), f.resolved, f.srcID, f.dstID)
+	if err != nil {
+		t.Fatalf("InvokeWithAuthorizedMove error = %v, want an in-band result", err)
+	}
+	if res.ExitCode == 0 {
+		return ""
+	}
+	return string(res.Stderr)
+}
+
+func snapshotTrees(t *testing.T, roots ...string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			switch {
+			case d.Type()&os.ModeSymlink != 0:
+				target, _ := os.Readlink(path)
+				out[path] = "link:" + target
+			case d.IsDir():
+				out[path] = "dir"
+			default:
+				out[path] = readFile(t, path)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkDir: %v", err)
+		}
+	}
+	return out
+}
+
+func replaceWithDir(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Rename(dir, dir+"-orig"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+}
+
+func replaceWithSymlink(t *testing.T, dir, target string) {
+	t.Helper()
+	if err := os.Rename(dir, dir+"-orig"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if err := os.Symlink(target, dir); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+}
+
+func TestMoveTool_InvokeWithAuthorizedMoveMovesWhenNothingWasSwapped(t *testing.T) {
+	for _, same := range []bool{true, false} {
+		f := newAuthorizedMoveFixture(t, same)
+		if stderr := f.invoke(t); stderr != "" {
+			t.Fatalf("sameFolder=%v: move refused: %s", same, stderr)
+		}
+		if got := readFile(t, f.dst); got != "PAYLOAD\n" {
+			t.Fatalf("sameFolder=%v: destination = %q, want the moved bytes", same, got)
+		}
+		if _, err := os.Lstat(f.src); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("sameFolder=%v: source still present: %v", same, err)
+		}
+		want := []string{"begin_move:" + f.src + ">" + f.dst, "resolve_move:" + f.src + ">" + f.dst}
+		if !reflect.DeepEqual(f.journal.events, want) {
+			t.Fatalf("sameFolder=%v: journal events = %v, want %v", same, f.journal.events, want)
+		}
+	}
+}
+
+func TestMoveTool_InvokeWithAuthorizedMoveRefusesAParentReplacedBeforeConfirmation(t *testing.T) {
+	cases := []struct {
+		name string
+		same bool
+		swap func(t *testing.T, f *authorizedMoveFixture)
+	}{
+		{"source parent replaced by a folder", false, func(t *testing.T, f *authorizedMoveFixture) {
+			replaceWithDir(t, f.srcDir)
+			writeFile(t, f.src, "DECOY\n")
+		}},
+		{"source ancestor replaced by a symlink", false, func(t *testing.T, f *authorizedMoveFixture) {
+			if err := os.MkdirAll(filepath.Join(f.outside, "src"), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			writeFile(t, filepath.Join(f.outside, "src", "f.txt"), "DECOY\n")
+			replaceWithSymlink(t, filepath.Dir(f.srcDir), f.outside)
+		}},
+		{"destination parent replaced by a folder", false, func(t *testing.T, f *authorizedMoveFixture) {
+			replaceWithDir(t, f.dstDir)
+		}},
+		{"destination ancestor replaced by a symlink", false, func(t *testing.T, f *authorizedMoveFixture) {
+			if err := os.MkdirAll(filepath.Join(f.outside, "dst"), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			replaceWithSymlink(t, filepath.Dir(f.dstDir), f.outside)
+		}},
+		{"shared parent replaced by a folder", true, func(t *testing.T, f *authorizedMoveFixture) {
+			replaceWithDir(t, f.srcDir)
+			writeFile(t, f.src, "DECOY\n")
+		}},
+		{"destination parent removed", false, func(t *testing.T, f *authorizedMoveFixture) {
+			if err := os.Rename(f.dstDir, f.dstDir+"-orig"); err != nil {
+				t.Fatalf("Rename: %v", err)
+			}
+		}},
+		{"source identity absent", false, func(_ *testing.T, f *authorizedMoveFixture) { f.srcID = ScopeIdentity{} }},
+		{"destination identity absent", false, func(_ *testing.T, f *authorizedMoveFixture) { f.dstID = ScopeIdentity{} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAuthorizedMoveFixture(t, tc.same)
+			tc.swap(t, f)
+			before := snapshotTrees(t, f.root, f.outside)
+
+			stderr := f.invoke(t)
+			if !strings.Contains(stderr, authorizedScopeReplaced) {
+				t.Fatalf("stderr = %q, want the authorized-directory-replaced refusal", stderr)
+			}
+			if after := snapshotTrees(t, f.root, f.outside); !reflect.DeepEqual(after, before) {
+				t.Fatalf("trees changed:\nbefore %v\nafter  %v", before, after)
+			}
+			if len(f.journal.events) != 0 {
+				t.Fatalf("journal events = %v, want none before both parents are confirmed", f.journal.events)
+			}
+		})
+	}
+}
+
+func TestMoveTool_InvokeWithAuthorizedMoveRefusesAnEndpointOutsideItsScope(t *testing.T) {
+	f := newAuthorizedMoveFixture(t, false)
+	f.resolved.DestinationScope = filepath.Dir(f.dstDir)
+	var err error
+	if f.dstID, err = CaptureScopeIdentity(f.resolved.DestinationScope); err != nil {
+		t.Fatalf("CaptureScopeIdentity: %v", err)
+	}
+	before := snapshotTrees(t, f.root)
+
+	if stderr := f.invoke(t); !strings.Contains(stderr, "not directly inside its authorized directory") {
+		t.Fatalf("stderr = %q, want the endpoint-scope refusal", stderr)
+	}
+	if after := snapshotTrees(t, f.root); !reflect.DeepEqual(after, before) || len(f.journal.events) != 0 {
+		t.Fatalf("trees changed or journal ran (%v)", f.journal.events)
+	}
+}
+
+func TestMoveTool_ParentsReplacedAfterConfirmationCannotRedirectTheMove(t *testing.T) {
+	f := newAuthorizedMoveFixture(t, false)
+	heldSrc := f.srcDir + "-orig"
+	afterScopeConfirmedOnce(t, func() {
+		replaceWithDir(t, f.srcDir)
+		writeFile(t, f.src, "DECOY\n")
+		replaceWithSymlink(t, f.dstDir, f.outside)
+	})
+
+	if stderr := f.invoke(t); !strings.Contains(stderr, "parent directory was renamed or replaced") {
+		t.Fatalf("stderr = %q, want the post-rename parent guard", stderr)
+	}
+	if got := readFile(t, f.src); got != "DECOY\n" {
+		t.Fatalf("replacement source = %q, want the decoy untouched", got)
+	}
+	if got := readFile(t, filepath.Join(heldSrc, "f.txt")); got != "PAYLOAD\n" {
+		t.Fatalf("held source = %q, want the entry compensated back", got)
+	}
+	if entries, _ := os.ReadDir(f.outside); len(entries) != 0 {
+		t.Fatalf("outside holds %d entries, want none", len(entries))
+	}
+	want := []string{"begin_move:" + f.src + ">" + f.dst, "resolve_move:" + f.src + ">" + f.dst}
+	if !reflect.DeepEqual(f.journal.events, want) {
+		t.Fatalf("journal events = %v, want %v", f.journal.events, want)
+	}
+}
+
+type descriptorCheckingJournal struct {
+	*fakeJournal
+	t *testing.T
+}
+
+func (j descriptorCheckingJournal) MoveLifecycle(source, destination string) fsutil.MoveLifecycle {
+	inner := j.fakeJournal.MoveLifecycle(source, destination)
+	return fsutil.MoveLifecycle{
+		BeforeRename: inner.BeforeRename,
+		AfterRename: func(s, d *os.File) {
+			for _, dir := range []*os.File{s, d} {
+				if _, err := dir.ReadDir(-1); err != nil {
+					j.t.Errorf("parent %s unusable in AfterRename: %v", dir.Name(), err)
+				}
+			}
+			inner.AfterRename(s, d)
+		},
+	}
+}
+
+func TestMoveTool_InvokeWithAuthorizedMoveJournalLifecycle(t *testing.T) {
+	t.Run("destination-only journal brackets a failed rename with live descriptors", func(t *testing.T) {
+		f := newAuthorizedMoveFixture(t, false)
+		f.journal = newFakeJournal(f.dst)
+		writeFile(t, f.dst, "OCCUPIED\n")
+		res, err := f.tool.InvokeWithAuthorizedMove(WithWriteJournal(context.Background(), descriptorCheckingJournal{f.journal, t}), f.resolved, f.srcID, f.dstID)
+		if err != nil || res.ExitCode == 0 {
+			t.Fatalf("move = %+v, %v; want an in-band rename failure", res, err)
+		}
+		want := []string{"begin_move:" + f.src + ">" + f.dst, "resolve_move:" + f.src + ">" + f.dst}
+		if !reflect.DeepEqual(f.journal.events, want) {
+			t.Fatalf("journal events = %v, want %v", f.journal.events, want)
+		}
+		if readFile(t, f.src) != "PAYLOAD\n" || readFile(t, f.dst) != "OCCUPIED\n" {
+			t.Fatal("a refused rename changed an endpoint")
+		}
+	})
+
+	t.Run("source-only journal on success keeps descriptors live", func(t *testing.T) {
+		f := newAuthorizedMoveFixture(t, false)
+		f.journal = newFakeJournal(f.src)
+		res, err := f.tool.InvokeWithAuthorizedMove(WithWriteJournal(context.Background(), descriptorCheckingJournal{f.journal, t}), f.resolved, f.srcID, f.dstID)
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("move = %+v, %v; want success", res, err)
+		}
+		if len(f.journal.events) != 2 {
+			t.Fatalf("journal events = %v, want begin and resolve", f.journal.events)
+		}
+	})
+
+	t.Run("journal refusal leaves both endpoints and skips AfterRename", func(t *testing.T) {
+		f := newAuthorizedMoveFixture(t, false)
+		f.journal.beginMoveErr = errors.New("not a declared move pair")
+		before := snapshotTrees(t, f.root)
+		if stderr := f.invoke(t); !strings.Contains(stderr, "not a declared move pair") {
+			t.Fatalf("stderr = %q, want the journal refusal", stderr)
+		}
+		if after := snapshotTrees(t, f.root); !reflect.DeepEqual(after, before) {
+			t.Fatalf("trees changed after a journal refusal")
+		}
+		if want := []string{"begin_move:" + f.src + ">" + f.dst}; !reflect.DeepEqual(f.journal.events, want) {
+			t.Fatalf("journal events = %v, want only %v", f.journal.events, want)
+		}
+	})
 }

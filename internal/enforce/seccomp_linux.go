@@ -1,6 +1,7 @@
 package enforce
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"unsafe"
@@ -51,22 +52,58 @@ var (
 		}
 		return nil
 	}
+	loadSeccompListener = func(flags uintptr, prog *unix.SockFprog) (int, error) {
+		fd, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, flags, uintptr(unsafe.Pointer(prog)))
+		if errno != 0 {
+			return -1, errno
+		}
+		return int(fd), nil
+	}
 )
 
 func installSeccomp(p Policy) error {
-	insts, err := seccompFilter(p)
+	if p.Broker != BrokerNone {
+		return fmt.Errorf("seccomp install without a listener refuses broker %q", p.Broker)
+	}
+	prog, err := seccompProgram(p)
 	if err != nil {
 		return err
 	}
+	return loadSeccomp(unix.SECCOMP_FILTER_FLAG_TSYNC, prog)
+}
+
+func installSeccompListener(p Policy) (int, error) {
+	if p.Broker == BrokerNone {
+		return -1, errors.New("seccomp listener install requires a broker policy")
+	}
+	prog, err := seccompProgram(p)
+	if err != nil {
+		return -1, err
+	}
+	fd, err := loadSeccompListener(unix.SECCOMP_FILTER_FLAG_NEW_LISTENER|unix.SECCOMP_FILTER_FLAG_TSYNC|unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH, prog)
+	if errors.Is(err, unix.ESRCH) {
+		return -1, fmt.Errorf("a thread could not synchronize: %w", err)
+	}
+	if err != nil {
+		return -1, fmt.Errorf("install seccomp listener filter: %w", err)
+	}
+	return fd, nil
+}
+
+func seccompProgram(p Policy) (*unix.SockFprog, error) {
+	insts, err := seccompFilter(p)
+	if err != nil {
+		return nil, err
+	}
 	raw, err := bpf.Assemble(insts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	filter := make([]unix.SockFilter, len(raw))
 	for i, r := range raw {
 		filter[i] = unix.SockFilter{Code: r.Op, Jt: r.Jt, Jf: r.Jf, K: r.K}
 	}
-	return loadSeccomp(unix.SECCOMP_FILTER_FLAG_TSYNC, &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]})
+	return &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}, nil
 }
 
 func seccompFilter(p Policy) ([]bpf.Instruction, error) {
@@ -78,6 +115,9 @@ func seccompFilter(p Policy) ([]bpf.Instruction, error) {
 }
 
 func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
+	if err := p.checkBroker(); err != nil {
+		return nil, err
+	}
 	if info.Name != arch.X86_64.Name && info.Name != arch.AARCH64.Name {
 		return nil, fmt.Errorf("unsupported architecture %s", info.Name)
 	}
@@ -130,6 +170,27 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 			bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW},
 		}
 	}
+	if p.Broker != BrokerNone {
+		full := p.Broker == BrokerFull
+		notify := bpf.RetConstant{Val: unix.SECCOMP_RET_USER_NOTIF}
+		blocks["socket"] = brokerSocketBlock(full, eperm)
+		blocks["connect"] = []bpf.Instruction{notify}
+		blocks["bind"] = []bpf.Instruction{eperm}
+		blocks["listen"] = []bpf.Instruction{eperm}
+		if full {
+			blocks["bind"] = []bpf.Instruction{notify}
+			blocks["listen"] = []bpf.Instruction{notify}
+		}
+		for name, flagsArg := range map[string]uint32{"sendto": 3, "sendmsg": 2, "sendmmsg": 3} {
+			blocks[name] = []bpf.Instruction{
+				loadArg(flagsArg),
+				bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: unix.MSG_FASTOPEN, SkipFalse: 1},
+				eperm,
+				loadNr,
+			}
+		}
+		names = append(names, "connect", "bind", "listen", "sendto", "sendmsg", "sendmmsg")
+	}
 	for _, name := range names {
 		nr, ok := info.SyscallNames[name]
 		if !ok {
@@ -145,6 +206,42 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 		prog = append(append(prog, bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: uint32(nr), SkipTrue: uint8(len(block))}), block...)
 	}
 	return append(prog, bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW}), nil
+}
+
+func brokerSocketBlock(full bool, eperm bpf.Instruction) []bpf.Instruction {
+	allow := bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW}
+	stripFlags := bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: ^uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)}
+	tcp := []bpf.Instruction{
+		loadArg(1),
+		stripFlags,
+		bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.SOCK_STREAM, SkipTrue: 3},
+		loadArg(2),
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0, SkipTrue: 2},
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.IPPROTO_TCP, SkipTrue: 1},
+		eperm,
+		allow,
+	}
+	block := []bpf.Instruction{loadArg(0)}
+	if full {
+		block = append(block, bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.AF_UNIX, SkipTrue: uint8(3 + len(tcp))})
+	}
+	block = append(block,
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.AF_INET, SkipTrue: 2},
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.AF_INET6, SkipTrue: 1},
+		eperm)
+	block = append(block, tcp...)
+	if full {
+		block = append(block,
+			loadArg(1),
+			stripFlags,
+			bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.SOCK_STREAM, SkipTrue: 1},
+			bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.SOCK_SEQPACKET, SkipTrue: 2},
+			loadArg(2),
+			bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0, SkipTrue: 1},
+			eperm,
+			allow)
+	}
+	return block
 }
 
 // The kernel reads these arguments as 32-bit ints, so only the low word is compared; both supported

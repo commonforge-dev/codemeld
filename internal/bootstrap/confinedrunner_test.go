@@ -1,14 +1,19 @@
 package bootstrap
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +30,7 @@ import (
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/locks"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/provider"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
@@ -119,6 +125,135 @@ func withSessionTemp(t *testing.T, c *confinement) *confinement {
 	c.tmpDir = dir.path
 	c.own(dir)
 	return c
+}
+
+func withSessionProxy(t *testing.T, c *confinement) *confinement {
+	t.Helper()
+	c.own(nil)
+	t.Cleanup(c.proxy.stop)
+	return c
+}
+
+func sessionWithGlobalGrant(t *testing.T, host string) *confinement {
+	t.Helper()
+	home, project := canonicalTempDir(t), canonicalTempDir(t)
+	path := SettingsPath(home)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("domain_grants:\n  - host: "+host+"\n    port: 9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	global, err := defaultLoadGlobalSettings(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	composition, err := defaultComposeConfig(global, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := config.NewCache(composition.Config, project, []string{path}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return withSessionProxy(t, launchConfinement(enforce.Resolution{SelfTestPassed: true}, t.TempDir(),
+		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, securitystate.Policy{Blocked: testBlocked(t)}, nil))
+}
+
+func sessionProxyRefusal(t *testing.T, c *confinement, ask netproxy.Asker, authority string) string {
+	t.Helper()
+	endpoint, err := c.proxy.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := c.proxy.running().NewOwner(ask)
+	t.Cleanup(owner.Close)
+	conn, err := net.Dial("tcp", endpoint.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := owner.Register(conn.LocalAddr().(*net.TCPAddr).AddrPort()); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(conn, "CONNECT "+authority+" HTTP/1.1\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.Header.Get("X-Proxy-Refused")
+}
+
+func failIfAsked(t *testing.T) netproxy.Asker {
+	return func(_ context.Context, host, port string, _ func() bool, _ func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		t.Errorf("asked for %s:%s", host, port)
+		return netproxy.DecisionDeny, nil
+	}
+}
+
+func TestLaunchConfinement_GlobalDomainGrantSkipsTheAsker(t *testing.T) {
+	granted := sessionWithGlobalGrant(t, "127.0.0.1")
+	if got := sessionProxyRefusal(t, granted, failIfAsked(t), "127.0.0.1:9"); got != "not public" {
+		t.Fatalf("granted session refusal = %q, want the address check to refuse after the grant skipped the asker", got)
+	}
+	other := sessionWithGlobalGrant(t, "127.0.0.2")
+	if got := sessionProxyRefusal(t, other, nil, "127.0.0.1:9"); got != "not approved (no one to ask)" {
+		t.Fatalf("ungranted session refusal = %q, want the request to need approval", got)
+	}
+}
+
+func TestSessionProxy_SessionsKeepTheirOwnSavedGrants(t *testing.T) {
+	a, b := sessionWithGlobalGrant(t, "127.0.0.1"), sessionWithGlobalGrant(t, "127.0.0.2")
+	real := startSessionProxy
+	var together sync.WaitGroup
+	together.Add(2)
+	startSessionProxy = func(allow []string) (*netproxy.Server, string, error) {
+		together.Done()
+		together.Wait()
+		return real(allow)
+	}
+	t.Cleanup(func() { startSessionProxy = real })
+	childA := *a
+	endpoints := make(chan error, 2)
+	for _, c := range []*confinement{&childA, b} {
+		go func() {
+			_, err := c.proxy.start()
+			endpoints <- err
+		}()
+	}
+	for range 2 {
+		if err := <-endpoints; err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent, err := a.proxy.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, _ := childA.proxy.start()
+	other, _ := b.proxy.start()
+	if parent != child || parent == other {
+		t.Fatalf("endpoints parent %v child %v other session %v; want parent and child to share only their own proxy", parent, child, other)
+	}
+	for _, tc := range []struct {
+		name       string
+		c          *confinement
+		own, alien string
+	}{
+		{"parent", a, "127.0.0.1:9", "127.0.0.2:9"},
+		{"child", &childA, "127.0.0.1:9", "127.0.0.2:9"},
+		{"other session", b, "127.0.0.2:9", "127.0.0.1:9"},
+	} {
+		if got := sessionProxyRefusal(t, tc.c, failIfAsked(t), tc.own); got != "not public" {
+			t.Errorf("%s: own grant %s refusal = %q, want admitted past the asker", tc.name, tc.own, got)
+		}
+		if got := sessionProxyRefusal(t, tc.c, nil, tc.alien); got != "not approved (no one to ask)" {
+			t.Errorf("%s: other session's grant %s refusal = %q, want it to need approval", tc.name, tc.alien, got)
+		}
+	}
 }
 
 func requireSessionTempEnv(t *testing.T, env []string, tmp string) {
@@ -550,10 +685,10 @@ func TestConfinedRunner_RunSpecEnvStaysOutAndPlanGetsTheSessionTemp(t *testing.T
 
 func TestConfinedRunner_ParallelPreparationsKeepTheLaunchSnapshot(t *testing.T) {
 	home := t.TempDir()
-	snapshot := launchSnapshot("MISE_DATA_DIR=/data/coding/mise", "GOPATH=/launch/go")
-	want := slices.Clone(snapshot)
+	snapshot := launchSnapshot("MISE_DATA_DIR=/data/coding/mise", "GOPATH=/launch/go", "GIT_CONFIG_GLOBAL=/x")
+	want := []string{"MISE_DATA_DIR=/data/coding/mise", "GOPATH=/launch/go", "GIT_CONFIG_GLOBAL=/x"}
 	conf := &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), home: home, lookupPath: programDir(t, "go"),
-		blocked: testBlocked(t), inherited: slices.Grow(snapshot, 64)}
+		blocked: permissions.NewBlockedPaths(home, blockedEntries(t, home, "~/.gitconfig")), inherited: slices.Grow(snapshot, 64)}
 	const n = 8
 	envs := make([][]string, n)
 	var wg sync.WaitGroup
@@ -561,7 +696,7 @@ func TestConfinedRunner_ParallelPreparationsKeepTheLaunchSnapshot(t *testing.T) 
 		wg.Go(func() {
 			spec := confinedSpec(home, "go", "env")
 			spec.Assignments = []string{"JOB=" + strconv.Itoa(i)}
-			prepared, err := conf.prepare(spec, "", conf.blocked.Current())
+			prepared, err := conf.prepare(spec, "", conf.blocked.Current(), "")
 			if err != nil {
 				t.Error(err)
 				return
@@ -574,9 +709,11 @@ func TestConfinedRunner_ParallelPreparationsKeepTheLaunchSnapshot(t *testing.T) 
 		t.Fatalf("stored snapshot = %q, want %q", conf.inherited, want)
 	}
 	for i, env := range envs {
-		if !slices.Equal(envNamed(env, "JOB"), []string{"JOB=" + strconv.Itoa(i)}) || !slices.Contains(env, "GOPATH=/launch/go") {
-			t.Errorf("command %d env = %q, want its own JOB and the launch GOPATH", i, env)
+		if !slices.Equal(envNamed(env, "JOB"), []string{"JOB=" + strconv.Itoa(i)}) || !slices.Contains(env, "GOPATH=/launch/go") ||
+			!slices.Equal(gitGlobalEntries(env), []string{wantGitNeutralizer}) || env[len(env)-1] != wantGitNeutralizer {
+			t.Errorf("command %d env = %q, want its own JOB, the launch GOPATH and the git override last", i, env)
 		}
+		requireOneEntryPerName(t, env)
 	}
 }
 
@@ -762,7 +899,7 @@ func TestConfinedRunner_InheritedLaunchTempFolderBecomesTheSessionTemp(t *testin
 				blocked: testBlocked(t), inherited: launchSnapshot("GOTMPDIR=" + s.value)}
 			spec := confinedSpec(cwd, "go", "build")
 			spec.Assignments = s.assignments
-			prepared, err := conf.prepare(spec, session, conf.blocked.Current())
+			prepared, err := conf.prepare(spec, session, conf.blocked.Current(), "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -906,7 +1043,7 @@ func TestConfinedRunner_GitConfigCheckFollowsSymlinksAndTheEffectiveHome(t *test
 		}
 		t.Chdir(cwd)
 		conf := &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: lookup}
-		prepared, err := conf.prepare(confinedSpec(cwd, "git"), "", permissions.NewBlockedPaths("", outsideEntry))
+		prepared, err := conf.prepare(confinedSpec(cwd, "git"), "", permissions.NewBlockedPaths("", outsideEntry), "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -964,6 +1101,32 @@ func TestConfinedRunner_GitAssignmentStaysRefused(t *testing.T) {
 	var assignErr *cmdrunner.EnvAssignmentError
 	if !errors.As(err, &assignErr) || assignErr.Name != "GIT_CONFIG_GLOBAL" || inner.calls() != 0 {
 		t.Fatalf("err = %v, calls = %d; want a GIT_CONFIG_GLOBAL assignment refusal before any run", err, inner.calls())
+	}
+}
+
+func TestConfinedRunner_InheritedGitGlobalConfigYieldsToTheOverride(t *testing.T) {
+	home := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		blocked []string
+		want    string
+	}{
+		{"blocked", []string{"~/.gitconfig"}, "GIT_CONFIG_GLOBAL=/dev/null"},
+		{"neither path blocked", []string{"~/.hgrc"}, "GIT_CONFIG_GLOBAL=/x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := []string{"GIT_CONFIG_GLOBAL=/x", "GOPATH=/launch/go"}
+			conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), home: home, lookupPath: programDir(t, "git"),
+				blocked: permissions.NewBlockedPaths(home, blockedEntries(t, home, tc.blocked...)), inherited: snapshot})
+			env := confinedExecEnv(t, conf, confinedSpec(home, "git", "status"))
+			if got := gitGlobalEntries(env); !slices.Equal(got, []string{tc.want}) {
+				t.Fatalf("GIT_CONFIG_GLOBAL entries = %q, want only %q", got, tc.want)
+			}
+			requireOneEntryPerName(t, env)
+			if !slices.Equal(snapshot, []string{"GIT_CONFIG_GLOBAL=/x", "GOPATH=/launch/go"}) {
+				t.Fatalf("snapshot = %q, want it unchanged", snapshot)
+			}
+		})
 	}
 }
 
@@ -1186,7 +1349,7 @@ func liveWritableConfinement(t *testing.T, current string, yaml string) (rereadF
 
 func policyWriteRoots(t *testing.T, conf *confinement) []string {
 	t.Helper()
-	p, err := conf.policy(conf.mode(), conf.tmpDir, "", conf.blocked.Current(), false)
+	p, err := conf.policy(conf.mode(), conf.tmpDir, conf.blocked.Current(), false)
 	if err != nil {
 		t.Fatalf("policy: %v", err)
 	}
@@ -1256,7 +1419,7 @@ func requirePrivateTempOnly(t *testing.T, conf *confinement, project, launchTmp 
 	if !slices.Contains(inner.bounded[0].Env, "TMPDIR="+policy.TmpDir) {
 		t.Fatalf("command env = %v, want TMPDIR=%s", inner.bounded[0].Env, policy.TmpDir)
 	}
-	plan, err := conf.policy(string(mode.Plan), conf.tmpDir, "", conf.blocked.Current(), false)
+	plan, err := conf.policy(string(mode.Plan), conf.tmpDir, conf.blocked.Current(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1311,7 +1474,7 @@ func TestConfinedRunner_NilReaderOrDegradedSettingsGrantNoDeclaredFolders(t *tes
 	own := filepath.Join(f.project, "src")
 	requireBase := func(t *testing.T, label string, want ...string) {
 		t.Helper()
-		p, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, "", conf.blocked.Current(), false)
+		p, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, conf.blocked.Current(), false)
 		if err != nil {
 			t.Fatalf("%s: policy: %v", label, err)
 		}
@@ -1406,7 +1569,7 @@ func TestConfinedRunner_AHeldSettingsWriterLockFailsClosedThenRecovers(t *testin
 	rewriteSettings(t, f.projectFile, writableFoldersYAML(next))
 	built := make(chan []string, 1)
 	go func() {
-		p, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, "", conf.blocked.Current(), false)
+		p, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, conf.blocked.Current(), false)
 		if err != nil {
 			t.Errorf("policy: %v", err)
 		}
@@ -1455,7 +1618,7 @@ func TestConfinedRunner_OverlappingPolicyBuildsSeeACompleteFolderList(t *testing
 
 	results := make(chan []string, 2)
 	build := func() {
-		p, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, "", conf.blocked.Current(), false)
+		p, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, conf.blocked.Current(), false)
 		if err != nil {
 			t.Errorf("policy: %v", err)
 		}
@@ -1586,15 +1749,23 @@ func TestConfinedRunner_OversizedPolicyStartsNothing(t *testing.T) {
 
 type confinedExec func(*confineInner, cmdrunner.RunSpec) (cmdrunner.RunResult, error)
 
+func execNoted(r *confinedShellRunner, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
+	res, err := r.Exec(context.Background(), spec)
+	if err != nil {
+		return res, err
+	}
+	return noteConfinedFailure(res, r.events.cap, r.failure), nil
+}
+
 func confinedAdapters(t *testing.T, conf *confinement, cap int) map[string]confinedExec {
 	store := mkStore(t)
 	return map[string]confinedExec{
 		"bash": func(in *confineInner, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
-			return (&confinedShellRunner{events: &shellEventRunner{inner: in, cap: cap}, conf: conf}).Exec(context.Background(), spec)
+			return execNoted(&confinedShellRunner{events: &shellEventRunner{inner: in, cap: cap}, conf: conf}, spec)
 		},
 		"bash with store": func(in *confineInner, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
 			active := func() *sessions.Store { return store }
-			return (&confinedShellRunner{events: &shellEventRunner{inner: in, active: active, cap: cap}, conf: conf}).Exec(context.Background(), spec)
+			return execNoted(&confinedShellRunner{events: &shellEventRunner{inner: in, active: active, cap: cap}, conf: conf}, spec)
 		},
 		"vcs": func(in *confineInner, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
 			return (&confinedRunner{inner: in, conf: conf, cap: cap}).Exec(context.Background(), spec)
@@ -1602,7 +1773,7 @@ func confinedAdapters(t *testing.T, conf *confinement, cap int) map[string]confi
 	}
 }
 
-func TestConfinedRunner_NetworkAuthoritySelectsTheNetworkPolicyVariant(t *testing.T) {
+func TestConfinedRunner_ExceptionalAuthorityKeepsTheOrdinaryPolicy(t *testing.T) {
 	cwd := t.TempDir()
 	lookup := programDir(t, "curl")
 	classified, _ := permissions.ExceptionalAuthority([]string{"curl", "https://example.com"})
@@ -1638,24 +1809,13 @@ func TestConfinedRunner_NetworkAuthoritySelectsTheNetworkPolicyVariant(t *testin
 				if ordinary.ExceptionalAuthority != "" {
 					t.Fatalf("ordinary policy = %+v, want no exceptional authority", ordinary)
 				}
-				for _, tc := range []struct {
-					authority string
-					network   bool
-				}{
-					{enforce.NetworkAccessAuthority, m == mode.AutoEdits},
-					{classified, m == mode.AutoEdits},
-					{deletion, false},
-				} {
-					spec, policy := run(tc.authority)
-					want := ordinary
-					if tc.network {
-						want.ExceptionalAuthority = enforce.NetworkAccessAuthority
-					}
-					if !reflect.DeepEqual(policy, want) {
-						t.Fatalf("authority %q: policy = %+v, want %+v", tc.authority, policy, want)
+				for _, authority := range []string{enforce.NetworkAccessAuthority, classified, deletion} {
+					spec, policy := run(authority)
+					if !reflect.DeepEqual(policy, ordinary) {
+						t.Fatalf("authority %q: policy = %+v, want the ordinary %+v", authority, policy, ordinary)
 					}
 					if !reflect.DeepEqual(spec, ordinarySpec) {
-						t.Fatalf("authority %q: inner spec = %+v, want the ordinary rewritten spec %+v", tc.authority, spec, ordinarySpec)
+						t.Fatalf("authority %q: inner spec = %+v, want the ordinary rewritten spec %+v", authority, spec, ordinarySpec)
 					}
 				}
 			})
@@ -1750,7 +1910,7 @@ func TestConfinedRunner_PartialStateNoteSurvivesTheOutputCap(t *testing.T) {
 					if withStore {
 						shell.active = func() *sessions.Store { return store }
 					}
-					res, err := (&confinedShellRunner{events: shell, conf: conf}).Exec(context.Background(), confinedSpec(t.TempDir(), "ls"))
+					res, err := execNoted(&confinedShellRunner{events: shell, conf: conf}, confinedSpec(t.TempDir(), "ls"))
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -1827,7 +1987,7 @@ func TestConfinedRunner_PartialStateNoteKeepsTruncationThroughNormalization(t *t
 				if withStore {
 					shell.active = func() *sessions.Store { return store }
 				}
-				res, err := (&confinedShellRunner{events: shell, conf: conf}).Exec(context.Background(), confinedSpec(t.TempDir(), "ls"))
+				res, err := execNoted(&confinedShellRunner{events: shell, conf: conf}, confinedSpec(t.TempDir(), "ls"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2266,8 +2426,8 @@ func TestConfinedRunner_SkillsLinkedIntoTheProjectStayUnwritableThroughTheRealHe
 		t.Fatal(err)
 	}
 	guard := securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, blockedEntries(t, home, filepath.Join(x, "sub")))}
-	conf := launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
-		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, guard, nil)
+	conf := withSessionProxy(t, launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
+		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, guard, nil))
 
 	inner := &confineInner{}
 	if _, err := shellAdapter(conf, inner).Exec(context.Background(), confinedSpec(project, "sh")); err != nil {
@@ -2439,4 +2599,501 @@ func TestConfinedRunner_BrokenGitPointerStopsOnlyAutoEdits(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestConfinedShell_RefusedAssignmentStopsTheReroutedCommand(t *testing.T) {
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
+		t.Run(string(m), func(t *testing.T) {
+			inner := &confineInner{}
+			auth := &recordingAuthorizer{decision: allow()}
+			d := dispatcherFor(t, tools.NewRegistry(), inner, auth)
+			d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(m)), lookupPath: programDir(t, "sh"), blocked: testBlocked(t), projectRoot: d.processCWD})
+
+			got, err := d.Dispatch(context.Background(), bashCall("c1", "XDG_CACHE_HOME=x grep x dir/*.md"))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if !strings.Contains(got.Content, `environment assignment to "XDG_CACHE_HOME" is not allowed`) {
+				t.Fatalf("content = %q, want the XDG_CACHE_HOME assignment refused", got.Content)
+			}
+			if auth.callCount() != 0 || inner.calls() != 0 {
+				t.Fatalf("authorize calls = %d, runner calls = %d; want 0/0", auth.callCount(), inner.calls())
+			}
+		})
+	}
+}
+
+func TestConfinedShell_ReroutedNetworkCommandKeepsItsModeRules(t *testing.T) {
+	for _, command := range []string{"curl x/*", "ls dir/*.md && curl x", "env FOO=bar curl x/*", "FOO=$BAR curl x/*", "env FOO=bar curl x/* | grep y dir/*.md", "FOO=$BAR curl x/* | grep y dir/*.md"} {
+		for _, m := range []mode.Mode{mode.AutoEdits, mode.Plan} {
+			t.Run(fmt.Sprintf("%s/%s", command, m), func(t *testing.T) {
+				t.Setenv("TMPDIR", t.TempDir())
+				swapResolveExecutionCapability(t, constrainedResolution)
+				inner := &confineInner{}
+				result := headlessResult(t, t.TempDir(), mode.NewActiveState(m, mode.SourceDefault))
+				runHeadlessShellAnswering(t, result, inner, command, nil)
+				requireConfinedShellRun(t, inner, command)
+				spec := inner.bounded[0]
+				if spec.ExceptionalAuthority != enforce.NetworkAccessAuthority {
+					t.Fatalf("RunSpec authority = %q, want the classified network authority", spec.ExceptionalAuthority)
+				}
+				policy, _ := decodeFrame(t, spec.Stdin)
+				if policy.ExceptionalAuthority != "" || policy.Mode != string(m) {
+					t.Fatalf("policy = %+v, want mode %s without network authority", policy, m)
+				}
+			})
+		}
+	}
+}
+
+func TestConfinedShell_BlockedReadOnlyStageRefusesTheReroutedCommand(t *testing.T) {
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
+		for _, command := range []string{"cat ~/.ssh/k*", "rm x && cat ~/.ssh/k*"} {
+			t.Run(string(m)+"/"+command, func(t *testing.T) {
+				inner := &confineInner{}
+				auth := &recordingAuthorizer{decision: allow()}
+				d := dispatcherFor(t, tools.NewRegistry(), inner, auth)
+				ssh := filepath.Join(d.home, ".ssh")
+				if err := os.Mkdir(ssh, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				d.guard = securitystate.Policy{Blocked: permissions.NewBlockedPaths(d.home, blockedEntries(t, d.home, "~/.ssh"))}
+				d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(m)), lookupPath: programDir(t, "sh"), blocked: d.guard.Blocked, projectRoot: d.processCWD})
+
+				got, err := d.Dispatch(context.Background(), bashCall("c1", command))
+				if err != nil {
+					t.Fatalf("Dispatch: %v", err)
+				}
+				if !got.Denied || !strings.Contains(got.Notice, "blocked_paths entry") {
+					t.Fatalf("result = %+v, want a blocked-path refusal", got)
+				}
+				if auth.callCount() != 0 || inner.calls() != 0 {
+					t.Fatalf("authorize calls = %d, runner calls = %d; want 0/0", auth.callCount(), inner.calls())
+				}
+			})
+		}
+	}
+}
+
+type refusalHelper struct {
+	records []netproxy.Refusal
+	closed  bool
+}
+
+func (h *refusalHelper) HelperChannel() *os.File { return nil }
+func (h *refusalHelper) Started() error          { return nil }
+func (h *refusalHelper) Close()                  { h.closed = true }
+
+func (h *refusalHelper) refusals() []netproxy.Refusal {
+	if !h.closed {
+		return nil
+	}
+	return slices.Clone(h.records)
+}
+
+type refusalReads struct {
+	mu      sync.Mutex
+	pending [][]netproxy.Refusal
+	reads   int
+}
+
+func (r *refusalReads) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads
+}
+
+func swapInvocationRefusals(t *testing.T, calls ...[]netproxy.Refusal) *refusalReads {
+	t.Helper()
+	r := &refusalReads{pending: calls}
+	real := invocationRefusals
+	invocationRefusals = func(helper cmdrunner.HelperLaunch) []netproxy.Refusal {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.reads++
+		if helper == nil {
+			t.Error("refusals read for an invocation without a helper launch")
+			return nil
+		}
+		helper.Close()
+		var records []netproxy.Refusal
+		if len(r.pending) > 0 {
+			records, r.pending = r.pending[0], r.pending[1:]
+		}
+		return real(&refusalHelper{records: records})
+	}
+	t.Cleanup(func() { invocationRefusals = real })
+	return r
+}
+
+func proxyRouteUnitConfinement(t *testing.T, projectRoot string, programs ...string) *confinement {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("the proxy route needs the linux connect broker")
+	}
+	conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), lookupPath: programDir(t, programs...),
+		projectRoot: projectRoot, blocked: testBlocked(t), broker: enforce.BrokerSlice})
+	t.Cleanup(conf.proxy.stop)
+	return conf
+}
+
+const wantProxyRouteNote = "codemeld: this command ran on the proxy route; tools that do not use HTTPS_PROXY/HTTP_PROXY, including ssh, scp and SSH URLs, get no network; use Build mode for those."
+
+func refusedLine(hostPort, reason string) string {
+	return "codemeld: network refused: " + hostPort + " (" + reason + ")"
+}
+
+func omittedLine(n int) string {
+	return fmt.Sprintf("codemeld: %d more network refusals omitted.", n)
+}
+
+func dispatchedStderr(t *testing.T, content string) string {
+	t.Helper()
+	if _, after, ok := strings.Cut(content, "stderr:\n"); ok {
+		content = after
+	}
+	stderr, _, _ := strings.Cut(content, "\nexit status ")
+	return stderr
+}
+
+func TestConfinedRunner_ProxyRouteDiagnosticsGetTheRouteExplanation(t *testing.T) {
+	malformed := netproxy.Refusal{Reason: "bad request"}
+	notTCP := netproxy.Refusal{Reason: "not a TCP connect"}
+	uninspectable := netproxy.Refusal{Reason: "connect not inspectable"}
+	dest := netproxy.Refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
+	destLine := refusedLine("a.test:80", "not approved (no one to ask)")
+	long := netproxy.Refusal{Host: strings.Repeat("h", 150) + ".test", Port: "443", Reason: "not approved (denied)"}
+	tight := len("\n"+confinedFailureNote) + 1 + 120
+	for _, tc := range []struct {
+		name     string
+		records  []netproxy.Refusal
+		cap      int
+		addition string
+	}{
+		{"malformed proxy request", []netproxy.Refusal{malformed}, 4096, wantProxyRouteNote},
+		{"not a TCP connect", []netproxy.Refusal{notTCP}, 4096, wantProxyRouteNote},
+		{"connect not inspectable", []netproxy.Refusal{uninspectable}, 4096, wantProxyRouteNote},
+		{"mixed diagnostics", []netproxy.Refusal{malformed, notTCP, uninspectable}, 4096, wantProxyRouteNote},
+		{"malformed proxy request and a destination", []netproxy.Refusal{malformed, dest}, 4096, destLine},
+		{"not a TCP connect and a destination", []netproxy.Refusal{dest, notTCP}, 4096, destLine},
+		{"connect not inspectable and a destination", []netproxy.Refusal{uninspectable, dest}, 4096, destLine},
+		{"mixed diagnostics and a destination", []netproxy.Refusal{malformed, dest, notTCP, uninspectable}, 4096, destLine},
+		{"a destination that does not fit", []netproxy.Refusal{malformed, long, notTCP}, tight, omittedLine(1)},
+	} {
+		want := "boom\n" + tc.addition + "\n" + confinedFailureNote
+		conf := proxyRouteUnitConfinement(t, t.TempDir(), "ls")
+		for name, exec := range confinedAdapters(t, conf, tc.cap) {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				swapInvocationRefusals(t, tc.records)
+				res, err := exec(&confineInner{exitCode: 1, stderr: []byte("boom")}, confinedSpec(t.TempDir(), "ls"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(res.Stderr) != want {
+					t.Fatalf("stderr = %q, want %q", res.Stderr, want)
+				}
+			})
+		}
+		t.Run(tc.name+"/dispatch", func(t *testing.T) {
+			swapInvocationRefusals(t, tc.records)
+			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: 1, stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
+			d.outputCap = tc.cap
+			d.confinement = proxyRouteUnitConfinement(t, d.processCWD, "ls")
+			got, err := d.Dispatch(context.Background(), bashCall("c1", "ls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stderr := dispatchedStderr(t, got.Content); stderr != want {
+				t.Fatalf("model stderr = %q, want %q", stderr, want)
+			}
+		})
+	}
+}
+
+func TestConfinedFailure_RefusalLinesStayWithinTheOutputCap(t *testing.T) {
+	noteRoom := len("\n" + confinedFailureNote)
+	failed := cmdrunner.RunResult{ExitCode: 1}
+	long := strings.Repeat("x", 200) + ".test"
+	records := []netproxy.Refusal{
+		{Host: "a.test", Port: "443", Reason: "not approved (denied)"},
+		{Reason: "bad request"},
+		{Host: "a.test", Port: "443", Reason: "not approved (denied)"},
+		{Host: "2001:db8::1", Port: "8080", Reason: "direct connection not allowed (use the proxy)"},
+		{Host: "a.test", Port: "443", Reason: "not approved (no one to ask)"},
+		{Host: "a.test", Port: "443", Reason: "not approved (denied)"},
+		{Host: long, Port: "443", Reason: "not approved (denied)"},
+		{Host: "2001:db8::1", Port: "8080", Reason: "direct connection not allowed (use the proxy)"},
+	}
+	lines := []string{
+		refusedLine("a.test:443", "not approved (denied)"),
+		refusedLine("[2001:db8::1]:8080", "direct connection not allowed (use the proxy)"),
+		refusedLine("a.test:443", "not approved (no one to ask)"),
+		refusedLine(long+":443", "not approved (denied)"),
+	}
+	f := confinedFailureOf(failed, true, &refusalHelper{records: records})
+	if f == nil || confinedFailureOf(cmdrunner.RunResult{}, true, &refusalHelper{records: records}) != nil {
+		t.Fatalf("failure state = %+v, want one for the failed run and none for a successful one", f)
+	}
+
+	t.Run("exact", func(t *testing.T) {
+		two := noteRoom + 1 + len(lines[0]) + 1 + len(lines[1]) + 1 + len(omittedLine(2)) + 1
+		for _, tc := range []struct {
+			name string
+			cap  int
+			want string
+		}{
+			{"everything fits", 4096, "boom\n" + strings.Join(lines, "\n") + "\n" + confinedFailureNote},
+			{"two lines and the marker", two, "b\n" + lines[0] + "\n" + lines[1] + "\n" + omittedLine(2) + "\n" + confinedFailureNote},
+			{"lines before the marker", two - 1, "boom\n" + lines[0] + "\n" + lines[1] + "\n" + confinedFailureNote},
+		} {
+			res := noteConfinedFailure(cmdrunner.RunResult{ExitCode: 1, Stderr: []byte("boom"), StderrTotal: 1000}, tc.cap, f)
+			if string(res.Stderr) != tc.want {
+				t.Fatalf("%s: stderr = %q, want %q", tc.name, res.Stderr, tc.want)
+			}
+			kept := len(tc.want) - len(strings.TrimPrefix(strings.TrimPrefix(tc.want, "boom"), "b"))
+			if res.StderrTotal != 1000+int64(len(tc.want)-kept) {
+				t.Fatalf("%s: StderrTotal = %d, want the 1000 command bytes plus %d rendered bytes", tc.name, res.StderrTotal, len(tc.want)-kept)
+			}
+		}
+	})
+
+	for name, stderr := range map[string][]byte{
+		"no stderr":        nil,
+		"short":            []byte("boom"),
+		"multi-byte":       bytes.Repeat([]byte("é"), 300),
+		"long":             bytes.Repeat([]byte("a"), 5000),
+		"invalid UTF-8":    bytes.Repeat([]byte{0xff, 'a'}, 100),
+		"continuation 1st": append([]byte{0x80, 0x80}, bytes.Repeat([]byte("z"), 50)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for cap := 256; cap <= 1400; cap++ {
+				out, kept := withConfinedFailure(stderr, cap, f)
+				if _, model := events.BuildModelInputBytes(nil, out, 1<<20); len(model) > cap {
+					t.Fatalf("cap %d: model stderr is %d bytes", cap, len(model))
+				}
+				body, ok := bytes.CutSuffix(out, []byte(confinedFailureNote))
+				if !ok || bytes.Count(out, []byte(confinedFailureNote)) != 1 || !bytes.HasPrefix(body, stderr[:kept]) {
+					t.Fatalf("cap %d: stderr = %q, want a command prefix and one trailing note", cap, out)
+				}
+				if len(stderr) > 0 && kept == 0 {
+					t.Fatalf("cap %d: stderr = %q, want a non-empty command prefix", cap, out)
+				}
+				rest := strings.TrimPrefix(string(body[kept:]), "\n")
+				var got []string
+				if rest != "" {
+					got = strings.Split(strings.TrimSuffix(rest, "\n"), "\n")
+				}
+				shown := 0
+				for shown < len(got) && shown < len(lines) && got[shown] == lines[shown] {
+					shown++
+				}
+				switch {
+				case shown == len(got):
+				case shown == len(got)-1 && got[shown] == omittedLine(len(lines)-shown):
+				default:
+					t.Fatalf("cap %d: additions %q, want a prefix of %q and at most the omission marker", cap, got, lines)
+				}
+			}
+		})
+	}
+}
+
+func TestConfinedRunner_ProxyRouteNoteOnlyForFailedRuns(t *testing.T) {
+	record := []netproxy.Refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	for _, tc := range []struct {
+		name    string
+		inner   confineInner
+		want    string
+		wantErr bool
+	}{
+		{"success", confineInner{stderr: []byte("warn")}, "warn", false},
+		{"launch failure", confineInner{exitCode: -1, launchErr: fserrors.NotFound}, "", false},
+		{"runner error", confineInner{exitCode: 1, stderr: []byte("boom"), err: errors.New("runner broke")}, "", true},
+	} {
+		conf := proxyRouteUnitConfinement(t, t.TempDir(), "ls")
+		for name, exec := range confinedAdapters(t, conf, 4096) {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				reads := swapInvocationRefusals(t, record)
+				inner := tc.inner
+				res, err := exec(&inner, confinedSpec(t.TempDir(), "ls"))
+				if (err != nil) != tc.wantErr || strings.Contains(string(res.Stderr), "codemeld:") {
+					t.Fatalf("result %+v, err %v; want error %v and no note", res, err, tc.wantErr)
+				}
+				if !tc.wantErr && string(res.Stderr) != tc.want {
+					t.Fatalf("stderr = %q, want %q", res.Stderr, tc.want)
+				}
+				if reads.count() != 0 {
+					t.Fatalf("refusals read %d times, want none", reads.count())
+				}
+			})
+		}
+	}
+}
+
+func TestConfinedRunner_ProxyRefusalTotalsCountOnlyRenderedBytes(t *testing.T) {
+	var records []netproxy.Refusal
+	var lines []string
+	for _, host := range []string{"first", "second", "third"} {
+		host = strings.Repeat(host, 8) + ".test"
+		records = append(records, netproxy.Refusal{Host: host, Port: "443", Reason: "not approved (denied)"})
+		lines = append(lines, refusedLine(host+":443", "not approved (denied)"))
+	}
+	cap := len("\n"+confinedFailureNote) + 1 + len(lines[0]) + 1 + len(lines[1]) + 1 + len(omittedLine(1)) + 1
+	want := "b\n" + lines[0] + "\n" + lines[1] + "\n" + omittedLine(1) + "\n" + confinedFailureNote
+	wantTotal := int64(1000 + len(want) - len("b"))
+	conf := proxyRouteUnitConfinement(t, t.TempDir(), "ls", "hg")
+	newInner := func() *confineInner { return &confineInner{exitCode: 1, stderr: []byte("boom"), stderrSize: 1000} }
+
+	for _, withStore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bash session %v", withStore), func(t *testing.T) {
+			swapInvocationRefusals(t, records)
+			store := mkStore(t)
+			shell := &shellEventRunner{inner: newInner(), cap: cap}
+			if withStore {
+				shell.active = func() *sessions.Store { return store }
+			}
+			res, err := execNoted(&confinedShellRunner{events: shell, conf: conf}, confinedSpec(t.TempDir(), "ls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(res.Stderr) != want || res.StderrTotal != wantTotal {
+				t.Fatalf("shell stderr = %q, total %d; want %q, total %d", res.Stderr, res.StderrTotal, want, wantTotal)
+			}
+			if withStore {
+				ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+				if len(ends) != 1 || ends[0].Stderr != want || ends[0].OriginalBytes == nil || ends[0].OriginalBytes.Stderr != wantTotal {
+					t.Fatalf("tool_exec_end = %+v, want stderr %q and original stderr %d", ends, want, wantTotal)
+				}
+			}
+		})
+	}
+
+	t.Run("vcs", func(t *testing.T) {
+		swapInvocationRefusals(t, records)
+		res, err := (&confinedRunner{inner: newInner(), conf: conf, cap: cap}).Exec(context.Background(), confinedSpec(t.TempDir(), "hg"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(res.Stderr) != want || res.StderrTotal != wantTotal {
+			t.Fatalf("vcs stderr = %q, total %d; want %q, total %d", res.Stderr, res.StderrTotal, want, wantTotal)
+		}
+	})
+}
+
+func TestConfinedShell_ProxyRefusalsSurviveShellAggregation(t *testing.T) {
+	ok := cmdrunner.RunResult{Stdout: []byte("one\n"), Stderr: []byte("fine")}
+	failed := cmdrunner.RunResult{ExitCode: 1, Stdout: []byte("two\n"), Stderr: []byte("boom")}
+	ref := func(host string) netproxy.Refusal {
+		return netproxy.Refusal{Host: host, Port: "80", Reason: "not approved (no one to ask)"}
+	}
+	line := func(host string) string { return refusedLine(host+":80", "not approved (no one to ask)") }
+	noted := func(stderr string, lines ...string) string {
+		return stderr + "\n" + strings.Join(lines, "\n") + "\n" + confinedFailureNote
+	}
+	short := len("\n"+confinedFailureNote) + 1 + len(line("a.test")) + 1 + len(line("b.test")) + 1 + len(omittedLine(1)) + 1
+	for _, tc := range []struct {
+		name    string
+		command string
+		cap     int
+		results []cmdrunner.RunResult
+		records [][]netproxy.Refusal
+		ends    []string
+		model   string
+	}{
+		{"ls && false", "ls && false", 4096, []cmdrunner.RunResult{ok, failed}, [][]netproxy.Refusal{{ref("a.test")}},
+			[]string{"fine", noted("boom", line("a.test"))}, noted("fineboom", line("a.test"))},
+		{"false; ls", "false; ls", 4096, []cmdrunner.RunResult{failed, ok}, [][]netproxy.Refusal{{ref("a.test")}},
+			[]string{noted("boom", line("a.test")), "fine"}, noted("boomfine", line("a.test"))},
+		{"ls | false", "ls | false", 4096, []cmdrunner.RunResult{ok, failed}, [][]netproxy.Refusal{{ref("a.test")}},
+			[]string{"fine", noted("boom", line("a.test"))}, noted("fineboom", line("a.test"))},
+		{"two failing stages", "false; false", 4096, []cmdrunner.RunResult{failed, failed},
+			[][]netproxy.Refusal{{ref("a.test"), ref("b.test")}, {ref("b.test"), ref("c.test")}},
+			[]string{noted("boom", line("a.test"), line("b.test")), noted("boom", line("b.test"), line("c.test"))},
+			noted("boomboom", line("a.test"), line("b.test"), line("c.test"))},
+		{"two failing stages over budget", "false; false", short, []cmdrunner.RunResult{failed, failed},
+			[][]netproxy.Refusal{{ref("a.test"), ref("b.test")}, {ref("b.test"), ref("c.test")}},
+			nil, noted("b", line("a.test"), line("b.test"), omittedLine(1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			swapInvocationRefusals(t, tc.records...)
+			inner := &confineInner{results: tc.results}
+			d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()})
+			d.outputCap = tc.cap
+			d.confinement = proxyRouteUnitConfinement(t, d.processCWD, "ls", "false")
+
+			got, err := d.Dispatch(context.Background(), bashCall("c1", tc.command))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if inner.calls() != 2 || len(inner.bounded) != 2 {
+				t.Fatalf("inner calls = %d, bounded = %d, want two confined stages", inner.calls(), len(inner.bounded))
+			}
+			if stderr := dispatchedStderr(t, got.Content); stderr != tc.model || len(stderr) > tc.cap {
+				t.Fatalf("model stderr = %q, want %q", stderr, tc.model)
+			}
+			ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, d.active()), events.KindToolExecEnd)
+			if len(ends) != 2 {
+				t.Fatalf("tool_exec_end = %+v, want one per stage", ends)
+			}
+			for i, want := range tc.ends {
+				if ends[i].Stderr != want {
+					t.Fatalf("stage %d tool_exec_end stderr = %q, want %q", i, ends[i].Stderr, want)
+				}
+			}
+		})
+	}
+}
+
+func TestConfinedShell_ProxyRefusalNoteIsTheRecordedEndAndKeepsTheTimeoutNote(t *testing.T) {
+	record := []netproxy.Refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	line := refusedLine("a.test:80", "not approved (no one to ask)")
+	want := "boom\n" + line + "\n" + confinedFailureNote
+	for _, withSession := range []bool{true, false} {
+		t.Run(fmt.Sprintf("session %v", withSession), func(t *testing.T) {
+			swapInvocationRefusals(t, record)
+			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: 1, stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
+			store := d.active()
+			if !withSession {
+				d.active = nil
+			}
+			d.confinement = proxyRouteUnitConfinement(t, d.processCWD, "ls")
+			got, err := d.Dispatch(context.Background(), bashCall("c1", "ls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stderr := dispatchedStderr(t, got.Content); stderr != want {
+				t.Fatalf("model stderr = %q, want %q", stderr, want)
+			}
+			ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+			if withSession && (len(ends) != 1 || ends[0].Stderr != want) {
+				t.Fatalf("tool_exec_end = %+v, want the model stderr %q", ends, want)
+			}
+			if !withSession && len(ends) != 0 {
+				t.Fatalf("tool_exec_end = %+v, want none without a session", ends)
+			}
+		})
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		const cap = 512
+		limit := 100 * time.Millisecond
+		swapInvocationRefusals(t, record)
+		inner := &confineInner{exitCode: -1, stderr: bytes.Repeat([]byte("e"), 2*cap), onBounded: func(cmdrunner.RunSpec) { time.Sleep(limit + 100*time.Millisecond) }}
+		d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()})
+		d.outputCap = cap
+		d.confinement = proxyRouteUnitConfinement(t, d.processCWD, "ls")
+		got, err := d.Dispatch(context.Background(), bashCallWithTimeout("c1", "ls", int(limit.Milliseconds())))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderr := dispatchedStderr(t, got.Content)
+		if len(stderr) > cap || !strings.HasPrefix(stderr, "e") || !strings.HasSuffix(stderr, "\n"+line+"\n"+confinedFailureNote+"\n"+bashTimeoutNote(limit)) ||
+			strings.Count(stderr, confinedFailureNote) != 1 {
+			t.Fatalf("model stderr = %q (%d bytes), want a command prefix, the refusal, the note and the timeout note within %d", stderr, len(stderr), cap)
+		}
+		ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, d.active()), events.KindToolExecEnd)
+		if len(ends) != 1 || len(ends[0].Stderr) > cap || !strings.HasSuffix(ends[0].Stderr, "\n"+line+"\n"+confinedFailureNote) {
+			t.Fatalf("tool_exec_end = %+v, want the bounded execution stderr without the timeout note", ends)
+		}
+	})
 }

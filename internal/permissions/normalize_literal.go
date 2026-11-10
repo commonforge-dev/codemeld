@@ -7,7 +7,8 @@ import "strings"
 // Leading and trailing whitespace is stripped, the command is
 // tokenized with the shared shell parser (the same tokenizer direct-command
 // normalization uses), and the tokens are re-emitted separated
-// by a single ASCII space (U+0020).
+// by a single ASCII space (U+0020), or by the bare newline and carriage-return
+// bytes of the original separator when it holds any.
 //
 // Each token is normalized conservatively so that commands which execute
 // identically collapse to one subject. A token whose unescaped value is free of
@@ -41,18 +42,40 @@ import "strings"
 // or dangling backslash) returns the tokenizer's error so callers never silently
 // broaden a permission match.
 func CanonicalLiteralForm(input string) (string, error) {
-	tokens, err := tokenizeShell(strings.TrimSpace(input))
+	trimmed := strings.TrimSpace(input)
+	tokens, err := tokenizeShell(trimmed)
 	if err != nil {
 		return "", err
 	}
 	var b strings.Builder
+	pos := 0
 	for i, t := range tokens {
-		if i > 0 {
-			b.WriteByte(' ')
+		start := pos
+		for isShellSpace(trimmed[pos]) {
+			pos++
 		}
+		if i > 0 {
+			b.WriteString(literalSeparator(trimmed[start:pos]))
+		}
+		pos += len(t.Raw)
 		b.WriteString(canonicalToken(t))
 	}
 	return b.String(), nil
+}
+
+// literalSeparator keeps a bare line break between tokens, because sh runs the words on either side
+// of it as separate commands.
+func literalSeparator(gap string) string {
+	breaks := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return r
+		}
+		return -1
+	}, gap)
+	if breaks == "" {
+		return " "
+	}
+	return breaks
 }
 
 // canonicalToken returns the single normalized spelling of one parsed token.

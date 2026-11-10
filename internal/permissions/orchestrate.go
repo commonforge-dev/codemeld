@@ -313,12 +313,6 @@ func resolveWithoutPrompt(ctx context.Context, req MatchRequest, modeCtx ModeCon
 		return Decision{}, false, nil
 	}
 
-	if modeCtx.Mode == modeAutoEdits && confinedShell(req, modeCtx) {
-		if SandboxedAutoEditsAuthority(req, modeCtx) != "" {
-			return Decision{}, false, nil
-		}
-	}
-
 	if res := Match(req, deps.Grants.Permissions()); res.Matched {
 		grant := res.Grant
 		outcome := grantOutcome(grant.GrantKind)
@@ -1046,9 +1040,6 @@ func autoEditsPosture(req MatchRequest, mc ModeContext, deps AuthorizeDeps) (Dec
 		return Decision{Outcome: outcomeOnce}, true, nil
 	}
 	if confinedShell(req, mc) {
-		if SandboxedAutoEditsAuthority(req, mc) != "" {
-			return Decision{}, false, nil
-		}
 		if err := emitConfined(req, deps); err != nil {
 			return Decision{}, true, err
 		}

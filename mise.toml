@@ -1,6 +1,7 @@
 [tools]
 go = "1.26.10"
 "go:golang.org/x/vuln/cmd/govulncheck" = "v1.6.0"
+"go:github.com/mibk/dupl" = "v1.1.0"
 
 # Machine-local, non-portable config (the process-tooling scripts PATH entry and
 # the personal scratch-build task) lives in the hgignored mise.local.toml, not here,
@@ -97,5 +98,5 @@ description = "Self-test the OSS shipping-set scanners against fixtures (proves 
 run = "scripts/oss-reference-check.sh --self-test && scripts/oss-secret-scan.sh --self-test"
 
 [tasks.release-check]
-description = "Release gate: OSS reference check + secret scan, then go vet and the Go vulnerability scan (only the secret scan and govulncheck are exclusive to it; govulncheck needs outbound network)"
-run = "mise run oss-reference-check && mise run oss-secret-scan && go vet ./... && govulncheck ./..."
+description = "Release gate: OSS reference check + secret scan, then go vet and the Go vulnerability gate (govulncheck plus the expiring exceptions file named by CODEMELD_VULN_EXCEPTIONS; only the secret scan and the vulnerability gate are exclusive to it; govulncheck needs outbound network)"
+run = "mise run oss-reference-check && mise run oss-secret-scan && go vet ./... && scripts/govulncheck-gate.sh"

@@ -23,10 +23,11 @@ type Leg struct {
 }
 
 type Resolution struct {
-	Capability     Capability
-	Reason         string
-	Legs           []Leg
-	SelfTestPassed bool
+	Capability          Capability
+	Reason              string
+	Legs                []Leg
+	SelfTestPassed      bool
+	SliceSelfTestPassed bool
 }
 
 type ResolveInput struct {
@@ -58,7 +59,8 @@ func resolveLinux(in ResolveInput) Resolution {
 	if !filepath.IsAbs(in.Home) {
 		return Resolution{Capability: Refused, Reason: "linux: invalid home: path must be absolute"}
 	}
-	results := runSelfTestLegs(filepath.Clean(in.Home), cmp.Or(in.HelperExecutable, helperExecutable))
+	home, exe := filepath.Clean(in.Home), cmp.Or(in.HelperExecutable, helperExecutable)
+	results := runSelfTestLegs(home, exe)
 	r := Resolution{Capability: Refused}
 	for _, l := range results {
 		r.Legs = append(r.Legs, Leg{Name: l.Name, Observed: l.Observed, Diagnostic: l.Diagnostic})
@@ -76,6 +78,7 @@ func resolveLinux(in ResolveInput) Resolution {
 		return r
 	}
 	r.Capability, r.SelfTestPassed = Constrained, true
+	r.SliceSelfTestPassed, _ = sliceSelfTest(home, exe)
 	return r
 }
 

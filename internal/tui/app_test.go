@@ -1816,3 +1816,73 @@ func TestRefreshStatusLineFromBackground_BeforeRunWhileRunningAndAfterShutdown(t
 		t.Fatalf("status line after shutdown = %q (%d reads), want %q unchanged (%d reads)", after, afterHits, got, hits)
 	}
 }
+
+func TestApp_EventLoopReturnEndsAPendingNetworkPrompt(t *testing.T) {
+	a := New(nil)
+	screen := tcell.NewSimulationScreen("UTF-8")
+	a.newScreen = func() (tcell.Screen, error) { return screen, nil }
+	errC := make(chan error, 1)
+	go func() { errC <- a.Run() }()
+	waitLoopRunning(t, a)
+
+	call := promptNetworkAsync(a, context.Background(), "one.example")
+	waitNetworkPrompt(t, a, "one.example")
+	failure := errors.New("terminal lost")
+	if err := screen.PostEvent(tcell.NewEventError(failure)); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errC; err == nil {
+		t.Fatal("App.Run returned nil after a terminal error")
+	}
+	if got := awaitNetworkCall(t, a, call); got.err == nil || got.opt != OptionDeny {
+		t.Fatalf("pending prompt after the event loop returned = %+v, want a refusal", got)
+	}
+}
+
+func TestApp_ShutdownEndsNetworkPromptWaitsWithQueuedCallbacksLeftInert(t *testing.T) {
+	for _, tc := range []string{"queued show", "queued withdrawal"} {
+		t.Run(tc, func(t *testing.T) {
+			a := New(nil)
+			h := startPromptLoop(t, a)
+			defer func() {
+				a.app.Stop()
+				<-h.errc
+			}()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var call chan networkCall
+			var release func()
+			if tc == "queued show" {
+				release = blockEventLoop(a)
+				call = promptNetworkAsync(a, ctx, "one.example")
+			} else {
+				call = promptNetworkAsync(a, ctx, "one.example")
+				waitNetworkPrompt(t, a, "one.example")
+				release = blockEventLoop(a)
+				cancel()
+			}
+			select {
+			case got := <-call:
+				release()
+				t.Fatalf("PromptNetwork returned %+v before shutdown while its UI callback was still queued", got)
+			case <-time.After(50 * time.Millisecond):
+			}
+			a.BeginShutdown()
+			got := awaitNetworkCall(t, a, call)
+			release()
+			if got.err == nil || got.opt != OptionDeny {
+				t.Fatalf("prompt = %+v, want a refusal", got)
+			}
+
+			shown := true
+			waitOnLoop(t, a, "queued callbacks", func() bool {
+				shown = a.network != nil || a.pages.HasPage(promptBasePage)
+				return true
+			})
+			if shown {
+				t.Fatal("a queued network prompt callback mounted a prompt after shutdown")
+			}
+		})
+	}
+}

@@ -1,6 +1,6 @@
 # Development setup
 
-_Last updated: 2026-11-03_
+_Last updated: 2026-11-10_
 
 This page is the whole "get building" story: the toolchain, the commands, and how to run the
 binary. The dependency list itself is [`go.mod`](../go.mod).
@@ -30,6 +30,11 @@ go install golang.org/x/tools/cmd/deadcode@latest                          # for
 `govulncheck`, used by the release-only `mise run release-check`, is **not** installed this way —
 mise pins it at `v1.6.0` through its Go backend, so `mise install` provides it.
 
+The release gate also needs `jq` on your `PATH`. mise does not install it; install it with your
+system package manager. Without it, `scripts/govulncheck-gate.sh` stops with
+`govulncheck-gate: jq is required` before running the vulnerability scan. Building, testing and
+running codemeld do not need `jq`.
+
 ## Build, test, lint
 
 Run these from the repository root. Use the `mise run` tasks rather than raw `go` /
@@ -50,7 +55,7 @@ full task list lives in [`docs/tech-stack.md`](../docs/tech-stack.md) → "Build
 | `mise run check-dev` | lint → `test-fast` → wiring-stub check. The iterative loop while you work. |
 | `mise run check` | lint → `test-fast` → deadcode → wiring-stub check → shipping-set reference check. The gate before you propose a change. |
 | `mise run check-race` | lint → race test → deadcode → wiring-stub check → shipping-set reference check. The authoritative gate. |
-| `mise run release-check` | **Release** gate, fail-fast in order: shipping-set reference check → secret scan → `go vet ./...` → `govulncheck ./...`. Only the secret scan and `govulncheck` are exclusive to it, and `govulncheck` needs network access to `https://vuln.go.dev`. |
+| `mise run release-check` | **Release** gate, fail-fast in order: shipping-set reference check → secret scan → `go vet ./...` → `govulncheck ./...` through `scripts/govulncheck-gate.sh`. Only the secret scan and the vulnerability gate are exclusive to it, and `govulncheck` needs network access to `https://vuln.go.dev`. The gate fails on any reachable vulnerability unless `CODEMELD_VULN_EXCEPTIONS` names a file with an unexpired exception for it; an exception stays active through the seventh day after the date on its line. Needs `jq` (see above). |
 
 Run **`mise run fmt`** and then **`mise run check`** before proposing a change, and
 `mise run check-race` before it lands — the race build and the deadcode reachability check are

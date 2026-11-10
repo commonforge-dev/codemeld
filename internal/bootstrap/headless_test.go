@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"io/fs"
 	"maps"
 	"os"
@@ -37,12 +38,14 @@ import (
 	"codemeld.dev/codemeld/internal/filetools"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/provider"
 	"codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/subagent"
+	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/trust"
 	"codemeld.dev/codemeld/internal/tui"
 	"codemeld.dev/codemeld/internal/turn"
@@ -5769,7 +5772,34 @@ func TestMain(m *testing.M) {
 	}
 	code := m.Run()
 	_ = os.RemoveAll(home)
+	if helperBuild.dir != "" {
+		_ = os.RemoveAll(helperBuild.dir)
+	}
 	os.Exit(code)
+}
+
+var helperBuild struct {
+	once     sync.Once
+	dir, bin string
+	out      []byte
+	err      error
+}
+
+func builtHelper(t *testing.T) string {
+	t.Helper()
+	helperBuild.once.Do(func() {
+		if helperBuild.dir, helperBuild.err = os.MkdirTemp("", "bootstrap-helper-"); helperBuild.err != nil {
+			return
+		}
+		helperBuild.bin = filepath.Join(helperBuild.dir, "codemeld")
+		build := exec.Command("go", "build", "-o", helperBuild.bin, "codemeld.dev/codemeld/cmd/codemeld")
+		build.Env = append(os.Environ(), "CGO_ENABLED=0")
+		helperBuild.out, helperBuild.err = build.CombinedOutput()
+	})
+	if helperBuild.err != nil {
+		t.Fatalf("build cgo-free codemeld: %v\n%s", helperBuild.err, helperBuild.out)
+	}
+	return helperBuild.bin
 }
 
 func runHeadlessCapturingDispatcher(t *testing.T, result *BootstrapResult) (*productionToolDispatcher, string) {
@@ -5815,6 +5845,98 @@ func TestRunHeadless_AnAncestorSwapCannotRedirectExitCleanup(t *testing.T) {
 	s.requireHeld(t, []string{created}, nil)
 }
 
+func TestRunHeadless_ExitStopsAndJoinsTheSessionProxy(t *testing.T) {
+	swapResolveExecutionCapability(t, injectedResolution)
+	result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Build, mode.SourceDefault))
+	client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	var conf *confinement
+	var endpoint string
+	var held net.Conn
+	defer swapToolLoop(func(deps turn.Deps, d turn.ToolDispatcher, n int) *turn.ToolLoop {
+		conf = d.(*productionToolDispatcher).confinement
+		if started, err := conf.proxy.start(); err == nil {
+			endpoint = started.String()
+			held, _ = net.Dial("tcp", endpoint)
+		}
+		return turn.NewToolLoop(deps, d, n)
+	})()
+
+	var stdout, stderr bytes.Buffer
+	if err := NewHeadlessDriver("hi", &stdout, &stderr).Run(context.Background(), result); err != nil {
+		t.Fatalf("driver.Run: %v; stderr %q", err, stderr.String())
+	}
+	if conf == nil || conf.owned != nil || held == nil {
+		t.Fatalf("confinement %+v, proxy connection %v; want a started session proxy and no temp folders", conf, held)
+	}
+	defer func() { _ = held.Close() }()
+	_ = held.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := held.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("connection held into the proxy read %d, %v after exit; want EOF from a stopped proxy", n, err)
+	}
+	if c, err := net.DialTimeout("tcp", endpoint, time.Second); err == nil {
+		_ = c.Close()
+		t.Errorf("the session proxy at %s still accepts connections after exit", endpoint)
+	}
+	if _, err := conf.proxy.start(); !errors.Is(err, errSessionProxyStopped) {
+		t.Errorf("start after exit = %v, want the stopped refusal", err)
+	}
+}
+
+func TestRunHeadless_PromptForApprovalGivesTheConfinementTheTerminalNetworkAsker(t *testing.T) {
+	for _, prompting := range []bool{true, false} {
+		t.Run(fmt.Sprintf("prompt for approval %v", prompting), func(t *testing.T) {
+			swapResolveExecutionCapability(t, injectedResolution)
+			result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Build, mode.SourceDefault))
+			client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+				return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+			}}
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+			var hasAsker bool
+			var decision netproxy.Decision
+			var askErr error
+			var accepted []netproxy.Decision
+			defer swapToolLoop(func(deps turn.Deps, d turn.ToolDispatcher, n int) *turn.ToolLoop {
+				conf := d.(*productionToolDispatcher).confinement
+				hasAsker = conf.proxyAsker != nil
+				if hasAsker {
+					decision, askErr = conf.proxyAsker(context.Background(), "example.com", "8443", func() bool { return false },
+						func(d netproxy.Decision) bool { accepted = append(accepted, d); return true })
+				}
+				return turn.NewToolLoop(deps, d, n)
+			})()
+
+			var stdout, stderr bytes.Buffer
+			driver := NewHeadlessDriver("hi", &stdout, &stderr)
+			if prompting {
+				driver.EnablePromptForApproval(strings.NewReader("3\n"))
+			}
+			if err := driver.Run(context.Background(), result); err != nil {
+				t.Fatalf("driver.Run: %v; stderr %q", err, stderr.String())
+			}
+			if !prompting {
+				if hasAsker {
+					t.Fatal("the confinement has a network asker without --prompt-for-approval")
+				}
+				return
+			}
+			if !hasAsker {
+				t.Fatal("the confinement has no network asker with --prompt-for-approval")
+			}
+			if askErr != nil || decision != netproxy.DecisionSession || !slices.Equal(accepted, []netproxy.Decision{netproxy.DecisionSession}) {
+				t.Fatalf("asker = %v, %v, accepted %v; want the scripted session answer accepted", decision, askErr, accepted)
+			}
+			for _, want := range []string{"host: example.com", "port: 8443", "the command can send data to this host", "choose 1-4"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+				}
+			}
+		})
+	}
+}
+
 func TestRunHeadless_AFailedCreationRollbackIsRetriedAtExit(t *testing.T) {
 	skipUnlessLinuxTempDirs(t)
 	f := failCreationRollback(t)
@@ -5829,7 +5951,13 @@ func TestRunHeadless_AFailedCreationRollbackIsRetriedAtExit(t *testing.T) {
 
 func TestRunHeadless_PrintsTheInjectedLabelAndRecordsTheCapability(t *testing.T) {
 	const sentinel = "headless-sentinel-value-9c1d"
+	const urlSentinel = "https://user:headless-url-sentinel-4e7a@mirror.example/x"
+	const inheritedEntry = "XDG_SENTINEL_DIR=/headless-inherited-sentinel-2b8f"
+	fixedSentinel := filepath.Join(t.TempDir(), "headless-fixed-sentinel-71c3")
 	t.Setenv("SENTINEL_API_TOKEN", sentinel)
+	t.Setenv("SENTINEL_MIRROR", urlSentinel)
+	t.Setenv("XDG_SENTINEL_DIR", "/headless-inherited-sentinel-2b8f")
+	t.Setenv("GOCACHE", fixedSentinel)
 	t.Setenv("PATH", os.Getenv("PATH"))
 	resolution := injectedResolution
 	resolution.SelfTestPassed = true
@@ -5850,15 +5978,26 @@ func TestRunHeadless_PrintsTheInjectedLabelAndRecordsTheCapability(t *testing.T)
 	if want := launchCapability(injectedCapability); len(caps) != 1 || !reflect.DeepEqual(caps[0], want) {
 		t.Fatalf("execution_capability on disk = %+v, want exactly %+v", caps, want)
 	}
-	if names := caps[0].WithheldEnvironment; !slices.Contains(names, "SENTINEL_API_TOKEN") || !slices.Contains(names, "PATH") {
-		t.Fatalf("withheld_environment = %v, want SENTINEL_API_TOKEN and PATH", names)
+	names := caps[0].WithheldEnvironment
+	for _, want := range []string{"SENTINEL_API_TOKEN", "SENTINEL_MIRROR", "GOCACHE", "PATH"} {
+		if !slices.Contains(names, want) {
+			t.Fatalf("withheld_environment = %v, want %s", names, want)
+		}
+	}
+	if slices.Contains(names, "XDG_SENTINEL_DIR") {
+		t.Fatalf("withheld_environment = %v, want XDG_SENTINEL_DIR inherited", names)
+	}
+	if !slices.Contains(d.confinement.inherited, inheritedEntry) {
+		t.Fatalf("launch snapshot = %q, want %s", d.confinement.inherited, inheritedEntry)
 	}
 	raw, err := os.ReadFile(result.Session.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), sentinel) {
-		t.Fatal("the session file holds the withheld variable's value")
+	for _, value := range []string{sentinel, "headless-url-sentinel-4e7a", fixedSentinel} {
+		if strings.Contains(string(raw), value) {
+			t.Fatalf("the session file holds the withheld value %q", value)
+		}
 	}
 }
 
@@ -5989,6 +6128,11 @@ var selfTestCases = []struct {
 
 func runHeadlessShell(t *testing.T, result *BootstrapResult, run runner.Runner, command string) *productionToolDispatcher {
 	t.Helper()
+	return runHeadlessShellAnswering(t, result, run, command, nil)
+}
+
+func runHeadlessShellAnswering(t *testing.T, result *BootstrapResult, run runner.Runner, command string, approvals io.Reader) *productionToolDispatcher {
+	t.Helper()
 	prev := newShellRunner
 	newShellRunner = func() runner.Runner { return run }
 	defer func() { newShellRunner = prev }()
@@ -5999,7 +6143,11 @@ func runHeadlessShell(t *testing.T, result *BootstrapResult, run runner.Runner, 
 		captured, _ = d.(*productionToolDispatcher)
 		return turn.NewToolLoop(deps, d, n)
 	})()
-	if err := NewHeadlessDriver("run it", &bytes.Buffer{}, &bytes.Buffer{}).Run(context.Background(), result); err != nil {
+	driver := NewHeadlessDriver("run it", &bytes.Buffer{}, &bytes.Buffer{})
+	if approvals != nil {
+		driver.EnablePromptForApproval(approvals)
+	}
+	if err := driver.Run(context.Background(), result); err != nil {
 		t.Fatalf("driver.Run: %v", err)
 	}
 	if captured == nil {
@@ -6283,12 +6431,7 @@ func realConfinementHost(t *testing.T) (home, project, bin string) {
 	if err := os.Mkdir(project, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	bin = filepath.Join(t.TempDir(), "codemeld")
-	build := exec.Command("go", "build", "-o", bin, "codemeld.dev/codemeld/cmd/codemeld")
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build cgo-free codemeld: %v\n%s", err, out)
-	}
+	bin = builtHelper(t)
 	res := enforce.Resolve(enforce.ResolveInput{Home: home, HelperExecutable: bin})
 	if !res.SelfTestPassed {
 		if missing := missingHostPrimitive(res); missing != "" {
@@ -6307,7 +6450,7 @@ func TestRunHeadless_ConfinedPlanShellThroughTheRealHelper(t *testing.T) {
 	for _, tc := range []struct {
 		name, program, command, wantErr string
 	}{
-		{"socket", "python3", `python3 -c 'import socket; socket.socket()'`, "PermissionError"},
+		{"udp socket", "python3", `python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)'`, "PermissionError"},
 		{"write outside", "sh", "sh -c 'echo hi > " + probe + "'", "Permission denied"},
 		{"write TMPDIR", "sh", `sh -c 'echo hi > "$TMPDIR/x" && cat "$TMPDIR/x" && printf %s "$TMPDIR"'`, ""},
 		{"read home settings", "sh", "sh -c 'cat " + fixture + "; touch read-probe'", fixture + ": Permission denied"},
@@ -7945,5 +8088,95 @@ func TestHeadlessFreshSteps_NeverAsksAboutVCSUserConfig(t *testing.T) {
 	}
 	if got := settingsBytes(t, SettingsPath(home)); got != before {
 		t.Fatalf("settings = %q, want %q unchanged", got, before)
+	}
+}
+
+func requireConfinedShellRun(t *testing.T, inner *confineInner, command string) {
+	t.Helper()
+	if len(inner.bounded) != 1 || len(inner.execs) != 0 {
+		t.Fatalf("bounded/exec = %d/%d, want one confined run", len(inner.bounded), len(inner.execs))
+	}
+	argv := inner.bounded[0].Argv
+	if len(argv) != 5 || argv[0] != "/proc/self/exe" || argv[1] != enforce.HelperCommand || filepath.Base(argv[2]) != "sh" || argv[3] != "-c" || argv[4] != command {
+		t.Fatalf("argv = %q, want the helper running sh -c %q", argv, command)
+	}
+}
+
+func TestRunHeadless_ConfinedShellSyntaxRunsThroughTheShell(t *testing.T) {
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
+		for _, command := range []string{"grep -n x dir/*.md", "ls && grep -n x dir/*.md"} {
+			t.Run(string(m)+"/"+command, func(t *testing.T) {
+				t.Setenv("TMPDIR", t.TempDir())
+				swapResolveExecutionCapability(t, constrainedResolution)
+				inner := &confineInner{}
+				runHeadlessShell(t, headlessResult(t, t.TempDir(), mode.NewActiveState(m, mode.SourceDefault)), inner, command)
+				requireConfinedShellRun(t, inner, command)
+			})
+		}
+	}
+}
+
+func TestRunHeadless_UnconfinedWildcardKeepsItsArgv(t *testing.T) {
+	noSelfTest := enforce.Resolution{Capability: enforce.Refused, Reason: "test: no self-test"}
+	for _, tc := range []struct {
+		m          mode.Mode
+		resolution enforce.Resolution
+	}{
+		{mode.Build, constrainedResolution},
+		{mode.Plan, noSelfTest},
+		{mode.AutoEdits, noSelfTest},
+	} {
+		t.Run(string(tc.m), func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			swapResolveExecutionCapability(t, tc.resolution)
+			inner := &confineInner{}
+			runHeadlessShell(t, headlessResult(t, t.TempDir(), mode.NewActiveState(tc.m, mode.SourceDefault)), inner, "grep -n x dir/*.md")
+			if len(inner.bounded) != 0 || len(inner.execs) != 1 || !slices.Equal(inner.execs[0].Argv, []string{"grep", "-n", "x", "dir/*.md"}) {
+				t.Fatalf("bounded = %+v, execs = %+v; want one unconfined run with the literal wildcard argv", inner.bounded, inner.execs)
+			}
+		})
+	}
+}
+
+func TestHeadlessAuthorizer_BrokenSettingsReroutedWildcardStillAsksAndStaysConfined(t *testing.T) {
+	const command = "grep -n x dir/*.md"
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
+		for _, approver := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/approver=%v", m, approver), func(t *testing.T) {
+				f := newRereadFixture(t)
+				f.writeGlobal(t, "a")
+				var terminal *terminalPrompter
+				if approver {
+					terminal = newTerminalPrompter(strings.NewReader("1\n"), &bytes.Buffer{})
+				}
+				store := mkStore(t)
+				active := func() *sessions.Store { return store }
+				auth := newHeadlessAuthorizer(emptyCache(t, f.project), active, mode.NewActiveState(m, mode.SourceDefault), terminal, &recordingNotices{})
+				auth.executionConstrained = true
+				auth.blocked = f.blocked(t, true)
+				rewriteSettings(t, f.global, brokenSettings)
+				if !auth.blocked.Current().Degraded() {
+					t.Fatal("the blocked list is not degraded over a broken settings file")
+				}
+				inner := &confineInner{}
+				d := newProductionToolDispatcher(tools.NewRegistry(), inner, auth, f.home, f.project, active, 65536, securitystate.Policy{Blocked: auth.blocked})
+				d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(m)), lookupPath: programDir(t, "sh"), blocked: auth.blocked, projectRoot: f.project})
+
+				got, err := d.Dispatch(context.Background(), bashCall("c1", command))
+				if err != nil {
+					t.Fatalf("Dispatch: %v", err)
+				}
+				if !approver {
+					if !got.Denied || !strings.Contains(got.Content, headlessDenyReason) || inner.calls() != 0 {
+						t.Fatalf("result = %+v, runner calls = %d; want the unattended refusal and nothing run", got, inner.calls())
+					}
+					return
+				}
+				if got.Denied {
+					t.Fatalf("result = %+v, want the approved command run", got)
+				}
+				requireConfinedShellRun(t, inner, command)
+			})
+		}
 	}
 }

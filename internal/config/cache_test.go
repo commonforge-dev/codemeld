@@ -2423,3 +2423,135 @@ func TestCacheContextWindowRaceSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func domainGrantsCache(t *testing.T, global, project, local string) *Cache {
+	t.Helper()
+	dir := t.TempDir()
+	layer := func(validate func([]byte, string) (map[string]any, LoadFailure, error), content, name string) map[string]any {
+		raw, cat, err := validate([]byte(content), filepath.Join(dir, name))
+		if cat != LoadOK || err != nil {
+			t.Fatalf("validate %s: cat = %q, err = %v", name, cat, err)
+		}
+		return raw
+	}
+	composed, err := Compose(
+		layer(ValidateGlobalSettingsBytes, global, "global.yaml"),
+		layer(ValidateProjectSettingsBytes, project, "settings.yaml"),
+		layer(ValidateLocalSettingsBytes, local, "settings.local.yaml"),
+	)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	return newCacheOrFatal(t, composed, dir, nil)
+}
+
+func TestCacheDomainGrants_GlobalAndLocalBothApply(t *testing.T) {
+	c := domainGrantsCache(t,
+		"domain_grants:\n  - host: global.example\n    port: 443\n",
+		"",
+		"domain_grants:\n  - host: local.example\n    port: 8443\n",
+	)
+	want := []string{"global.example:443", "local.example:8443"}
+	if got := c.DomainGrants(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("DomainGrants() = %q, want %q", got, want)
+	}
+}
+
+func TestCacheDomainGrants_CommittedProjectGrantIsIgnored(t *testing.T) {
+	c := domainGrantsCache(t,
+		"",
+		"domain_grants:\n  - host: project.example\n    port: 443\nagent:\n  max_concurrency: 9\n",
+		"",
+	)
+	if got := c.DomainGrants(); len(got) != 0 {
+		t.Fatalf("DomainGrants() = %q, want none from the committed project file", got)
+	}
+	if got := c.AgentMaxConcurrency(); got != 9 {
+		t.Fatalf("AgentMaxConcurrency() = %d, want 9 from the same project file", got)
+	}
+}
+
+func TestCacheDomainGrants_HandEditShowsInTheNextCacheOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.yaml")
+	load := func() *Cache {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return domainGrantsCache(t, string(b), "", "")
+	}
+	if err := os.WriteFile(path, []byte("domain_grants:\n  - host: old.example\n    port: 443\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	first := load()
+	if err := os.WriteFile(path, []byte("domain_grants:\n  - host: new.example\n    port: 443\n"), 0o600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if got := first.DomainGrants(); !reflect.DeepEqual(got, []string{"old.example:443"}) {
+		t.Fatalf("first cache DomainGrants() = %q, want the grant it was built with", got)
+	}
+	if got := load().DomainGrants(); !reflect.DeepEqual(got, []string{"new.example:443"}) {
+		t.Fatalf("next cache DomainGrants() = %q, want the edited grant", got)
+	}
+}
+
+func TestCacheDomainGrants_DecodeShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    []string
+	}{
+		{"absent key", "", nil},
+		{"empty list", "domain_grants: []\n", nil},
+		{"port 1", "domain_grants:\n  - host: a.example\n    port: 1\n", []string{"a.example:1"}},
+		{"port 65535", "domain_grants:\n  - host: a.example\n    port: 65535\n", []string{"a.example:65535"}},
+		{"whole float port", "domain_grants:\n  - host: a.example\n    port: 443.0\n", []string{"a.example:443"}},
+		{"hex port", "domain_grants:\n  - host: a.example\n    port: 0x1BB\n", []string{"a.example:443"}},
+		{"host spelling kept", "domain_grants:\n  - host: Example.COM.\n    port: 443\n", []string{"Example.COM.:443"}},
+		{"IPv6 host", "domain_grants:\n  - host: \"2001:db8::1\"\n    port: 443\n", []string{"[2001:db8::1]:443"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := domainGrantsCache(t, tc.content, "", "").DomainGrants()
+			if len(got) != len(tc.want) || (len(got) > 0 && !reflect.DeepEqual(got, tc.want)) {
+				t.Fatalf("DomainGrants() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCacheDomainGrants_RejectsUnvalidatedBadEntries(t *testing.T) {
+	for name, entry := range map[string]any{
+		"fractional port": map[string]any{"host": "a.example", "port": 443.5},
+		"port 0":          map[string]any{"host": "a.example", "port": 0},
+		"port 65536":      map[string]any{"host": "a.example", "port": uint64(65536)},
+		"string port":     map[string]any{"host": "a.example", "port": "443"},
+		"missing port":    map[string]any{"host": "a.example"},
+		"empty host":      map[string]any{"host": "", "port": 443},
+		"non-mapping":     "a.example:443",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := NewCache(map[string]any{"domain_grants": []any{entry}}, "", nil)
+			if err == nil {
+				t.Fatalf("NewCache = %q grants, want an error", c.DomainGrants())
+			}
+		})
+	}
+}
+
+func TestCacheDomainGrants_CopiesIsolateTheCache(t *testing.T) {
+	entry := map[string]any{"host": "a.example", "port": 443}
+	list := []any{entry}
+	composed := map[string]any{"domain_grants": list}
+	c := newCacheOrFatal(t, composed, "", nil)
+
+	entry["host"] = "mutated.example"
+	list[0] = map[string]any{"host": "other.example", "port": 80}
+	composed["domain_grants"] = []any{}
+	got := c.DomainGrants()
+	got[0] = "returned.example:1"
+
+	if again := c.DomainGrants(); !reflect.DeepEqual(again, []string{"a.example:443"}) {
+		t.Fatalf("DomainGrants() = %q, want the grant from construction", again)
+	}
+}

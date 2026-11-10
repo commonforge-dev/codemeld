@@ -73,11 +73,11 @@ func MoveNoReplace(src, dst string, observe ...MoveLifecycle) (step AtomicWriteS
 	if len(observe) > 0 {
 		lifecycle = observe[0]
 	}
-	srcParent, srcName, verr := splitMoveEndpoint(src)
+	srcParent, _, verr := splitMoveEndpoint(src)
 	if verr != nil {
 		return RenameStep, fserrors.CategorizeErrno(verr), verr
 	}
-	dstParent, dstName, verr := splitMoveEndpoint(dst)
+	dstParent, _, verr := splitMoveEndpoint(dst)
 	if verr != nil {
 		return RenameStep, fserrors.CategorizeErrno(verr), verr
 	}
@@ -93,6 +93,19 @@ func MoveNoReplace(src, dst string, observe ...MoveLifecycle) (step AtomicWriteS
 		return ParentSyncStep, fserrors.CategorizeErrno(oerr), oerr
 	}
 	defer dstParentFD.Close() //nolint:errcheck // read-only descriptor held only to rename relative to / re-identify the parent
+
+	return MoveNoReplaceAt(srcParentFD, dstParentFD, src, dst, lifecycle)
+}
+
+func MoveNoReplaceAt(srcParentFD, dstParentFD *os.File, src, dst string, lifecycle MoveLifecycle) (step AtomicWriteStep, cat fserrors.Category, err error) {
+	srcParent, srcName, verr := splitMoveEndpoint(src)
+	if verr != nil {
+		return RenameStep, fserrors.CategorizeErrno(verr), verr
+	}
+	dstParent, dstName, verr := splitMoveEndpoint(dst)
+	if verr != nil {
+		return RenameStep, fserrors.CategorizeErrno(verr), verr
+	}
 
 	beforeMoveRename()
 

@@ -1909,3 +1909,116 @@ func TestPersist_GlobalSaveThroughSymlinkedAncestor(t *testing.T) {
 		})
 	}
 }
+
+func TestPersist_DomainGrants_ConcurrentAdditionsBothSurvive(t *testing.T) {
+	holderGrant := DomainGrant{Host: "holder.example", Port: 443}
+	lateGrant := DomainGrant{Host: "late.example", Port: 8443}
+	for _, layer := range []string{"global", "local"} {
+		t.Run(layer, func(t *testing.T) {
+			root := t.TempDir()
+			target := filepath.Join(root, "settings.yaml")
+			persist := func(g DomainGrant) (PersistReason, error) {
+				reason, _, err := Persist(target, KeyDomainGrants, g)
+				return reason, err
+			}
+			if layer == "local" {
+				target = LocalSettingsPath(root)
+				persist = func(g DomainGrant) (PersistReason, error) {
+					_, reason, _, err := PersistLocal(root, KeyDomainGrants, g)
+					return reason, err
+				}
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeAt(t, target, "domain_grants:\n  - host: seed.example # seeded\n    port: 443\n")
+
+			holderIn, releaseHolder, lateIn := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			realMerge := mergeWrite
+			setMergeWrite(t, func(dir *os.File, path string, src fsutil.FileSnapshot, key string, val any) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+				switch val {
+				case holderGrant:
+					close(holderIn)
+					<-releaseHolder
+				case lateGrant:
+					close(lateIn)
+				}
+				return realMerge(dir, path, src, key, val)
+			})
+
+			var wg sync.WaitGroup
+			reasons, errs := make([]PersistReason, 2), make([]error, 2)
+			wg.Go(func() { reasons[0], errs[0] = persist(holderGrant) })
+			<-holderIn
+			wg.Go(func() { reasons[1], errs[1] = persist(lateGrant) })
+			select {
+			case <-lateIn:
+				close(releaseHolder)
+				t.Fatal("the second writer merged while the first held the sidecar lock")
+			case <-time.After(150 * time.Millisecond):
+			}
+			close(releaseHolder)
+			wg.Wait()
+			for i := range reasons {
+				if errs[i] != nil || reasons[i] != ReasonNone {
+					t.Fatalf("writer %d = (%q, %v), want success", i, reasons[i], errs[i])
+				}
+			}
+			want := "domain_grants:\n  - host: seed.example # seeded\n    port: 443\n" +
+				"  - host: holder.example\n    port: 443\n" +
+				"  - host: late.example\n    port: 8443\n"
+			if got := readAt(t, target); got != want {
+				t.Fatalf("file =\n%s\nwant both additions after the seed:\n%s", got, want)
+			}
+		})
+	}
+}
+
+func TestPersist_DomainGrants_PreReplacementFailureLeavesTheTargetUnchanged(t *testing.T) {
+	const seed = "domain_grants:\n  - host: seed.example # seeded\n    port: 443\n"
+	grant := DomainGrant{Host: "example.com", Port: 443}
+	for _, tc := range []struct {
+		name   string
+		inject func(t *testing.T, dir string)
+		reason PersistReason
+	}{
+		{"write", func(t *testing.T, _ string) {
+			t.Cleanup(fsutil.SetSyncFileForTest(func(*os.File) error { return errors.New("forced sync failure") }))
+		}, ReasonWriteError},
+		{"rename", func(t *testing.T, dir string) {
+			if os.Geteuid() == 0 {
+				t.Skip("root bypasses mode bits")
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			t.Cleanup(fsutil.SetBeforePublishRenameForTest(func() { _ = os.Chmod(dir, 0o500) }))
+		}, ReasonRenameError},
+	} {
+		for _, layer := range []string{"global", "local"} {
+			t.Run(tc.name+"/"+layer, func(t *testing.T) {
+				root := t.TempDir()
+				target := filepath.Join(root, "settings.yaml")
+				if layer == "local" {
+					target = LocalSettingsPath(root)
+				}
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				writeAt(t, target, seed)
+				tc.inject(t, filepath.Dir(target))
+				var reason PersistReason
+				var err error
+				if layer == "local" {
+					_, reason, _, err = PersistLocal(root, KeyDomainGrants, grant)
+				} else {
+					reason, _, err = Persist(target, KeyDomainGrants, grant)
+				}
+				if err == nil || reason != tc.reason {
+					t.Fatalf("persist = (%q, %v), want %q", reason, err, tc.reason)
+				}
+				if got := readAt(t, target); got != seed {
+					t.Fatalf("target changed after a pre-replacement failure:\n%s", got)
+				}
+			})
+		}
+	}
+}

@@ -38,7 +38,12 @@ var helperSteps = []helperStep{
 		return nil
 	}},
 	{"landlock", func(s *helperState) error { return applyLandlock(s.policy) }},
-	{"seccomp", func(s *helperState) error { return installSeccomp(s.policy) }},
+	{"seccomp", func(s *helperState) error {
+		if s.policy.Broker == BrokerNone {
+			return installSeccomp(s.policy)
+		}
+		return handOffListener(s.policy)
+	}},
 }
 
 var execStep = helperStep{"exec", func(s *helperState) error { return syscall.Exec(s.args[0], s.args, os.Environ()) }}

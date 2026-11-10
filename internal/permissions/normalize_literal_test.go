@@ -27,7 +27,9 @@ func TestCanonicalLiteralForm(t *testing.T) {
 		{name: "unquoted tokens stay unquoted", input: "git log --oneline", want: "git log --oneline"},
 		{name: "runs of spaces collapse to one", input: "echo    hi", want: "echo hi"},
 		{name: "leading and trailing whitespace stripped", input: "   echo hi   ", want: "echo hi"},
-		{name: "tabs and newlines between tokens collapse", input: "echo\thi\nthere", want: "echo hi there"},
+		{name: "tabs collapse and a bare newline stays a separator", input: "echo\thi\nthere", want: "echo hi\nthere"},
+		{name: "blanks around a bare line break are dropped", input: "a x \t\r\n  b y", want: "a x\r\nb y"},
+		{name: "bare carriage return stays a separator", input: "a x\rb y", want: "a x\rb y"},
 		{name: "concatenated quote styles fold to value", input: `foo"bar"baz 'q'`, want: `foobarbaz q`},
 		{name: "backslash-escaped space becomes single-quoted", input: `echo a\ b`, want: `echo 'a b'`},
 		{name: "empty quoted token kept as empty quotes", input: `echo ''`, want: `echo ''`},
@@ -219,6 +221,7 @@ func TestCanonicalLiteralForm_DistinctForms(t *testing.T) {
 		// their canonical subjects must not collapse — the safe argv pair
 		// `gofmt -w x` / `gofmt -w "x"` (no reserved word) still collapses above.
 		{`for > out`, `"for" > out`},
+		{"a x\nb y", "a x b y", "a x\rb y", "a x\r\nb y"},
 	}
 	for _, group := range groups {
 		seen := map[string]string{}

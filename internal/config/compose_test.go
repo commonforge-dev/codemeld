@@ -625,3 +625,40 @@ func TestLayerPermissions_EmptyAndMalformed(t *testing.T) {
 		t.Fatalf("err = nil, want a rejection of a non-list permissions value")
 	}
 }
+
+func TestCompose_DomainGrantsComeFromGlobalAndLocalOnly(t *testing.T) {
+	grant := func(host string, port int) map[string]any { return map[string]any{"host": host, "port": port} }
+	global := map[string]any{"domain_grants": []any{grant("global.example", 443)}}
+	project := map[string]any{"domain_grants": []any{grant("project.example", 443)}}
+	local := map[string]any{"domain_grants": []any{grant("local.example", 8443)}}
+
+	got, err := Compose(global, project, local)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	want := []any{grant("global.example", 443), grant("local.example", 8443)}
+	if !reflect.DeepEqual(got["domain_grants"], want) {
+		t.Fatalf("domain_grants = %#v, want %#v", got["domain_grants"], want)
+	}
+
+	got["domain_grants"].([]any)[0].(map[string]any)["host"] = "mutated.example"
+	if global["domain_grants"].([]any)[0].(map[string]any)["host"] != "global.example" {
+		t.Fatalf("global layer = %#v, mutating the composed entry reached it", global["domain_grants"])
+	}
+	got["domain_grants"].([]any)[1].(map[string]any)["port"] = 1
+	if local["domain_grants"].([]any)[0].(map[string]any)["port"] != 8443 {
+		t.Fatalf("local layer = %#v, mutating the composed entry reached it", local["domain_grants"])
+	}
+}
+
+func TestCompose_EmptyLocalDomainGrantsKeepGlobalOnes(t *testing.T) {
+	global := map[string]any{"domain_grants": []any{map[string]any{"host": "global.example", "port": 443}}}
+	got, err := Compose(global, nil, map[string]any{"domain_grants": []any{}})
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	want := []any{map[string]any{"host": "global.example", "port": 443}}
+	if !reflect.DeepEqual(got["domain_grants"], want) {
+		t.Fatalf("domain_grants = %#v, want %#v", got["domain_grants"], want)
+	}
+}

@@ -28,8 +28,8 @@ const (
 //
 // AllowedShell == false: a rejected construct was found.
 //
-//	  RejectedConstruct names it; the permission system is skipped entirely (no
-//	  prompt, no grant authorizes). Stages is nil and LiteralRoute is false.
+//	  RejectedConstruct names it. Stages is nil and LiteralRoute is false;
+//	  LiteralInput carries the prefix-stripped command for a caller that runs it confined.
 //	- AllowedShell == true && LiteralRoute == true: the command is syntactically
 //	  accepted but outside the direct-command boundary (I/O redirection, a
 //	  wrapper/literal-route stage, a bare simple compound, or a double-quoted
@@ -40,7 +40,8 @@ const (
 //	- AllowedShell == true && LiteralRoute == false: every pipeline stage is a
 //	  direct command. Stages holds one RouteDirect StageNormalization per stage,
 //
-// each authorized independently.
+// each authorized independently. LiteralInput still carries the prefix-stripped
+// command so a caller can run it through the shell instead.
 //
 // CdHint carries the raw `<path>` from a leading `cd <path> && ` prefix,
 // unquoted exactly as the shell would pass it to cd, or "" when no
@@ -96,7 +97,7 @@ func SplitCommand(input string) (SplitResult, error) {
 	// before redirection and pipeline handling. Simple-compound operators are not rejected here; they
 	// route to literal matching below.
 	if construct, ok := firstRejectedConstruct(work, mask); ok {
-		return SplitResult{CdHint: cdHint, AllowedShell: false, RejectedConstruct: construct}, nil
+		return SplitResult{CdHint: cdHint, LiteralInput: work, AllowedShell: false, RejectedConstruct: construct}, nil
 	}
 
 	// The direct executors run argv without a shell, so they would pass a double-quoted substitution
@@ -152,7 +153,7 @@ func SplitCommand(input string) (SplitResult, error) {
 		normalized = append(normalized, norm)
 	}
 
-	return SplitResult{CdHint: cdHint, Stages: normalized, AllowedShell: true}, nil
+	return SplitResult{CdHint: cdHint, Stages: normalized, LiteralInput: work, AllowedShell: true}, nil
 }
 
 // stripCdPrefix removes a single leading `cd <path> && ` prefix from input,

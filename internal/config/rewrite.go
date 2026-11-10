@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -37,8 +38,14 @@ const (
 	KeySystemOne         = "system_one"
 	KeyRetentionDays    = "sessions.retention_days"
 	KeyVCSUserConfig     = "confinement.vcs_user_config"
+	KeyDomainGrants      = domainGrantsKey
 	keyModelFavorites    = "model.favorites"
 )
+
+type DomainGrant struct {
+	Host string
+	Port int
+}
 
 const favoritesSub = "favorites"
 
@@ -258,6 +265,12 @@ func rewriteKey(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWrit
 		return setNestedScalar(r, "confinement", "vcs_user_config", v)
 	case blockedPathsKey:
 		return rewriteBlockedPaths(r, newValue)
+	case KeyDomainGrants:
+		g, ok := newValue.(DomainGrant)
+		if !ok || g.Host == "" || g.Port < 1 || g.Port > 65535 {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires a DomainGrant with a host and a port from 1 to 65535, got %T", key, newValue)
+		}
+		return addDomainGrant(r, g)
 	case KeyOpenRouterRoutingDataCollection, KeyOpenRouterRoutingSort:
 		v, ok := newValue.(string)
 		if !ok {
@@ -418,6 +431,23 @@ func dashColumnFromSource(data []byte, seq *ast.SequenceNode) int {
 			return i - lineStart
 		}
 	}
+	for end := lineStart; end > 0; {
+		prev := end - 1
+		if prev > 0 && data[prev] == '\n' && data[prev-1] == '\r' {
+			prev--
+		}
+		start := startOfLine(data, prev)
+		line := data[start:prev]
+		content := bytes.TrimLeft(line, " \t")
+		if len(content) == 0 || content[0] == '#' {
+			end = start
+			continue
+		}
+		if rest := bytes.TrimLeft(content[1:], " \t"); content[0] == '-' && (len(rest) == 0 || rest[0] == '#') {
+			return len(line) - len(content)
+		}
+		return -1
+	}
 	return -1
 }
 
@@ -442,6 +472,23 @@ func leadingEdge(data []byte, mv *ast.MappingValueNode) int {
 func blockEnd(data []byte, siblings []*ast.MappingValueNode, idx int) int {
 	if idx+1 < len(siblings) {
 		return leadingEdge(data, siblings[idx+1])
+	}
+	return documentEnd(data)
+}
+
+func documentEnd(data []byte) int {
+	for off := 0; off < len(data); {
+		if rest, ok := bytes.CutPrefix(data[off:], []byte("...")); ok && (len(rest) == 0 || strings.ContainsRune(" \t\r\n", rune(rest[0]))) {
+			return off
+		}
+		next := bytes.IndexAny(data[off:], "\r\n")
+		if next < 0 {
+			break
+		}
+		off += next + 1
+		if data[off-1] == '\r' && off < len(data) && data[off] == '\n' {
+			off++
+		}
 	}
 	return len(data)
 }
@@ -773,7 +820,8 @@ func insertTopLevelEntry(data []byte, doc *ast.File, block, flowEntry string) ([
 	if root := rootMapping(doc); root.flow != nil {
 		return insertMappingEntry(data, root, nil, flowEntry)
 	}
-	return appendBlockAtEnd(data, block), nil
+	at := documentEnd(data)
+	return append(appendBlockAtEnd(data[:at:at], block), data[at:]...), nil
 }
 
 func flowYAML(v any, what string) (string, error) {
@@ -954,9 +1002,12 @@ func appendInsertionPoint(data []byte, end int) (offset int, needLeadingNewline 
 		}
 		break
 	}
-	nl := bytes.IndexByte(data[i:end], '\n')
+	nl := bytes.IndexAny(data[i:end], "\r\n")
 	if nl < 0 {
 		return i, true
+	}
+	if data[i+nl] == '\r' && i+nl+1 < end && data[i+nl+1] == '\n' {
+		nl++
 	}
 	return i + nl + 1, false
 }
@@ -1830,14 +1881,7 @@ func setNestedScalar(r *settingsRewrite, container, field, value string) (fsutil
 			}
 			return r.publish(body)
 		}
-		at, off := len(data), 0
-		for line := range bytes.Lines(data) {
-			if rest, ok := bytes.CutPrefix(line, []byte("...")); ok && (len(rest) == 0 || strings.ContainsRune(" \t\r\n", rune(rest[0]))) {
-				at = off
-				break
-			}
-			off += len(line)
-		}
+		at := documentEnd(data)
 		return r.publish(append(appendBlockAtEnd(data[:at:at], block), data[at:]...))
 	}
 
@@ -3471,4 +3515,149 @@ func favoritesFlowValue(favs []Favorite, entries []string) (string, error) {
 		start = entry + 1
 	}
 	return value, nil
+}
+
+func addDomainGrant(r *settingsRewrite, g DomainGrant) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	host, err := flowYAML(g.Host, KeyDomainGrants)
+	if err != nil {
+		return fsutil.LoadStep, "", err
+	}
+	port := strconv.Itoa(g.Port)
+	lines := []string{"host: " + host, "port: " + port}
+	flow := "{host: " + host + ", port: " + port + "}"
+	want := net.JoinHostPort(g.Host, port)
+
+	data, exists, step, cat, err := r.read()
+	if err != nil {
+		return step, cat, err
+	}
+	if !exists || len(bytes.TrimSpace(data)) == 0 {
+		var b strings.Builder
+		b.WriteString(KeyDomainGrants + ":\n")
+		writeSequenceEntry(&b, lines, 2)
+		return publishDomainGrants(r, []byte(b.String()), []string{want})
+	}
+	existing, err := decodeDomainGrants(data)
+	if err != nil {
+		return fsutil.LoadStep, "", err
+	}
+	body, err := spliceDomainGrant(data, lines, flow)
+	if err != nil {
+		return fsutil.LoadStep, "", err
+	}
+	if slices.Contains(existing, want) {
+		return "", "", nil
+	}
+	return publishDomainGrants(r, body, append(existing, want))
+}
+
+func decodeDomainGrants(data []byte) ([]string, error) {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("config.RewriteKey: re-decode for domain_grants: %w", err)
+	}
+	if raw[KeyDomainGrants] == nil {
+		return nil, nil
+	}
+	return parseDomainGrants(raw)
+}
+
+func publishDomainGrants(r *settingsRewrite, body []byte, want []string) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	got, err := decodeDomainGrants(body)
+	if err != nil {
+		return fsutil.LoadStep, "", err
+	}
+	if !slices.Equal(got, want) {
+		return fsutil.LoadStep, "", errors.New("config.RewriteKey: domain_grants edit did not produce the expected list")
+	}
+	if err := Validate(body, r.path); err != nil {
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: domain_grants edit failed schema validation: %w", err)
+	}
+	return r.publish(body)
+}
+
+func spliceDomainGrant(data []byte, lines []string, flow string) ([]byte, error) {
+	for _, tk := range lexer.Tokenize(string(data)) {
+		switch tk.Type {
+		case token.AnchorType, token.TagType:
+			return nil, errors.New("config.RewriteKey: domain_grants is not written to a settings file that uses anchors, aliases or tags")
+		}
+	}
+	doc, err := parser.ParseBytes(data, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range doc.Docs[min(1, len(doc.Docs)):] {
+		if _, comment := d.Body.(*ast.CommentGroupNode); d.Body != nil && !comment {
+			return nil, errors.New("config.RewriteKey: domain_grants is not written to a multi-document settings file")
+		}
+	}
+	if len(doc.Docs) > 0 {
+		if _, ok := doc.Docs[0].Body.(*ast.CommentGroupNode); ok {
+			doc.Docs = nil
+		}
+	}
+	vals, err := rootValues(doc)
+	if err != nil {
+		return nil, err
+	}
+	mv := findMV(vals, KeyDomainGrants)
+	if mv == nil {
+		var b strings.Builder
+		b.WriteString(KeyDomainGrants + ":\n")
+		writeSequenceEntry(&b, lines, 2)
+		return insertTopLevelEntry(data, doc, b.String(), KeyDomainGrants+": ["+flow+"]")
+	}
+	if mv.Start == nil || mv.Start.Position == nil {
+		return nil, errors.New("config.RewriteKey: domain_grants key has no ':' position")
+	}
+	seq, ok := mv.Value.(*ast.SequenceNode)
+	if !ok {
+		colon := tokenOffset(data, mv.Start)
+		p := colon + 1
+		for p < len(data) && (data[p] == ' ' || data[p] == '\t') {
+			p++
+		}
+		q := p
+		for q < len(data) && !isFlowSpace(data[q]) && strings.IndexByte(",}#", data[q]) < 0 {
+			q++
+		}
+		if q == p {
+			return spliceBytes(data, colon+1, colon+1, " ["+flow+"]"), nil
+		}
+		return spliceBytes(data, p, q, "["+flow+"]"), nil
+	}
+	if !seq.IsFlowStyle {
+		dashCol := dashColumnFromSource(data, seq)
+		if dashCol < 0 {
+			return nil, errors.New("config.RewriteKey: domain_grants block list has no '-' position")
+		}
+		at, needNL := appendInsertionPoint(data, blockEnd(data, vals, indexInValues(vals, mv)))
+		var b strings.Builder
+		if needNL {
+			b.WriteString("\n")
+		}
+		writeSequenceEntry(&b, lines, dashCol)
+		return spliceBytes(data, at, at, b.String()), nil
+	}
+	if seq.Start == nil || seq.Start.Position == nil || seq.End == nil || seq.End.Position == nil {
+		return nil, errors.New("config.RewriteKey: domain_grants flow list has no '[' or ']' position")
+	}
+	open, closing := tokenOffset(data, seq.Start), tokenOffset(data, seq.End)
+	if bytes.ContainsAny(data[open:closing], "\r\n") {
+		for _, tk := range lexer.Tokenize(string(data)) {
+			if at := tokenOffset(data, tk); tk.Type == token.CommentType && at > open && at < closing {
+				return nil, errors.New("config.RewriteKey: domain_grants is a multi-line flow list with comments inside it")
+			}
+		}
+	}
+	if len(seq.Values) == 0 {
+		return spliceBytes(data, open+1, open+1, flow), nil
+	}
+	last := seq.Values[len(seq.Values)-1].GetToken()
+	if last == nil || last.Position == nil {
+		return nil, errors.New("config.RewriteKey: domain_grants flow entry has no position")
+	}
+	end := flowValueEnd(data, tokenOffset(data, last), closing)
+	return spliceBytes(data, end, end, ", "+flow), nil
 }

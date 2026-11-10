@@ -37,6 +37,7 @@ import (
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/provider"
 	"codemeld.dev/codemeld/internal/runner"
@@ -7557,5 +7558,246 @@ func TestStartTUI_LiteralPromptRefusedWhileCompactionHeld(t *testing.T) {
 	}
 	if diskHasUserMessage(readSessionFile(t, parent.Path()), "/help from a held skill") {
 		t.Fatal("the refused literal prompt was persisted")
+	}
+}
+
+func TestStartTUI_ProxyAskerSharesTheAuthorizerPromptGate(t *testing.T) {
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	client := &stubTurnClient{fn: func(_ context.Context, req provider.Request) (provider.Response, error) {
+		if isTitleRequest(req) {
+			return titleCompletion("Proxy session"), nil
+		}
+		return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	var d *productionToolDispatcher
+	defer swapToolLoop(func(deps turn.Deps, disp turn.ToolDispatcher, n int) *turn.ToolLoop {
+		d, _ = disp.(*productionToolDispatcher)
+		return turn.NewToolLoop(deps, disp, n)
+	})()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	defer runLiveApp(t, screen, func(app *tui.App) {
+		if !submitOnEventLoop(t, app, "hi") {
+			t.Fatal("wired submit rejected a plain prompt")
+		}
+		turns.Wait()
+		if d == nil || d.confinement == nil {
+			t.Fatal("no production dispatcher with a launch confinement was captured")
+		}
+		auth := d.authorizer.(*productionAuthorizer)
+		conf := d.confinement
+		endpoint, err := conf.proxy.start()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		permissionDone := make(chan error, 1)
+		go func() {
+			req := permissions.MatchRequest{Kind: "tool", Subject: "Read", PathScope: "/work"}
+			_, err := auth.prompts.Build(req, PromptDisplay{Action: "Run tool", Subject: "Read"})(context.Background(), permissions.ScopeEscalation{})
+			permissionDone <- err
+		}()
+		waitScreen(t, app, screen, "permission required", true)
+
+		owner := conf.proxy.running().NewOwner(conf.proxyAsker)
+		defer owner.Close()
+		call := sendProxyRequest(t, endpoint.String(), owner, "127.0.0.1")
+		select {
+		case got := <-call.refused:
+			t.Fatalf("the proxy request finished (%q) while a permission prompt was pending", got)
+		case <-time.After(150 * time.Millisecond):
+		}
+		waitScreen(t, app, screen, "network access", false)
+
+		screen.InjectKey(tcell.KeyRune, 'd', tcell.ModNone)
+		if err := <-permissionDone; err != nil {
+			t.Fatalf("permission prompt: %v", err)
+		}
+		waitScreen(t, app, screen, "network access", true)
+		screen.InjectKey(tcell.KeyRune, 'o', tcell.ModNone)
+		if got := call.await(t); got != "not public" {
+			t.Fatalf("proxy request refused %q, want it admitted by the allow-once answer", got)
+		}
+	})()
+
+	if err := StartTUI(context.Background(), indicatorTurnResult(t, mkStore(t)), io.Discard); err != nil {
+		t.Fatalf("StartTUI error: %v", err)
+	}
+}
+
+type liveStartTUI struct {
+	app    *tui.App
+	screen tcell.SimulationScreen
+	conf   *confinement
+	done   chan error
+}
+
+func startLiveStartTUI(t *testing.T, result *BootstrapResult) *liveStartTUI {
+	t.Helper()
+	l := &liveStartTUI{screen: tcell.NewSimulationScreen("UTF-8"), done: make(chan error, 1)}
+	build := newResumeDeps
+	restoreDeps := swapNewResumeDeps(func(c context.Context, app *tui.App, r *BootstrapResult, lock *resumeLockHolder, cache *config.Cache, active *model.ActiveState, recorder *capabilityRecorder, launched *confinement) tui.ResumeDeps {
+		l.conf = launched
+		return build(c, app, r, lock, cache, active, recorder, launched)
+	})
+	appC := make(chan *tui.App, 1)
+	restoreRun := swapRunApp(func(a *tui.App) error {
+		a.SetScreenFactoryForTest(func() (tcell.Screen, error) { return l.screen, nil })
+		appC <- a
+		return a.Run()
+	})
+	t.Cleanup(func() {
+		restoreRun()
+		restoreDeps()
+	})
+	go func() { l.done <- StartTUI(context.Background(), result, io.Discard) }()
+	select {
+	case l.app = <-appC:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartTUI did not start the simulation event loop")
+	}
+	onEventLoop(t, l.app, func() {})
+	return l
+}
+
+func (l *liveStartTUI) awaitReturn(t *testing.T) error {
+	t.Helper()
+	select {
+	case err := <-l.done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("StartTUI did not return within 10s: shutdown waited on a UI acknowledgment")
+		return nil
+	}
+}
+
+func (l *liveStartTUI) pendingNetworkPrompt(t *testing.T) (*netproxy.Server, *netproxy.Owner) {
+	t.Helper()
+	endpoint, err := l.conf.proxy.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := l.conf.proxy.running()
+	owner := server.NewOwner(l.conf.proxyAsker)
+	sendProxyRequest(t, endpoint.String(), owner, "127.0.0.1")
+	waitScreen(t, l.app, l.screen, "network access", true)
+	return server, owner
+}
+
+func TestStartTUI_ExitWithAPendingNetworkPromptDrainsWithoutAUIAcknowledgment(t *testing.T) {
+	var turns sync.WaitGroup
+	defer swapGoTurn(waitableGoTurn(&turns))()
+	ready := make(chan struct{})
+	owners := make(chan *netproxy.Owner, 1)
+	client := &stubTurnClient{fn: func(ctx context.Context, req provider.Request) (provider.Response, error) {
+		if isTitleRequest(req) {
+			return titleCompletion("Proxy session"), nil
+		}
+		release := make(chan struct{})
+		context.AfterFunc(ctx, func() {
+			(<-owners).Close()
+			close(release)
+		})
+		return provider.Response{Stream: gatedStream(ctx, contentChunk("working"), ready, release)}, nil
+	}}
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	code := -1
+	defer swapExitProcess(func(c int) { code = c })()
+
+	l := startLiveStartTUI(t, indicatorTurnResult(t, mkStore(t)))
+	if !submitOnEventLoop(t, l.app, "hello") {
+		t.Fatal("wired submit rejected a plain prompt")
+	}
+	<-ready
+	server, owner := l.pendingNetworkPrompt(t)
+	owners <- owner
+
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		l.app.RunOnEventLoopForTest(func() { l.app.SubmitInput("/exit") })
+	}()
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("/exit never finished draining: the network prompt waited on the event loop the drain occupies")
+	}
+	if err := l.awaitReturn(t); err != nil {
+		t.Fatalf("StartTUI: %v", err)
+	}
+	turns.Wait()
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if got := server.Refusals(); len(got) != 1 || got[0].Host != "127.0.0.1" || !strings.HasPrefix(got[0].Reason, "not approved (") {
+		t.Fatalf("refusals = %+v, want the pending request refused without an approval", got)
+	}
+}
+
+func TestStartTUI_EventLoopReturnWithAPendingNetworkPromptCleansUpWithoutAUIAcknowledgment(t *testing.T) {
+	l := startLiveStartTUI(t, &BootstrapResult{Home: t.TempDir(), LaunchDir: "/launch", Session: mkStore(t)})
+	server, _ := l.pendingNetworkPrompt(t)
+
+	if err := l.screen.PostEvent(tcell.NewEventError(errors.New("terminal lost"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.awaitReturn(t); err == nil || !strings.Contains(err.Error(), "TUI run failed") {
+		t.Fatalf("StartTUI error = %v, want the event loop's failure", err)
+	}
+	if l.conf.proxy.running() != nil {
+		t.Fatal("the session proxy is still running after StartTUI returned")
+	}
+	if got := server.Refusals(); len(got) != 1 || got[0].Host != "127.0.0.1" || !strings.HasPrefix(got[0].Reason, "not approved (") {
+		t.Fatalf("refusals = %+v, want the pending request refused without an approval", got)
+	}
+}
+
+func TestStartTUI_SavedNetworkAnswersWriteToTheRunsTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trust   trust.Decision
+		key     rune
+		project bool
+	}{
+		{"approved project answer", trust.Decision{Trusted: true, Reason: trust.ReasonTrusted}, 'p', true},
+		{"approved global answer", trust.Decision{Trusted: true, Reason: trust.ReasonTrusted}, 'g', false},
+		{"nothing covered project answer", trust.Decision{Trusted: true, Reason: trust.ReasonNothingCovered}, 'p', true},
+		{"unapproved global answer", trust.Decision{Reason: trust.ReasonNoRecord}, 'g', false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, root := t.TempDir(), t.TempDir()
+			tc.trust.Root = root
+			l := startLiveStartTUI(t, &BootstrapResult{Home: home, LaunchDir: root, ProjectRoot: root, TrustDecision: tc.trust, Session: mkStore(t)})
+			endpoint, err := l.conf.proxy.start()
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := l.conf.proxy.running().NewOwner(l.conf.proxyAsker)
+			t.Cleanup(owner.Close)
+			call := sendProxyRequest(t, endpoint.String(), owner, "127.0.0.1")
+			waitScreen(t, l.app, l.screen, "network access", true)
+			waitScreen(t, l.app, l.screen, "allow in this [p]roject", tc.trust.Trusted)
+			l.screen.InjectKey(tcell.KeyRune, tc.key, tcell.ModNone)
+			if got := call.await(t); got != "not public" {
+				t.Fatalf("request refused %q, want it admitted by the saved answer", got)
+			}
+			local := filepath.Join(root, ".codemeld", "settings.local.yaml")
+			global := filepath.Join(home, ".codemeld", "global", "settings.yaml")
+			written, untouched := global, local
+			if tc.project {
+				written, untouched = local, global
+			}
+			if _, err := os.Stat(untouched); err == nil {
+				t.Fatalf("the answer also wrote %s", untouched)
+			}
+			if got := reloadDomainGrants(t, home, root); !slices.Equal(got, []string{"127.0.0.1:9"}) {
+				t.Fatalf("a new session's DomainGrants() = %q, want 127.0.0.1:9 from %s", got, written)
+			}
+			if err := l.screen.PostEvent(tcell.NewEventError(errors.New("terminal lost"))); err != nil {
+				t.Fatal(err)
+			}
+			_ = l.awaitReturn(t)
+		})
 	}
 }

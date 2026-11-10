@@ -3,6 +3,7 @@ package enforce
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,7 +53,7 @@ var probes = map[string]probe{
 	}),
 	"write-tmp": pathProbe(createExclusive),
 	"socket-unix": {0, func([]string) int {
-		return fdProbe(unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0))
+		return targetFdProbe(unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0))
 	}},
 	"socket-inet": {0, func([]string) int {
 		return fdProbe(unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0))
@@ -67,6 +68,32 @@ var probes = map[string]probe{
 			_ = unix.Close(fds[1])
 		}
 		return probeAllowed
+	}},
+	"tcp-connect-main":   {2, tcpConnectMainProbe},
+	"tcp-connect-thread": {2, tcpConnectThreadProbe},
+	"tcp-bind": {1, func(a []string) int {
+		fd, sa, err := tcpSocket(a[0])
+		if err != nil {
+			return probeFailed
+		}
+		defer func() { _ = unix.Close(fd) }()
+		return targetExit(unix.Bind(fd, sa))
+	}},
+	"tcp-listen": {0, func([]string) int {
+		fd, _, err := tcpSocket("127.0.0.1:0")
+		if err != nil {
+			return probeFailed
+		}
+		defer func() { _ = unix.Close(fd) }()
+		return targetExit(unix.Listen(fd, 1))
+	}},
+	"tcp-fastopen": {1, func(a []string) int {
+		fd, sa, err := tcpSocket(a[0])
+		if err != nil {
+			return probeFailed
+		}
+		defer func() { _ = unix.Close(fd) }()
+		return targetExit(unix.Sendto(fd, []byte{'x'}, unix.MSG_FASTOPEN, sa))
 	}},
 	"io-uring-setup": {0, func([]string) int {
 		var params [120]byte
@@ -108,6 +135,68 @@ func pathProbe(f func(string) error) probe {
 	return probe{1, func(a []string) int { return probeExit(f(a[0])) }}
 }
 
+func tcpSocket(endpoint string) (int, unix.Sockaddr, error) {
+	ap, err := netip.ParseAddrPort(endpoint)
+	if err != nil {
+		return -1, nil, err
+	}
+	if !ap.Addr().Is4() {
+		return -1, nil, fmt.Errorf("%s: not an IPv4 endpoint", endpoint)
+	}
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	return fd, &unix.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()}, err
+}
+
+// targetExit differs from probeExit on purpose: only EPERM from the syscall under test counts as a denial.
+func targetExit(err error) int {
+	switch {
+	case err == nil:
+		return probeAllowed
+	case errors.Is(err, unix.EPERM):
+		return probeDenied
+	default:
+		return probeFailed
+	}
+}
+
+func tcpConnectMainProbe(a []string) int {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	return tcpConnectAs(true, a)
+}
+
+func tcpConnectThreadProbe(a []string) int {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if unix.Gettid() != unix.Getpid() {
+		return probeFailed
+	}
+	got := make(chan int)
+	go func() {
+		runtime.LockOSThread()
+		got <- tcpConnectAs(false, a)
+	}()
+	return <-got
+}
+
+func tcpConnectAs(leader bool, a []string) int {
+	if (unix.Gettid() == unix.Getpid()) != leader {
+		return probeFailed
+	}
+	fd, sa, err := tcpSocket(a[0])
+	if err != nil {
+		return probeFailed
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Connect(fd, sa); err != nil {
+		return targetExit(err)
+	}
+	if n, err := unix.Write(fd, []byte(a[1])); err != nil || n != len(a[1]) {
+		return probeFailed
+	}
+	return probeAllowed
+}
+
 func errnoErr(errno unix.Errno) error {
 	if errno == 0 {
 		return nil
@@ -117,6 +206,16 @@ func errnoErr(errno unix.Errno) error {
 
 func fdProbe(fd int, err error) int {
 	return undo(err, func() error { return unix.Close(fd) })
+}
+
+func targetFdProbe(fd int, err error) int {
+	if err != nil {
+		return targetExit(err)
+	}
+	if unix.Close(fd) != nil {
+		return probeFailed
+	}
+	return probeAllowed
 }
 
 func undo(err error, cleanup func() error) int {

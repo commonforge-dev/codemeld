@@ -847,6 +847,7 @@ func TestProductionDispatcher_SwitchWhileThePromptIsOpenKeepsTheCapturedMode(t *
 				active.ApplyUserCommand(mode.Build)
 				return tui.PromptDecision{Option: tui.OptionAllowOnce}
 			}, "curl")
+			h.spy.blocked = brokenBlockedPaths(t)
 			h.inner.exitCode = exitCode
 			h.inner.stderr = []byte("curl: denied\n")
 

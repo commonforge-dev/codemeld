@@ -48,6 +48,51 @@ func TestResolveNamesTheFirstMismatchedLeg(t *testing.T) {
 	}
 }
 
+func TestResolveRecordsTheSliceCheckApartFromTheBaseResult(t *testing.T) {
+	withArch(t, "amd64")
+	type call struct{ home, exe string }
+	stubSlice := func(t *testing.T, passed bool) *[]call {
+		var calls []call
+		setVar(t, &sliceSelfTest, func(home, exe string) (bool, string) {
+			calls = append(calls, call{home, exe})
+			if passed {
+				return true, ""
+			}
+			return false, "slice self-test: tcp-connect-main: helper exit 1, want 0"
+		})
+		return &calls
+	}
+	for _, passed := range []bool{true, false} {
+		stubStarter(t, expectedExit)
+		calls := stubSlice(t, passed)
+		home := homeWithCodemeld(t)
+		got := resolveFor("linux", ResolveInput{Home: home + "/.", HelperExecutable: "/opt/codemeld"})
+		if got.Capability != Constrained || !got.SelfTestPassed || got.Reason != "" || got.SliceSelfTestPassed != passed {
+			t.Errorf("slice check passed=%v: Resolve() = %+v, want the base Constrained result with slice %v", passed, got, passed)
+		}
+		if want := []call{{home, "/opt/codemeld"}}; !slices.Equal(*calls, want) {
+			t.Errorf("slice check passed=%v: calls = %v, want %v", passed, *calls, want)
+		}
+	}
+
+	stubStarter(t, func(mode, leg string) helperExit {
+		if mode == ProbeArg && leg == "socket-inet" {
+			return helperExit{code: probeAllowed}
+		}
+		return expectedExit(mode, leg)
+	})
+	calls := stubSlice(t, true)
+	got := resolveFor("linux", ResolveInput{Home: homeWithCodemeld(t)})
+	if got.Capability != Refused || got.SelfTestPassed || got.SliceSelfTestPassed || len(*calls) != 0 {
+		t.Errorf("base failure: Resolve() = %+v after %d slice checks, want Refused with no slice check", got, len(*calls))
+	}
+	for _, goos := range []string{"darwin", "freebsd", "windows"} {
+		if got := resolveFor(goos, ResolveInput{Home: homeWithCodemeld(t)}); got.SliceSelfTestPassed || len(*calls) != 0 {
+			t.Errorf("%s: Resolve() = %+v after %d slice checks", goos, got, len(*calls))
+		}
+	}
+}
+
 func TestResolveKeepsSetupFailureStderr(t *testing.T) {
 	const line = "codemeld confinement: landlock: landlock ABI 2 < 3"
 	stubStarter(t, func(mode, leg string) helperExit {

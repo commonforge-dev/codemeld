@@ -2,11 +2,14 @@
 package bootstrap
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,7 +23,9 @@ import (
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/events"
+	"codemeld.dev/codemeld/internal/fsutil"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/tui"
@@ -2562,6 +2567,7 @@ func exceptionalHeadlessAuthorizer(t *testing.T, input string, out io.Writer) (*
 	store := mkStore(t)
 	auth := newHeadlessAuthorizer(emptyCache(t, cwd), func() *sessions.Store { return store }, modeActive, terminal, stderrNoticeRenderer{w: &bytes.Buffer{}})
 	auth.executionConstrained = true
+	auth.blocked = brokenBlockedPaths(t)
 	return auth, cwd
 }
 
@@ -2899,5 +2905,554 @@ func TestHeadlessAuthorizer_WorkDeadlineLeavesAWaitingPromptOpenButAuthorizesNot
 	requireCancelledWithNoGrant(t, done, auth, store)
 	if entered, _ := in.counts(); entered != 1 {
 		t.Fatalf("stdin reads = %d, want none after the late answer", entered)
+	}
+}
+
+type networkAnswer struct {
+	decision netproxy.Decision
+	err      error
+	accepted []netproxy.Decision
+}
+
+func askNetwork(ctx context.Context, p *terminalPrompter, port string) <-chan networkAnswer {
+	done := make(chan networkAnswer, 1)
+	go func() {
+		var r networkAnswer
+		r.decision, r.err = p.askNetwork(ctx, "example.com", port, func() bool { return false },
+			func(d netproxy.Decision) bool { r.accepted = append(r.accepted, d); return true })
+		done <- r
+	}()
+	return done
+}
+
+func awaitNetwork(t *testing.T, done <-chan networkAnswer) networkAnswer {
+	t.Helper()
+	select {
+	case r := <-done:
+		return r
+	case <-time.After(2 * time.Second):
+		t.Fatal("the network prompt never returned")
+		return networkAnswer{}
+	}
+}
+
+func requireStillQueued[T any](t *testing.T, done <-chan T) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal("a queued request returned while another prompt held the gate")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+type closeTrackingReader struct {
+	*steppedReader
+	closed atomic.Bool
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+func TestTerminalPrompter_NetworkPromptOffersOnceSessionAndDeny(t *testing.T) {
+	for _, tc := range []struct {
+		input    string
+		want     netproxy.Decision
+		accepted []netproxy.Decision
+		failed   bool
+	}{
+		{"1\n", netproxy.DecisionOnce, []netproxy.Decision{netproxy.DecisionOnce}, false},
+		{"3\n", netproxy.DecisionSession, []netproxy.Decision{netproxy.DecisionSession}, false},
+		{"2\n", netproxy.DecisionDeny, nil, false},
+		{"deny\n", netproxy.DecisionDeny, nil, false},
+		{"4\n", netproxy.DecisionDeny, nil, true},
+		{"project\n", netproxy.DecisionDeny, nil, true},
+		{"maybe\n", netproxy.DecisionDeny, nil, true},
+		{"\n", netproxy.DecisionDeny, nil, true},
+		{"", netproxy.DecisionDeny, nil, true},
+	} {
+		var out bytes.Buffer
+		p := newTerminalPrompter(strings.NewReader(tc.input), &out)
+		p.projectUntrusted = true
+		r := awaitNetwork(t, askNetwork(context.Background(), p, "8443"))
+		if (r.err != nil) != tc.failed || r.decision != tc.want || !slices.Equal(r.accepted, tc.accepted) {
+			t.Fatalf("input %q = %v, %v, accepted %v; want %v, failed %v, accepted %v", tc.input, r.decision, r.err, r.accepted, tc.want, tc.failed, tc.accepted)
+		}
+		got := out.String()
+		for _, want := range []string{"host: example.com", "port: 8443", "the command can send data to this host",
+			"[1] allow once", "[2] deny", "[3] allow this session", "codemeld: choose 1-3: "} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("network prompt missing %q:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "[4]") {
+			t.Fatalf("network prompt offers a fourth choice:\n%s", got)
+		}
+	}
+}
+
+func TestTerminalPrompter_AbandonedNetworkReadRefusesQueuedRequestsWithOneReader(t *testing.T) {
+	var out bytes.Buffer
+	in := &closeTrackingReader{steppedReader: newSteppedReader("3\n", "3\n")}
+	t.Cleanup(in.releaseAbandoned)
+	p := newTerminalPrompter(in, &out)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	p.runCtx = runCtx
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first := askNetwork(ctx, p, "443")
+	in.awaitBlocked(t)
+	queuedNetwork := askNetwork(context.Background(), p, "443")
+	queuedPermission := startPrompt(context.Background(), p, "rm b.txt")
+	requireStillQueued(t, queuedNetwork)
+	requireStillQueued(t, queuedPermission)
+
+	cancel()
+	if r := awaitNetwork(t, first); !errors.Is(r.err, context.Canceled) || r.decision != netproxy.DecisionDeny || r.accepted != nil {
+		t.Fatalf("cancelled request = %v, %v, accepted %v; want context.Canceled and no approval", r.decision, r.err, r.accepted)
+	}
+	in.release()
+	if r := awaitNetwork(t, queuedNetwork); r.err == nil || r.decision != netproxy.DecisionDeny || r.accepted != nil {
+		t.Fatalf("queued request = %v, %v, accepted %v; want a refusal", r.decision, r.err, r.accepted)
+	}
+	awaitCancelledPrompt(t, queuedPermission)
+	if r := awaitNetwork(t, askNetwork(context.Background(), p, "443")); r.err == nil || r.accepted != nil {
+		t.Fatalf("request after the late answer = %v, %v, accepted %v; want a refusal", r.decision, r.err, r.accepted)
+	}
+	if n := strings.Count(promptOutput(p, &out), "approval required"); n != 1 {
+		t.Fatalf("%d prompts rendered, want only the abandoned one", n)
+	}
+	if entered, _ := in.counts(); entered != 1 {
+		t.Fatalf("stdin reads started = %d, want only the abandoned one", entered)
+	}
+	if in.closed.Load() {
+		t.Fatal("the prompter closed caller-owned stdin")
+	}
+}
+
+func TestTerminalPrompter_CancellingAQueuedNetworkRequestLeavesThePrompterUsable(t *testing.T) {
+	var out bytes.Buffer
+	in := newSteppedReader("1\n", "1\n")
+	t.Cleanup(in.releaseAbandoned)
+	p := newTerminalPrompter(in, &out)
+
+	first := askNetwork(context.Background(), p, "443")
+	in.awaitBlocked(t)
+	queuedCtx, cancelQueued := context.WithCancel(context.Background())
+	queued := askNetwork(queuedCtx, p, "443")
+	requireStillQueued(t, queued)
+	cancelQueued()
+	if r := awaitNetwork(t, queued); !errors.Is(r.err, context.Canceled) || r.accepted != nil {
+		t.Fatalf("cancelled queued request = %v, %v, accepted %v; want context.Canceled", r.decision, r.err, r.accepted)
+	}
+	in.release()
+	if r := awaitNetwork(t, first); r.err != nil || r.decision != netproxy.DecisionOnce {
+		t.Fatalf("active request = %v, %v; want allow once", r.decision, r.err)
+	}
+	later := askNetwork(context.Background(), p, "443")
+	in.awaitBlocked(t)
+	in.release()
+	if r := awaitNetwork(t, later); r.err != nil || r.decision != netproxy.DecisionOnce {
+		t.Fatalf("later request = %v, %v; want a prompt answered allow once", r.decision, r.err)
+	}
+}
+
+func startTerminalProxy(t *testing.T, ask netproxy.Asker) (string, *netproxy.Server, *netproxy.Owner) {
+	t.Helper()
+	server, err := netproxy.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Stop)
+	owner := server.NewOwner(ask)
+	t.Cleanup(owner.Close)
+	return addr, server, owner
+}
+
+func proxyRefusal(addr string, owner *netproxy.Owner, target string) (string, error) {
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = c.Close() }()
+	if err := owner.Register(c.LocalAddr().(*net.TCPAddr).AddrPort()); err != nil {
+		return "", err
+	}
+	if _, err := fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		return "", err
+	}
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		return "", err
+	}
+	_ = resp.Body.Close()
+	return resp.Header.Get("X-Proxy-Refused"), nil
+}
+
+func TestTerminalPrompter_NetworkAnswersThroughTheSessionProxy(t *testing.T) {
+	var out bytes.Buffer
+	p := newTerminalPrompter(strings.NewReader("1\n1\n3\nmaybe\n2\n4\n"), &out)
+	addr, server, owner := startTerminalProxy(t, p.askNetwork)
+	failing := newTerminalPrompter(strings.NewReader("3\n"), &out)
+	failing.readErr = errors.New("stdin is gone")
+	failingOwner := server.NewOwner(failing.askNetwork)
+	t.Cleanup(failingOwner.Close)
+	const approved = "not public"
+	for i, step := range []struct {
+		owner        *netproxy.Owner
+		target, want string
+		prompts      int
+	}{
+		{owner, "127.0.0.1:443", approved, 1},
+		{owner, "127.0.0.1:443", approved, 2},
+		{owner, "127.0.0.1:443", approved, 3},
+		{owner, "127.0.0.1:443", approved, 3},
+		{owner, "127.0.0.1:8443", "not approved (prompt failed)", 4},
+		{owner, "127.0.0.1:8443", "not approved (denied)", 5},
+		{owner, "127.0.0.1:8443", "not approved (prompt failed)", 6},
+		{failingOwner, "127.0.0.1:8443", "not approved (prompt failed)", 6},
+		{failingOwner, "127.0.0.1:443", approved, 6},
+	} {
+		got, err := proxyRefusal(addr, step.owner, step.target)
+		if err != nil || got != step.want {
+			t.Fatalf("request %d to %s refused %q, %v; want %q", i+1, step.target, got, err, step.want)
+		}
+		if n := strings.Count(out.String(), "approval required"); n != step.prompts {
+			t.Fatalf("after request %d: %d prompts, want %d:\n%s", i+1, n, step.prompts, out.String())
+		}
+	}
+}
+
+func TestTerminalPrompter_NetworkAnswerReadWithAStdinErrorApprovesNothing(t *testing.T) {
+	type chunk struct {
+		data string
+		err  error
+	}
+	broke := errors.New("stdin broke")
+	const approved = "not public"
+	for _, tc := range []struct {
+		name   string
+		chunks []chunk
+		want   []string
+	}{
+		{"allow once with an error", []chunk{{"1", broke}, {"2\n", nil}}, []string{"not approved (prompt failed)", "not approved (denied)"}},
+		{"allow session with an error", []chunk{{"3", broke}, {"2\n", nil}}, []string{"not approved (prompt failed)", "not approved (denied)"}},
+		{"allow session as the final line at EOF", []chunk{{"3", io.EOF}}, []string{approved, approved}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := tc.chunks
+			stdin := readerFunc(func(b []byte) (int, error) {
+				if len(chunks) == 0 {
+					return 0, io.EOF
+				}
+				c := chunks[0]
+				chunks = chunks[1:]
+				return copy(b, c.data), c.err
+			})
+			var out bytes.Buffer
+			p := newTerminalPrompter(stdin, &out)
+			addr, _, owner := startTerminalProxy(t, p.askNetwork)
+			for i, want := range tc.want {
+				got, err := proxyRefusal(addr, owner, "127.0.0.1:443")
+				if err != nil || got != want {
+					t.Fatalf("request %d refused %q, %v; want %q", i+1, got, err, want)
+				}
+			}
+			wantPrompts := 2
+			if tc.want[1] == approved {
+				wantPrompts = 1
+			}
+			if n := strings.Count(out.String(), "approval required"); n != wantPrompts {
+				t.Fatalf("%d prompts, want %d:\n%s", n, wantPrompts, out.String())
+			}
+		})
+	}
+}
+
+func TestTerminalPrompter_EndedRunRefusesAReadySessionAnswerThroughTheProxy(t *testing.T) {
+	const approved = "not public"
+	for _, tc := range []struct {
+		name                 string
+		endBefore, endOnRead bool
+		want                 string
+	}{
+		{"run already ended", true, false, "not approved (prompt failed)"},
+		{"run ended after the answer is read", false, true, "not approved (prompt failed)"},
+		{"live run with the final line at EOF", false, false, approved},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runCtx := &errOnlyCtx{Context: context.Background()}
+			runCtx.cancelled.Store(tc.endBefore)
+			sent := false
+			stdin := readerFunc(func(b []byte) (int, error) {
+				if sent {
+					return 0, io.EOF
+				}
+				sent = true
+				if tc.endOnRead {
+					runCtx.cancelled.Store(true)
+				}
+				return copy(b, "3"), io.EOF
+			})
+			var out bytes.Buffer
+			p := newTerminalPrompter(stdin, &out)
+			p.runCtx = runCtx
+			addr, server, owner := startTerminalProxy(t, p.askNetwork)
+			if got, err := proxyRefusal(addr, owner, "127.0.0.1:443"); err != nil || got != tc.want {
+				t.Fatalf("request refused %q, %v; want %q", got, err, tc.want)
+			}
+			probe := newTerminalPrompter(strings.NewReader("2\n"), &out)
+			probeOwner := server.NewOwner(probe.askNetwork)
+			t.Cleanup(probeOwner.Close)
+			wantProbe := "not approved (denied)"
+			if tc.want == approved {
+				wantProbe = approved
+			}
+			if got, err := proxyRefusal(addr, probeOwner, "127.0.0.1:443"); err != nil || got != wantProbe {
+				t.Fatalf("same-target probe refused %q, %v; want %q", got, err, wantProbe)
+			}
+		})
+	}
+}
+
+func TestTerminalPrompter_SessionAnswerIsAcceptedBeforeTheQueuedRequestRuns(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() { _ = stdinWriter.Close() })
+	p := newTerminalPrompter(stdin, &out)
+	var calls atomic.Int32
+	secondDone := make(chan struct{})
+	addr, _, owner := startTerminalProxy(t, func(ctx context.Context, host, port string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		n := calls.Add(1)
+		d, err := p.askNetwork(ctx, host, port, covered, accept)
+		if n == 1 {
+			select {
+			case <-secondDone:
+			case <-time.After(2 * time.Second):
+			}
+		} else {
+			close(secondDone)
+		}
+		return d, err
+	})
+	type refusal struct {
+		reason string
+		err    error
+	}
+	send := func() <-chan refusal {
+		done := make(chan refusal, 1)
+		go func() {
+			reason, err := proxyRefusal(addr, owner, "127.0.0.1:443")
+			done <- refusal{reason, err}
+		}()
+		return done
+	}
+
+	first := send()
+	waitForOutput(t, p, &out, "choose 1-4")
+	second := send()
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the second request never reached the asker")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := io.WriteString(stdinWriter, "3\n"); err != nil {
+		t.Fatal(err)
+	}
+	for i, done := range []<-chan refusal{first, second} {
+		select {
+		case r := <-done:
+			if r.err != nil || r.reason != "not public" {
+				t.Fatalf("request %d refused %q, %v; want it approved and then refused not public", i+1, r.reason, r.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("request %d never finished", i+1)
+		}
+	}
+	if n := strings.Count(promptOutput(p, &out), "approval required"); n != 1 {
+		t.Fatalf("%d prompts rendered, want one for both queued requests:\n%s", n, promptOutput(p, &out))
+	}
+}
+
+func TestTerminalPrompter_NetworkProjectAnswerSavesTheGrantAndCoversTheQueuedRequest(t *testing.T) {
+	var out bytes.Buffer
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() { _ = stdinWriter.Close() })
+	p := newTerminalPrompter(stdin, &out)
+	home, root := t.TempDir(), t.TempDir()
+	p.disclosure.projectRoot = root
+	ask, counts := countAccepts(p.askNetwork, p.gate.slot)
+	addr, _, owner := startTerminalProxy(t, ask)
+	send := func() <-chan string {
+		done := make(chan string, 1)
+		go func() {
+			reason, err := proxyRefusal(addr, owner, "127.0.0.1:443")
+			if err != nil {
+				reason = err.Error()
+			}
+			done <- reason
+		}()
+		return done
+	}
+	first := send()
+	waitForOutput(t, p, &out, "choose 1-4")
+	second := send()
+	<-counts.arrived
+	<-counts.arrived
+	if _, err := io.WriteString(stdinWriter, "4\n"); err != nil {
+		t.Fatal(err)
+	}
+	for i, done := range []<-chan string{first, second} {
+		if got := <-done; got != "not public" {
+			t.Fatalf("request %d refused %q, want it admitted", i+1, got)
+		}
+	}
+	if n := strings.Count(promptOutput(p, &out), "approval required"); n != 1 || counts.calls.Load() != 1 || counts.whileHeld.Load() != 1 {
+		t.Fatalf("prompts %d, accepts %d, session accepts while the slot was held %d; want 1, 1, 1", n, counts.calls.Load(), counts.whileHeld.Load())
+	}
+	if got := reloadDomainGrants(t, home, root); !slices.Equal(got, []string{"127.0.0.1:443"}) {
+		t.Fatalf("a new session's DomainGrants() = %q, want the saved 127.0.0.1:443", got)
+	}
+}
+
+func TestTerminalPrompter_NetworkAnswersItDidNotOfferWriteAndApproveNothing(t *testing.T) {
+	for _, tc := range []struct {
+		answer    string
+		untrusted bool
+	}{
+		{"5", false}, {"global", false}, {"everywhere", false}, {"allow-global", false}, {"g", false},
+		{"4", true}, {"project", true}, {"p", true},
+	} {
+		t.Run(fmt.Sprintf("%s untrusted=%v", tc.answer, tc.untrusted), func(t *testing.T) {
+			var out bytes.Buffer
+			p := newTerminalPrompter(strings.NewReader(tc.answer+"\n2\n"), &out)
+			home, root := t.TempDir(), t.TempDir()
+			p.disclosure.projectRoot = root
+			p.home = home
+			p.projectUntrusted = tc.untrusted
+			ask, counts := countAccepts(p.askNetwork, p.gate.slot)
+			addr, _, owner := startTerminalProxy(t, ask)
+			for i, want := range []string{"not approved (prompt failed)", "not approved (denied)"} {
+				if got, err := proxyRefusal(addr, owner, "127.0.0.1:443"); err != nil || got != want {
+					t.Fatalf("request %d refused %q, %v; want %q", i+1, got, err, want)
+				}
+			}
+			if counts.calls.Load() != 0 {
+				t.Fatalf("accept called %d times", counts.calls.Load())
+			}
+			for _, path := range []string{filepath.Join(root, ".codemeld", "settings.local.yaml"), filepath.Join(home, ".codemeld", "global", "settings.yaml")} {
+				if fileExists(path) {
+					t.Fatalf("an answer the prompt did not offer wrote %s", path)
+				}
+			}
+			got := out.String()
+			if strings.Contains(got, "everywhere") || strings.Contains(got, "global") {
+				t.Fatalf("the headless network prompt offers a global answer:\n%s", got)
+			}
+			wantMenu, project := "choose 1-4", true
+			if tc.untrusted {
+				wantMenu, project = "choose 1-3", false
+			}
+			if !strings.Contains(got, wantMenu) || strings.Contains(got, "[4] allow in this project") != project {
+				t.Fatalf("menu for untrusted=%v:\n%s", tc.untrusted, got)
+			}
+		})
+	}
+}
+
+func TestTerminalPrompter_NetworkProjectAnswerPersistenceFailureApprovesNothing(t *testing.T) {
+	const seed = "domain_grants:\n  - host: seed.example\n    port: 443\n"
+	for _, failure := range []string{"persist seam", "pre-replacement write"} {
+		t.Run(failure, func(t *testing.T) {
+			var out bytes.Buffer
+			p := newTerminalPrompter(strings.NewReader("4\n2\n"), &out)
+			root := t.TempDir()
+			p.disclosure.projectRoot = root
+			target := filepath.Join(root, ".codemeld", "settings.local.yaml")
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte(seed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if failure == "persist seam" {
+				p.persistGrant = func(config.DomainGrant) error { return errors.New("disk full") }
+			} else {
+				t.Cleanup(fsutil.SetSyncFileForTest(func(*os.File) error { return errors.New("forced sync failure") }))
+			}
+			ask, counts := countAccepts(p.askNetwork, p.gate.slot)
+			addr, _, owner := startTerminalProxy(t, ask)
+			for i, want := range []string{"not approved (prompt failed)", "not approved (denied)"} {
+				if got, err := proxyRefusal(addr, owner, "127.0.0.1:443"); err != nil || got != want {
+					t.Fatalf("request %d refused %q, %v; want %q", i+1, got, err, want)
+				}
+			}
+			if counts.calls.Load() != 0 {
+				t.Fatalf("accept called %d times on a failed write", counts.calls.Load())
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != seed {
+				t.Fatalf("target = %q, %v; want it unchanged", got, err)
+			}
+		})
+	}
+}
+
+func TestTerminalPrompter_CancellationDuringAProjectWriteIsNotAccepted(t *testing.T) {
+	for _, tc := range []struct{ name, want string }{
+		{"request cancelled", "not approved (command ended)"},
+		{"run ended", "not approved (prompt failed)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			p := newTerminalPrompter(strings.NewReader("4\n"), &out)
+			home, root := t.TempDir(), t.TempDir()
+			p.disclosure.projectRoot = root
+			runCtx, endRun := context.WithCancel(context.Background())
+			defer endRun()
+			p.runCtx = runCtx
+			entered, resume := make(chan struct{}), make(chan struct{})
+			persist := p.persistGrant
+			p.persistGrant = func(g config.DomainGrant) error {
+				close(entered)
+				<-resume
+				return persist(g)
+			}
+			ask, counts := countAccepts(p.askNetwork, p.gate.slot)
+			endpoint, server, owner := startTerminalProxy(t, ask)
+			call := sendProxyRequest(t, endpoint, owner, "127.0.0.1")
+			reqCtx := <-counts.arrived
+			<-entered
+			if tc.name == "request cancelled" {
+				_ = call.conn.Close()
+				select {
+				case <-reqCtx.Done():
+				case <-time.After(5 * time.Second):
+					t.Fatal("closing the client did not cancel the request")
+				}
+			} else {
+				endRun()
+			}
+			close(resume)
+			if got := waitRefusal(t, server, "127.0.0.1"); got != tc.want {
+				t.Fatalf("request refused %q, want %q", got, tc.want)
+			}
+			if counts.calls.Load() != 0 {
+				t.Fatalf("accept called %d times after cancellation won", counts.calls.Load())
+			}
+			if got := reloadDomainGrants(t, home, root); !slices.Equal(got, []string{"127.0.0.1:9"}) {
+				t.Fatalf("DomainGrants() = %q, want the grant the write already published", got)
+			}
+			requireAskedAgain(t, server, endpoint, "127.0.0.1")
+		})
 	}
 }

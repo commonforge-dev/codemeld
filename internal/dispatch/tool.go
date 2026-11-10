@@ -161,12 +161,10 @@ type multiScopeFileTool interface {
 	// unresolvable parent, malformed args) returns an error before any prompt; an out-of-root endpoint is
 	// not such an error — it resolves to its real out-of-root folder and flows to the prompt.
 	ResolveEndpoints(args map[string]any) (filetools.ResolvedMove, error)
-	// InvokeWithResolvedMove performs the move for the endpoint pair dispatch already resolved and
-	// authorized, reusing the resolved real paths so authorization and the rename cannot drift if a symlink
-	// changes in between — the reuse-at-invoke contract resolvedTargetInvoker provides for a single target,
-	// extended to both move endpoints.
-	InvokeWithResolvedMove(ctx context.Context, resolved filetools.ResolvedMove) (tools.Result, error)
+	InvokeWithAuthorizedMove(ctx context.Context, resolved filetools.ResolvedMove, sourceIdentity, destinationIdentity filetools.ScopeIdentity) (tools.Result, error)
 }
+
+var captureScopeIdentity = filetools.CaptureScopeIdentity
 
 // DispatchTool looks up a structured tool by exact name, authorizes it against its effective
 // execution directory, and — only if authorized — invokes it. name is the
@@ -200,8 +198,10 @@ type PreparedTool struct {
 	args    map[string]any
 	modeCtx permissions.ModeContext
 
-	multi        multiScopeFileTool
-	resolvedMove filetools.ResolvedMove
+	multi                   multiScopeFileTool
+	resolvedMove            filetools.ResolvedMove
+	moveSourceIdentity      filetools.ScopeIdentity
+	moveDestinationIdentity filetools.ScopeIdentity
 
 	generalAgent            preparedGeneralAgentTool
 	generalAgentInstruction string
@@ -374,8 +374,20 @@ func prepareTool(ctx context.Context, name string, args map[string]any, home str
 		if refusal := policy.RefuseResolved(name, resolved.Source, resolved.Destination); refusal != nil {
 			return PreparedTool{}, refusal
 		}
+		sourceIdentity, ierr := captureScopeIdentity(resolved.SourceScope)
+		if ierr != nil {
+			return PreparedTool{}, ierr
+		}
+		destinationIdentity := sourceIdentity
+		if resolved.DestinationScope != resolved.SourceScope {
+			if destinationIdentity, ierr = captureScopeIdentity(resolved.DestinationScope); ierr != nil {
+				return PreparedTool{}, ierr
+			}
+		}
 		prepared.multi = multiTool
 		prepared.resolvedMove = resolved
+		prepared.moveSourceIdentity = sourceIdentity
+		prepared.moveDestinationIdentity = destinationIdentity
 		prepared.modeCtx.MoveSource = resolved.Source
 		prepared.modeCtx.MoveDestination = resolved.Destination
 		return prepared, nil
@@ -673,7 +685,7 @@ func dispatchPreparedMultiScope(ctx context.Context, prepared PreparedTool, auth
 		return tools.Result{}, err
 	}
 	// every required scope granted: invoke with the endpoints resolved before authorization.
-	return prepared.multi.InvokeWithResolvedMove(ctx, prepared.resolvedMove)
+	return prepared.multi.InvokeWithAuthorizedMove(ctx, prepared.resolvedMove, prepared.moveSourceIdentity, prepared.moveDestinationIdentity)
 }
 
 func authorizeMoveEndpoints(ctx context.Context, prepared PreparedTool, authorizer Authorizer) error {

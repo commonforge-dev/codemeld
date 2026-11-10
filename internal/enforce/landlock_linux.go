@@ -78,7 +78,7 @@ func applyLandlock(p Policy) error {
 	}
 	opts := make([]landlock.Rule, len(rules))
 	for i, r := range rules {
-		opts[i] = landlock.PathAccess(r.Access, r.Path)
+		opts[i] = landlock.PathAccess(r.Access, r.Path).IgnoreIfMissing()
 	}
 	return restrictPaths(opts...)
 }

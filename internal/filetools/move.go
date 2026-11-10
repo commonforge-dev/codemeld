@@ -227,14 +227,36 @@ func moveDestinationPrecondition(parent string, candidate string) (target string
 // InvokeWithResolvedMove performs the rename for the endpoint pair dispatch already resolved and
 // authorized, so authorization and the rename cannot drift if a symlink changes in between — the
 // resolved-before-authorize / reuse-at-invoke contract the edit and create tools follow, extended to two
-// endpoints. It is the pre-resolved invocation path the multi-scope dispatch seam will call after
-// authorizing both scopes; it does not re-resolve the lexical arguments.
+// endpoints. It re-opens both parents by path; production dispatch uses InvokeWithAuthorizedMove instead.
 func (t *MoveTool) InvokeWithResolvedMove(ctx context.Context, resolved ResolvedMove) (tools.Result, error) {
-	return t.move(ctx, resolved.Source, resolved.Destination), nil
+	return t.move(ctx, resolved.Source, resolved.Destination, nil, nil), nil
+}
+
+func (t *MoveTool) InvokeWithAuthorizedMove(ctx context.Context, resolved ResolvedMove, sourceIdentity, destinationIdentity ScopeIdentity) (tools.Result, error) {
+	if !directlyWithin(resolved.Source, resolved.SourceScope) || !directlyWithin(resolved.Destination, resolved.DestinationScope) {
+		return failResult("move endpoint is not directly inside its authorized directory"), nil
+	}
+	src, replaced := confirmAuthorizedScope(resolved.SourceScope, sourceIdentity)
+	if replaced != "" {
+		return failResult(replaced), nil
+	}
+	defer src.Close()
+	dst, replaced := confirmAuthorizedScope(resolved.DestinationScope, destinationIdentity)
+	if replaced != "" {
+		return failResult(replaced), nil
+	}
+	defer dst.Close()
+	afterScopeConfirmed()
+	return t.move(ctx, resolved.Source, resolved.Destination, src, dst), nil
+}
+
+func directlyWithin(endpoint, scope string) bool {
+	name := filepath.Base(endpoint)
+	return filepath.Dir(endpoint) == scope && name != "." && name != ".." && name != string(os.PathSeparator)
 }
 
 // Invoke resolves both endpoints and moves in one call (the standalone, non-dispatch path). Production
-// dispatch instead calls ResolveEndpoints then InvokeWithResolvedMove; this method keeps the tool a
+// dispatch instead calls ResolveEndpoints then InvokeWithAuthorizedMove; this method keeps the tool a
 // complete unit for direct callers and tests. An endpoint-resolution failure surfaces as the same in-band
 // error result the dispatcher would render, so the observable outcome matches either entry.
 //
@@ -261,7 +283,7 @@ func (t *MoveTool) Invoke(ctx context.Context, args map[string]any) (tools.Resul
 // and overwrite guards live in the helper rather than being re-implemented here. A failure surfaces as a
 // non-zero result (not a Go error) so the tool-call loop records it in-band and the model can correct
 // itself rather than aborting the turn.
-func (t *MoveTool) move(ctx context.Context, source string, destination string) tools.Result {
+func (t *MoveTool) move(ctx context.Context, source string, destination string, srcScope, dstScope *authorizedScope) tools.Result {
 	journal := WriteJournalFor(ctx, source)
 	if journal == nil {
 		journal = WriteJournalFor(ctx, destination)
@@ -270,7 +292,13 @@ func (t *MoveTool) move(ctx context.Context, source string, destination string) 
 	if journal != nil {
 		lifecycle = journal.MoveLifecycle(source, destination)
 	}
-	if _, _, err := fsutil.MoveNoReplace(source, destination, lifecycle); err != nil {
+	var err error
+	if srcScope != nil {
+		_, _, err = fsutil.MoveNoReplaceAt(srcScope.dir, dstScope.dir, source, destination, lifecycle)
+	} else {
+		_, _, err = fsutil.MoveNoReplace(source, destination, lifecycle)
+	}
+	if err != nil {
 		return failResult("failed to move " + source + " to " + destination + ": " + err.Error())
 	}
 	return tools.Result{ExitCode: 0, Stdout: []byte(fmt.Sprintf("moved %s to %s\n", source, destination))}

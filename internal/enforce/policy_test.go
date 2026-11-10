@@ -204,3 +204,41 @@ func TestControlArg(t *testing.T) {
 		t.Errorf("ControlArg = %q", ControlArg)
 	}
 }
+
+func TestPolicyBrokerVariants(t *testing.T) {
+	for _, broker := range []string{"slice", "full"} {
+		p := validAutoEdits()
+		p.Broker = broker
+		if got := roundTrip(t, p); !reflect.DeepEqual(got, p) {
+			t.Errorf("%s: round trip = %+v, want %+v", broker, got, p)
+		}
+		network, unknown := p, p
+		network.ExceptionalAuthority = NetworkAccessAuthority
+		unknown.Broker = broker + "x"
+		bad := map[string]Policy{"network": network, "unknown": unknown}
+		plan := Policy{Mode: ModePlan, BlockedPaths: []string{"/b"}, TmpDir: "/t", TmpDirDev: 1, TmpDirIno: 2, Broker: broker}
+		if broker == "slice" {
+			if got := roundTrip(t, plan); !reflect.DeepEqual(got, plan) {
+				t.Errorf("slice plan: round trip = %+v, want %+v", got, plan)
+			}
+		} else {
+			bad["plan"] = plan
+		}
+		for name, bad := range bad {
+			if err := WritePolicyFrame(io.Discard, bad); err == nil {
+				t.Errorf("%s %s: WritePolicyFrame accepted", broker, name)
+			}
+			payload, err := jsonOf(bad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadPolicyFrame(bytes.NewReader(frameBytes(payload))); err == nil {
+				t.Errorf("%s %s: ReadPolicyFrame accepted", broker, name)
+			}
+		}
+	}
+	p, err := ReadPolicyFrame(bytes.NewReader(frameBytes(`{"mode":"auto_edits","blocked_paths":["/b"],"tmp_dir":"/t"}`)))
+	if err != nil || p.Broker != "" {
+		t.Errorf("frame without broker: %+v, %v; want no broker", p, err)
+	}
+}

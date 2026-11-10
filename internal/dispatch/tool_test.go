@@ -6,6 +6,7 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -148,12 +149,13 @@ func (f *fakeGeneralAgentTool) Invoke(context.Context, map[string]any) (tools.Re
 // was invoked with so a test can prove invocation reused the authorized resolution rather than
 // re-resolving from arguments.
 type fakeMoveTool struct {
-	name            string
-	resolved        filetools.ResolvedMove
-	resolveErr      error
-	result          tools.Result
-	invoked         bool
-	invokedResolved filetools.ResolvedMove
+	name              string
+	resolved          filetools.ResolvedMove
+	resolveErr        error
+	result            tools.Result
+	invoked           bool
+	invokedResolved   filetools.ResolvedMove
+	invokedIdentities [2]filetools.ScopeIdentity
 }
 
 var _ tools.Tool = (*fakeMoveTool)(nil)
@@ -169,14 +171,27 @@ func (f *fakeMoveTool) ResolveEndpoints(map[string]any) (filetools.ResolvedMove,
 	return f.resolved, nil
 }
 
-func (f *fakeMoveTool) InvokeWithResolvedMove(_ context.Context, resolved filetools.ResolvedMove) (tools.Result, error) {
+func (f *fakeMoveTool) InvokeWithAuthorizedMove(_ context.Context, resolved filetools.ResolvedMove, sourceIdentity, destinationIdentity filetools.ScopeIdentity) (tools.Result, error) {
 	f.invoked = true
 	f.invokedResolved = resolved
+	f.invokedIdentities = [2]filetools.ScopeIdentity{sourceIdentity, destinationIdentity}
 	return f.result, nil
 }
 
+func moveScopeDirs(t *testing.T) (string, string) {
+	t.Helper()
+	root := mustEval(t, t.TempDir())
+	src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
+	for _, dir := range []string{src, dst} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+	}
+	return src, dst
+}
+
 // Invoke is the Tool-interface fallback; dispatch routes a multiScopeFileTool through
-// InvokeWithResolvedMove, so reaching this in a move test is itself a failure.
+// InvokeWithAuthorizedMove, so reaching this in a move test is itself a failure.
 func (f *fakeMoveTool) Invoke(context.Context, map[string]any) (tools.Result, error) {
 	f.invoked = true
 	return f.result, nil
@@ -1480,11 +1495,12 @@ func TestDispatchTool_MkdirOutOfRootPromptsForRealFolderAndDeniedNotCreated(t *t
 // the lexical endpoints with the bare "move" matching subject and no folded capability, and — once
 // granted — invokes the tool with the exact pair resolved before authorization.
 func TestDispatchTool_MoveSameScopeAuthorizesOnceAndInvokes(t *testing.T) {
+	sub, _ := moveScopeDirs(t)
 	home := t.TempDir()
 	cwd := t.TempDir()
 	resolved := filetools.ResolvedMove{
-		Source: "/proj/sub/a.txt", SourceScope: "/proj/sub",
-		Destination: "/proj/sub/b.txt", DestinationScope: "/proj/sub",
+		Source: filepath.Join(sub, "a.txt"), SourceScope: sub,
+		Destination: filepath.Join(sub, "b.txt"), DestinationScope: sub,
 	}
 	ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved, result: tools.Result{ExitCode: 0, Stdout: []byte("moved")}}
 	reg := tools.NewRegistry()
@@ -1503,8 +1519,8 @@ func TestDispatchTool_MoveSameScopeAuthorizesOnceAndInvokes(t *testing.T) {
 	if len(auth.requests) != 1 {
 		t.Fatalf("authorize calls = %d, want 1 (a same-directory rename authorizes its one shared scope once)", len(auth.requests))
 	}
-	if got := auth.requests[0]; got.Kind != "tool" || got.Subject != filetools.MoveToolName || got.PathScope != "/proj/sub" {
-		t.Fatalf("MatchRequest = %+v, want tool/move at the shared resolved scope /proj/sub", got)
+	if got := auth.requests[0]; got.Kind != "tool" || got.Subject != filetools.MoveToolName || got.PathScope != sub {
+		t.Fatalf("MatchRequest = %+v, want tool/move at the shared resolved scope %q", got, sub)
 	}
 	want := PromptDisplay{Action: ActionMoveFile, Subject: "a.txt -> b.txt", RequestedTarget: "a.txt -> b.txt", Body: ""}
 	if got := auth.displays[0]; got != want {
@@ -1526,11 +1542,12 @@ func TestDispatchTool_MoveSameScopeAuthorizesOnceAndInvokes(t *testing.T) {
 // invoking, and the invocation reuses the same resolved pair. Both authorizations carry the bare "move"
 // subject and the same "source -> destination" display.
 func TestDispatchTool_MoveTwoScopesAuthorizeIndependentlyAndInvoke(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
 	home := t.TempDir()
 	cwd := t.TempDir()
 	resolved := filetools.ResolvedMove{
-		Source: "/proj/src/a.txt", SourceScope: "/proj/src",
-		Destination: "/proj/dst/a.txt", DestinationScope: "/proj/dst",
+		Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir,
+		Destination: filepath.Join(dstDir, "a.txt"), DestinationScope: dstDir,
 	}
 	ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved, result: tools.Result{ExitCode: 0}}
 	reg := tools.NewRegistry()
@@ -1545,11 +1562,11 @@ func TestDispatchTool_MoveTwoScopesAuthorizeIndependentlyAndInvoke(t *testing.T)
 	if len(auth.requests) != 2 {
 		t.Fatalf("authorize calls = %d, want 2 (distinct source and destination scopes authorize independently)", len(auth.requests))
 	}
-	if got := auth.requests[0].PathScope; got != "/proj/src" {
-		t.Fatalf("first authorized scope = %q, want the source scope /proj/src (source is authorized first)", got)
+	if got := auth.requests[0].PathScope; got != srcDir {
+		t.Fatalf("first authorized scope = %q, want the source scope %q (source is authorized first)", got, srcDir)
 	}
-	if got := auth.requests[1].PathScope; got != "/proj/dst" {
-		t.Fatalf("second authorized scope = %q, want the destination scope /proj/dst", got)
+	if got := auth.requests[1].PathScope; got != dstDir {
+		t.Fatalf("second authorized scope = %q, want the destination scope %q", got, dstDir)
 	}
 	for i, d := range auth.displays {
 		if d.Subject != "src/a.txt -> dst/a.txt" || d.Action != ActionMoveFile {
@@ -1565,6 +1582,214 @@ func TestDispatchTool_MoveTwoScopesAuthorizeIndependentlyAndInvoke(t *testing.T)
 	if !ft.invoked || ft.invokedResolved != resolved {
 		t.Fatalf("invoked=%v invokedResolved=%+v, want invoked with the resolved pair %+v after both scopes granted", ft.invoked, ft.invokedResolved, resolved)
 	}
+	srcID, err := filetools.CaptureScopeIdentity(srcDir)
+	if err != nil {
+		t.Fatalf("CaptureScopeIdentity: %v", err)
+	}
+	dstID, err := filetools.CaptureScopeIdentity(dstDir)
+	if err != nil {
+		t.Fatalf("CaptureScopeIdentity: %v", err)
+	}
+	if want := [2]filetools.ScopeIdentity{srcID, dstID}; ft.invokedIdentities != want || srcID == dstID {
+		t.Fatalf("invoked identities = %+v, want the source and destination identities %+v", ft.invokedIdentities, want)
+	}
+}
+
+func TestPrepareTool_MoveCapturesEachDistinctScopeOnce(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
+	cases := []struct {
+		name      string
+		dstScope  string
+		wantCalls []string
+	}{
+		{"shared scope", srcDir, []string{srcDir}},
+		{"distinct scopes", dstDir, []string{srcDir, dstDir}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			orig := captureScopeIdentity
+			t.Cleanup(func() { captureScopeIdentity = orig })
+			captureScopeIdentity = func(scope string) (filetools.ScopeIdentity, error) {
+				calls = append(calls, scope)
+				return orig(scope)
+			}
+			ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: filetools.ResolvedMove{
+				Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir,
+				Destination: filepath.Join(tc.dstScope, "b.txt"), DestinationScope: tc.dstScope,
+			}}
+			reg := tools.NewRegistry()
+			if err := reg.Register(tools.BuiltinSource, ft); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			auth := &fakeAuthorizer{bySubject: map[string]authBehavior{filetools.MoveToolName: {decision: grantDecision()}}}
+			if _, err := DispatchTool(context.Background(), filetools.MoveToolName, map[string]any{"source": "a.txt", "destination": "b.txt"}, t.TempDir(), t.TempDir(), reg, auth); err != nil {
+				t.Fatalf("DispatchTool: %v", err)
+			}
+			if !slices.Equal(calls, tc.wantCalls) {
+				t.Fatalf("captured scopes = %v, want %v", calls, tc.wantCalls)
+			}
+			if ft.invokedIdentities[0] != ft.invokedIdentities[1] && tc.dstScope == srcDir {
+				t.Fatalf("shared scope invoked with identities %+v, want one identity for both", ft.invokedIdentities)
+			}
+		})
+	}
+}
+
+func TestDispatchTool_MoveScopeThatCannotBeCapturedFailsBeforeAuthorization(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
+	missing := filepath.Join(dstDir, "gone")
+	for _, resolved := range []filetools.ResolvedMove{
+		{Source: filepath.Join(missing, "a.txt"), SourceScope: missing, Destination: filepath.Join(dstDir, "a.txt"), DestinationScope: dstDir},
+		{Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir, Destination: filepath.Join(missing, "a.txt"), DestinationScope: missing},
+	} {
+		ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved}
+		reg := tools.NewRegistry()
+		if err := reg.Register(tools.BuiltinSource, ft); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		auth := &fakeAuthorizer{bySubject: map[string]authBehavior{filetools.MoveToolName: {decision: grantDecision()}}}
+		_, err := DispatchTool(context.Background(), filetools.MoveToolName, map[string]any{"source": "a.txt", "destination": "b.txt"}, t.TempDir(), t.TempDir(), reg, auth)
+		if err == nil || !strings.Contains(err.Error(), "cannot record the identity of the authorized directory "+missing) {
+			t.Fatalf("DispatchTool error = %v, want the capture failure for %s", err, missing)
+		}
+		if len(auth.requests) != 0 || ft.invoked {
+			t.Fatalf("authorize calls = %d, invoked = %v, want 0/false", len(auth.requests), ft.invoked)
+		}
+	}
+}
+
+func dispatchTreeSnapshot(t *testing.T, roots ...string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			switch {
+			case d.Type()&os.ModeSymlink != 0:
+				target, _ := os.Readlink(path)
+				out[path] = "link:" + target
+			case d.IsDir():
+				out[path] = "dir"
+			default:
+				out[path] = readTarget(t, path)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkDir: %v", err)
+		}
+	}
+	return out
+}
+
+func TestDispatchPreparedTool_MoveRefusesAParentSwappedDuringApproval(t *testing.T) {
+	moveAside := func(t *testing.T, dir string) {
+		t.Helper()
+		if err := os.Rename(dir, dir+"-orig"); err != nil {
+			t.Fatalf("Rename: %v", err)
+		}
+	}
+	cases := []struct {
+		name string
+		dst  string
+		swap func(t *testing.T, project, outside string)
+	}{
+		{"source ancestor replaced by a symlink", "b/dst/g.txt", func(t *testing.T, project, outside string) {
+			if err := os.MkdirAll(filepath.Join(outside, "src"), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			writeLaunchFile(t, filepath.Join(outside, "src", "f.txt"))
+			moveAside(t, filepath.Join(project, "a"))
+			if err := os.Symlink(outside, filepath.Join(project, "a")); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+		}},
+		{"source parent replaced by a folder", "b/dst/g.txt", func(t *testing.T, project, _ string) {
+			moveAside(t, filepath.Join(project, "a", "src"))
+			writeLaunchFile(t, filepath.Join(project, "a", "src", "f.txt"))
+		}},
+		{"destination ancestor replaced by a symlink", "b/dst/g.txt", func(t *testing.T, project, outside string) {
+			if err := os.MkdirAll(filepath.Join(outside, "dst"), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			moveAside(t, filepath.Join(project, "b"))
+			if err := os.Symlink(outside, filepath.Join(project, "b")); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+		}},
+		{"destination parent replaced by a folder", "b/dst/g.txt", func(t *testing.T, project, _ string) {
+			moveAside(t, filepath.Join(project, "b", "dst"))
+			if err := os.Mkdir(filepath.Join(project, "b", "dst"), 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+		}},
+		{"shared parent replaced by a folder", "a/src/g.txt", func(t *testing.T, project, _ string) {
+			moveAside(t, filepath.Join(project, "a", "src"))
+			writeLaunchFile(t, filepath.Join(project, "a", "src", "f.txt"))
+		}},
+		{"destination parent removed", "b/dst/g.txt", func(t *testing.T, project, _ string) {
+			moveAside(t, filepath.Join(project, "b", "dst"))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			project := mustEval(t, t.TempDir())
+			outside := mustEval(t, t.TempDir())
+			writeLaunchFile(t, filepath.Join(project, "a", "src", "f.txt"))
+			if err := os.MkdirAll(filepath.Join(project, "b", "dst"), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			reg := tools.NewRegistry()
+			if err := reg.Register(tools.BuiltinSource, filetools.NewMoveTool(home, project, project)); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			prepared, err := PrepareTool(context.Background(), filetools.MoveToolName, map[string]any{"source": "a/src/f.txt", "destination": tc.dst}, home, project, reg)
+			if err != nil {
+				t.Fatalf("PrepareTool: %v", err)
+			}
+			tc.swap(t, project, outside)
+			before := dispatchTreeSnapshot(t, project, outside)
+			auth := &fakeAuthorizer{bySubject: map[string]authBehavior{filetools.MoveToolName: {decision: grantDecision()}}}
+
+			res, err := DispatchPreparedTool(context.Background(), prepared, auth)
+			if err != nil {
+				t.Fatalf("DispatchPreparedTool: %v, want the refusal in-band", err)
+			}
+			if got := string(res.Stderr); res.ExitCode == 0 || !strings.Contains(got, "authorized directory was replaced while the request was pending") {
+				t.Fatalf("result = %+v, want the authorized-directory-replaced refusal", res)
+			}
+			if after := dispatchTreeSnapshot(t, project, outside); !maps.Equal(after, before) {
+				t.Fatalf("trees changed:\nbefore %v\nafter  %v", before, after)
+			}
+		})
+	}
+}
+
+func TestDispatchTool_UnswappedMovesSucceed(t *testing.T) {
+	for _, dst := range []string{"a/src/g.txt", "b/dst/g.txt"} {
+		home := t.TempDir()
+		project := mustEval(t, t.TempDir())
+		writeLaunchFile(t, filepath.Join(project, "a", "src", "f.txt"))
+		if err := os.MkdirAll(filepath.Join(project, "b", "dst"), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		reg := tools.NewRegistry()
+		if err := reg.Register(tools.BuiltinSource, filetools.NewMoveTool(home, project, project)); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		auth := &fakeAuthorizer{bySubject: map[string]authBehavior{filetools.MoveToolName: {decision: grantDecision()}}}
+		res, err := DispatchTool(context.Background(), filetools.MoveToolName, map[string]any{"source": "a/src/f.txt", "destination": dst}, home, project, reg, auth)
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("move to %s = %+v, %v; want success", dst, res, err)
+		}
+		if got := readTarget(t, filepath.Join(project, dst)); got != "body\n" {
+			t.Fatalf("destination %s = %q, want the moved bytes", dst, got)
+		}
+	}
 }
 
 // TestDispatchTool_MoveSourceDenialDoesNotInvokeOrAuthorizeDestination proves a denied source endpoint
@@ -1572,12 +1797,13 @@ func TestDispatchTool_MoveTwoScopesAuthorizeIndependentlyAndInvoke(t *testing.T)
 // source first, and on its denial returns the *DeniedError without prompting the destination scope or
 // invoking the tool — no partial mutation.
 func TestDispatchTool_MoveSourceDenialDoesNotInvokeOrAuthorizeDestination(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
 	home := t.TempDir()
 	cwd := t.TempDir()
 	env := permissions.BuildDenyEnvelope("nope")
 	resolved := filetools.ResolvedMove{
-		Source: "/proj/src/a.txt", SourceScope: "/proj/src",
-		Destination: "/proj/dst/a.txt", DestinationScope: "/proj/dst",
+		Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir,
+		Destination: filepath.Join(dstDir, "a.txt"), DestinationScope: dstDir,
 	}
 	ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved}
 	reg := tools.NewRegistry()
@@ -1607,12 +1833,13 @@ func TestDispatchTool_MoveSourceDenialDoesNotInvokeOrAuthorizeDestination(t *tes
 // denied) and returns the *DeniedError without invoking — an approved source endpoint never authorizes the
 // mutation on its own.
 func TestDispatchTool_MoveDestinationDenialDoesNotInvoke(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
 	home := t.TempDir()
 	cwd := t.TempDir()
 	env := permissions.BuildDenyEnvelope("nope")
 	resolved := filetools.ResolvedMove{
-		Source: "/proj/src/a.txt", SourceScope: "/proj/src",
-		Destination: "/proj/dst/a.txt", DestinationScope: "/proj/dst",
+		Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir,
+		Destination: filepath.Join(dstDir, "a.txt"), DestinationScope: dstDir,
 	}
 	ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved}
 	reg := tools.NewRegistry()
@@ -1621,7 +1848,7 @@ func TestDispatchTool_MoveDestinationDenialDoesNotInvoke(t *testing.T) {
 	}
 	// Grant every scope except the destination, which is denied — the source share of the move authorizes,
 	// the destination does not.
-	auth := &denyScopeAuthorizer{denyScope: "/proj/dst", envelope: env}
+	auth := &denyScopeAuthorizer{denyScope: dstDir, envelope: env}
 
 	_, err := DispatchTool(context.Background(), filetools.MoveToolName, map[string]any{"source": "src/a.txt", "destination": "dst/a.txt"}, home, cwd, reg, auth)
 	var de *DeniedError
@@ -1631,8 +1858,8 @@ func TestDispatchTool_MoveDestinationDenialDoesNotInvoke(t *testing.T) {
 	if len(auth.requests) != 2 {
 		t.Fatalf("authorize calls = %d, want 2 (source granted, then destination denied)", len(auth.requests))
 	}
-	if auth.requests[0].PathScope != "/proj/src" || auth.requests[1].PathScope != "/proj/dst" {
-		t.Fatalf("authorized scopes = %q then %q, want source /proj/src then destination /proj/dst", auth.requests[0].PathScope, auth.requests[1].PathScope)
+	if auth.requests[0].PathScope != srcDir || auth.requests[1].PathScope != dstDir {
+		t.Fatalf("authorized scopes = %q then %q, want source %q then destination %q", auth.requests[0].PathScope, auth.requests[1].PathScope, srcDir, dstDir)
 	}
 	if ft.invoked {
 		t.Fatal("a move with a denied destination must not be invoked, even though the source was approved")
@@ -1644,13 +1871,15 @@ func TestDispatchTool_MoveDestinationDenialDoesNotInvoke(t *testing.T) {
 // raises the write signal only on the destination scope's prompt, the read signal is never raised (a move
 // is a write, not an external read), and the reverse pairing raises it only on the source.
 func TestDispatchTool_MoveOutOfRootEndpointsRaiseFolderSignalPerScope(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
+	outside := mustEval(t, t.TempDir())
 	home := t.TempDir()
 	cwd := t.TempDir()
 
 	t.Run("out-of-root destination raises the signal only on the destination", func(t *testing.T) {
 		resolved := filetools.ResolvedMove{
-			Source: "/proj/src/a.txt", SourceScope: "/proj/src", SourceOutOfRoot: false,
-			Destination: "/outside/a.txt", DestinationScope: "/outside", DestinationOutOfRoot: true,
+			Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir, SourceOutOfRoot: false,
+			Destination: filepath.Join(outside, "a.txt"), DestinationScope: outside, DestinationOutOfRoot: true,
 		}
 		ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved}
 		reg := tools.NewRegistry()
@@ -1676,8 +1905,8 @@ func TestDispatchTool_MoveOutOfRootEndpointsRaiseFolderSignalPerScope(t *testing
 
 	t.Run("out-of-root source raises the signal only on the source", func(t *testing.T) {
 		resolved := filetools.ResolvedMove{
-			Source: "/outside/a.txt", SourceScope: "/outside", SourceOutOfRoot: true,
-			Destination: "/proj/dst/a.txt", DestinationScope: "/proj/dst", DestinationOutOfRoot: false,
+			Source: filepath.Join(outside, "a.txt"), SourceScope: outside, SourceOutOfRoot: true,
+			Destination: filepath.Join(dstDir, "a.txt"), DestinationScope: dstDir, DestinationOutOfRoot: false,
 		}
 		ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved}
 		reg := tools.NewRegistry()
@@ -2706,6 +2935,9 @@ func TestPrepareTool_DegradedListAsksForOutsideReads(t *testing.T) {
 func TestPrepareTool_OneBlockedListPerCall(t *testing.T) {
 	f := newGuardFixture(t)
 	secrets := filepath.Join(f.projectRoot, "secrets")
+	if err := os.Mkdir(secrets, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
 	entry := permissions.BlockedEntry{Path: secrets, Source: blockedEntrySource}
 	moveInto := func(t *testing.T) *tools.Registry {
 		t.Helper()
@@ -3383,9 +3615,10 @@ func TestInvokeDecided_CancelledAfterApprovalDoesNotInvoke(t *testing.T) {
 }
 
 func TestDispatchTool_MoveCancelledDuringAuthorizationDoesNotInvoke(t *testing.T) {
+	srcDir, dstDir := moveScopeDirs(t)
 	resolved := filetools.ResolvedMove{
-		Source: "/proj/src/a.txt", SourceScope: "/proj/src",
-		Destination: "/proj/dst/a.txt", DestinationScope: "/proj/dst",
+		Source: filepath.Join(srcDir, "a.txt"), SourceScope: srcDir,
+		Destination: filepath.Join(dstDir, "a.txt"), DestinationScope: dstDir,
 	}
 	ft := &fakeMoveTool{name: filetools.MoveToolName, resolved: resolved}
 	reg := tools.NewRegistry()

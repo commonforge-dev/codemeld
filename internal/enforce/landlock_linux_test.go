@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -782,4 +783,51 @@ func TestLandlockRulesCarveResolvedBlockedPaths(t *testing.T) {
 	if _, err := landlockRules(Policy{Mode: ModePlan, BlockedPaths: []string{"/home/a/x"}}, loop, heldTmp{}); !errors.Is(err, syscall.ELOOP) {
 		t.Errorf("symlink loop: err = %v, want ELOOP", err)
 	}
+}
+
+const vanishChildEnv = "CODEMELD_TEST_LANDLOCK_VANISH_CHILD"
+
+func TestApplyLandlockSkipsPathRemovedAfterListing(t *testing.T) {
+	if abi, err := landlockABI(); err != nil || abi < 3 {
+		t.Skipf("landlock ABI 3 unavailable (abi %d, err %v)", abi, err)
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"blocked", "victim"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestApplyLandlockVanishChild$")
+	cmd.Env = append(os.Environ(), vanishChildEnv+"="+dir)
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "result=ok") {
+		t.Fatalf("child: %v\n%s", err, out)
+	}
+}
+
+func TestApplyLandlockVanishChild(t *testing.T) {
+	dir := os.Getenv(vanishChildEnv)
+	if dir == "" {
+		t.Skip("runs only as the child of TestApplyLandlockSkipsPathRemovedAfterListing")
+	}
+	victim := filepath.Join(dir, "victim")
+	restrictPaths = func(rules ...landlock.Rule) error {
+		if err := os.Remove(victim); err != nil {
+			return err
+		}
+		return landlock.V3.RestrictPaths(rules...)
+	}
+	if err := applyLandlock(Policy{Mode: ModePlan, BlockedPaths: []string{filepath.Join(dir, "blocked")}}); err != nil {
+		t.Fatalf("applyLandlock: %v", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(dir, "blocked")); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("blocked read err = %v, want EACCES", err)
+	}
+	if err := os.WriteFile(victim, nil, 0o600); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("recreate removed path err = %v, want EACCES", err)
+	}
+	_, _ = os.Stdout.WriteString("result=ok\n")
 }

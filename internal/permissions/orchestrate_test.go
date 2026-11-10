@@ -6147,7 +6147,7 @@ func wantModeAutoAllow(t *testing.T, req MatchRequest, mc ModeContext) {
 func TestModePostureConstrainedAutoShell(t *testing.T) {
 	for _, input := range []string{"bash build.sh", "make", "touch a", "python -m pip install x", "sudo rm x", "rg foo | head", "ls && pwd", `sh -c 'go build ./...'`,
 		"rm x", `sh -c 'if true; then curl x; fi'`, "git rebase main", "hg --cwd /repo strip", "hg --config extensions.strip= strip",
-		"git -c x=y reset --hard", "git reset HEAD~1 --hard"} {
+		"git -c x=y reset --hard", "git reset HEAD~1 --hard", `sh -c 'curl x'`, "curl x", `ls && curl x`, "git push origin rebase"} {
 		t.Run("confined "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
 			f := newFixture(neverPrompt, nil)
@@ -6161,8 +6161,9 @@ func TestModePostureConstrainedAutoShell(t *testing.T) {
 	for _, input := range []string{
 		`sh -c 'curl x'`, "curl x", `ls && curl x`, "git push origin rebase",
 	} {
-		t.Run("unhandled "+input, func(t *testing.T) {
+		t.Run("unsandboxed unhandled "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
+			mc.ExecutionConstrained = false
 			wantUnhandled(t, req, mc)
 		})
 	}
@@ -6234,7 +6235,7 @@ func TestAuthorizeConstrainedAutoOrdinaryShellRecordsConfined(t *testing.T) {
 		func(mc *ModeContext) { mc.ExternalRead = true },
 		func(mc *ModeContext) { mc.NetworkEgress = true },
 	}
-	for _, input := range []string{"touch a", "rg foo | head", "ls && pwd", `sh -c 'go build ./...'`} {
+	for _, input := range []string{"touch a", "rg foo | head", "ls && pwd", `sh -c 'go build ./...'`, "curl x"} {
 		for i, set := range flags {
 			t.Run(fmt.Sprintf("%s/%d", input, i), func(t *testing.T) {
 				req, mc := constrainedAutoShell(t, input)
@@ -6243,17 +6244,6 @@ func TestAuthorizeConstrainedAutoOrdinaryShellRecordsConfined(t *testing.T) {
 				assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
 			})
 		}
-	}
-	for i, set := range flags {
-		t.Run(fmt.Sprintf("exceptional/%d", i), func(t *testing.T) {
-			req, mc := constrainedAutoShell(t, "curl x")
-			set(&mc)
-			f := newFixture(choose(PromptAllowOnce), nil)
-			mustAuthorizeMode(t, req, mc, f.deps)
-			if f.cap.prompts != 1 {
-				t.Fatalf("prompts = %d, want 1", f.cap.prompts)
-			}
-		})
 	}
 	for _, input := range []string{
 		"sh -c 'r\\\nm --version'", "ls && cu\\\nrl x", "sh -c 'git re\\\nset --hard'",
@@ -6273,7 +6263,7 @@ func TestAuthorizeConstrainedAutoOrdinaryShellRecordsConfined(t *testing.T) {
 	})
 }
 
-func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) {
+func TestAuthorizeConstrainedAutoNetworkRunsConfinedOverGrantsAndCache(t *testing.T) {
 	cases := []struct {
 		input string
 		grant PermissionEntry
@@ -6286,19 +6276,13 @@ func TestAuthorizeConstrainedAutoExceptionalIgnoresGrantsAndCache(t *testing.T) 
 		t.Run(tc.input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, tc.input)
 
-			f := newFixture(choose(PromptAllowOnce), nil)
+			f := newFixture(neverPrompt, nil)
 			f.grants.entries = []PermissionEntry{tc.grant}
-			mustAuthorizeMode(t, req, mc, f.deps)
-			if f.cap.prompts != 1 {
-				t.Fatalf("saved grant suppressed the constrained prompt: prompts = %d", f.cap.prompts)
-			}
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
 
-			f = newFixture(choose(PromptAllowOnce), nil)
+			f = newFixture(neverPrompt, nil)
 			f.cache.hits[turnCacheKeyOf(req)] = outcomeOnce
-			mustAuthorizeMode(t, req, mc, f.deps)
-			if f.cap.prompts != 1 {
-				t.Fatalf("cache entry suppressed the constrained prompt: prompts = %d", f.cap.prompts)
-			}
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
 
 			mc.ExecutionConstrained = false
 			f = newFixture(neverPrompt, nil)
@@ -6442,6 +6426,8 @@ func TestAuthorizeConstrainedAutoScriptAndAssignmentChains(t *testing.T) {
 		`sh $OPTIONS > out`,
 		`bash ~/x.sh; ls`,
 		`ls; $X -rf .`,
+		`GIT_DIR=x git push && ls`,
+		`ls;  A=1   curl u`,
 	} {
 		t.Run("confined "+input, func(t *testing.T) {
 			req, mc := canonicalShellReqCtxFor(t, modeAutoEdits, input)
@@ -6449,19 +6435,6 @@ func TestAuthorizeConstrainedAutoScriptAndAssignmentChains(t *testing.T) {
 			mc.ProjectRoot = scopeProj
 			f := newFixture(neverPrompt, nil)
 			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
-		})
-	}
-	for _, input := range []string{
-		`GIT_DIR=x git push && ls`,
-		`ls;  A=1   curl u`,
-	} {
-		t.Run("prompts "+input, func(t *testing.T) {
-			req, mc := canonicalShellReqCtxFor(t, modeAutoEdits, input)
-			mc.ExecutionConstrained = true
-			mc.ProjectRoot = scopeProj
-			f := newFixture(choose(PromptAllowOnce), nil)
-			mustAuthorizeMode(t, req, mc, f.deps)
-			assertPromptedNotConfined(t, f)
 		})
 	}
 }
@@ -6533,16 +6506,53 @@ func TestAuthorizeConstrainedAutoDeletionAndUnsplittableRunConfined(t *testing.T
 	}
 }
 
-func TestAuthorizeConstrainedAutoNetworkStagesStillAsk(t *testing.T) {
+func TestAuthorizeConstrainedAutoNetworkStagesAskOnlyOutsideTheSandbox(t *testing.T) {
 	for _, input := range []string{
 		`rm x; curl y`, `git reset --hard && git push`, `rm x && command git push`, `rm x && nice git push`,
 		`rm x | xargs git push`, `rm x; bash -c 'git push'`, `git push origin rebase`,
 	} {
-		t.Run(input, func(t *testing.T) {
+		t.Run("sandboxed "+input, func(t *testing.T) {
 			req, mc := constrainedAutoShell(t, input)
-			f := newFixture(choose(PromptAllowOnce), nil)
-			mustAuthorizeMode(t, req, mc, f.deps)
-			assertPromptedNotConfined(t, f)
+			f := newFixture(neverPrompt, nil)
+			assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+		})
+		for name, set := range map[string]func(*ModeContext){
+			"no sandbox":      func(mc *ModeContext) { mc.ExecutionConstrained = false },
+			"build":           func(mc *ModeContext) { mc.Mode = "build" },
+			"broken settings": func(mc *ModeContext) { mc.SettingsBroken = true },
+		} {
+			t.Run(name+" "+input, func(t *testing.T) {
+				req, mc := constrainedAutoShell(t, input)
+				set(&mc)
+				f := newFixture(choose(PromptAllowOnce), nil)
+				mustAuthorizeMode(t, req, mc, f.deps)
+				assertPromptedNotConfined(t, f)
+			})
+		}
+	}
+}
+
+func TestAuthorizeSandboxedNetworkCommandsRunWithoutApproval(t *testing.T) {
+	check := func(context.Context, MatchRequest, ModeContext) PrePromptResult { return PrePromptResult{} }
+	for _, input := range []string{"curl https://example.com", "git fetch", "pip install x"} {
+		for _, mode := range []string{modePlan, modeAutoEdits} {
+			t.Run(mode+" "+input, func(t *testing.T) {
+				req, mc := constrainedAutoShell(t, input)
+				mc.Mode = mode
+				f := newFixture(neverPrompt, nil)
+				assertConfinedOnce(t, f, req, mustAuthorizeMode(t, req, mc, f.deps))
+				if prePromptEligible(req, mc, AuthorizeDeps{PrePromptCheck: check}) {
+					t.Fatalf("%q is eligible for the pre-prompt check", input)
+				}
+			})
+		}
+		t.Run("plan unsandboxed "+input, func(t *testing.T) {
+			req, mc := constrainedAutoShell(t, input)
+			mc.Mode, mc.ExecutionConstrained = modePlan, false
+			f := newFixture(neverPrompt, nil)
+			if d := mustAuthorizeMode(t, req, mc, f.deps); d.Outcome != outcomeDeny || f.cap.prompts != 0 {
+				t.Fatalf("decision = %+v prompts = %d, want a Plan denial without a prompt", d, f.cap.prompts)
+			}
 		})
 	}
 }

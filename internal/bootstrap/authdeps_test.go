@@ -3925,6 +3925,232 @@ func TestProductionAuthorizer_HomeStateActorsDoNotShareApprovalOrFallback(t *tes
 	}
 }
 
+const (
+	literalHomeCompound   = `sh -c "mv x '~/t' && true"`
+	expandingHomeCompound = `sh -c "mv x ~/t && true"`
+)
+
+func compoundChooserShow(t *testing.T, option tui.PromptOption, shown *[]tui.PromptRequest) func(tui.PromptRequest) (tui.PromptDecision, error) {
+	t.Helper()
+	return func(req tui.PromptRequest) (tui.PromptDecision, error) {
+		*shown = append(*shown, req)
+		if req.Compound == nil {
+			return tui.PromptDecision{Option: tui.OptionDeny, DenyEnvelope: permissions.BuildDenyEnvelope("")}, nil
+		}
+		subject, err := exactCompoundGrant(*req.Compound)
+		if err != nil {
+			return tui.PromptDecision{}, err
+		}
+		return tui.PromptDecision{Option: option, StoredSubject: subject}, nil
+	}
+}
+
+func wantLiteralShellRun(t *testing.T, run *confineInner, runs int) {
+	t.Helper()
+	if len(run.execs) != runs {
+		t.Fatalf("runner Exec calls = %d, want %d", len(run.execs), runs)
+	}
+	for _, spec := range run.execs {
+		if !slices.Equal(spec.Argv, []string{"sh", "-c", literalHomeCompound}) {
+			t.Fatalf("runner argv = %q, want the literal sh -c invocation", spec.Argv)
+		}
+	}
+}
+
+func wantExpandingRefused(t *testing.T, auth *productionAuthorizer, home, cwd string, shown *[]tui.PromptRequest) {
+	t.Helper()
+	before := len(*shown)
+	run := &confineInner{}
+	_, err := dispatch.DispatchShell(context.Background(), expandingHomeCompound, home, cwd, auth, run)
+	var denied *dispatch.DeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("DispatchShell(%s) = %v, want *dispatch.DeniedError", expandingHomeCompound, err)
+	}
+	if len(*shown) != before+1 || (*shown)[before].Compound != nil {
+		t.Fatalf("expanding request prompts = %d (was %d), want one new prompt with no compound chooser", len(*shown), before)
+	}
+	if len(run.execs) != 0 {
+		t.Fatalf("runner Exec calls for the expanding request = %d, want 0", len(run.execs))
+	}
+}
+
+func TestProductionAuthorizer_LiteralHomeCompoundGrantReusedAndExpandingRefused(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	subjects := map[string]bool{}
+	for _, homeCase := range []struct {
+		name string
+		home string
+	}{{"empty codemeld home", ""}, {"nonempty codemeld home", t.TempDir()}} {
+		for _, grant := range []struct {
+			name   string
+			option tui.PromptOption
+		}{{"session", tui.OptionAllowSession}, {"folder", tui.OptionAllowFolder}} {
+			t.Run(homeCase.name+"/"+grant.name, func(t *testing.T) {
+				home := homeCase.home
+				cwd, err := filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatalf("EvalSymlinks: %v", err)
+				}
+				store := mkStore(t)
+				app := tui.New(nil)
+				app.SetActiveStore(store)
+				cache := emptyCache(t, cwd)
+				var shown []tui.PromptRequest
+				auth := newProductionAuthorizer(app, cache, permissions.NewTurnCache(), newPromptGateBuilder(compoundChooserShow(t, grant.option, &shown)), home, cwd, mode.NewActiveState(mode.Build, mode.SourceDefault))
+
+				run := &confineInner{}
+				if _, err := dispatch.DispatchShell(context.Background(), literalHomeCompound, home, cwd, auth, run); err != nil {
+					t.Fatalf("DispatchShell = %v, want the approval to authorize it", err)
+				}
+				if len(shown) != 1 || shown[0].Compound == nil {
+					t.Fatalf("prompts = %d, want one prompt carrying the compound decomposition", len(shown))
+				}
+				wantLiteralShellRun(t, run, 1)
+				var stored []permissions.PermissionEntry
+				for _, e := range cache.Permissions() {
+					if strings.HasPrefix(e.Subject, "compound/v2 W ") && e.Kind == "literal" && e.GrantKind == grant.name {
+						stored = append(stored, e)
+					}
+				}
+				if len(stored) != 1 {
+					t.Fatalf("grants = %+v, want one %s literal grant with the state-aware compound subject", cache.Permissions(), grant.name)
+				}
+				subjects[stored[0].Subject] = true
+
+				auth.resetTurnCache()
+				if _, err := dispatch.DispatchShell(context.Background(), literalHomeCompound, home, cwd, auth, run); err != nil {
+					t.Fatalf("repeat DispatchShell = %v, want the stored grant to cover it", err)
+				}
+				if len(shown) != 1 {
+					t.Fatalf("prompts after repeat = %d, want 1 (grant reused)", len(shown))
+				}
+				wantLiteralShellRun(t, run, 2)
+
+				auth.resetTurnCache()
+				wantExpandingRefused(t, auth, home, cwd, &shown)
+				if grant.option != tui.OptionAllowFolder {
+					return
+				}
+
+				entry := findGrant(t, readPersistedPermissions(t, config.LocalSettingsPath(cwd), cwd), stored[0].Subject)
+				if entry.Kind != "literal" || entry.GrantKind != "folder" || entry.PathScope != cwd {
+					t.Fatalf("persisted entry = %+v, want a literal folder grant scoped to %q", entry, cwd)
+				}
+				composition, err := defaultComposeConfig(nil, cwd)
+				if err != nil {
+					t.Fatalf("defaultComposeConfig: %v", err)
+				}
+				reloadedCache, err := config.NewCache(composition.Config, cwd, []string{projectSettingsPath(cwd)})
+				if err != nil {
+					t.Fatalf("config.NewCache: %v", err)
+				}
+				var reshown []tui.PromptRequest
+				reloaded := newProductionAuthorizer(app, reloadedCache, permissions.NewTurnCache(), newPromptGateBuilder(compoundChooserShow(t, tui.OptionAllowFolder, &reshown)), home, cwd, mode.NewActiveState(mode.Build, mode.SourceDefault))
+				later := &confineInner{}
+				if _, err := dispatch.DispatchShell(context.Background(), literalHomeCompound, home, cwd, reloaded, later); err != nil {
+					t.Fatalf("DispatchShell after reload = %v, want the persisted grant to cover it", err)
+				}
+				if len(reshown) != 0 {
+					t.Fatalf("prompts after reload = %d, want 0", len(reshown))
+				}
+				wantLiteralShellRun(t, later, 1)
+				reloaded.resetTurnCache()
+				wantExpandingRefused(t, reloaded, home, cwd, &reshown)
+			})
+		}
+	}
+	if len(subjects) != 1 {
+		t.Fatalf("stored compound subjects = %v, want one subject regardless of codemeld home", subjects)
+	}
+}
+
+func TestProductionAuthorizer_LiteralAndExpandingCompoundActorsDoNotShareApprovalOrFallback(t *testing.T) {
+	cwd := t.TempDir()
+	home := t.TempDir()
+	store := mkStore(t)
+	app := tui.New(nil)
+	app.SetActiveStore(store)
+	cache := emptyCache(t, cwd)
+
+	globalParent := filepath.Dir(SettingsPath(home))
+	if err := os.MkdirAll(filepath.Dir(globalParent), 0o755); err != nil {
+		t.Fatalf("seed global parent dir: %v", err)
+	}
+	if err := os.WriteFile(globalParent, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed global parent file: %v", err)
+	}
+
+	type shownPrompt struct {
+		req    tui.PromptRequest
+		decide chan tui.PromptDecision
+	}
+	prompts := make(chan shownPrompt)
+	show := func(req tui.PromptRequest) (tui.PromptDecision, error) {
+		p := shownPrompt{req: req, decide: make(chan tui.PromptDecision)}
+		prompts <- p
+		return <-p.decide, nil
+	}
+	auth := newProductionAuthorizer(app, cache, permissions.NewTurnCache(), newPromptGateBuilder(show), home, cwd, mode.NewActiveState(mode.Build, mode.SourceDefault))
+
+	runA, runB := &confineInner{}, &confineInner{}
+	doneA, doneB := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := dispatch.DispatchShell(context.Background(), literalHomeCompound, home, cwd, auth, runA)
+		doneA <- err
+	}()
+	promptA := <-prompts
+	if promptA.req.Compound == nil {
+		t.Fatalf("actor A prompt carries no compound decomposition")
+	}
+	subjectA, err := exactCompoundGrant(*promptA.req.Compound)
+	if err != nil {
+		t.Fatalf("chooser subject for A: %v", err)
+	}
+
+	go func() {
+		_, err := dispatch.DispatchShell(context.Background(), expandingHomeCompound, home, cwd, auth, runB)
+		doneB <- err
+	}()
+	select {
+	case p := <-prompts:
+		t.Fatalf("actor B reached its prompt (%q) while A holds the gate", p.req.Subject)
+	case err := <-doneB:
+		t.Fatalf("actor B finished (%v) while A holds the gate", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	promptA.decide <- tui.PromptDecision{Option: tui.OptionAllowGlobal, StoredSubject: subjectA}
+	if err := <-doneA; err != nil {
+		t.Fatalf("actor A: %v, want approved", err)
+	}
+	wantLiteralShellRun(t, runA, 1)
+
+	var promptB shownPrompt
+	select {
+	case promptB = <-prompts:
+	case err := <-doneB:
+		t.Fatalf("actor B finished (%v) without its own prompt; A's approval or fallback released it", err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("actor B never reached its prompt")
+	}
+	if promptB.req.Compound != nil {
+		t.Fatalf("actor B prompt carries a compound decomposition, want the byte-exact literal prompt")
+	}
+	promptB.decide <- tui.PromptDecision{Option: tui.OptionDeny, DenyEnvelope: permissions.BuildDenyEnvelope("")}
+	var denied *dispatch.DeniedError
+	if err := <-doneB; !errors.As(err, &denied) || len(runB.execs) != 0 {
+		t.Fatalf("actor B: err = %v, runs = %d; want *dispatch.DeniedError and nothing run", err, len(runB.execs))
+	}
+
+	if got := countPermissionEvents(store, events.KindPermissionPersistFailed); got != 1 {
+		t.Fatalf("permission_persist_failed events = %d, want 1 (A's global persist degrades)", got)
+	}
+	grants := cache.Permissions()
+	if len(grants) != 1 || grants[0].Subject != subjectA || grants[0].GrantKind != "session" {
+		t.Fatalf("grants = %+v, want only A's session fallback carrying %q", grants, subjectA)
+	}
+}
+
 // One choice authorizes every stage, so the batched summary must describe the whole batch: the
 // stage count plus the union of the stages' effects and targets, and the unknown fallback for the
 // entire batch as soon as one stage cannot be classified.
@@ -5667,34 +5893,29 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 	for _, tc := range []struct {
 		name, command, authority string
 		check                    func(tui.PromptRequest) bool
-		brokenOnly               bool
-		validSubject             string
 	}{
 		{"direct network", "curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "curl https://example.com" && pr.Pipeline == "" && !pr.WholeCommand
-		}, false, ""},
+		}},
 		{"direct history rewrite", "git rebase main", "VCS history rewrite", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "git rebase main" && pr.Pipeline == ""
-		}, true, ""},
-		{"pipeline with a later exceptional stage", "sort data.txt | curl -d @- https://example.com", "network access", func(pr tui.PromptRequest) bool {
-			return pr.Subject == "curl -d @- https://example.com" && pr.Pipeline == "sort data.txt | curl -d @- https://example.com" && pr.BatchedStages == nil
-		}, false, ""},
+		}},
+		{"pipeline with a later exceptional stage", "tee log.txt | curl -d @- https://example.com", "network access", func(pr tui.PromptRequest) bool {
+			return pr.Subject == "" && pr.Pipeline == "tee log.txt | curl -d @- https://example.com" && slices.Equal(pr.BatchedStages, []string{"tee log.txt", "curl -d @- https://example.com"})
+		}},
 		{"literal network", "sh -c 'curl https://example.com'", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "sh -c 'curl https://example.com'" && pr.WholeCommand
-		}, false, ""},
+		}},
 		{"literal history rewrite", "sh -c 'git rebase main'", "VCS history rewrite", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "sh -c 'git rebase main'" && pr.WholeCommand
-		}, true, ""},
+		}},
 		{"staged history rewrite then network", "git rebase main && curl https://example.com", "network access", func(pr tui.PromptRequest) bool {
 			return pr.Subject == "" && slices.Equal(pr.BatchedStages, []string{"git rebase main", "curl https://example.com"})
-		}, true, "curl https://example.com"},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, home, cwd := exceptionalTestAuthorizer(t, mode.Build, false)
-			settings := newRereadFixture(t)
-			settings.writeGlobal(t, "a")
-			broken := settings.blocked(t, true)
-			rewriteSettings(t, settings.global, "blocked_paths: [\n")
+			broken := brokenBlockedPaths(t)
 			dispatched := func(m mode.Mode, constrained bool, blocked *permissions.BlockedPaths, runs int) []tui.PromptRequest {
 				t.Helper()
 				auth, shown := exceptionalAuthorizerAt(t, m, constrained, home, cwd)
@@ -5719,21 +5940,10 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 				}
 				return shown[0]
 			}
-			var marked tui.PromptRequest
-			if tc.brokenOnly {
-				valid := dispatched(mode.AutoEdits, true, nil, 2)
-				if want := map[bool]int{false: 0, true: 2}[tc.validSubject != ""]; len(valid) != want {
-					t.Fatalf("valid-settings sandboxed Auto edits showed %d prompts %+v, want %d", len(valid), valid, want)
-				}
-				for _, pr := range valid {
-					if pr.Action != "Allow network access" || pr.ExceptionalAuthority != "network access" || pr.Subject != tc.validSubject || pr.BatchedStages != nil {
-						t.Fatalf("valid-settings prompt = %+v, want network access for %q alone", pr, tc.validSubject)
-					}
-				}
-				marked = prompted(mode.AutoEdits, true, broken, 2)
-			} else {
-				marked = prompted(mode.AutoEdits, true, nil, 2)
+			if valid := dispatched(mode.AutoEdits, true, nil, 2); len(valid) != 0 {
+				t.Fatalf("valid-settings sandboxed Auto edits showed prompts %+v, want none", valid)
 			}
+			marked := prompted(mode.AutoEdits, true, broken, 2)
 			if marked.Action != "Allow "+tc.authority || marked.ExceptionalAuthority != tc.authority || marked.Body != "" || !tc.check(marked) {
 				t.Fatalf("prompt = %+v, want %q over the complete command", marked, "Allow "+tc.authority)
 			}
@@ -5754,8 +5964,18 @@ func TestProductionAuthorizer_ExceptionalShellPromptNamesTheAuthority(t *testing
 	}
 }
 
+func brokenBlockedPaths(t *testing.T) *permissions.BlockedPaths {
+	t.Helper()
+	settings := newRereadFixture(t)
+	settings.writeGlobal(t, "a")
+	broken := settings.blocked(t, true)
+	rewriteSettings(t, settings.global, "blocked_paths: [\n")
+	return broken
+}
+
 func TestProductionAuthorizer_ExceptionalHeaderReadsTheOverlaidMode(t *testing.T) {
 	auth, shown, _, cwd := exceptionalTestAuthorizer(t, mode.AutoEdits, true)
+	auth.blocked = brokenBlockedPaths(t)
 	stage := func(source string) dispatch.BatchAuthRequest {
 		tokens := strings.Fields(source)
 		return dispatch.BatchAuthRequest{
@@ -5783,6 +6003,7 @@ func TestProductionAuthorizer_ExceptionalHeaderReadsTheOverlaidMode(t *testing.T
 
 func TestProductionAuthorizer_IndependentKeepsTheExceptionalMarker(t *testing.T) {
 	auth, shown, _, cwd := exceptionalTestAuthorizer(t, mode.AutoEdits, true)
+	auth.blocked = brokenBlockedPaths(t)
 	literal := dispatch.IndependentAuthRequest{
 		Req:     permissions.MatchRequest{Kind: "literal", Subject: "sh -c 'curl https://example.com'", PathScope: cwd},
 		Display: dispatch.PromptDisplay{Action: dispatch.ActionRunCommand, Subject: "sh -c 'curl https://example.com'", WholeCommand: true},

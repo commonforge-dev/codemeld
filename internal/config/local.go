@@ -24,6 +24,7 @@ var localAllowedKeys = map[string]bool{
 	"model":         true,
 	"permissions":   true,
 	blockedPathsKey: true,
+	domainGrantsKey: true,
 }
 
 var localAllowedModelSubkeys = map[string]bool{"active": true}

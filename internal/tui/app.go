@@ -241,6 +241,11 @@ type App struct {
 	promptOpen       bool
 	promptPrev       tview.Primitive
 	promptDecisionCh chan PromptDecision
+	network          *networkPrompt
+
+	lifecycle     chan struct{}
+	lifecycleOnce sync.Once
+	lifecycleMu   sync.Mutex
 
 	// secretPromptOpen / secretPromptPrev track the reusable masked secret prompt:
 	// whether it is mounted and the primitive focus returns to when it closes.
@@ -566,6 +571,7 @@ func New(submit SubmitFunc) *App {
 		promptNotifyAfter:  time.After,
 		promptNotifyWrite:  defaultPromptNotifyWrite,
 		questionFormMounts: make(chan struct{}, 1),
+		lifecycle:          make(chan struct{}),
 	}
 	// The repaint seam wraps the owned tview application's ForceDraw so handlers request
 	// a redraw without depending on the terminal; tests override it. ForceDraw and not
@@ -1194,6 +1200,7 @@ func (a *App) restoreModalFocusOnTerminalFocus() {
 // through the tview queue; running tracks that window so the same methods mutate
 // directly before Run and in unit tests.
 func (a *App) Run() error {
+	defer a.endLifecycle()
 	// Build the production terminal screen and wrap it so bracketed-paste line breaks
 	// are normalized before tview's paste collector sees them. Installing the
 	// wrapper with SetScreen before app.Run makes tview use it instead of creating its
@@ -2157,7 +2164,30 @@ func (a *App) NoticeSeq() uint64 { return a.noticeSeq.Load() }
 // to be dropped rather than queued, or the drain and the turn deadlock on each other.
 // The dropped mutations are view-only — the turn's durable records still land on the
 // store, which is what the drain exists to order before the final flush.
-func (a *App) BeginShutdown() { a.stopping.Store(true) }
+func (a *App) BeginShutdown() {
+	a.stopping.Store(true)
+	a.endLifecycle()
+}
+
+func (a *App) endLifecycle() {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	a.lifecycleOnce.Do(func() { close(a.lifecycle) })
+}
+
+func (a *App) Done() <-chan struct{} {
+	return a.lifecycle
+}
+
+func (a *App) WhileRunning(f func()) bool {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	if a.shuttingDown() {
+		return false
+	}
+	f()
+	return true
+}
 
 // Stop ends the tview event loop, returning control from Run. The production exit
 // controller calls it as part of the clean-shutdown sequence before the

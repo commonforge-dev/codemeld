@@ -131,13 +131,14 @@ func TestFixedEnvironment_AcceptsAssignments(t *testing.T) {
 
 func TestInheritedEnvironment_WithholdsNamesAndCredentialURLs(t *testing.T) {
 	for _, entry := range []string{
-		"LD_PRELOAD=x", "GIT_DIR=x", "HGRCPATH=x", "SSH_AUTH_SOCK=x", "HTTPS_PROXY=x", "https_proxy=x",
-		"XDG_CONFIG_HOME=x", "BASH_ENV=x", "DOCKER_HOST=x", "GITHUB_TOKEN=x", "OPENROUTER_API_KEY=x",
+		"GITHUB_TOKEN=x", "OPENROUTER_API_KEY=x",
 		"AWS_SECRET_ACCESS_KEY=x", "my_secret=x", "DB_PASSWORD=x", "SERVICE_PW=x", "SESSION_COOKIE=x",
 		"PASSWD_FILE=x", "MY_CREDENTIALS=x", "STRIPE_APIKEY=x", "S3_ACCESS_KEY_ID=x", "SSL_PRIVATE_KEY_PATH=x",
 		"SIGNING_KEY=x", "SMTP_PASS=x", "PROXY_AUTH=x", "AUTH_HEADER=x", "AZURE_TENANT=x", "GOOGLE_PROJECT=x",
-		"GH_HOST=x", "GITLAB_HOST=x", "NPM_TOKEN_FILE=x", "CODEMELD_RUN_ID=x", "PATH=/x", "HOME=/x", "TMPDIR=/x",
+		"GH_HOST=x", "GITLAB_HOST=x", "NPM_TOKEN_FILE=x", "CODEMELD_RUN_ID=x",
+		"PATH=/x", "HOME=/x", "PWD=/x", "TMPDIR=/x", "GOCACHE=/x", "SHELL=/x", "TERM=x", "LANG=x", "LC_ALL=x",
 		"DATABASE_URL=postgres://u:p@h/db", "PGURL=postgresql://u:p@/db", "MIRROR=see git+ssh://me:pw@host:22/x for it",
+		"HTTPS_PROXY=http://u:p@host",
 	} {
 		name, _, _ := strings.Cut(entry, "=")
 		inherited, withheld := InheritedEnvironment([]string{"KEEP=1", entry})
@@ -158,11 +159,28 @@ func TestInheritedEnvironment_KeepsOrdinaryEntries(t *testing.T) {
 	}
 }
 
+func TestInheritedEnvironment_KeepsFormerlyWithheldAuthorityNames(t *testing.T) {
+	environ := []string{
+		"XDG_CONFIG_HOME=/data/config", "XDG_CACHE_HOME=/c", "PYTHONPATH=/p", "PERL5LIB=/l", "LD_PRELOAD=x",
+		"GIT_AUTHOR_NAME=me", "HGUSER=me", "SSH_AUTH_SOCK=/s", "DBUS_SESSION_BUS_ADDRESS=unix:path=/b",
+		"HTTPS_PROXY=http://proxy:3128", "https_proxy=http://proxy:3128", "BASH_ENV=/e", "ENV=/e", "IFS= ",
+		"SHELLOPTS=x", "NODE_OPTIONS=x", "DOCKER_HOST=unix:///d", "RIPGREP_CONFIG_PATH=/r",
+	}
+	inherited, withheld := InheritedEnvironment(environ)
+	if !slices.Equal(inherited, environ) || withheld != nil {
+		t.Fatalf("inherited = %q, withheld = %q; want every entry inherited and none withheld", inherited, withheld)
+	}
+	if _, err := FixedEnvironment("/h", "/p", "/t", FixedPATH, []string{"XDG_CACHE_HOME=x"}); !isAssignmentError(err) {
+		t.Fatalf("assignment XDG_CACHE_HOME=x: err = %v, want *EnvAssignmentError", err)
+	}
+}
+
 func TestInheritedEnvironment_SortsWithheldAndDedupesLastWins(t *testing.T) {
 	inherited, withheld := InheritedEnvironment([]string{
 		"ZED_TOKEN=x", "A=1", "noequals", "=empty", "LD_PRELOAD=x", "A=2", "B=1", "B=postgres://u:p@h/db", "C=postgres://u:p@h/db", "C=3",
+		"LD_PRELOAD=y", "PATH=/a", "PATH=/b",
 	})
-	if !slices.Equal(inherited, []string{"A=2", "C=3"}) || !slices.Equal(withheld, []string{"B", "LD_PRELOAD", "ZED_TOKEN"}) {
+	if !slices.Equal(inherited, []string{"A=2", "LD_PRELOAD=y", "C=3"}) || !slices.Equal(withheld, []string{"B", "PATH", "ZED_TOKEN"}) {
 		t.Fatalf("inherited = %q, withheld = %q", inherited, withheld)
 	}
 }

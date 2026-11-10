@@ -407,3 +407,53 @@ func TestPersistLocal_AbsentFileNoOpRemovalIsNotACreation(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateLocalSettingsBytes_AcceptsDomainGrants(t *testing.T) {
+	content := "domain_grants:\n  - host: example.com\n    port: 443\n"
+	path := filepath.Join(t.TempDir(), "settings.local.yaml")
+	raw, cat, err := ValidateLocalSettingsBytes([]byte(content), path)
+	if cat != LoadOK || err != nil {
+		t.Fatalf("cat = %q, err = %v; want LoadOK and nil", cat, err)
+	}
+	if _, ok := raw["domain_grants"]; !ok {
+		t.Fatalf("raw = %v, want domain_grants preserved", raw)
+	}
+}
+
+func TestValidateSettingsBytes_RejectsMisshapedDomainGrantsInEveryLayer(t *testing.T) {
+	validators := []struct {
+		name     string
+		validate func([]byte, string) (map[string]any, LoadFailure, error)
+	}{
+		{"global", ValidateGlobalSettingsBytes},
+		{"project", ValidateProjectSettingsBytes},
+		{"local", ValidateLocalSettingsBytes},
+	}
+	contents := map[string]string{
+		"non-list value":   "domain_grants:\n  host: example.com\n  port: 443\n",
+		"non-object entry": "domain_grants: [\"example.com:443\"]\n",
+		"missing host":     "domain_grants:\n  - port: 443\n",
+		"missing port":     "domain_grants:\n  - host: example.com\n",
+		"non-string host":  "domain_grants:\n  - host: 3\n    port: 443\n",
+		"empty host":       "domain_grants:\n  - host: \"\"\n    port: 443\n",
+		"extra field":      "domain_grants:\n  - host: example.com\n    port: 443\n    scheme: https\n",
+		"string port":      "domain_grants:\n  - host: example.com\n    port: \"443\"\n",
+		"fractional port":  "domain_grants:\n  - host: example.com\n    port: 443.5\n",
+		"port 0":           "domain_grants:\n  - host: example.com\n    port: 0\n",
+		"port 65536":       "domain_grants:\n  - host: example.com\n    port: 65536\n",
+	}
+	for _, v := range validators {
+		for name, content := range contents {
+			t.Run(v.name+" "+name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "settings.yaml")
+				raw, cat, err := v.validate([]byte(content), path)
+				if cat != SchemaValidationError {
+					t.Fatalf("cat = %q, err = %v; want %q", cat, err, SchemaValidationError)
+				}
+				if err == nil || raw != nil {
+					t.Fatalf("raw = %v, err = %v; want a rejection with no settings", raw, err)
+				}
+			})
+		}
+	}
+}

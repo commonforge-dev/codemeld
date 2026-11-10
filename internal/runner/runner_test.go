@@ -42,6 +42,7 @@ const (
 	helperBlock     = "CODEMELD_RUNNER_BLOCK"      // when "1", block forever without reading or writing
 	helperTouch     = "CODEMELD_RUNNER_TOUCH"
 	helperDumpEnv   = "CODEMELD_RUNNER_DUMP_ENV" // when "1", write every environment entry to stderr, one per line
+	helperChannel   = "CODEMELD_RUNNER_CHANNEL"
 )
 
 func TestMain(m *testing.M) {
@@ -54,6 +55,12 @@ func TestMain(m *testing.M) {
 // runHelper emits the configured stdout/stderr and exits with the configured code, then never
 // returns. It is reached only in the re-exec'd child process.
 func runHelper() {
+	if os.Getenv(helperChannel) == "1" {
+		b := make([]byte, 1)
+		if n, _ := os.NewFile(3, "channel").Read(b); n != 1 || b[0] != 'R' {
+			os.Exit(97)
+		}
+	}
 	if s := os.Getenv(helperStdout); s != "" {
 		_, _ = os.Stdout.WriteString(s)
 	}

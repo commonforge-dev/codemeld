@@ -15,9 +15,9 @@ checks. Switch with `/mode <plan|build|auto-edits>` or shift+tab.
 
 | Mode | Reads | Changes through codemeld's own tools | Shell commands |
 |---|---|---|---|
-| **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (your files are never changed and network fails; commands may write a private temp folder that is deleted when the session ends); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
+| **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (your files are never changed and network goes only through codemeld's [proxy](#sandboxed-network), approved per destination; commands may write a private temp folder; cleanup is attempted, but the folder may remain); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
 | **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Never sandboxed; asked unless read-only or already approved |
-| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking unless recognized as network access, or while a settings file is broken; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
+| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking, except while a settings file is broken; network goes only through codemeld's [proxy](#sandboxed-network), approved per destination; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
 
 - Auto edits approves only a target that is inside the project after symlinks are resolved, apart
   from the declared folders in [Writing outside the project](#writing-outside-the-project). A move
@@ -44,14 +44,17 @@ When codemeld asks, you choose one of:
   tool in the same folder, or the same command in the same folder. A delete or a move that reaches
   this prompt, and a command Auto edits flags as exceptional (below), are asked every time.
 - **Allow for this session**: kept in memory until codemeld exits; no settings file is written.
-- **Allow in this folder permanently** (*allow in this project* for web access): saved to the
-  project's `.codemeld/settings.local.yaml`. Not offered in an unapproved project.
-- **Allow globally**: saved to `~/.codemeld/global/settings.yaml` and used in every folder. Not
-  offered for web access or in a headless run.
+- **Allow in this folder permanently** (*allow in this project* for web and network access): saved
+  to the project's `.codemeld/settings.local.yaml`. Not offered in an unapproved project.
+- **Allow globally** (*allow everywhere — global settings* for network access): saved to
+  `~/.codemeld/global/settings.yaml` and used in every folder. Not offered for web access or in a
+  headless run.
 - **Deny**: nothing runs and no approval is saved. The denial is recorded in the session and shown
   to you, and the turn stops after that round, so the model gets no further round to try another
   way. Within that round the same request is denied without asking, except the requests that Allow
   once asks every time and a web request on a non-default scheme or port, which are asked again.
+  Deny at the sandboxed network prompt is different: it refuses only that connection
+  ([Sandboxed network](#sandboxed-network)).
   A refusal by a mode, by the protection of codemeld's settings files and blocked paths, or because
   nobody can approve is different: the model sees it in the next round and may continue another
   way. A file change outside a declared file scope starts as a refusal like yours. The scope comes
@@ -201,9 +204,12 @@ piece and needs an approval of the whole command (a simple compound, bare or in 
 can be approved stage by stage, see [Approving a request](#approving-a-request)), except with the
 sandbox in Auto edits and
 valid settings. There,
-every command codemeld accepts runs in the sandbox without asking unless one of its stages is
-recognized as network access (`SandboxedAutoEditsAuthority`,
-`internal/permissions/exceptional.go`). To find those stages codemeld splits the command itself,
+every command codemeld accepts runs in the sandbox without asking, and its network access is decided
+per destination by the [proxy](#sandboxed-network), never by the program's name. While a settings
+file is broken, every sandboxed command asks, and a command with a stage that deletes files,
+rewrites history or names a network program (such as `curl` or `git push`) is asked with allow once
+or deny only (`ClassifyExceptional`, `internal/permissions/exceptional.go`). To find those stages
+codemeld splits the command itself,
 after removing redirections to a fixed file name (one with no `$`, backtick, `~` or wildcard), and
 judges each stage that is a plain command, a plain command after leading `VAR=value` assignments
 whose values have no `$`, backtick, `~` or wildcard (judged by the program after them), or one of
@@ -214,21 +220,21 @@ these shell and wrapper forms:
   no `$`, `~` or wildcard.
 - `bash -c '<body>'` or `sh -c '<body>'`, also with other options (`bash -ec`, `sh -lc`), anywhere
   in a chain: the body goes through the same redirection removal and checks, is split, and each of
-  its stages is judged by these rules, so `bash -c 'git push'` asks for network access. The body
+  its stages is judged by these rules, so `bash -c 'git push'` is judged as `git push`. The body
   and the words after it must not expand when the outer command is read (`bash -c "$X"` is not
   split).
 - `command`, `nice`, `nohup`, `time` and `xargs` are judged by the command they run, so
-  `nice git push`, `time curl x` and `xargs git push` ask as `git push` and `curl x` would. Each
+  `nice git push`, `time curl x` and `xargs git push` are judged as `git push` and `curl x`. Each
   accepts only its own option list (`wrapperOptionArgs`, `xargsOptionArgs`) and `--`. `xargs` with
   no command runs `echo`. Up to three wrappers may be nested; a fourth is not split.
 - `command -v`, `command -V` and `type` (optionally with `-a`, `-f`, `-p`, `-P` or `-t`) followed
   by one or more names only print where each name resolves. `command -v` may also have one `--`
   before the names (`command -v -- jq`); `command -V` and `type` may not (`lookupWrapperStage`).
 
-Every stage is checked, so a deletion or history rewrite anywhere in the chain does not hide
-network access: `rm x; curl y` and `git push origin rebase` ask for network access. File deletion
-(`rm`, `git clean`, `find . -delete`) and history rewrites (`git rebase main`,
-`rm x && git rebase main`, `rm x | hg strip .`) run without asking. A command codemeld cannot
+Every stage is checked, so one kind of stage does not hide another: `rm x; curl y` is judged as
+both a deletion and `curl`. With valid settings, file deletion (`rm`, `git clean`,
+`find . -delete`), history rewrites (`git rebase main`, `rm x && git rebase main`,
+`rm x | hg strip .`) and network programs run without asking. A command codemeld cannot
 split also runs in the sandbox without asking, as an unrecognized script does. That covers a
 program name holding a `$` (`$X -rf .`), `env` with assignments or
 `-i`, assignments before `env`, `bash`, `sh` or a wrapper, a `-c` body holding another `bash -c` or
@@ -237,8 +243,9 @@ program name holding a `$` (`$X -rf .`), `env` with assignments or
 word or option value that expands (`bash -$FLAGS`, `xargs -n $N`), a wrapper option outside its
 list (`xargs --unknown`), `exec`, `eval`, `source`, `.`, `builtin`, control words such as `if`,
 and a `$(...)`, backtick or newline inside a quoted `-c` body. In the command itself, an unquoted
-`$(...)`, a backtick or a newline is refused outright before anything is asked (`SplitCommand`,
-`internal/permissions/pipeline.go`).
+`$(...)`, a backtick or a newline is refused outright before anything is asked when the command runs
+outside the sandbox (`SplitCommand`, `internal/permissions/pipeline.go`); a sandboxed Plan or Auto
+edits command containing one is passed to the shell as written.
 
 Text a shell reads from standard input or a script file, and arguments `xargs` reads while it runs,
 are not inspected: `echo 'rm -rf x' | bash` runs in the sandbox without asking, as `bash x.sh`
@@ -246,7 +253,7 @@ does.
 
 A here-string that passes the read-only check's word rules above, and a bare `env`, are split like
 any other stage: `jq -n 'input' <<< '1'` and `env | grep -i shell` run without asking, while
-`curl x <<< y` still asks for network access (`classifierStages`,
+`curl x <<< y` is judged as `curl` (`classifierStages`,
 `internal/permissions/exceptional.go`). A command that has such a here-string and also any `bash`
 or `sh` stage without `-c` is not split, wherever that stage sits: after a pipe
 (`cat <<< 'rm x' | sh`), in a visible `-c` body (`bash -c 'sh' <<< 'rm x'`), or in an unrelated
@@ -260,11 +267,17 @@ judges and runs the rest of the command with that folder as its scope.
 
 **The Linux sandbox.** On a Linux amd64 or arm64 host that passes codemeld's startup self-test,
 Plan and Auto edits commands run inside a sandbox, and the sandbox, not a prompt, is what allows
-them. Plan commands never change your files and cannot reach the network. They may write only
-`/dev/null` and a private temp folder for the session (their `TMPDIR`, which also holds Go's build cache), deleted
-when the session ends, so temporary build and test files work while project outputs, module
+them. Plan commands never change your files and reach the network only through codemeld's
+[proxy](#sandboxed-network). They may write only
+`/dev/null` and a private temp folder for the session (their `TMPDIR`, which also holds Go's build cache), so
+temporary build and test files work while project outputs, module
 downloads and `go.mod`/`go.sum` updates still fail. If that folder is moved or replaced during the
-session, Plan commands run without it and print a line saying so. Auto edits commands may write the
+session, Plan commands run without it and print a line saying so. A headless run attempts to remove
+that folder when it returns and reports a failure; a normal interactive exit, even a clean `/exit`,
+skips that cleanup, so the folder can remain. The next Linux launch attempts to remove a recorded
+folder whose process is gone only when the recorded device, inode and birth time prove codemeld
+created it, and reports a failure or a folder it cannot prove; a missing record or birth time, a
+mismatch or a failed removal leaves the folder behind. Auto edits commands may write the
 project (except its `.codemeld` folder), a private temp folder for the session, and the folders
 listed in `writable_folders`. Each command reads that list when it starts, so a folder added or
 removed mid-session applies from the next command without a restart; a command already running
@@ -303,22 +316,36 @@ own commands keep write access to the stores (`storesWritable` on the runner
 Sandboxed commands get the environment codemeld was started with, so a tool that finds its files
 through a variable, such as mise with `MISE_DATA_DIR`, keeps working. codemeld reads it once, at
 startup (`StartTUI`, `HeadlessDriver.Run`), and withholds three kinds of entries (`runner.InheritedEnvironment` in
-`internal/runner/childenv.go`): names that change how programs load or what they connect to
-(`LD_*`, `GIT_*`, `HG*`, `SSH_*`, `DBUS_*`, `XDG_*`, `*_PROXY`, `BASH_ENV`, `DOCKER_HOST`, and
-others), secret-looking names (containing `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY`, `COOKIE` and
-similar, ending in `_KEY`, `_PASS` or `_PW`, or starting with `AWS_`, `GITHUB_`, `CODEMELD_` and
-similar), and values holding a URL with a username and password (`scheme://user:password@`).
-`PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` and `LC_ALL` always come from
-codemeld's fixed table, and a command's own `VAR=value` assignment replaces an inherited value
-(`confinement.prepare`). When each command is prepared in Plan or Auto edits, an inherited value that
+`internal/runner/childenv.go`): the fixed-table names `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`,
+`SHELL`, `TERM`, `LANG` and `LC_ALL`, secret-looking names (containing `TOKEN`, `SECRET`,
+`PASSWORD`, `API_KEY`, `COOKIE` and similar, ending in `_KEY`, `_PASS` or `_PW`, or starting with
+`AWS_`, `GITHUB_`, `CODEMELD_` and similar), and values holding a URL with a username and password
+(`scheme://user:password@`). Every other name is inherited, including ones that change how programs
+load or what they connect to, such as `LD_PRELOAD`, `PYTHONPATH`, `XDG_CONFIG_HOME` and
+`SSH_AUTH_SOCK`. The proxy variables are the exception: on the proxy route codemeld sets
+`HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy` and `http_proxy` to its session proxy and `NO_PROXY` and
+`no_proxy` to `localhost,127.0.0.1,::1`, replacing inherited values, and drops inherited
+`ALL_PROXY` and `all_proxy` (`confinement.prepare`). A `VAR=value` assignment to such a name is
+refused when codemeld parses it from the command (`runner.FixedEnvironment`); an assignment inside
+text the shell runs as written, such as a sandboxed command with `$(...)`, an `sh -c` body or a
+script, is not inspected. The fixed-table names always come from codemeld's fixed table, an
+allowed assignment replaces an inherited value, and the `GIT_CONFIG_GLOBAL=/dev/null` override
+described above replaces an inherited `GIT_CONFIG_GLOBAL` (`confinement.prepare`). When each command is prepared in Plan or Auto edits, an inherited value that
 names the same folder as codemeld's own temp folder (`os.TempDir()`, after resolving symlinks and a
-relative value against the command's working folder) becomes the session temp folder, since the
-sandbox never lets the command write codemeld's temp folder; a subfolder, a path list or a value that
+relative value against the command's working folder) becomes the session temp folder. The sandbox
+gives codemeld's temp folder no automatic write grant. In Plan, project entries and
+`writable_folders` grant no write access: commands may write `/dev/null` and the private session temp
+folder while its identity check succeeds, but not the temp folder it sits in. In Auto edits,
+codemeld's temp folder is writable only when an effective declared `writable_folders` entry or a
+granted top-level project entry covers it, subject to the blocked and no-write paths; declared
+folders grant nothing while settings are degraded (`confinement.policy`). The rewrite applies in both
+modes either way. A subfolder, a path list or a value that
 does not resolve keeps its inherited value (`namesFolder` in `internal/bootstrap/confinedrunner.go`).
 Name matching cannot catch every secret: one stored under an unusual name, such as `MYAPP_PW2`,
 reaches sandboxed commands. A sandboxed command cannot open a network
 connection itself, but such a secret can still leave through the command's output (which reaches
-the transcript and the model provider), through a network command you approve, or through a
+the transcript and the model provider), through a destination you approve at the proxy or in
+`domain_grants`, or through a
 program outside the sandbox that watches a folder the command can write. Build mode runs approved
 commands with codemeld's full environment (`commandEnv` in `internal/runner/descendants_linux.go`).
 When the launch self-test passed, the `execution_capability` record written when codemeld starts
@@ -330,19 +357,62 @@ that any command ran sandboxed. The records written by an in-process `/clear`, `
 compact do not repeat it, because those do not take a new snapshot of the process environment;
 for those, read the record written when that codemeld process started.
 
-In Auto edits with valid settings, a sandboxed command that codemeld recognizes as network access
-(such as `curl`, `git push`) still asks, with allow once or deny only, and runs inside the sandbox
-when approved; only an approved network command runs with network access (`confinement.policy`,
-`internal/bootstrap/confinedrunner.go`). A saved approval never answers it (`resolveWithoutPrompt`,
-`internal/permissions/orchestrate.go`). Every other command runs in the sandbox without asking
+In Auto edits with valid settings, every sandboxed command runs without asking
 (`autoEditsPosture`): file deletion such as `rm`, a history rewrite such as `git reset --hard` or
 `hg strip`, a command codemeld cannot split, and a script or program it does not recognize, so any
 of them can delete or rewrite files inside the writable folders. Version control brings back
 committed content only: a deleted file loses its uncommitted edits, and an untracked or ignored
 file is gone, the same loss an overwrite causes. If a settings
-file breaks after the self-test passed, every sandboxed command asks until it is fixed, and a
-recognized file deletion or history rewrite is again asked with allow once or deny only
-(`exceptionalAuthority`, `internal/bootstrap/promptgate.go`).
+file breaks after the self-test passed, every sandboxed command asks until it is fixed, and a file
+deletion, history rewrite or network program is asked with allow once or deny only
+(`exceptionalAuthority`, `internal/bootstrap/promptgate.go`). An approved command still reaches the
+network only through the proxy.
+
+<a id="sandboxed-network"></a>**Sandboxed network.** A sandboxed Plan or Auto edits command reaches
+the network only through codemeld's session proxy, whatever the program's name: `curl`, `git fetch`
+over HTTPS, `go mod download` and an unknown script are treated alike. The proxy decides each
+destination, a host and port, on its own. It admits one that this session already approved or that a
+saved grant covers, and otherwise asks:
+
+- **allow this once**: this connection; the next one to that host and port asks again.
+- **allow for this session**: this host and port until codemeld exits.
+- **allow in this project**: saves the host and port in the project's
+  `.codemeld/settings.local.yaml`. Offered only in an approved project.
+- **allow everywhere — global settings**: saves the host and port in
+  `~/.codemeld/global/settings.yaml` for every project. Offered only in the terminal UI.
+- **deny**: refuses this connection only. Unlike Deny at other prompts, it is not recorded in the
+  session and the turn goes on: the command sees the refusal, and the model may try something else,
+  which asks again.
+
+The proxy connects only to public internet addresses that are not this machine's own, even for an
+approved or saved destination; loopback and local-network addresses are refused. When a command
+fails, its output ends with a `codemeld: network refused: <host>:<port> (<reason>)` line for each
+destination the proxy refused, as many as fit the output limit, then a count of any left out if that
+fits too, then codemeld's general note about the sandbox (`confinedFailureOf`,
+`internal/bootstrap/confinedrunner.go`). Only tools that use `HTTPS_PROXY` or `HTTP_PROXY`, or are
+set up to tunnel through an HTTP proxy, get network: ordinary SSH does not go through the proxy, so a
+sandboxed `ssh`, `scp` or SSH-URL `git` connection fails; use Build mode for it. An SSH client set up
+to tunnel through an HTTP proxy, for example with a `ProxyCommand`, can reach an approved host and
+port. When the proxy refused nothing and there is room, the
+failure note says this instead of listing destinations. If the launch self-test's network check does not pass, sandboxed commands get no network at
+all. File deletion and history-rewrite rules are not changed by any of this. Build mode and hosts
+without the sandbox do not use the proxy: an allowed command there has your account's full network
+access.
+
+Saved grants are the `domain_grants` key, a list of exact host and port pairs:
+
+```yaml
+domain_grants:
+  - host: api.example.com
+    port: 443
+```
+
+codemeld reads it from `~/.codemeld/global/settings.yaml` and the project's
+`.codemeld/settings.local.yaml`, and ignores it in the committed `.codemeld/settings.yaml`, so a
+repository cannot grant itself a destination. There are no wildcards and no default port. To revoke a
+saved grant, delete its entry from the file. Grants are read once when the session starts: an entry
+added or removed by hand takes effect in the next session, and removing one does not undo this
+session's copy or an approval already given for the session.
 
 **Without the sandbox** (Build mode, or a host where the self-test did not pass) a command runs with
 your account's full authority once it is allowed. Plan refuses every command that is not proven
@@ -385,7 +455,11 @@ denial stays, and any failure or pause note is added to its reason
 
 - `--prompt-for-approval` asks on the terminal instead of denying. It needs a terminal on stdin and
   exits before starting without one. Its choices are allow once, deny, allow for this session, and
-  allow in this project (offered only for an approved project). It never offers a global approval.
+  allow in this project (offered only for an approved project), for tool, web and
+  [network](#sandboxed-network) prompts alike. It never offers a global approval, so the network
+  prompt's *allow everywhere* is terminal-UI only.
+- Without `--prompt-for-approval`, a sandboxed command's connection to a destination that no saved
+  grant or session approval covers is refused.
 - `--files-authorized <path>` and `--files-authorized-delete <path>` (repeat each once per path)
   name the only files the run may create or edit, and delete. With either flag set, nothing else
   can approve a file change, not a saved approval, a mode, or a prompt; making a folder or moving a

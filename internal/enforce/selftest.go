@@ -115,6 +115,7 @@ var (
 	helperExecutable  = "/proc/self/exe"
 	selfTestTimeout   = 5 * time.Second
 	startHelper       = startHelperProcess
+	sliceSelfTest     = runSliceSelfTest
 	writeArm32Fixture func(root string) (string, error)
 )
 

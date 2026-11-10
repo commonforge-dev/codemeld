@@ -2,7 +2,10 @@
 // matching for the permission system.
 package permissions
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // compoundSubjectPrefix is the sentinel + version that marks a literal grant subject as the
 // generalized compound form rather than a byte-exact literal command. It is the first whitespace
@@ -16,6 +19,8 @@ import "strings"
 // friction, never to a silent widening.
 const compoundSubjectPrefix = "compound/v1"
 
+const compoundHomeSubjectPrefix = "compound/v2"
+
 // SimpleCompound is the ordered decomposition of a recognized simple compound command: its inner
 // direct-command stages with their pinned operator structure. Wrapped reports the single accepted
 // wrapper flavour, `sh -c '<compound>'`, as opposed to a bare simple compound; the two never
@@ -27,12 +32,16 @@ type SimpleCompound struct {
 	Wrapped   bool
 	Stages    [][]string
 	Operators []string
+	// homeExpands is set only by RecognizeSimpleCompoundForGrant once the shell expansion-free check
+	// has passed, so a hand-built value never carries home-form state.
+	homeExpands  [][]bool
+	provenStages [][]string
 }
 
 // decodedCompound is the parsed form of a stored generalized compound subject: the same pinned
 // structure as SimpleCompound but with each stage held as its stored direct-subject string (the
 // Exact / Subcommand / Program scope form, e.g. `go build :*`) rather than request tokens, because
-// a grant stage matches a request stage through MatchesDirectSubject.
+// a grant stage matches a request stage through matchesDirectSubject.
 type decodedCompound struct {
 	wrapped       bool
 	stageSubjects []string
@@ -43,7 +52,12 @@ type decodedCompound struct {
 // discriminator is the sentinel prefix as a whole first token; full structural validity is decided
 // by decodeCompoundSubject, which fails closed.
 func isCompoundSubject(subject string) bool {
-	return subject == compoundSubjectPrefix || strings.HasPrefix(subject, compoundSubjectPrefix+" ")
+	for _, prefix := range []string{compoundSubjectPrefix, compoundHomeSubjectPrefix} {
+		if subject == prefix || strings.HasPrefix(subject, prefix+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 // RecognizeSimpleCompound decomposes a canonical literal command into its ordered direct-command
@@ -79,6 +93,11 @@ func RecognizeSimpleCompoundForGrant(canonical string) (SimpleCompound, bool) {
 	if !ok {
 		return SimpleCompound{}, false
 	}
+	// The outer shell evaluates the `sh -c` argument before the inner stages are parsed; stripping
+	// re-quotes a wrapped body, so both spellings carry the wrapper boundary.
+	if !wrapperArgumentExpansionFree(canonical) || !wrapperArgumentExpansionFree(stripped) {
+		return SimpleCompound{}, false
+	}
 	wrapped, norms, _, ok := SimpleCompoundStages(stripped)
 	if !ok {
 		return SimpleCompound{}, false
@@ -88,7 +107,68 @@ func RecognizeSimpleCompoundForGrant(canonical string) (SimpleCompound, bool) {
 	if (wrapped || removed) && !stagesExpansionFree(norms) {
 		return SimpleCompound{}, false
 	}
-	return RecognizeSimpleCompound(stripped)
+	sc, ok := RecognizeSimpleCompound(stripped)
+	if ok && (wrapped || removed) {
+		sc.homeExpands = literalHomeState(sc.Stages)
+		if sc.homeExpands != nil {
+			sc.provenStages = make([][]string, len(sc.Stages))
+			for i, stage := range sc.Stages {
+				sc.provenStages[i] = slices.Clone(stage)
+			}
+		}
+	}
+	return sc, ok
+}
+
+func wrapperArgumentExpansionFree(command string) bool {
+	toks, err := tokenizeShell(command)
+	if err != nil {
+		return false
+	}
+	if len(toks) != 3 || toks[0].Value != "sh" || toks[0].Quoted || toks[1].Value != "-c" {
+		return true
+	}
+	return tokenExpansionFree(toks[2].Raw)
+}
+
+func literalHomeState(stages [][]string) [][]bool {
+	if !slices.ContainsFunc(stages, func(stage []string) bool { return len(homePositions(stage)) > 0 }) {
+		return nil
+	}
+	state := make([][]bool, len(stages))
+	for i, stage := range stages {
+		state[i] = make([]bool, len(stage))
+	}
+	return state
+}
+
+// The expansion-free check proves every token runs literally, so recorded expanding state contradicts
+// the proof.
+func (sc SimpleCompound) provenHomeExpands(stage int) ([]bool, bool) {
+	if len(sc.homeExpands) != len(sc.Stages) || len(sc.provenStages) != len(sc.Stages) ||
+		!slices.Equal(sc.provenStages[stage], sc.Stages[stage]) ||
+		len(sc.homeExpands[stage]) != len(sc.Stages[stage]) || slices.Contains(sc.homeExpands[stage], true) {
+		return nil, false
+	}
+	return sc.homeExpands[stage], true
+}
+
+func CompoundStageScopeSubject(sc SimpleCompound, stageIndex int, scope string) (string, error) {
+	if stageIndex < 0 || stageIndex >= len(sc.Stages) {
+		return "", errCompound("stage position out of range")
+	}
+	stage := sc.Stages[stageIndex]
+	if canon, ok := canonicalStageSubject(scope); !ok || canon != scope || !matchesDirectScope(stage, scope) {
+		return "", errCompound("scope does not cover the recognized stage")
+	}
+	if len(homePositions(scopePinnedTokens(scope))) == 0 {
+		return scope, nil
+	}
+	expands, ok := sc.provenHomeExpands(stageIndex)
+	if !ok {
+		return "", errCompound("no shell-literal proof for the pinned home-form argument")
+	}
+	return wrapHomeState(scope, stage, expands)
 }
 
 // An ineligible redirect is left in place rather than rejected here, so the caller's decomposition
@@ -233,8 +313,12 @@ func EncodeCompoundSubject(wrapped bool, stageSubjects, operators []string) (str
 		return "", errCompound("operator count does not match stage count")
 	}
 
+	prefix := compoundSubjectPrefix
+	if slices.ContainsFunc(stageSubjects, isDirectHomeSubject) {
+		prefix = compoundHomeSubjectPrefix
+	}
 	var b strings.Builder
-	b.WriteString(compoundSubjectPrefix)
+	b.WriteString(prefix)
 	b.WriteByte(' ')
 	if wrapped {
 		b.WriteByte('W')
@@ -246,6 +330,9 @@ func EncodeCompoundSubject(wrapped bool, stageSubjects, operators []string) (str
 	}
 	for i, ss := range stageSubjects {
 		canon, ok := canonicalStageSubject(ss)
+		if isDirectHomeSubject(ss) {
+			canon, ok = ShellQuote(ss), true
+		}
 		if !ok {
 			return "", errCompound("stage is not a valid direct subject")
 		}
@@ -280,8 +367,12 @@ func EncodeCompoundSubject(wrapped bool, stageSubjects, operators []string) (str
 // stage whose program IsDestructiveProgram flags.
 func decodeCompoundSubject(encoded string) (decodedCompound, error) {
 	rest, ok := strings.CutPrefix(encoded, compoundSubjectPrefix+" ")
+	homeForm := false
 	if !ok {
-		return decodedCompound{}, errCompound("missing compound subject prefix")
+		rest, homeForm = strings.CutPrefix(encoded, compoundHomeSubjectPrefix+" ")
+		if !homeForm {
+			return decodedCompound{}, errCompound("missing compound subject prefix")
+		}
 	}
 
 	var wrapped bool
@@ -308,8 +399,24 @@ func decodeCompoundSubject(encoded string) (decodedCompound, error) {
 	}
 
 	stageSubjects := make([]string, 0, len(rawStages))
-	for _, raw := range rawStages {
-		ss := strings.TrimSpace(raw)
+	homeStages := 0
+	var rebuilt strings.Builder
+	rebuilt.WriteString(encoded[:len(encoded)-len(rest)-1])
+	for i, raw := range rawStages {
+		stored := strings.TrimSpace(raw)
+		if i > 0 {
+			rebuilt.WriteString(" " + operators[i-1])
+		}
+		rebuilt.WriteString(" " + stored)
+		ss := stored
+		if homeForm {
+			if stored, ss, err = decodeCompoundHomeStage(ss); err != nil {
+				return decodedCompound{}, err
+			}
+			if stored != ss {
+				homeStages++
+			}
+		}
 		// A stored stage subject must already be in its one canonical spelling — the same form the
 		// encoder emits — so a hand-authored non-canonical or ambiguous stage is rejected rather than
 		// silently re-spelled. This is also the load/match check that keeps the decoder and encoder
@@ -325,9 +432,61 @@ func decodeCompoundSubject(encoded string) (decodedCompound, error) {
 		if IsDestructiveProgram(prog) {
 			return decodedCompound{}, errCompound("destructive program is ineligible for widening")
 		}
-		stageSubjects = append(stageSubjects, ss)
+		stageSubjects = append(stageSubjects, stored)
+	}
+	if homeForm && homeStages == 0 {
+		return decodedCompound{}, errCompound("compound/v2 subject records no home state")
+	}
+	if homeForm && rebuilt.String() != encoded {
+		return decodedCompound{}, errCompound("compound/v2 subject is not in its canonical spelling")
 	}
 	return decodedCompound{wrapped: wrapped, stageSubjects: stageSubjects, operators: operators}, nil
+}
+
+func decodeCompoundHomeStage(stage string) (stored, scope string, err error) {
+	toks, err := tokenizeShell(stage)
+	if err != nil || len(toks) == 0 {
+		return "", "", errCompound("stage is not a valid direct subject")
+	}
+	if len(toks) == 1 && isVersionedDirectSubject(toks[0].Value) {
+		envelope := toks[0].Value
+		if ShellQuote(envelope) != stage {
+			return "", "", errCompound("home-state stage is not canonical")
+		}
+		h, err := decodeDirectHomeSubject(envelope)
+		if err != nil {
+			return "", "", err
+		}
+		return envelope, h.Subject, nil
+	}
+	if len(homePositions(scopePinnedTokens(stage))) > 0 {
+		return "", "", errCompound("pinned home-form argument has no recorded state")
+	}
+	return stage, stage, nil
+}
+
+func CompoundSubjectReadable(subject string) (string, bool) {
+	if !strings.HasPrefix(subject, compoundHomeSubjectPrefix+" ") {
+		return "", false
+	}
+	d, err := decodeCompoundSubject(subject)
+	if err != nil {
+		return "", false
+	}
+	var parts []string
+	if d.wrapped {
+		parts = append(parts, "sh -c:")
+	}
+	for i, ss := range d.stageSubjects {
+		if i > 0 {
+			parts = append(parts, d.operators[i-1])
+		}
+		if readable, ok := DirectHomeSubjectReadable(ss); ok {
+			ss = readable
+		}
+		parts = append(parts, ss)
+	}
+	return strings.Join(parts, " "), true
 }
 
 // matchesCompoundSubject reports whether a request command matches a stored generalized compound
@@ -364,7 +523,8 @@ func matchesCompoundSubject(requestCanonical, grantSubject string) bool {
 	for i := range req.Stages {
 		// RecognizeSimpleCompound refuses an assignment-bearing or environment-clearing
 		// stage, so a compound request never carries either to match.
-		if !MatchesDirectSubject(req.Stages[i], nil, false, grant.stageSubjects[i]) {
+		expands, _ := req.provenHomeExpands(i)
+		if !matchesDirectSubject(req.Stages[i], nil, false, expands, grant.stageSubjects[i]) {
 			return false
 		}
 	}

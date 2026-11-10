@@ -259,6 +259,41 @@ func TestRenderPermissionEntry_HomeStateDirectGrants(t *testing.T) {
 	}
 }
 
+func TestRenderPermissionEntry_HomeStateCompoundGrants(t *testing.T) {
+	literalTilde := permissions.ShellQuote(homeStateEnvelope(t, "cat '~/f'", []int{}, []int{1}))
+	cases := []struct {
+		name, subject, want string
+	}{
+		{name: "wrapped literal home pin", subject: "compound/v2 W " + literalTilde + " ; echo done", want: "run sh -c: cat '~/f' ; echo done"},
+		{
+			name:    "bare chain with a pinned prefix in a later stage",
+			subject: "compound/v2 B go build ./... && " + permissions.ShellQuote(homeStateEnvelope(t, "cat '$HOME' :*", []int{}, []int{1})),
+			want:    "run go build ./... && cat '$HOME' :*",
+		},
+		{
+			name:    "stored expanding state",
+			subject: "compound/v2 W " + permissions.ShellQuote(homeStateEnvelope(t, "cat '~/f'", []int{1}, []int{})) + " | wc -l",
+			want:    "run sh -c: cat ~/f | wc -l",
+		},
+		{name: "legacy home pin", subject: "compound/v1 W cat '~/f' ; echo done", want: "run compound/v1 W cat '~/f' ; echo done"},
+		{name: "legacy chain", subject: "compound/v1 W cat :* ; echo done", want: "run compound/v1 W cat :* ; echo done"},
+		{name: "home form without state", subject: "compound/v2 W cat x ; echo done", want: "run compound/v2 W cat x ; echo done"},
+		{
+			name:    "envelope missing a position's state",
+			subject: "compound/v2 W " + permissions.ShellQuote(homeStateEnvelope(t, "cat '~/f'", []int{}, []int{})) + " ; echo done",
+			want:    "run compound/v2 W " + permissions.ShellQuote(homeStateEnvelope(t, "cat '~/f'", []int{}, []int{})) + " ; echo done",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := permissions.PermissionEntry{Kind: "literal", Subject: tc.subject, PathScope: "/srv/app", GrantKind: "folder"}
+			if got, want := renderPermissionEntry(e), tc.want+" — in /srv/app"; got != want {
+				t.Errorf("renderPermissionEntry() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // permissionsFixture is a mix of global and folder grants, legacy and capability subjects.
 func permissionsFixture() []permissions.PermissionEntry {
 	return []permissions.PermissionEntry{

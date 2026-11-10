@@ -251,48 +251,51 @@ func (r *shellEventRunner) Exec(ctx context.Context, spec runner.RunSpec) (runne
 }
 
 func (r *shellEventRunner) ExecBounded(ctx context.Context, spec runner.RunSpec, maxCapture int) (runner.RunResult, error) {
-	return r.execBoundedPrepared(ctx, spec, spec, maxCapture, false)
+	res, _, err := r.execBoundedPrepared(ctx, spec, spec, maxCapture, nil)
+	return res, err
 }
 
-func (r *shellEventRunner) execBoundedPrepared(ctx context.Context, original, spec runner.RunSpec, maxCapture int, confined bool) (runner.RunResult, error) {
+func (r *shellEventRunner) execBoundedPrepared(ctx context.Context, original, spec runner.RunSpec, maxCapture int, report func(runner.RunResult) *confinedFailure) (runner.RunResult, *confinedFailure, error) {
 	ctx = r.ExecutionContext(ctx)
 	inner, ok := r.inner.(runner.BoundedExecRunner)
 	if !ok {
-		return runner.RunResult{}, errors.New("bootstrap: inner runner cannot bound command output")
+		return runner.RunResult{}, nil, errors.New("bootstrap: inner runner cannot bound command output")
 	}
+	var failure *confinedFailure
 	if r.active == nil {
 		res, err := inner.ExecBounded(ctx, spec, maxCapture)
-		if err == nil && confined {
-			res = noteConfinedFailure(res, r.cap)
+		if err == nil && report != nil {
+			failure = report(res)
 		}
-		return res, err
+		return res, failure, err
 	}
 	kind, subject := shellExecSubject(original.Argv)
 	if err := events.EmitToolExecStart(r.active(), original.InvocationID, kind, subject, original.Cwd, r.childInvocationID); err != nil {
-		return runner.RunResult{}, err
+		return runner.RunResult{}, nil, err
 	}
 	res, runErr := inner.ExecBounded(ctx, spec, maxCapture)
 	if runErr != nil {
 		res = runner.RunResult{ExitCode: -1}
-	} else if confined {
-		res = noteConfinedFailure(res, r.cap)
+	} else if report != nil {
+		failure = report(res)
 	}
+	noted := noteConfinedFailure(res, r.cap, failure)
 	_, endErr := events.Append(r.active(), events.ToolExecEndFromBounded(events.BoundedToolExec{
 		InvocationID:      spec.InvocationID,
 		ChildInvocationID: r.childInvocationID,
 		SubjectKind:       kind,
 		Subject:           subject,
-		ExitCode:          res.ExitCode,
-		DurationMs:        res.Duration.Milliseconds(),
-		Stdout:            res.Stdout,
-		Stderr:            res.Stderr,
-		StdoutTotal:       res.StdoutTotal,
-		StderrTotal:       res.StderrTotal,
+		ExitCode:          noted.ExitCode,
+		DurationMs:        noted.Duration.Milliseconds(),
+		Stdout:            noted.Stdout,
+		Stderr:            noted.Stderr,
+		StdoutTotal:       noted.StdoutTotal,
+		StderrTotal:       noted.StderrTotal,
 	}, r.cap))
 	if runErr != nil || endErr != nil {
-		return runner.RunResult{}, errors.Join(runErr, endErr)
+		return runner.RunResult{}, nil, errors.Join(runErr, endErr)
 	}
-	return res, nil
+	return res, failure, nil
 }
 
 func (r *confinedShellRunner) ExecutionContext(ctx context.Context) context.Context {

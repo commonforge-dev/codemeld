@@ -5,6 +5,8 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2133,6 +2135,63 @@ func TestPromptUser_CompoundDestructiveStageExactOnly(t *testing.T) {
 	}
 	if d.StoredSubject != "" {
 		t.Fatalf("StoredSubject = %q, want empty (a compound with a destructive stage is not generalized)", d.StoredSubject)
+	}
+}
+
+func TestPromptUser_CompoundHomeLiteralStoresStateAwareSubject(t *testing.T) {
+	const command = `sh -c "mv x '~/t' && true"`
+	_, sc := recognizedLiteral(t, command)
+	a := New(nil)
+	h := startPrompt(t, a, compoundPromptRequest(sc))
+
+	h.down(2) // allow for this session
+	h.key(tcell.KeyEnter)
+	h.waitPage(promptCompoundPage)
+	h.key(tcell.KeyEnter)
+	h.key(tcell.KeyEnter)
+
+	d := h.await()
+	if d.Option != OptionAllowSession {
+		t.Fatalf("Option = %d, want OptionAllowSession (%d)", d.Option, OptionAllowSession)
+	}
+	if !strings.HasPrefix(d.StoredSubject, "compound/v2 W ") {
+		t.Fatalf("StoredSubject = %q, want the state-aware wrapped compound form", d.StoredSubject)
+	}
+	if !literalGrantMatches(t, command, d.StoredSubject) {
+		t.Fatalf("StoredSubject %q does not match its own request %q", d.StoredSubject, command)
+	}
+}
+
+func TestPromptUser_CompoundHomePinWithoutProofStoresConcreteLiteral(t *testing.T) {
+	sc := permissions.SimpleCompound{
+		Wrapped: true, Stages: [][]string{{"mv", "x", "~/t"}, {"true"}}, Operators: []string{"&&"},
+	}
+	a := New(nil)
+	h := startPrompt(t, a, compoundPromptRequest(sc))
+
+	h.down(2) // allow for this session
+	h.key(tcell.KeyEnter)
+	h.waitPage(promptCompoundPage)
+	h.key(tcell.KeyEnter)
+	h.key(tcell.KeyEnter)
+
+	d := h.await()
+	if d.Option != OptionAllowSession {
+		t.Fatalf("Option = %d, want OptionAllowSession (%d)", d.Option, OptionAllowSession)
+	}
+	if d.StoredSubject != "" {
+		t.Fatalf("StoredSubject = %q, want empty (the concrete literal fallback)", d.StoredSubject)
+	}
+}
+
+func TestFinalizeCompound_InvalidEncodingFallsBackToLiteral(t *testing.T) {
+	for _, stageSubjects := range [][]string{{"", "true"}, {"go build"}, {"go build", "rm -rf x"}} {
+		ch := make(chan PromptDecision, 1)
+		New(nil).finalizeCompound(OptionAllowFolder, permissions.SimpleCompound{Operators: []string{"&&"}}, stageSubjects, ch)
+		d := <-ch
+		if d.Option != OptionAllowFolder || d.StoredSubject != "" {
+			t.Fatalf("finalizeCompound(%q) = %+v, want the folder option with an empty stored subject", stageSubjects, d)
+		}
 	}
 }
 
@@ -4653,6 +4712,248 @@ func TestPromptFactLines_BoundsHostileNotes(t *testing.T) {
 			}
 			if !strings.HasSuffix(body, "…") || utf8.RuneCountInString(body) != 121 {
 				t.Fatalf("note row %q (%d code points) is not cut at 120 with an ellipsis", body, utf8.RuneCountInString(body))
+			}
+		})
+	}
+}
+
+type networkCall struct {
+	opt PromptOption
+	err error
+}
+
+func promptNetworkAsync(a *App, ctx context.Context, host string) chan networkCall {
+	c := make(chan networkCall, 1)
+	go func() {
+		opt, err := a.PromptNetwork(ctx, host, "443", false)
+		c <- networkCall{opt, err}
+	}()
+	return c
+}
+
+func awaitNetworkCall(t *testing.T, a *App, c chan networkCall) networkCall {
+	t.Helper()
+	select {
+	case got := <-c:
+		return got
+	case <-time.After(2 * time.Second):
+		a.app.Stop()
+		t.Fatal("PromptNetwork did not return within 2s")
+		return networkCall{}
+	}
+}
+
+func waitNetworkPrompt(t *testing.T, a *App, host string) *networkPrompt {
+	t.Helper()
+	var p *networkPrompt
+	waitOnLoop(t, a, "network prompt for "+host, func() bool {
+		if a.network != nil && a.network.host == host && a.pages.HasPage(promptBasePage) {
+			p = a.network
+		}
+		return p != nil
+	})
+	return p
+}
+
+func blockEventLoop(a *App) (release func()) {
+	entered, done := make(chan struct{}), make(chan struct{})
+	go a.app.QueueUpdate(func() {
+		close(entered)
+		<-done
+	})
+	<-entered
+	return func() { close(done) }
+}
+
+func TestPromptNetwork_WithdrawalClosesOnlyItsOwnPromptAndALateAnswerIsIgnored(t *testing.T) {
+	a := New(nil)
+	h := startPromptLoop(t, a)
+	defer func() {
+		a.app.Stop()
+		<-h.errc
+	}()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	first := promptNetworkAsync(a, ctx1, "one.example")
+	p1 := waitNetworkPrompt(t, a, "one.example")
+	cancel1()
+	if got := awaitNetworkCall(t, a, first); !errors.Is(got.err, context.Canceled) || got.opt != OptionDeny {
+		t.Fatalf("cancelled prompt = %+v, want deny with context.Canceled", got)
+	}
+	if h.hasPage(promptBasePage) {
+		t.Fatal("a cancelled network prompt returned before its overlay was withdrawn")
+	}
+
+	second := promptNetworkAsync(a, context.Background(), "two.example")
+	p2 := waitNetworkPrompt(t, a, "two.example")
+	text := screenTextSync(a, h.screen)
+	for _, want := range []string{"two.example", "443", "send data to this host", "allow this [o]nce", "allow for this [s]ession", "[d]eny"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("network prompt screen lacks %q:\n%s", want, text)
+		}
+	}
+	stillShown := false
+	a.app.QueueUpdate(func() {
+		a.answerNetworkPrompt(p1, OptionAllowSession)
+		a.withdrawNetworkPrompt(p1)
+		stillShown = a.network == p2 && a.pages.HasPage(promptBasePage)
+	})
+	if !stillShown || len(p1.answer) != 0 {
+		t.Fatalf("a stale answer or withdrawal for the first prompt changed the second: shown %v, stale answers %d", stillShown, len(p1.answer))
+	}
+	select {
+	case got := <-second:
+		t.Fatalf("the second prompt resolved %+v from the first prompt's late answer", got)
+	default:
+	}
+
+	h.typeText("s")
+	if got := awaitNetworkCall(t, a, second); got.err != nil || got.opt != OptionAllowSession {
+		t.Fatalf("second prompt = %+v, want allow for this session", got)
+	}
+	if h.hasPage(promptBasePage) {
+		t.Fatal("the answered network prompt left its overlay mounted")
+	}
+}
+
+func TestPromptNetwork_ShutdownWithAVisiblePromptReturnsWithoutADraw(t *testing.T) {
+	a := New(nil)
+	h := startPromptLoop(t, a)
+	defer func() {
+		a.app.Stop()
+		<-h.errc
+	}()
+
+	call := promptNetworkAsync(a, context.Background(), "one.example")
+	p := waitNetworkPrompt(t, a, "one.example")
+	release := blockEventLoop(a)
+	a.BeginShutdown()
+	got := awaitNetworkCall(t, a, call)
+	release()
+	if got.err == nil || got.opt != OptionDeny {
+		t.Fatalf("prompt during shutdown = %+v, want a refusal", got)
+	}
+	stillShown := false
+	a.app.QueueUpdate(func() {
+		a.answerNetworkPrompt(p, OptionAllowSession)
+		stillShown = a.network == p && a.pages.HasPage(promptBasePage)
+	})
+	if len(p.answer) != 0 || !stillShown {
+		t.Fatalf("a late answer after shutdown was delivered (%d answers) or changed the UI (prompt still shown %v)", len(p.answer), stillShown)
+	}
+	if again := awaitNetworkCall(t, a, promptNetworkAsync(a, context.Background(), "two.example")); again.err == nil {
+		t.Fatalf("a network prompt after shutdown = %+v, want a refusal", again)
+	}
+	var current *networkPrompt
+	a.app.QueueUpdate(func() { current = a.network })
+	if current != p {
+		t.Fatal("a network prompt opened after shutdown began")
+	}
+}
+
+func TestPromptNetwork_CancelBeforeTheQueuedShowRunsMountsNothing(t *testing.T) {
+	a := New(nil)
+	h := startPromptLoop(t, a)
+	defer func() {
+		a.app.Stop()
+		<-h.errc
+	}()
+
+	release := blockEventLoop(a)
+	ctx, cancel := context.WithCancel(context.Background())
+	call := promptNetworkAsync(a, ctx, "one.example")
+	select {
+	case got := <-call:
+		release()
+		t.Fatalf("PromptNetwork returned %+v before its prompt could be shown", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case got := <-call:
+		release()
+		t.Fatalf("a cancelled PromptNetwork returned %+v before its withdrawal ran on the UI", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	if got := awaitNetworkCall(t, a, call); !errors.Is(got.err, context.Canceled) || got.opt != OptionDeny {
+		t.Fatalf("cancelled prompt = %+v, want deny with context.Canceled", got)
+	}
+	mounted := true
+	a.app.QueueUpdate(func() { mounted = a.network != nil || a.pages.HasPage(promptBasePage) })
+	if mounted {
+		t.Fatal("the show queued before cancellation mounted a network prompt")
+	}
+}
+
+func TestPromptNetwork_ShutdownWithAQueuedWithdrawalReturnsWithoutTheLoop(t *testing.T) {
+	a := New(nil)
+	h := startPromptLoop(t, a)
+	defer func() {
+		a.app.Stop()
+		<-h.errc
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	call := promptNetworkAsync(a, ctx, "one.example")
+	waitNetworkPrompt(t, a, "one.example")
+	release := blockEventLoop(a)
+	cancel()
+	select {
+	case got := <-call:
+		release()
+		t.Fatalf("a cancelled PromptNetwork returned %+v before its withdrawal ran on the UI", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	a.BeginShutdown()
+	got := awaitNetworkCall(t, a, call)
+	release()
+	if !errors.Is(got.err, context.Canceled) || got.opt != OptionDeny {
+		t.Fatalf("prompt cancelled then shut down = %+v, want deny with context.Canceled", got)
+	}
+	h.waitPageGone(promptBasePage)
+	var current *networkPrompt
+	a.app.QueueUpdate(func() { current = a.network })
+	if current != nil {
+		t.Fatal("the queued withdrawal left its network prompt mounted")
+	}
+}
+
+func TestPromptNetwork_ProjectChoiceFollowsTheRunTrustAndGlobalStaysOffered(t *testing.T) {
+	for _, project := range []bool{true, false} {
+		t.Run(fmt.Sprintf("project choice %v", project), func(t *testing.T) {
+			a := New(nil)
+			h := startPromptLoop(t, a)
+			defer func() {
+				a.app.Stop()
+				<-h.errc
+			}()
+			call := make(chan networkCall, 1)
+			go func() {
+				opt, err := a.PromptNetwork(context.Background(), "one.example", "443", project)
+				call <- networkCall{opt, err}
+			}()
+			waitNetworkPrompt(t, a, "one.example")
+			text := screenTextSync(a, h.screen)
+			if got := strings.Contains(text, "allow in this [p]roject"); got != project {
+				t.Fatalf("project choice shown = %v, want %v:\n%s", got, project, text)
+			}
+			if !strings.Contains(text, "allow everywhere — [g]lobal settings") {
+				t.Fatalf("network prompt lacks the global choice:\n%s", text)
+			}
+			h.typeText("p")
+			want := OptionAllowProject
+			if !project {
+				select {
+				case got := <-call:
+					t.Fatalf("a hidden project key answered the prompt: %+v", got)
+				case <-time.After(100 * time.Millisecond):
+				}
+				h.typeText("g")
+				want = OptionAllowGlobal
+			}
+			if got := awaitNetworkCall(t, a, call); got.err != nil || got.opt != want {
+				t.Fatalf("prompt = %+v, want option %d", got, want)
 			}
 		})
 	}

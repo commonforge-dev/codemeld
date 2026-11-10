@@ -38,15 +38,25 @@ safely.
     commands, including those of the version-control tools and child agents,
     run inside a mandatory boundary with no ordinary prompt, and no setting
     turns it off. Plan never changes your files: it may write only `/dev/null`
-    and a private temp folder for the session, deleted when the session ends,
-    and has no network. Auto
+    and a private temp folder for the session, and reaches the network only
+    through codemeld's session proxy, as Auto edits does (below). A headless
+    run attempts to remove that folder when it returns and reports a failure;
+    a normal interactive exit, even a clean `/exit`, skips that cleanup, so the
+    folder can remain. The next Linux launch attempts to remove a recorded
+    folder whose process is gone only when the recorded device, inode and
+    birth time prove codemeld created it, and reports a failure or a folder it
+    cannot prove; a missing record or birth time, a mismatch or a failed
+    removal leaves the folder behind. Auto
     edits may write the project's top-level files and folders (not
     `.codemeld`), a private temp folder for the session, and each folder
-    declared in `writable_folders`. There, a command with a recognized network
-    stage asks (allow once or deny), wherever a deletion or history rewrite
-    sits in the chain; every other command runs confined without asking,
-    including file deletion such as `rm` and history rewrites such as
-    `git rebase`. Shell commands cannot write the Git or Mercurial history
+    declared in `writable_folders`. There, every command runs confined
+    without asking, including file deletion such as `rm` and history
+    rewrites such as `git rebase`. In Plan and Auto edits a command reaches
+    the network only through codemeld's session proxy, which asks per
+    destination (host and port) whatever the program's name, admits saved
+    `domain_grants`, and connects only to public addresses that are not
+    this machine's; ordinary SSH does not use it and fails, though an SSH client set up to tunnel
+    through an HTTP proxy (for example with a `ProxyCommand`) can reach an approved host and port. Shell commands cannot write the Git or Mercurial history
     store of a repository at the project root or at a declared
     `writable_folders` root, including a worktree's `.git` pointer file, so a
     rewrite of those stores fails; a nested repository below those roots
@@ -145,9 +155,10 @@ further than described here are still welcome.
   that watches a write root or the session temp folder can upload or run what a
   command writes there, or read from a FIFO or socket file the command creates
   there.
-- **An approved network command is an upload channel** to any address,
-  loopback and the local network included, and every process it starts
-  inherits that reach.
+- **An approved destination is an upload channel.** Any sandboxed command can
+  send data to a host and port approved at the proxy or saved in
+  `domain_grants`, for as long as the approval lasts. The proxy refuses
+  loopback, local-network and this machine's own addresses.
 - **Authorized writes can still corrupt.** A command can empty or garble any
   file it may write.
 - **Subfolder swaps around a carved-out path.** When a write folder holds a
@@ -168,7 +179,12 @@ codemeld itself connects only to:
   `https://chatgpt.com/backend-api/codex` (model requests), only if you use the
   ChatGPT subscription login;
 - Exa at `mcp.exa.ai` for `web_search`, and the page and redirect hops of a
-  `web_fetch`.
+  `web_fetch`;
+- for a sandboxed shell command, the host and port it asked for through the
+  session proxy, once a prompt answer or a saved `domain_grants` entry
+  approved it, and only at a public address that is not this machine's. That
+  limit applies to the proxy only, not to the destinations above or to
+  unsandboxed commands.
 
 Model requests to a configured provider, and ChatGPT login, token refresh, and
 logout, refuse redirects. Only `web_fetch` follows redirects, and it authorizes

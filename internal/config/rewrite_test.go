@@ -4108,3 +4108,223 @@ func TestRewriteKey_VCSUserConfig_RejectsOtherPayloads(t *testing.T) {
 		})
 	}
 }
+
+func TestRewriteKey_DomainGrants_AppendPreservesBytes(t *testing.T) {
+	grant := DomainGrant{Host: "example.com", Port: 443}
+	newBlock := "domain_grants:\n  - host: example.com\n    port: 443\n"
+	for _, rc := range []rewriteCase{
+		{name: "absent file", value: grant, want: newBlock},
+		{name: "whitespace file", input: "  \n\n", value: grant, want: newBlock},
+		{name: "comment-only file", input: "# only a comment\n", value: grant, want: "# only a comment\n" + newBlock},
+		{
+			name:  "file without the key",
+			input: "# top\nblocked_paths:\n  - ~/.secret # inline\n",
+			value: grant,
+			want:  "# top\nblocked_paths:\n  - ~/.secret # inline\n" + newBlock,
+		},
+		{
+			name:  "null key followed by another key",
+			input: "domain_grants:\nblocked_paths:\n  - ~/.secret\n",
+			value: grant,
+			want:  "domain_grants: [{host: example.com, port: 443}]\nblocked_paths:\n  - ~/.secret\n",
+		},
+		{
+			name:  "explicit null with a comment",
+			input: "domain_grants: null # none yet\n",
+			value: grant,
+			want:  "domain_grants: [{host: example.com, port: 443}] # none yet\n",
+		},
+		{
+			name:  "empty flow list with a comment",
+			input: "domain_grants: [] # empty\n",
+			value: grant,
+			want:  "domain_grants: [{host: example.com, port: 443}] # empty\n",
+		},
+		{
+			name:  "block list with comments and a following key",
+			input: "# grants\ndomain_grants:\n  # team\n  - host: a.example # first\n    port: 443\nblocked_paths:\n  - ~/.secret\n",
+			value: grant,
+			want:  "# grants\ndomain_grants:\n  # team\n  - host: a.example # first\n    port: 443\n  - host: example.com\n    port: 443\nblocked_paths:\n  - ~/.secret\n",
+		},
+		{
+			name:  "block list at column zero",
+			input: "domain_grants:\n- host: a.example\n  port: 8443\n",
+			value: grant,
+			want:  "domain_grants:\n- host: a.example\n  port: 8443\n- host: example.com\n  port: 443\n",
+		},
+		{
+			name:  "flow list",
+			input: "domain_grants: [{host: a.example, port: 443}] # kept\n",
+			value: grant,
+			want:  "domain_grants: [{host: a.example, port: 443}, {host: example.com, port: 443}] # kept\n",
+		},
+		{
+			name:  "multi-line flow list without comments",
+			input: "domain_grants: [\n  {host: a.example, port: 443},\n]\n",
+			value: grant,
+			want:  "domain_grants: [\n  {host: a.example, port: 443}, {host: example.com, port: 443},\n]\n",
+		},
+		{
+			name:  "flow root without the key",
+			input: "{agent: {max_concurrency: 2}}\n",
+			value: grant,
+			want:  "{agent: {max_concurrency: 2}, domain_grants: [{host: example.com, port: 443}]}\n",
+		},
+		{
+			name:  "flow root with a flow list",
+			input: "{domain_grants: [{host: a.example, port: 443}], agent: {max_concurrency: 2}}\n",
+			value: grant,
+			want:  "{domain_grants: [{host: a.example, port: 443}, {host: example.com, port: 443}], agent: {max_concurrency: 2}}\n",
+		},
+		{
+			name:  "no trailing newline",
+			input: "blocked_paths:\n  - ~/.secret",
+			value: grant,
+			want:  "blocked_paths:\n  - ~/.secret\n" + newBlock,
+		},
+		{
+			name:  "block list without a trailing newline",
+			input: "domain_grants:\n  - host: a.example\n    port: 443",
+			value: grant,
+			want:  "domain_grants:\n  - host: a.example\n    port: 443\n  - host: example.com\n    port: 443\n",
+		},
+		{
+			name:  "block list with a standalone dash",
+			input: "domain_grants:\n  -\n    host: a.example\n    port: 443\n",
+			value: grant,
+			want:  "domain_grants:\n  -\n    host: a.example\n    port: 443\n  - host: example.com\n    port: 443\n",
+		},
+		{
+			name:  "file without the key ending in a document-end marker",
+			input: "blocked_paths:\n  - ~/.secret # inline\n...\n# after\n",
+			value: grant,
+			want:  "blocked_paths:\n  - ~/.secret # inline\n" + newBlock + "...\n# after\n",
+		},
+		{
+			name:  "final block list ending in a document-end marker",
+			input: "blocked_paths:\n  - ~/.secret\ndomain_grants:\n  - host: a.example\n    port: 443\n...\n# after\n",
+			value: grant,
+			want:  "blocked_paths:\n  - ~/.secret\ndomain_grants:\n  - host: a.example\n    port: 443\n  - host: example.com\n    port: 443\n...\n# after\n",
+		},
+		{
+			name:  "file without the key ending in a bare-CR document-end marker",
+			input: "blocked_paths: []\r...\r# after\r",
+			value: grant,
+			want:  "blocked_paths: []\r\n" + newBlock + "...\r# after\r",
+		},
+		{
+			name:  "final block list ending in a bare-CR document-end marker",
+			input: "blocked_paths: []\rdomain_grants:\r  - host: a.example\r    port: 443\r...\r# after\r",
+			value: grant,
+			want:  "blocked_paths: []\rdomain_grants:\r  - host: a.example\r    port: 443\r  - host: example.com\n    port: 443\n...\r# after\r",
+		},
+		{
+			name:  "duplicate is a no-op",
+			input: "domain_grants:\n  - host: example.com # mine\n    port: 443\n",
+			value: grant,
+			want:  "domain_grants:\n  - host: example.com # mine\n    port: 443\n",
+		},
+	} {
+		rc.key = KeyDomainGrants
+		t.Run(rc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "settings.yaml")
+			if rc.name != "absent file" {
+				writeAt(t, path, rc.input)
+			}
+			if step, cat, err := RewriteKey(path, rc.key, rc.value); err != nil || step != "" || cat != "" {
+				t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+			}
+			got := readAt(t, path)
+			if got != rc.want {
+				t.Fatalf("output mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, rc.want)
+			}
+			if strings.HasPrefix(got, "{") {
+				return
+			}
+			grants := domainGrantsCache(t, got, "", "").DomainGrants()
+			if local := domainGrantsCache(t, "", "", got).DomainGrants(); !slices.Equal(local, grants) {
+				t.Fatalf("local layer grants %q differ from global layer grants %q", local, grants)
+			}
+			if !slices.Contains(grants, "example.com:443") {
+				t.Fatalf("DomainGrants() = %q, want the appended example.com:443", grants)
+			}
+			if strings.Contains(strings.ReplaceAll(rc.input, "\r", "\n"), "host: a.example\n    port: 443") && !slices.Contains(grants, "a.example:443") {
+				t.Fatalf("DomainGrants() = %q, want the original a.example:443 kept", grants)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_DomainGrants_YAMLSensitiveHostsAreWrittenAsData(t *testing.T) {
+	for _, host := range []string{"null", "true", "yes", "on", "123", "1e3", "0x1f", "10.0.0.1", "::1", "2001:db8::1", "a: b #c"} {
+		for _, seed := range []string{"", "domain_grants: [{host: a.example, port: 443}]\n"} {
+			t.Run(host+"/"+seed, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "settings.yaml")
+				if seed != "" {
+					writeAt(t, path, seed)
+				}
+				if _, _, err := RewriteKey(path, KeyDomainGrants, DomainGrant{Host: host, Port: 8443}); err != nil {
+					t.Fatalf("RewriteKey(%q): %v", host, err)
+				}
+				got := readAt(t, path)
+				if seed != "" && !strings.HasPrefix(got, "domain_grants: [{host: a.example, port: 443}, ") {
+					t.Fatalf("existing flow entry not preserved:\n%s", got)
+				}
+				want := "[" + host + "]:8443"
+				if !strings.Contains(host, ":") {
+					want = host + ":8443"
+				}
+				for _, grants := range [][]string{
+					domainGrantsCache(t, got, "", "").DomainGrants(),
+					domainGrantsCache(t, "", "", got).DomainGrants(),
+				} {
+					if grants[len(grants)-1] != want {
+						t.Fatalf("DomainGrants() = %q, want last %q from:\n%s", grants, want, got)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRewriteKey_DomainGrants_RefusalsLeaveTheFileUnchanged(t *testing.T) {
+	const plain = "agent:\n  max_concurrency: 2 # keep\ndomain_grants:\n  - host: a.example\n    port: 443\n"
+	valid := DomainGrant{Host: "example.com", Port: 443}
+	for _, tc := range []struct {
+		name  string
+		input string
+		value any
+	}{
+		{"string payload", plain, "example.com:443"},
+		{"pointer payload", plain, &valid},
+		{"empty host", plain, DomainGrant{Port: 443}},
+		{"port zero", plain, DomainGrant{Host: "example.com"}},
+		{"port above 65535", plain, DomainGrant{Host: "example.com", Port: 65536}},
+		{"negative port", plain, DomainGrant{Host: "example.com", Port: -1}},
+		{"anchor", "domain_grants:\n  - &g {host: a.example, port: 443}\n", valid},
+		{"alias", "blocked_paths:\n  - &h a.example\ndomain_grants:\n  - host: *h\n    port: 443\n", valid},
+		{"tag", "domain_grants:\n  - host: !!str a.example\n    port: 443\n", valid},
+		{"multi-document file", "blocked_paths: []\n---\nblocked_paths: []\n", valid},
+		{"multi-line flow list with a comment inside", "domain_grants: [\n  {host: a.example, port: 443}, # mine\n]\n", valid},
+		{"existing entry with a bad port", "domain_grants:\n  - host: a.example\n    port: 0\n", valid},
+		{"not a list", "domain_grants:\n  host: a.example\n  port: 443\n", valid},
+		{"multi-document file with a document-end marker", "blocked_paths: []\n...\n---\nblocked_paths: []\n", valid},
+		{"multi-document file with a bare-CR document-end marker", "blocked_paths: []\r...\r---\rblocked_paths: []\r", valid},
+		{"duplicate in an anchored file", "blocked_paths:\n  - &h x\ndomain_grants:\n  - host: example.com\n    port: 443\n", valid},
+		{"duplicate in a tagged file", "domain_grants:\n  - host: !!str example.com\n    port: 443\n", valid},
+		{"duplicate in a multi-line flow list with a comment inside", "domain_grants: [\n  {host: example.com, port: 443}, # retained\n]\n", valid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, path, tc.input)
+			step, _, err := RewriteKey(path, KeyDomainGrants, tc.value)
+			if err == nil || step != fsutil.LoadStep {
+				t.Fatalf("RewriteKey = (%q, %v), want a load-step refusal", step, err)
+			}
+			if got := readAt(t, path); got != tc.input {
+				t.Fatalf("file changed on refusal:\n%s", got)
+			}
+		})
+	}
+}

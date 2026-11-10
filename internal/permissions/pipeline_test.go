@@ -84,6 +84,61 @@ func TestSplitCommand_CdPrefixPropagatesToEveryStage(t *testing.T) {
 	}
 }
 
+func TestSplitCommand_DirectRouteCarriesPrefixStrippedInput(t *testing.T) {
+	for _, tc := range []struct{ input, cd, literal string }{
+		{input: "grep -n x dir/*.md", literal: "grep -n x dir/*.md"},
+		{input: "ls | grep x dir/*.md", literal: "ls | grep x dir/*.md"},
+		{input: "cd sub && grep -n x dir/*.md", cd: "sub", literal: "grep -n x dir/*.md"},
+		{input: "cd sub &&  ls | grep x dir/*.md ", cd: "sub", literal: "ls | grep x dir/*.md"},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			res, err := SplitCommand(tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.LiteralRoute || len(res.Stages) == 0 || res.CdHint != tc.cd || res.LiteralInput != tc.literal {
+				t.Fatalf("SplitCommand(%q) = %+v, want direct stages, cd %q and literal input %q", tc.input, res, tc.cd, tc.literal)
+			}
+		})
+	}
+}
+
+func TestStageNeedsShell(t *testing.T) {
+	runDir := t.TempDir()
+	for input, want := range map[string]bool{
+		"grep -n x dir/*.md":         true,
+		"grep -n x dir/?.md":         true,
+		"grep -n x dir/[ab].md":      true,
+		"grep -n x dir/{a,b}.md":     true,
+		"*.sh":                       true,
+		"grep -n x -- -*.md":         true,
+		"grep -n x f":                false,
+		"grep '*' f":                 false,
+		`grep "a*" f`:                false,
+		`grep a\* f`:                 false,
+		"FOO=bar grep x f":           false,
+		"FOO='a b' grep x f":         false,
+		"env FOO='a b' grep x f":     false,
+		"env -i PATH=/usr/bin ls -l": false,
+		"FOO=bar grep x dir/*.md":    true,
+		"grep -r x . --include=*.md": false,
+		"ls ~/notes":                 false,
+		"ls ~/notes/*.md":            true,
+		"FOO=bar ls ~/notes":         false,
+		"env FOO=bar ls ~/notes":     false,
+	} {
+		t.Run(input, func(t *testing.T) {
+			res, err := SplitCommand(input)
+			if err != nil || res.LiteralRoute || len(res.Stages) != 1 {
+				t.Fatalf("SplitCommand(%q) = %+v, %v; want one direct stage", input, res, err)
+			}
+			if got := StageNeedsShell(res.Stages[0], runDir); got != want {
+				t.Fatalf("StageNeedsShell(%q) = %v, want %v", input, got, want)
+			}
+		})
+	}
+}
+
 // TestSplitCommand_CdPrefixOperatorBypass guards against a construct smuggled into the `cd <path>`
 // prefix. tokenizeShell splits only on whitespace, so a path token such as `foo;bar` or `$(pwd)`
 // looks like a single word; the prefix must not be stripped (CdHint stays empty) and the construct
@@ -176,6 +231,28 @@ func TestSplitCommand_RejectedConstructs(t *testing.T) {
 			}
 			if res.LiteralRoute || res.Stages != nil {
 				t.Fatalf("SplitCommand(%q) produced a route (literal=%v stages=%v) for a rejected command", tt.input, res.LiteralRoute, res.Stages)
+			}
+		})
+	}
+}
+
+func TestSplitCommand_RejectedConstructCarriesPrefixStrippedInput(t *testing.T) {
+	for _, tc := range []struct{ input, cd, literal, construct string }{
+		{input: "echo $(pwd)", literal: "echo $(pwd)", construct: "$()"},
+		{input: "  ls\necho x ", literal: "ls\necho x", construct: "newline"},
+		{input: "cd sub && echo `pwd`", cd: "sub", literal: "echo `pwd`", construct: "`"},
+		{input: "cd sub &&  ls\recho x", cd: "sub", literal: "ls\recho x", construct: "newline"},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			res, err := SplitCommand(tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.AllowedShell || res.RejectedConstruct != tc.construct || res.LiteralRoute || res.Stages != nil {
+				t.Fatalf("SplitCommand(%q) = %+v, want the %q rejection", tc.input, res, tc.construct)
+			}
+			if res.CdHint != tc.cd || res.LiteralInput != tc.literal {
+				t.Fatalf("SplitCommand(%q) cd = %q, literal input = %q; want %q, %q", tc.input, res.CdHint, res.LiteralInput, tc.cd, tc.literal)
 			}
 		})
 	}

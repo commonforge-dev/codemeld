@@ -6,19 +6,31 @@
 package bootstrap
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gdamore/tcell/v2"
+
+	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
+	"codemeld.dev/codemeld/internal/fsutil"
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/tui"
@@ -785,6 +797,51 @@ func TestGatedPrompt_StructuredToolEndToEnd(t *testing.T) {
 	}
 }
 
+func exactCompoundGrant(sc permissions.SimpleCompound) (string, error) {
+	stageSubjects := make([]string, len(sc.Stages))
+	for i, stage := range sc.Stages {
+		ss, err := permissions.CompoundStageScopeSubject(sc, i, permissions.ExactSubject(stage[0], stage[1:]))
+		if err != nil {
+			return "", err
+		}
+		stageSubjects[i] = ss
+	}
+	return permissions.EncodeCompoundSubject(sc.Wrapped, stageSubjects, sc.Operators)
+}
+
+func TestGatedPrompt_LiteralHomeCompoundCarriesProofAndStoredSubject(t *testing.T) {
+	const command = `sh -c "mv x '~/t' && true"`
+	canonical, err := permissions.CanonicalLiteralForm(command)
+	if err != nil {
+		t.Fatalf("CanonicalLiteralForm: %v", err)
+	}
+	var stored string
+	show := func(req tui.PromptRequest) (tui.PromptDecision, error) {
+		if req.Compound == nil {
+			return tui.PromptDecision{}, errors.New("literal compound prompt carries no decomposition")
+		}
+		subject, err := exactCompoundGrant(*req.Compound)
+		if err != nil {
+			return tui.PromptDecision{}, err
+		}
+		stored = subject
+		return tui.PromptDecision{Option: tui.OptionAllowFolder, StoredSubject: subject}, nil
+	}
+	req := permissions.MatchRequest{Kind: "literal", Subject: canonical, PathScope: "/work/proj"}
+	display := PromptDisplay{Action: "Run command", Subject: command, ProjectRoot: "/work/proj", LaunchDir: "/work/proj"}
+
+	outcome, err := newPromptGateBuilder(show).Build(req, display)(context.Background(), permissions.ScopeEscalation{})
+	if err != nil {
+		t.Fatalf("prompt closure: %v", err)
+	}
+	if !strings.HasPrefix(stored, "compound/v2 W ") {
+		t.Fatalf("chooser subject = %q, want the state-aware wrapped compound form", stored)
+	}
+	if outcome.Choice != permissions.PromptAllowFolder || outcome.StoredSubject != stored {
+		t.Fatalf("outcome = %+v, want PromptAllowFolder carrying %q", outcome, stored)
+	}
+}
+
 // TestPromptGate_SerializesConcurrentPrompts fires N prompts concurrently through
 // one shared gate and asserts only one is ever on screen at a time, resolving one
 // after another.
@@ -1287,7 +1344,7 @@ func TestBuildBatchPromptRequest_ExceptionalBatchNamesThePrecedenceAuthority(t *
 		{"exceptional stage not first", []string{"sort data.txt", "curl https://example.com", "rm -f out.txt"}, "network access"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			prompts, displays, modeCtxs := constrainedAutoBatch(tc.stages...)
+			prompts, displays, modeCtxs := brokenSettingsAutoBatch(tc.stages...)
 			pr, err := buildBatchPromptRequest(prompts, displays, modeCtxs)
 			if err != nil {
 				t.Fatalf("buildBatchPromptRequest: %v", err)
@@ -1301,7 +1358,7 @@ func TestBuildBatchPromptRequest_ExceptionalBatchNamesThePrecedenceAuthority(t *
 		})
 	}
 
-	prompts, displays, modeCtxs := constrainedAutoBatch("curl https://example.com")
+	prompts, displays, modeCtxs := brokenSettingsAutoBatch("curl https://example.com")
 	pr, err := buildBatchPromptRequest(prompts, displays, modeCtxs)
 	if err != nil {
 		t.Fatalf("buildBatchPromptRequest: %v", err)
@@ -1310,7 +1367,7 @@ func TestBuildBatchPromptRequest_ExceptionalBatchNamesThePrecedenceAuthority(t *
 		t.Fatalf("one-stage batch = %+v, want the single-request shape naming network access", pr)
 	}
 
-	for _, stages := range [][]string{{"sort data.txt", "tee out.txt"}, {"sort data.txt", "hg strip tip"}} {
+	for _, stages := range [][]string{{"sort data.txt", "tee out.txt"}, {"sort data.txt", "hg strip tip"}, {"rm -f out.txt", "curl https://example.com"}} {
 		prompts, displays, modeCtxs = constrainedAutoBatch(stages...)
 		pr, err = buildBatchPromptRequest(prompts, displays, modeCtxs)
 		if err != nil {
@@ -1332,8 +1389,10 @@ func TestExceptionalAuthority_OnlyConstrainedAutoEditsShell(t *testing.T) {
 		mc   permissions.ModeContext
 		want string
 	}{
-		{"constrained auto direct", direct, permissions.ModeContext{Mode: "auto_edits", ExecutionConstrained: true, Stages: stage}, "network access"},
-		{"constrained auto literal", literal, permissions.ModeContext{Mode: "auto_edits", ExecutionConstrained: true}, "network access"},
+		{"broken settings auto direct", direct, permissions.ModeContext{Mode: "auto_edits", ExecutionConstrained: true, SettingsBroken: true, Stages: stage}, "network access"},
+		{"broken settings auto literal", literal, permissions.ModeContext{Mode: "auto_edits", ExecutionConstrained: true, SettingsBroken: true}, "network access"},
+		{"valid settings auto direct", direct, permissions.ModeContext{Mode: "auto_edits", ExecutionConstrained: true, Stages: stage}, ""},
+		{"valid settings auto literal", literal, permissions.ModeContext{Mode: "auto_edits", ExecutionConstrained: true}, ""},
 		{"unconstrained auto", direct, permissions.ModeContext{Mode: "auto_edits", Stages: stage}, ""},
 		{"build", direct, permissions.ModeContext{Mode: "build", ExecutionConstrained: true, Stages: stage}, ""},
 		{"plan", direct, permissions.ModeContext{Mode: "plan", ExecutionConstrained: true, Stages: stage}, ""},
@@ -1359,7 +1418,8 @@ func TestExceptionalAuthority_OnlyConstrainedAutoEditsShell(t *testing.T) {
 }
 
 func TestPromptGate_ExceptionalPromptRejectsGrantChoices(t *testing.T) {
-	_, display, _ := constrainedAutoStage("curl https://example.com")
+	_, displays, _ := brokenSettingsAutoBatch("curl https://example.com")
+	display := displays[0]
 	req := permissions.MatchRequest{Kind: matchKindDirect, Subject: "curl https://example.com", SubjectTokens: []string{"curl", "https://example.com"}}
 	for _, option := range []tui.PromptOption{tui.OptionAllowSession, tui.OptionAllowFolder, tui.OptionAllowGlobal, tui.OptionAllowProject} {
 		show := func(tui.PromptRequest) (tui.PromptDecision, error) {
@@ -1369,7 +1429,7 @@ func TestPromptGate_ExceptionalPromptRejectsGrantChoices(t *testing.T) {
 			t.Fatalf("option %d mapped to %+v, want an error", option, out)
 		}
 		auth := &productionAuthorizer{prompts: newPromptGateBuilder(show)}
-		prompts, displays, modeCtxs := constrainedAutoBatch("rm -f out.txt", "curl https://example.com")
+		prompts, displays, modeCtxs := brokenSettingsAutoBatch("rm -f out.txt", "curl https://example.com")
 		if out, err := auth.buildBatchPrompt(displays, modeCtxs)(context.Background(), prompts); err == nil {
 			t.Fatalf("batch option %d mapped to %+v, want an error", option, out)
 		}
@@ -1414,26 +1474,26 @@ func sandboxedAutoShell(t *testing.T, input string, broken bool) (permissions.Ma
 
 func TestExceptionalAuthority_SandboxedAutoEditsNamesWhatStillAsks(t *testing.T) {
 	const deletion, network, history = "file deletion", "network access", "VCS history rewrite"
-	for _, tc := range []struct{ command, valid, broken string }{
-		{`rm -rf build`, "", deletion},
-		{`git clean -fdx`, "", deletion},
-		{`which -a x; file "$(which x)"`, "", ""},
-		{`git rebase main`, "", history},
-		{`rm x && git rebase main`, "", deletion},
-		{`git rebase main; rm x`, "", deletion},
-		{`rm x | hg strip .`, "", deletion},
-		{`rm x; curl y`, network, network},
-		{`git reset --hard && git push`, network, network},
-		{`rm x && command git push`, network, network},
-		{`rm x && nice git push`, network, network},
-		{`rm x | xargs git push`, network, network},
-		{`rm x; bash -c 'git push'`, network, network},
-		{`rm x && git commit --amend`, "", deletion},
+	for _, tc := range []struct{ command, broken string }{
+		{`rm -rf build`, deletion},
+		{`git clean -fdx`, deletion},
+		{`which -a x; file "$(which x)"`, ""},
+		{`git rebase main`, history},
+		{`rm x && git rebase main`, deletion},
+		{`git rebase main; rm x`, deletion},
+		{`rm x | hg strip .`, deletion},
+		{`rm x; curl y`, network},
+		{`git reset --hard && git push`, network},
+		{`rm x && command git push`, network},
+		{`rm x && nice git push`, network},
+		{`rm x | xargs git push`, network},
+		{`rm x; bash -c 'git push'`, network},
+		{`rm x && git commit --amend`, deletion},
 	} {
 		for _, broken := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/broken=%v", tc.command, broken), func(t *testing.T) {
 				req, mc := sandboxedAutoShell(t, tc.command, broken)
-				want := tc.valid
+				want := ""
 				if broken {
 					want = tc.broken
 				}
@@ -1559,92 +1619,738 @@ func (a *requestRecordingAuthorizer) AuthorizeBatch(ctx context.Context, reqs []
 	return a.productionAuthorizer.AuthorizeBatch(ctx, reqs)
 }
 
-func TestDispatchShell_SandboxedAutoEditsRunsAutomaticCommandsAndAsksTheRest(t *testing.T) {
+func TestDispatchShell_SandboxedAutoEditsRunsEveryCommandOnTheProxyRoute(t *testing.T) {
 	const network = "network access"
 	for _, tc := range []struct {
-		command, authority string
-		stages             int
-		networkProgram     string
+		command        string
+		stages         int
+		networkProgram string
 	}{
-		{`rm -rf build`, "", 1, ""},
-		{`which -a ls; file "$(which ls)"`, "", 1, ""},
-		{`git rebase main`, "", 1, ""},
-		{`sh -c 'git rebase main'`, "", 1, ""},
-		{`rm x && git rebase main`, "", 2, ""},
-		{`rm x | hg strip .`, "", 2, ""},
-		{`rm x; curl https://example.com`, network, 2, "curl"},
+		{`rm -rf build`, 1, ""},
+		{`which -a ls; file "$(which ls)"`, 1, ""},
+		{`git rebase main`, 1, ""},
+		{`sh -c 'git rebase main'`, 1, ""},
+		{`rm x && git rebase main`, 2, ""},
+		{`rm x | hg strip .`, 2, ""},
+		{`rm x; curl https://example.com`, 2, "curl"},
 	} {
-		for _, approve := range []bool{true, false} {
-			if tc.authority == "" && !approve {
-				continue
+		t.Run(tc.command, func(t *testing.T) {
+			f := newS1Fixture(t, jevName)
+			prependFixturePrograms(t, "git", "hg", "curl")
+			auth, _, _ := f.production(t, mode.AutoEdits, mkStore(t))
+			auth.executionConstrained = true
+			var shown []tui.PromptRequest
+			auth.prompts = newPromptGateBuilder(func(pr tui.PromptRequest) (tui.PromptDecision, error) {
+				shown = append(shown, pr)
+				return tui.PromptDecision{Option: tui.OptionDeny}, nil
+			})
+			rec := &requestRecordingAuthorizer{productionAuthorizer: auth}
+			run := &recordingShellRunner{}
+
+			if _, err := dispatch.DispatchShell(context.Background(), tc.command, f.home, f.project, rec, run); err != nil {
+				t.Fatalf("DispatchShell = %v", err)
 			}
-			t.Run(fmt.Sprintf("%s/approve=%v", tc.command, approve), func(t *testing.T) {
-				f := newS1Fixture(t, jevName)
-				prependFixturePrograms(t, "git", "hg", "curl")
-				auth, _, _ := f.production(t, mode.AutoEdits, mkStore(t))
-				auth.executionConstrained = true
-				option := tui.OptionDeny
-				if approve {
-					option = tui.OptionAllowOnce
+			if len(shown) != 0 {
+				t.Fatalf("prompts = %+v, want none", shown)
+			}
+			if len(run.specs) != tc.stages {
+				t.Fatalf("executed %d specs %+v, want %d", len(run.specs), run.specs, tc.stages)
+			}
+			conf := &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), tmpDir: t.TempDir(), projectRoot: f.project, blocked: testBlocked(t), broker: "slice"}
+			for _, spec := range run.specs {
+				wantNetwork := tc.networkProgram != "" && filepath.Base(spec.Argv[0]) == tc.networkProgram
+				if (spec.ExceptionalAuthority == network) != wantNetwork {
+					t.Fatalf("spec %q authority = %q, want network authority only on %q", spec.Argv, spec.ExceptionalAuthority, tc.networkProgram)
 				}
-				var shown []tui.PromptRequest
-				auth.prompts = newPromptGateBuilder(func(pr tui.PromptRequest) (tui.PromptDecision, error) {
-					shown = append(shown, pr)
-					return tui.PromptDecision{Option: option}, nil
-				})
-				rec := &requestRecordingAuthorizer{productionAuthorizer: auth}
-				run := &recordingShellRunner{}
+				policy, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, conf.blocked.Current(), false)
+				if err != nil {
+					t.Fatalf("policy: %v", err)
+				}
+				if policy.ExceptionalAuthority != "" || policy.Broker != "slice" {
+					t.Fatalf("spec %q confinement authority = %q broker = %q, want the slice broker and no authority", spec.Argv, policy.ExceptionalAuthority, policy.Broker)
+				}
+			}
+			if got := f.server.requests(); len(got) != 0 {
+				t.Fatalf("System One requests = %+v, want none", got)
+			}
+			if grants := auth.grants.Permissions(); len(grants) != 0 {
+				t.Fatalf("stored grants %+v, want none", grants)
+			}
+			for _, req := range rec.reqs {
+				if outcome, hit := auth.grants.turn.Lookup(req); hit {
+					t.Fatalf("automatic allowance cached %q for %+v", outcome, req)
+				}
+			}
+		})
+	}
+}
 
-				_, err := dispatch.DispatchShell(context.Background(), tc.command, f.home, f.project, rec, run)
+type proxyCall struct {
+	conn    net.Conn
+	refused chan string
+}
 
-				var denied *dispatch.DeniedError
-				if approve != (err == nil) || !approve && !errors.As(err, &denied) {
-					t.Fatalf("DispatchShell = %v, want approve=%v", err, approve)
+func startTestProxy(t *testing.T) (*netproxy.Server, string) {
+	t.Helper()
+	server, err := netproxy.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := server.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Stop)
+	return server, endpoint
+}
+
+func sendProxyRequest(t *testing.T, endpoint string, owner *netproxy.Owner, host string) *proxyCall {
+	t.Helper()
+	c, err := net.Dial("tcp", endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if err := owner.Register(c.LocalAddr().(*net.TCPAddr).AddrPort()); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := io.WriteString(c, "GET http://"+host+":9/ HTTP/1.1\r\nHost: "+host+":9\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	refused := make(chan string, 1)
+	go func() {
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			refused <- "no response: " + err.Error()
+			return
+		}
+		_ = resp.Body.Close()
+		refused <- resp.Header.Get("X-Proxy-Refused")
+	}()
+	return &proxyCall{conn: c, refused: refused}
+}
+
+func (p *proxyCall) await(t *testing.T) string {
+	t.Helper()
+	select {
+	case got := <-p.refused:
+		return got
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proxy request got no response within 10s")
+		return ""
+	}
+}
+
+func waitRefusal(t *testing.T, server *netproxy.Server, host string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, r := range server.Refusals() {
+			if r.Host == host {
+				return r.Reason
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no refusal for %s within 10s: %+v", host, server.Refusals())
+	return ""
+}
+
+func waitSlotFree(t *testing.T, b *PromptGateBuilder) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(b.gate.slot) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the prompt slot was not released within 10s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func startLiveTUI(t *testing.T) (*tui.App, tcell.SimulationScreen) {
+	t.Helper()
+	app := tui.New(nil)
+	screen := tcell.NewSimulationScreen("UTF-8")
+	app.SetScreenFactoryForTest(func() (tcell.Screen, error) { return screen, nil })
+	errc := make(chan error, 1)
+	go func() { errc <- app.Run() }()
+	t.Cleanup(func() {
+		app.Stop()
+		<-errc
+	})
+	onEventLoop(t, app, func() {})
+	return app, screen
+}
+
+func waitScreen(t *testing.T, app *tui.App, screen tcell.SimulationScreen, want string, shown bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var text string
+		onEventLoop(t, app, func() { text = simScreenText(screen) })
+		if strings.Contains(text, want) == shown {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("screen shown=%v for %q not reached within 5s:\n%s", shown, want, text)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func blockTUILoop(app *tui.App) (release func()) {
+	entered, done := make(chan struct{}), make(chan struct{})
+	go app.RunOnEventLoopForTest(func() {
+		close(entered)
+		<-done
+	})
+	<-entered
+	return func() { close(done) }
+}
+
+func TestPromptGateNetworkAsker_AllowOnceAdmitsOneRequestAndAsksAgain(t *testing.T) {
+	answers := []tui.PromptOption{tui.OptionAllowOnce, tui.OptionAllowOnce, tui.OptionDeny, tui.PromptOption(99)}
+	var asked atomic.Int32
+	b := newPromptGateBuilder(nil)
+	b.showNetwork = func(_ context.Context, host, port string, _ bool) (tui.PromptOption, error) {
+		if host != "127.0.0.1" || port != "9" {
+			t.Errorf("asked for %s:%s, want 127.0.0.1:9", host, port)
+		}
+		return answers[asked.Add(1)-1], nil
+	}
+	server, endpoint := startTestProxy(t)
+	for i, want := range []string{"not public", "not public", "not approved (denied)", "not approved (prompt failed)"} {
+		owner := server.NewOwner(b.AskNetwork)
+		t.Cleanup(owner.Close)
+		if got := sendProxyRequest(t, endpoint, owner, "127.0.0.1").await(t); got != want {
+			t.Fatalf("request %d refused %q, want %q", i+1, got, want)
+		}
+		if got := asked.Load(); got != int32(i+1) {
+			t.Fatalf("after request %d the asker showed %d prompts, want one per request", i+1, got)
+		}
+	}
+}
+
+func TestPromptGateNetworkAsker_WaitsWhileAPermissionPromptHoldsTheSlot(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	b := newPromptGateBuilder(func(tui.PromptRequest) (tui.PromptDecision, error) {
+		close(entered)
+		<-release
+		return tui.PromptDecision{Option: tui.OptionAllowOnce}, nil
+	})
+	var asked atomic.Int32
+	b.showNetwork = func(context.Context, string, string, bool) (tui.PromptOption, error) {
+		asked.Add(1)
+		return tui.OptionAllowOnce, nil
+	}
+	permissionDone := make(chan struct{})
+	go func() {
+		defer close(permissionDone)
+		req := permissions.MatchRequest{Kind: "tool", Subject: "Read", PathScope: "/work"}
+		_, _ = b.Build(req, PromptDisplay{Action: "Run tool", Subject: "Read"})(context.Background(), permissions.ScopeEscalation{})
+	}()
+	<-entered
+
+	server, endpoint := startTestProxy(t)
+	owner := server.NewOwner(b.AskNetwork)
+	t.Cleanup(owner.Close)
+	call := sendProxyRequest(t, endpoint, owner, "127.0.0.1")
+	select {
+	case got := <-call.refused:
+		t.Fatalf("the network request finished (%q) while a permission prompt held the slot", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := asked.Load(); got != 0 {
+		t.Fatalf("a network prompt was shown %d times while a permission prompt held the slot", got)
+	}
+	close(release)
+	<-permissionDone
+	if got := call.await(t); got != "not public" || asked.Load() != 1 {
+		t.Fatalf("after the permission prompt: refused %q, asked %d; want the request asked once and admitted", got, asked.Load())
+	}
+}
+
+func TestPromptGateNetworkAsker_SessionAnswerIsAcceptedBeforeTheSlotIsReleased(t *testing.T) {
+	b := newPromptGateBuilder(nil)
+	entered, release := make(chan struct{}, 2), make(chan struct{})
+	var asked atomic.Int32
+	b.showNetwork = func(context.Context, string, string, bool) (tui.PromptOption, error) {
+		asked.Add(1)
+		entered <- struct{}{}
+		<-release
+		return tui.OptionAllowSession, nil
+	}
+	arrived := make(chan struct{}, 2)
+	var accepts, acceptsWhileHeld atomic.Int32
+	ask := func(ctx context.Context, host, port string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		arrived <- struct{}{}
+		return b.AskNetwork(ctx, host, port, covered, func(d netproxy.Decision) bool {
+			accepts.Add(1)
+			if len(b.gate.slot) == 1 {
+				acceptsWhileHeld.Add(1)
+			}
+			return accept(d)
+		})
+	}
+	server, endpoint := startTestProxy(t)
+	first := server.NewOwner(ask)
+	t.Cleanup(first.Close)
+	firstCall := sendProxyRequest(t, endpoint, first, "127.0.0.1")
+	<-entered
+	second := server.NewOwner(ask)
+	t.Cleanup(second.Close)
+	secondCall := sendProxyRequest(t, endpoint, second, "127.0.0.1")
+	<-arrived
+	<-arrived
+	close(release)
+
+	for i, call := range []*proxyCall{firstCall, secondCall} {
+		if got := call.await(t); got != "not public" {
+			t.Fatalf("request %d refused %q, want it admitted", i+1, got)
+		}
+	}
+	if got := asked.Load(); got != 1 {
+		t.Fatalf("prompts shown = %d, want exactly one for two same-host requests after a session answer", got)
+	}
+	if accepts.Load() != 1 || acceptsWhileHeld.Load() != 1 {
+		t.Fatalf("accept calls = %d, while the slot was held = %d; want one accept before the slot was released", accepts.Load(), acceptsWhileHeld.Load())
+	}
+}
+
+func TestPromptGateNetworkAsker_CancellationWithdrawsOnlyItsPromptAfterTheUIAcknowledges(t *testing.T) {
+	app, screen := startLiveTUI(t)
+	b := NewPromptGateBuilder(app)
+	server, endpoint := startTestProxy(t)
+	first := sendProxyRequest(t, endpoint, server.NewOwner(b.AskNetwork), "127.0.0.2")
+	waitScreen(t, app, screen, "127.0.0.2", true)
+
+	queued := sendProxyRequest(t, endpoint, server.NewOwner(b.AskNetwork), "127.0.0.3")
+	_ = queued.conn.Close()
+	if got := waitRefusal(t, server, "127.0.0.3"); got != "not approved (command ended)" {
+		t.Fatalf("queued request refused %q, want not approved (command ended)", got)
+	}
+	waitScreen(t, app, screen, "127.0.0.2", true)
+
+	release := blockTUILoop(app)
+	_ = first.conn.Close()
+	time.Sleep(100 * time.Millisecond)
+	if len(b.gate.slot) != 1 {
+		release()
+		t.Fatal("the prompt slot was released before the UI acknowledged the withdrawal")
+	}
+	release()
+	if got := waitRefusal(t, server, "127.0.0.2"); got != "not approved (command ended)" {
+		t.Fatalf("cancelled request refused %q, want not approved (command ended)", got)
+	}
+	waitSlotFree(t, b)
+	waitScreen(t, app, screen, "network access", false)
+}
+
+func TestPromptGateNetworkAsker_ShutdownFreesTheSlotWithoutDrainingTheUI(t *testing.T) {
+	for _, tc := range []string{"before the acknowledgment wait", "during the acknowledgment wait"} {
+		t.Run(tc, func(t *testing.T) {
+			app, screen := startLiveTUI(t)
+			b := NewPromptGateBuilder(app)
+			server, endpoint := startTestProxy(t)
+			call := sendProxyRequest(t, endpoint, server.NewOwner(b.AskNetwork), "127.0.0.2")
+			waitScreen(t, app, screen, "127.0.0.2", true)
+
+			release := blockTUILoop(app)
+			want := "not approved (prompt failed)"
+			if tc == "during the acknowledgment wait" {
+				_ = call.conn.Close()
+				time.Sleep(50 * time.Millisecond)
+				want = "not approved (command ended)"
+			}
+			app.BeginShutdown()
+			waitSlotFree(t, b)
+			got := waitRefusal(t, server, "127.0.0.2")
+			release()
+			if got != want {
+				t.Fatalf("request refused %q, want %q", got, want)
+			}
+
+			screen.InjectKey(tcell.KeyRune, 's', tcell.ModNone)
+			onEventLoop(t, app, func() {})
+			var asked atomic.Int32
+			probe := server.NewOwner(func(context.Context, string, string, func() bool, func(netproxy.Decision) bool) (netproxy.Decision, error) {
+				asked.Add(1)
+				return netproxy.DecisionDeny, nil
+			})
+			t.Cleanup(probe.Close)
+			if got := sendProxyRequest(t, endpoint, probe, "127.0.0.2").await(t); got != "not approved (denied)" || asked.Load() != 1 {
+				t.Fatalf("later request refused %q after %d asks; want it asked again because no approval was stored", got, asked.Load())
+			}
+		})
+	}
+}
+
+func TestPromptGateNetworkAsker_ShutdownBetweenTheAnswerAndItsAcceptanceStoresNoGrant(t *testing.T) {
+	app := tui.New(nil)
+	b := newPromptGateBuilder(nil)
+	b.showNetwork = func(context.Context, string, string, bool) (tui.PromptOption, error) {
+		return tui.OptionAllowSession, nil
+	}
+	answered, resume := make(chan struct{}), make(chan struct{})
+	b.whileRunning = func(f func()) bool {
+		close(answered)
+		<-resume
+		return app.WhileRunning(f)
+	}
+	server, endpoint := startTestProxy(t)
+	owner := server.NewOwner(b.AskNetwork)
+	t.Cleanup(owner.Close)
+	call := sendProxyRequest(t, endpoint, owner, "127.0.0.2")
+	<-answered
+	app.BeginShutdown()
+	close(resume)
+	if got := call.await(t); got != "not approved (prompt failed)" {
+		t.Fatalf("request refused %q, want not approved (prompt failed)", got)
+	}
+
+	var asked atomic.Int32
+	probe := server.NewOwner(func(context.Context, string, string, func() bool, func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		asked.Add(1)
+		return netproxy.DecisionDeny, nil
+	})
+	t.Cleanup(probe.Close)
+	if got := sendProxyRequest(t, endpoint, probe, "127.0.0.2").await(t); got != "not approved (denied)" || asked.Load() != 1 {
+		t.Fatalf("later request refused %q after %d asks; want it asked again because no session grant was stored", got, asked.Load())
+	}
+}
+
+func TestPromptGateNetworkAsker_AppEndRefusesRequestsQueuedBehindAPermissionPrompt(t *testing.T) {
+	for _, tc := range []string{"shutdown", "event loop return"} {
+		t.Run(tc, func(t *testing.T) {
+			app, screen := startLiveTUI(t)
+			b := NewPromptGateBuilder(app)
+			entered, release := make(chan struct{}), make(chan struct{})
+			b.show = func(tui.PromptRequest) (tui.PromptDecision, error) {
+				close(entered)
+				<-release
+				return tui.PromptDecision{Option: tui.OptionDeny}, nil
+			}
+			permissionDone := make(chan struct{})
+			go func() {
+				defer close(permissionDone)
+				req := permissions.MatchRequest{Kind: "tool", Subject: "Read", PathScope: "/work"}
+				_, _ = b.Build(req, PromptDisplay{Action: "Run tool", Subject: "Read"})(context.Background(), permissions.ScopeEscalation{})
+			}()
+			t.Cleanup(func() {
+				close(release)
+				<-permissionDone
+			})
+			<-entered
+
+			server, endpoint := startTestProxy(t)
+			owner := server.NewOwner(b.AskNetwork)
+			t.Cleanup(owner.Close)
+			queued := sendProxyRequest(t, endpoint, owner, "127.0.0.2")
+			select {
+			case got := <-queued.refused:
+				t.Fatalf("the network request finished (%q) before the app ended", got)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			if tc == "shutdown" {
+				app.BeginShutdown()
+			} else if err := screen.PostEvent(tcell.NewEventError(errors.New("terminal lost"))); err != nil {
+				t.Fatal(err)
+			}
+			if got := queued.await(t); got != "not approved (prompt failed)" {
+				t.Fatalf("queued request refused %q, want not approved (prompt failed)", got)
+			}
+			if got := sendProxyRequest(t, endpoint, owner, "127.0.0.2").await(t); got != "not approved (prompt failed)" {
+				t.Fatalf("request after the app ended refused %q, want not approved (prompt failed)", got)
+			}
+			select {
+			case <-permissionDone:
+				t.Fatal("the permission prompt was released")
+			default:
+			}
+
+			var asked atomic.Int32
+			probe := server.NewOwner(func(context.Context, string, string, func() bool, func(netproxy.Decision) bool) (netproxy.Decision, error) {
+				asked.Add(1)
+				return netproxy.DecisionDeny, nil
+			})
+			t.Cleanup(probe.Close)
+			if got := sendProxyRequest(t, endpoint, probe, "127.0.0.2").await(t); got != "not approved (denied)" || asked.Load() != 1 {
+				t.Fatalf("later request refused %q after %d asks; want it asked again because no approval was stored", got, asked.Load())
+			}
+		})
+	}
+}
+
+func reloadDomainGrants(t *testing.T, home, projectRoot string) []string {
+	t.Helper()
+	global := map[string]any{}
+	if _, err := os.Stat(SettingsPath(home)); err == nil {
+		if global, err = defaultLoadGlobalSettings(home); err != nil {
+			t.Fatalf("load global settings: %v", err)
+		}
+	}
+	composition, err := defaultComposeConfig(global, projectRoot)
+	if err != nil {
+		t.Fatalf("compose settings: %v", err)
+	}
+	cache, err := config.NewCache(composition.Config, projectRoot, nil, home)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	return cache.DomainGrants()
+}
+
+type acceptCounts struct {
+	calls, whileHeld atomic.Int32
+	arrived          chan context.Context
+}
+
+func countAccepts(ask netproxy.Asker, slot chan struct{}) (netproxy.Asker, *acceptCounts) {
+	c := &acceptCounts{arrived: make(chan context.Context, 8)}
+	return func(ctx context.Context, host, port string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		c.arrived <- ctx
+		return ask(ctx, host, port, covered, func(d netproxy.Decision) bool {
+			c.calls.Add(1)
+			if d == netproxy.DecisionSession && len(slot) == 1 {
+				c.whileHeld.Add(1)
+			}
+			return accept(d)
+		})
+	}, c
+}
+
+func requireAskedAgain(t *testing.T, server *netproxy.Server, endpoint, host string) {
+	t.Helper()
+	var asked atomic.Int32
+	probe := server.NewOwner(func(context.Context, string, string, func() bool, func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		asked.Add(1)
+		return netproxy.DecisionDeny, nil
+	})
+	t.Cleanup(probe.Close)
+	if got := sendProxyRequest(t, endpoint, probe, host).await(t); got != "not approved (denied)" || asked.Load() != 1 {
+		t.Fatalf("later request refused %q after %d asks; want it asked again because no approval was stored", got, asked.Load())
+	}
+}
+
+func savedAnswerBuilder(t *testing.T, b *PromptGateBuilder, trusted bool) (home, root string) {
+	t.Helper()
+	home, root = t.TempDir(), t.TempDir()
+	b.projectTrusted = trusted
+	b.projectRoot = root
+	b.globalSettingsPath = SettingsPath(home)
+	return home, root
+}
+
+func savedTarget(opt tui.PromptOption, home, root string) (target, other string) {
+	if opt == tui.OptionAllowGlobal {
+		return filepath.Join(home, ".codemeld", "global", "settings.yaml"), filepath.Join(root, ".codemeld", "settings.local.yaml")
+	}
+	return filepath.Join(root, ".codemeld", "settings.local.yaml"), filepath.Join(home, ".codemeld", "global", "settings.yaml")
+}
+
+func TestPromptGateNetworkAsker_SavedAnswersPersistAndCoverTheQueuedRequest(t *testing.T) {
+	for _, opt := range []tui.PromptOption{tui.OptionAllowProject, tui.OptionAllowGlobal} {
+		t.Run(fmt.Sprint(opt), func(t *testing.T) {
+			b := newPromptGateBuilder(nil)
+			home, root := savedAnswerBuilder(t, b, true)
+			entered, release := make(chan struct{}, 2), make(chan struct{})
+			var asked atomic.Int32
+			b.showNetwork = func(_ context.Context, _, _ string, projectChoice bool) (tui.PromptOption, error) {
+				if !projectChoice {
+					t.Error("a trusted run's network prompt was not offered the project choice")
 				}
-				wantPrompts := 1
-				if tc.authority == "" {
-					wantPrompts = 0
+				asked.Add(1)
+				entered <- struct{}{}
+				<-release
+				return opt, nil
+			}
+			ask, counts := countAccepts(b.AskNetwork, b.gate.slot)
+			server, endpoint := startTestProxy(t)
+			first, second := server.NewOwner(ask), server.NewOwner(ask)
+			t.Cleanup(first.Close)
+			t.Cleanup(second.Close)
+			firstCall := sendProxyRequest(t, endpoint, first, "127.0.0.1")
+			<-entered
+			secondCall := sendProxyRequest(t, endpoint, second, "127.0.0.1")
+			<-counts.arrived
+			<-counts.arrived
+			close(release)
+			for i, call := range []*proxyCall{firstCall, secondCall} {
+				if got := call.await(t); got != "not public" {
+					t.Fatalf("request %d refused %q, want it admitted", i+1, got)
 				}
-				if len(shown) != wantPrompts || wantPrompts == 1 && shown[0].ExceptionalAuthority != tc.authority {
-					t.Fatalf("prompts = %+v, want %d naming %q", shown, wantPrompts, tc.authority)
+			}
+			if asked.Load() != 1 || counts.calls.Load() != 1 || counts.whileHeld.Load() != 1 {
+				t.Fatalf("prompts %d, accepts %d, session accepts while the slot was held %d; want 1, 1, 1",
+					asked.Load(), counts.calls.Load(), counts.whileHeld.Load())
+			}
+			if got := reloadDomainGrants(t, home, root); !slices.Equal(got, []string{"127.0.0.1:9"}) {
+				t.Fatalf("a new session's DomainGrants() = %q, want the saved 127.0.0.1:9", got)
+			}
+			if _, other := savedTarget(opt, home, root); fileExists(other) {
+				t.Fatalf("the answer also wrote %s", other)
+			}
+		})
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func TestPromptGateNetworkAsker_HiddenProjectAnswerInAnUntrustedRunFails(t *testing.T) {
+	b := newPromptGateBuilder(nil)
+	home, root := savedAnswerBuilder(t, b, false)
+	b.showNetwork = func(_ context.Context, _, _ string, projectChoice bool) (tui.PromptOption, error) {
+		if projectChoice {
+			t.Error("an untrusted run's network prompt was offered the project choice")
+		}
+		return tui.OptionAllowProject, nil
+	}
+	ask, counts := countAccepts(b.AskNetwork, b.gate.slot)
+	server, endpoint := startTestProxy(t)
+	owner := server.NewOwner(ask)
+	t.Cleanup(owner.Close)
+	if got := sendProxyRequest(t, endpoint, owner, "127.0.0.1").await(t); got != "not approved (prompt failed)" {
+		t.Fatalf("request refused %q, want not approved (prompt failed)", got)
+	}
+	if counts.calls.Load() != 0 {
+		t.Fatalf("accept called %d times for a hidden answer", counts.calls.Load())
+	}
+	for _, path := range []string{filepath.Join(root, ".codemeld", "settings.local.yaml"), filepath.Join(home, ".codemeld", "global", "settings.yaml")} {
+		if fileExists(path) {
+			t.Fatalf("a hidden answer wrote %s", path)
+		}
+	}
+	requireAskedAgain(t, server, endpoint, "127.0.0.1")
+}
+
+func TestPromptGateNetworkAsker_SavedAnswerPersistenceFailureApprovesNothing(t *testing.T) {
+	const seed = "domain_grants:\n  - host: seed.example\n    port: 443\n"
+	for _, opt := range []tui.PromptOption{tui.OptionAllowProject, tui.OptionAllowGlobal} {
+		for _, failure := range []string{"persist seam", "pre-replacement write"} {
+			t.Run(fmt.Sprint(opt)+"/"+failure, func(t *testing.T) {
+				b := newPromptGateBuilder(nil)
+				home, root := savedAnswerBuilder(t, b, true)
+				target, _ := savedTarget(opt, home, root)
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatal(err)
 				}
-				if !approve {
-					if len(run.specs) != 0 {
-						t.Fatalf("denied command executed %+v", run.specs)
-					}
-					return
+				if err := os.WriteFile(target, []byte(seed), 0o600); err != nil {
+					t.Fatal(err)
 				}
-				if len(run.specs) != tc.stages {
-					t.Fatalf("executed %d specs %+v, want %d", len(run.specs), run.specs, tc.stages)
+				if failure == "persist seam" {
+					b.persistGrant = func(bool, config.DomainGrant) error { return errors.New("disk full") }
+				} else {
+					t.Cleanup(fsutil.SetSyncFileForTest(func(*os.File) error { return errors.New("forced sync failure") }))
 				}
-				conf := &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), tmpDir: t.TempDir(), projectRoot: f.project, blocked: testBlocked(t)}
-				for _, spec := range run.specs {
-					wantNetwork := tc.networkProgram != "" && filepath.Base(spec.Argv[0]) == tc.networkProgram
-					if (spec.ExceptionalAuthority == network) != wantNetwork {
-						t.Fatalf("spec %q authority = %q, want network authority only on %q", spec.Argv, spec.ExceptionalAuthority, tc.networkProgram)
-					}
-					policy, err := conf.policy(string(mode.AutoEdits), conf.tmpDir, spec.ExceptionalAuthority, conf.blocked.Current(), false)
-					if err != nil {
-						t.Fatalf("policy: %v", err)
-					}
-					if (policy.ExceptionalAuthority == network) != wantNetwork || !wantNetwork && policy.ExceptionalAuthority != "" {
-						t.Fatalf("spec %q confinement authority = %q, want network authority only on %q", spec.Argv, policy.ExceptionalAuthority, tc.networkProgram)
-					}
+				b.showNetwork = func(context.Context, string, string, bool) (tui.PromptOption, error) { return opt, nil }
+				ask, counts := countAccepts(b.AskNetwork, b.gate.slot)
+				server, endpoint := startTestProxy(t)
+				owner := server.NewOwner(ask)
+				t.Cleanup(owner.Close)
+				if got := sendProxyRequest(t, endpoint, owner, "127.0.0.1").await(t); got != "not approved (prompt failed)" {
+					t.Fatalf("request refused %q, want not approved (prompt failed)", got)
 				}
-				if got := f.server.requests(); len(got) != 0 {
-					t.Fatalf("System One requests = %+v, want none", got)
+				if counts.calls.Load() != 0 {
+					t.Fatalf("accept called %d times on a failed write", counts.calls.Load())
 				}
-				if grants := auth.grants.Permissions(); len(grants) != 0 {
-					t.Fatalf("stored grants %+v, want none", grants)
+				if got, err := os.ReadFile(target); err != nil || string(got) != seed {
+					t.Fatalf("target = %q, %v; want it unchanged", got, err)
 				}
-				if tc.authority == "" {
-					for _, req := range rec.reqs {
-						if outcome, hit := auth.grants.turn.Lookup(req); hit {
-							t.Fatalf("automatic allowance cached %q for %+v", outcome, req)
-						}
-					}
-				}
+				requireAskedAgain(t, server, endpoint, "127.0.0.1")
 			})
 		}
 	}
+}
+
+func pausePersistence(b *PromptGateBuilder) (entered, resume chan struct{}) {
+	entered, resume = make(chan struct{}), make(chan struct{})
+	persist := b.persistGrant
+	b.persistGrant = func(global bool, g config.DomainGrant) error {
+		close(entered)
+		<-resume
+		return persist(global, g)
+	}
+	return entered, resume
+}
+
+func TestPromptGateNetworkAsker_RequestCancelledDuringASavedWriteIsNotAccepted(t *testing.T) {
+	b := newPromptGateBuilder(nil)
+	home, root := savedAnswerBuilder(t, b, true)
+	b.showNetwork = func(context.Context, string, string, bool) (tui.PromptOption, error) {
+		return tui.OptionAllowProject, nil
+	}
+	entered, resume := pausePersistence(b)
+	ask, counts := countAccepts(b.AskNetwork, b.gate.slot)
+	server, endpoint := startTestProxy(t)
+	owner := server.NewOwner(ask)
+	t.Cleanup(owner.Close)
+	call := sendProxyRequest(t, endpoint, owner, "127.0.0.1")
+	reqCtx := <-counts.arrived
+	<-entered
+	_ = call.conn.Close()
+	select {
+	case <-reqCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the client did not cancel the request")
+	}
+	close(resume)
+	if got := waitRefusal(t, server, "127.0.0.1"); got != "not approved (command ended)" {
+		t.Fatalf("request refused %q, want not approved (command ended)", got)
+	}
+	waitSlotFree(t, b)
+	if counts.calls.Load() != 0 {
+		t.Fatalf("accept called %d times after the request was cancelled", counts.calls.Load())
+	}
+	if got := reloadDomainGrants(t, home, root); !slices.Equal(got, []string{"127.0.0.1:9"}) {
+		t.Fatalf("DomainGrants() = %q, want the grant the write already published", got)
+	}
+	requireAskedAgain(t, server, endpoint, "127.0.0.1")
+}
+
+func TestPromptGateNetworkAsker_ShutdownDuringASavedWriteReturnsAndIsNotAccepted(t *testing.T) {
+	app := tui.New(nil)
+	b := NewPromptGateBuilder(app)
+	home, root := savedAnswerBuilder(t, b, true)
+	b.showNetwork = func(context.Context, string, string, bool) (tui.PromptOption, error) {
+		return tui.OptionAllowGlobal, nil
+	}
+	entered, resume := pausePersistence(b)
+	ask, counts := countAccepts(b.AskNetwork, b.gate.slot)
+	server, endpoint := startTestProxy(t)
+	owner := server.NewOwner(ask)
+	t.Cleanup(owner.Close)
+	call := sendProxyRequest(t, endpoint, owner, "127.0.0.1")
+	<-entered
+	shut := make(chan struct{})
+	go func() {
+		app.BeginShutdown()
+		close(shut)
+	}()
+	select {
+	case <-shut:
+	case <-time.After(2 * time.Second):
+		close(resume)
+		t.Fatal("BeginShutdown waited on the paused settings write")
+	}
+	if len(b.gate.slot) != 1 {
+		close(resume)
+		t.Fatal("the prompt slot was released before the settings write finished")
+	}
+	close(resume)
+	if got := call.await(t); got != "not approved (prompt failed)" {
+		t.Fatalf("request refused %q, want not approved (prompt failed)", got)
+	}
+	waitSlotFree(t, b)
+	if counts.calls.Load() != 0 {
+		t.Fatalf("accept called %d times after shutdown began", counts.calls.Load())
+	}
+	if got := reloadDomainGrants(t, home, root); !slices.Equal(got, []string{"127.0.0.1:9"}) {
+		t.Fatalf("DomainGrants() = %q, want the grant the write already published", got)
+	}
+	requireAskedAgain(t, server, endpoint, "127.0.0.1")
 }

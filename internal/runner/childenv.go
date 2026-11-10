@@ -29,6 +29,7 @@ func (e *ExecutableNotFoundError) Error() string {
 }
 
 var (
+	fixedTableNames  = []string{"PATH", "HOME", "PWD", "TMPDIR", "GOCACHE", "SHELL", "TERM", "LANG", "LC_ALL"}
 	withheldEnvNames = []string{
 		"PATH", "HOME", "PWD", "TMPDIR", "SHELL", "TERM", "LANG", "LC_ALL", "GOCACHE",
 		"NODE_OPTIONS", "BASH_ENV", "ENV", "IFS", "SHELLOPTS", "RIPGREP_CONFIG_PATH", "DOCKER_HOST",
@@ -59,7 +60,7 @@ func InheritedEnvironment(environ []string) (inherited, withheld []string) {
 	}
 	inherited = slices.DeleteFunc(inherited, func(e string) bool {
 		name, value, _ := strings.Cut(e, "=")
-		if envNameWithheld(name) || secretLookingName(name) || credentialURL.MatchString(value) {
+		if slices.Contains(fixedTableNames, name) || secretLookingName(name) || credentialURL.MatchString(value) {
 			withheld = append(withheld, name)
 			return true
 		}

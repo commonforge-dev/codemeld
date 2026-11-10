@@ -103,16 +103,6 @@ func ClassifyExceptional(req MatchRequest, mc ModeContext) (authority string, cl
 	return stagesAuthority(stages, ""), true
 }
 
-// Deletions and history rewrites run in the sandbox, which keeps the protected history stores
-// read-only, so only network access asks.
-func SandboxedAutoEditsAuthority(req MatchRequest, mc ModeContext) string {
-	stages, _ := exceptionalStages(req, mc)
-	if stagesAuthority(stages, authorityFileDeletion) == authorityNetwork {
-		return authorityNetwork
-	}
-	return ""
-}
-
 func stagesAuthority(stages []StageNormalization, dropped string) (authority string) {
 	for _, s := range stages {
 		authority = higherAuthority(authority, stageAuthority(s.Tokens, dropped))
@@ -125,6 +115,11 @@ func exceptionalStages(req MatchRequest, mc ModeContext) ([]StageNormalization, 
 	case subjectKindDirect:
 		return mc.Stages, len(mc.Stages) > 0
 	case subjectKindLiteral:
+		// A command rerouted from its direct or staged form carries its source stages, which its literal
+		// text cannot always be classified back into.
+		if len(mc.Stages) > 0 {
+			return mc.Stages, true
+		}
 		split, ok := literalClassifierStages(req.Subject)
 		if !ok {
 			return nil, false

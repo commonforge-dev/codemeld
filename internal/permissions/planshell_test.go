@@ -1574,8 +1574,8 @@ func TestRedirectFreePipelineStaysOnDirectRoute(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SplitCommand(%q) returned error: %v", input, err)
 			}
-			if !split.AllowedShell || split.LiteralRoute || split.LiteralInput != "" {
-				t.Fatalf("SplitCommand(%q) = %+v, want direct stages and no literal input", input, split)
+			if !split.AllowedShell || split.LiteralRoute || split.LiteralInput != input {
+				t.Fatalf("SplitCommand(%q) = %+v, want direct stages and the command as literal input", input, split)
 			}
 			for _, stage := range split.Stages {
 				if stage.Route != RouteDirect {

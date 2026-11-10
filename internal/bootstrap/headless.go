@@ -342,9 +342,15 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	}
 	execution := resolveExecutionCapability(enforce.ResolveInput{Home: result.Home})
 	owned, err := startExecutionCapability(execution, stderrNoticeRenderer{w: stderr})
-	if owned != nil {
-		defer func() { retErr = errors.Join(retErr, owned.removeAndRelease()) }()
-	}
+	var conf *confinement
+	defer func() {
+		switch {
+		case conf != nil:
+			retErr = errors.Join(retErr, conf.cleanupAll())
+		case owned != nil:
+			retErr = errors.Join(retErr, owned.removeAndRelease())
+		}
+	}()
 	if err != nil {
 		return fmt.Errorf("bootstrap: headless create confinement temp folder: %w", err)
 	}
@@ -392,7 +398,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	for _, line := range skillLines {
 		stderr.line(line)
 	}
-	conf := launchConfinement(execution, owned.folder(), modeActive, cache, result.Home, guard, inherited)
+	conf = launchConfinement(execution, owned.folder(), modeActive, cache, result.Home, guard, inherited)
 	conf.own(owned)
 	systemOne := newSystemOneCheck(cache, guard.Blocked)
 	registry, err := realizeToolRegistry(result.ToolRegistry, cache, storeAccessor, result.Home, result.LaunchDir, guard,
@@ -411,6 +417,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 		terminal.projectUntrusted = !result.TrustDecision.Trusted
 		terminal.home = result.Home
 		terminal.runCtx = ctx
+		conf.proxyAsker = terminal.askNetwork
 	}
 	authorizer := newHeadlessAuthorizer(cache, storeAccessor, modeActive, terminal, stderrNoticeRenderer{w: stderr})
 	authorizer.declaredWrite = declaredWrite

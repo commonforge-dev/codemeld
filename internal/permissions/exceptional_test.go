@@ -824,25 +824,23 @@ func TestClassifyExceptionalHereStringFactsStayPerCall(t *testing.T) {
 type classifierResults struct {
 	authority    string
 	classifiable bool
-	sandboxed    string
 }
 
 func classifyBoth(subject string) classifierResults {
-	req := MatchRequest{Kind: subjectKindLiteral, Subject: subject}
-	authority, classifiable := ClassifyExceptional(req, ModeContext{})
-	return classifierResults{authority, classifiable, SandboxedAutoEditsAuthority(req, ModeContext{})}
+	authority, classifiable := ClassifyExceptional(MatchRequest{Kind: subjectKindLiteral, Subject: subject}, ModeContext{})
+	return classifierResults{authority, classifiable}
 }
 
 func TestExceptionalClassificationsStayPerCallConcurrently(t *testing.T) {
 	want := map[string]classifierResults{
-		`ls -la`:                     {"", true, ""},
-		`rm -rf build`:               {"file deletion", true, ""},
-		`curl x`:                     {"network access", true, "network access"},
-		`hg strip tip`:               {"VCS history rewrite", true, ""},
-		`rm x && git rebase main`:    {"file deletion", true, ""},
-		`rm x; curl y`:               {"network access", true, "network access"},
-		`cat <<< x | sh`:             {"", false, ""},
-		`ls && cu` + "\\\n" + `rl x`: {"", false, ""},
+		`ls -la`:                     {"", true},
+		`rm -rf build`:               {"file deletion", true},
+		`curl x`:                     {"network access", true},
+		`hg strip tip`:               {"VCS history rewrite", true},
+		`rm x && git rebase main`:    {"file deletion", true},
+		`rm x; curl y`:               {"network access", true},
+		`cat <<< x | sh`:             {"", false},
+		`ls && cu` + "\\\n" + `rl x`: {"", false},
 	}
 	subjects := slices.Sorted(maps.Keys(want))
 	var wg sync.WaitGroup
@@ -913,54 +911,44 @@ func classifierCommandTable(t *testing.T) []classifierTableCase {
 	return table
 }
 
-func TestSandboxedAutoEditsAuthorityParityWithClassifierTable(t *testing.T) {
+func TestClassifyExceptionalMatchesClassifierTable(t *testing.T) {
 	for _, tc := range classifierCommandTable(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			authority, classifiable := ClassifyExceptional(tc.req, tc.mc)
 			if authority != tc.authority || classifiable != tc.classifiable {
 				t.Fatalf("ClassifyExceptional = (%q, %v), want (%q, %v)", authority, classifiable, tc.authority, tc.classifiable)
 			}
-			want := tc.authority
-			if want != "network access" || !tc.classifiable {
-				want = ""
-			}
-			if got := SandboxedAutoEditsAuthority(tc.req, tc.mc); got != want {
-				t.Fatalf("SandboxedAutoEditsAuthority = %q, want %q", got, want)
-			}
 		})
 	}
 }
 
-func TestSandboxedAutoEditsAuthorityChecksEveryStage(t *testing.T) {
-	for _, tc := range []struct{ source, classified, sandboxed string }{
-		{`rm -rf build`, "file deletion", ""},
-		{`rm x && touch y`, "file deletion", ""},
-		{`git clean -fdx`, "file deletion", ""},
-		{`find . -delete`, "file deletion", ""},
-		{`bash -c 'rm x'`, "file deletion", ""},
-		{`nice rm x`, "file deletion", ""},
-		{`rm x && git rebase main`, "file deletion", ""},
-		{`git rebase main; rm x`, "file deletion", ""},
-		{`rm x | hg strip .`, "file deletion", ""},
-		{`rm x; curl y`, "network access", "network access"},
-		{`git reset --hard && git push`, "network access", "network access"},
-		{`rm x && command git push`, "network access", "network access"},
-		{`rm x && nice git push`, "network access", "network access"},
-		{`rm x | xargs git push`, "network access", "network access"},
-		{`rm x; bash -c 'git push'`, "network access", "network access"},
-		{`rm x && git commit --amend`, "file deletion", ""},
-		{`git commit --amend -m clean`, "file deletion", ""},
-		{`find . -delete && hg histedit`, "file deletion", ""},
-		{`which -a x; file "$(which x)"`, "", ""},
-		{`env PATH="/d:$PATH" /abs/check.sh`, "", ""},
+func TestClassifyExceptionalChecksEveryStage(t *testing.T) {
+	for _, tc := range []struct{ source, classified string }{
+		{`rm -rf build`, "file deletion"},
+		{`rm x && touch y`, "file deletion"},
+		{`git clean -fdx`, "file deletion"},
+		{`find . -delete`, "file deletion"},
+		{`bash -c 'rm x'`, "file deletion"},
+		{`nice rm x`, "file deletion"},
+		{`rm x && git rebase main`, "file deletion"},
+		{`git rebase main; rm x`, "file deletion"},
+		{`rm x | hg strip .`, "file deletion"},
+		{`rm x; curl y`, "network access"},
+		{`git reset --hard && git push`, "network access"},
+		{`rm x && command git push`, "network access"},
+		{`rm x && nice git push`, "network access"},
+		{`rm x | xargs git push`, "network access"},
+		{`rm x; bash -c 'git push'`, "network access"},
+		{`rm x && git commit --amend`, "file deletion"},
+		{`git commit --amend -m clean`, "file deletion"},
+		{`find . -delete && hg histedit`, "file deletion"},
+		{`which -a x; file "$(which x)"`, ""},
+		{`env PATH="/d:$PATH" /abs/check.sh`, ""},
 	} {
 		t.Run(tc.source, func(t *testing.T) {
 			req, mc := shellCtx(t, tc.source)
 			if authority, _ := ClassifyExceptional(req, mc); authority != tc.classified {
 				t.Fatalf("ClassifyExceptional = %q, want %q", authority, tc.classified)
-			}
-			if got := SandboxedAutoEditsAuthority(req, mc); got != tc.sandboxed {
-				t.Fatalf("SandboxedAutoEditsAuthority = %q, want %q", got, tc.sandboxed)
 			}
 		})
 	}

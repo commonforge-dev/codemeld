@@ -706,3 +706,160 @@ func scopeOptionsFor(t *testing.T, program string, args []string, home string) (
 	}
 	return sc.options, sc.defaultIdx
 }
+
+func compoundGrantFromChooser(t *testing.T, sc permissions.SimpleCompound, pick func(stage int, opts []scopeOption) int) string {
+	t.Helper()
+	stages := buildCompoundStageScopeOptions(sc)
+	if len(stages) != len(sc.Stages) {
+		t.Fatalf("chooser built %d stages, want %d", len(stages), len(sc.Stages))
+	}
+	chosen := make([]string, len(stages))
+	for i, st := range stages {
+		chosen[i] = st.Options[pick(i, st.Options)].Subject
+	}
+	ch := make(chan PromptDecision, 1)
+	New(nil).finalizeCompound(OptionAllowFolder, sc, chosen, ch)
+	return (<-ch).StoredSubject
+}
+
+func recognizedLiteral(t *testing.T, command string) (string, permissions.SimpleCompound) {
+	t.Helper()
+	canonical, err := permissions.CanonicalLiteralForm(command)
+	if err != nil {
+		t.Fatalf("CanonicalLiteralForm(%q): %v", command, err)
+	}
+	sc, ok := permissions.RecognizeSimpleCompoundForGrant(canonical)
+	if !ok {
+		t.Fatalf("RecognizeSimpleCompoundForGrant(%q) refused an accepted literal compound", command)
+	}
+	return canonical, sc
+}
+
+func literalGrantMatches(t *testing.T, command, grant string) bool {
+	t.Helper()
+	canonical, err := permissions.CanonicalLiteralForm(command)
+	if err != nil {
+		t.Fatalf("CanonicalLiteralForm(%q): %v", command, err)
+	}
+	return permissions.Match(
+		permissions.MatchRequest{Kind: "literal", Subject: canonical, PathScope: "/work"},
+		[]permissions.PermissionEntry{{Kind: "literal", Subject: grant, PathScope: "/work", GrantKind: "folder"}},
+	).Matched
+}
+
+func TestBuildCompoundStageScopeOptions_HomeFormGrantsMatchTheirRequest(t *testing.T) {
+	cases := []struct {
+		name        string
+		command     string
+		prefixStage int
+		alsoMatches []string
+		refused     []string
+	}{
+		{
+			name: "wrapped ; quoted tilde path", command: `sh -c "cat '~/f' ; echo done"`, prefixStage: -1,
+			alsoMatches: []string{`sh -c 'cat \~/f ; echo done'`},
+			refused:     []string{`sh -c "cat ~/f ; echo done"`, `sh -c "cat '~/g' ; echo done"`},
+		},
+		{
+			name: "wrapped && escaped lone home variable", command: `sh -c 'cat \$HOME && true'`, prefixStage: -1,
+			refused: []string{`sh -c 'cat $HOME && true'`},
+		},
+		{
+			name: "wrapped | home variable path with a null redirect", command: `sh -c 'cat \$HOME/x 2>/dev/null | wc -l'`, prefixStage: -1,
+			refused: []string{`sh -c 'cat $HOME/x 2>/dev/null | wc -l'`},
+		},
+		{
+			name: "wrapped lone tilde and mixed spellings", command: `sh -c "cp '~' '~'/a \\\$HOME/b && true"`, prefixStage: -1,
+			refused: []string{`sh -c "cp ~ '~'/a \\\$HOME/b && true"`},
+		},
+		{
+			name: "bare ; with a null redirect", command: `cat '~/f' 2>/dev/null ; echo done`, prefixStage: -1,
+			refused: []string{`cat ~/f 2>/dev/null ; echo done`},
+		},
+		{
+			name: "bare | with a null redirect", command: `cat "\$HOME" 2>/dev/null | wc -l`, prefixStage: -1,
+			refused: []string{`cat "$HOME" 2>/dev/null | wc -l`},
+		},
+		{
+			name: "wrapped && pinned home variable prefix", command: `sh -c 'echo \$HOME x && true'`, prefixStage: 0,
+			alsoMatches: []string{`sh -c 'echo \$HOME y z && true'`},
+			refused:     []string{`sh -c 'echo $HOME x && true'`, `sh -c 'echo \$HOMEX x && true'`},
+		},
+		{
+			name: "wrapped ; pinned tilde path prefix", command: `sh -c "grep -f '~/p' foo ; echo done"`, prefixStage: 0,
+			alsoMatches: []string{`sh -c "grep -f '~/p' foo bar ; echo done"`},
+			refused:     []string{`sh -c "grep -f ~/p foo ; echo done"`, `sh -c "grep -f '~/q' foo ; echo done"`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, sc := recognizedLiteral(t, tc.command)
+			exact := compoundGrantFromChooser(t, sc, func(int, []scopeOption) int { return 0 })
+			grants := []string{exact}
+			if tc.prefixStage >= 0 {
+				prefix := compoundGrantFromChooser(t, sc, func(stage int, opts []scopeOption) int {
+					if stage != tc.prefixStage {
+						return 0
+					}
+					if len(opts) < 2 || opts[1].Kind != ScopeSubcommand {
+						t.Fatalf("stage %d rows = %+v, want a Subcommand row", stage, opts)
+					}
+					return 1
+				})
+				if literalGrantMatches(t, tc.alsoMatches[0], exact) {
+					t.Fatalf("all-exact grant %q matches the differently-tailed %q", exact, tc.alsoMatches[0])
+				}
+				grants = []string{prefix}
+			}
+			for _, grant := range grants {
+				if !strings.HasPrefix(grant, "compound/v2 ") {
+					t.Fatalf("stored subject = %q, want the state-aware compound form", grant)
+				}
+				for _, req := range append([]string{tc.command}, tc.alsoMatches...) {
+					if !literalGrantMatches(t, req, grant) {
+						t.Errorf("grant %q does not match %q", grant, req)
+					}
+				}
+				for _, req := range tc.refused {
+					if literalGrantMatches(t, req, grant) {
+						t.Errorf("grant %q matches %q", grant, req)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestBuildCompoundStageScopeOptions_HomePinWithoutProofTakesLiteralFallback(t *testing.T) {
+	_, bare := recognizedLiteral(t, `cat '~/f' ; echo done`)
+	cases := []struct {
+		name string
+		sc   permissions.SimpleCompound
+	}{
+		{"bare redirect-free recognition", bare},
+		{"hand-built decomposition", permissions.SimpleCompound{
+			Wrapped: true, Stages: [][]string{{"cat", "~/f"}, {"echo", "done"}}, Operators: []string{";"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stages := buildCompoundStageScopeOptions(tc.sc)
+			if len(stages) != 2 {
+				t.Fatalf("len(stages) = %d, want 2", len(stages))
+			}
+			home := stages[0].Options
+			if home[0].Kind != ScopeExact || home[0].Subject != "" {
+				t.Fatalf("home stage Exact row = %+v, want an empty subject", home[0])
+			}
+			if last := home[len(home)-1]; last.Kind != ScopeProgram || last.Subject != "cat :*" {
+				t.Fatalf("home stage Program row = %+v, want subject %q", last, "cat :*")
+			}
+			if stages[1].Options[0].Subject != "echo done" {
+				t.Fatalf("plain stage Exact subject = %q, want %q", stages[1].Options[0].Subject, "echo done")
+			}
+			if got := compoundGrantFromChooser(t, tc.sc, func(int, []scopeOption) int { return 0 }); got != "" {
+				t.Fatalf("all-exact stored subject = %q, want the concrete literal fallback", got)
+			}
+		})
+	}
+}

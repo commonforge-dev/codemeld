@@ -172,6 +172,10 @@ type ExecutionClock interface {
 	ExecutionContext(ctx context.Context) context.Context
 }
 
+type ConfinementReporter interface {
+	Confined(ctx context.Context) (bool, error)
+}
+
 func executionExpired(ctx context.Context, run Runner) (bool, error) {
 	clock, ok := run.(ExecutionClock)
 	if !ok {
@@ -242,10 +246,16 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 		return tools.Result{}, &MalformedCommandError{Err: err}
 	}
 
-	// a rejected construct is refused before any prompt or path resolution — no grant can
-	// authorize it, so the agent gets the error directly.
+	// Outside a confined run a rejected construct is refused before any prompt or path resolution — no
+	// grant can authorize it, so the agent gets the error directly.
 	if !split.AllowedShell {
-		return tools.Result{}, &UnsupportedConstructError{Construct: split.RejectedConstruct}
+		confined, err := runsConfined(ctx, runner)
+		if err != nil {
+			return tools.Result{}, err
+		}
+		if !confined {
+			return tools.Result{}, &UnsupportedConstructError{Construct: split.RejectedConstruct}
+		}
 	}
 
 	// resolve one cleaned absolute request scope reused for both authorization
@@ -265,11 +275,26 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 	modeCtx := permissions.ModeContext{
 		Class:        permissions.ClassMutating,
 		Stages:       split.Stages,
-		LiteralRoute: split.LiteralRoute,
+		LiteralRoute: split.LiteralRoute || !split.AllowedShell,
 	}
 
+	if !split.AllowedShell {
+		ask, err := refuseReadOnlyLiteral(split.LiteralInput, scope, home, modeCtx, policy)
+		if err != nil {
+			return tools.Result{}, err
+		}
+		modeCtx.ShellPathAsk = ask
+		return dispatchLiteral(ctx, split.LiteralInput, scope, authorizer, runner, modeCtx)
+	}
 	if split.LiteralRoute {
 		if wrapped, stages, operators, ok := permissions.SimpleCompoundStages(split.LiteralInput); ok && !wrapped && onlyStagedOperators(operators) {
+			reroute, err := confinedStagesNeedShell(ctx, runner, stages, scope, home)
+			if err != nil {
+				return tools.Result{}, err
+			}
+			if reroute {
+				return dispatchConfinedShell(ctx, split.LiteralInput, stages, scope, home, authorizer, runner, modeCtx, policy)
+			}
 			batch, ok := authorizer.(BatchAuthorizer)
 			if !ok {
 				batch = perStageBatchAuthorizer{authorizer}
@@ -283,6 +308,13 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 		modeCtx.ShellPathAsk = ask
 		return dispatchLiteral(ctx, split.LiteralInput, scope, authorizer, runner, modeCtx)
 	}
+	reroute, err := confinedStagesNeedShell(ctx, runner, split.Stages, scope, home)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	if reroute {
+		return dispatchConfinedShell(ctx, split.LiteralInput, split.Stages, scope, home, authorizer, runner, modeCtx, policy)
+	}
 	// A direct pipeline authorizes its stages through the batched seam so its remaining
 	// (non-read-only) stages can resolve into one command-level approval. Batching is a
 	// TUI presentation feature: the interactive authorizer implements BatchAuthorizer and renders the
@@ -294,6 +326,47 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 		batch = perStageBatchAuthorizer{authorizer}
 	}
 	return dispatchDirect(ctx, split.Stages, scope, home, batch, runner, modeCtx, policy)
+}
+
+// confinedStagesNeedShell asks for confinement only when a stage needs the shell or names a program
+// that is not found, so a resolution error never blocks a command that would keep its route anyway.
+func confinedStagesNeedShell(ctx context.Context, run Runner, stages []permissions.StageNormalization, scope string, home string) (bool, error) {
+	if !slices.ContainsFunc(stages, func(stage permissions.StageNormalization) bool { return permissions.StageNeedsShell(stage, scope) }) &&
+		verifyStagePrograms(stages, scope, home) == nil {
+		return false, nil
+	}
+	return runsConfined(ctx, run)
+}
+
+func runsConfined(ctx context.Context, run Runner) (bool, error) {
+	reporter, ok := run.(ConfinementReporter)
+	if !ok {
+		return false, nil
+	}
+	return reporter.Confined(ctx)
+}
+
+// dispatchConfinedShell checks the source stages before the literal route sees the command, because
+// the literal form's read-only classification and RunSpec no longer show every stage's paths or
+// assignments.
+func dispatchConfinedShell(ctx context.Context, literalInput string, stages []permissions.StageNormalization, scope string, home string, authorizer Authorizer, run Runner, modeCtx permissions.ModeContext, guard securitystate.Policy) (tools.Result, error) {
+	asks, err := refuseReadOnlyStages(stages, scope, home, modeCtx, guard)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	for _, stage := range stages {
+		if _, err := runner.FixedEnvironment("", "", "", "", stage.Assignments); err != nil {
+			return tools.Result{}, err
+		}
+	}
+	modeCtx.LiteralRoute = true
+	modeCtx.Stages = stages
+	ask, err := refuseReadOnlyLiteral(literalInput, scope, home, modeCtx, guard)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	modeCtx.ShellPathAsk = ask || slices.Contains(asks, true)
+	return dispatchLiteral(ctx, literalInput, scope, authorizer, run, modeCtx)
 }
 
 func refuseReadOnlyLiteral(literalInput string, scope string, home string, modeCtx permissions.ModeContext, guard securitystate.Policy) (bool, error) {

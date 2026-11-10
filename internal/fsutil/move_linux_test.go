@@ -199,3 +199,139 @@ func TestMoveNoReplace_ParentSwapDetected(t *testing.T) {
 		})
 	}
 }
+
+func TestMoveNoReplaceAt_RenamesThroughTheHeldParentsNotTheirPaths(t *testing.T) {
+	cases := []struct {
+		name    string
+		swapSrc bool
+	}{{"source parent replaced", true}, {"destination parent replaced by a symlink", false}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := t.TempDir()
+			srcDir := filepath.Join(root, "srcdir")
+			dstDir := filepath.Join(root, "dstdir")
+			mustMkdir(t, srcDir)
+			mustMkdir(t, dstDir)
+			src := filepath.Join(srcDir, "f.txt")
+			dst := filepath.Join(dstDir, "f.txt")
+			seedFile(t, src, "payload")
+			srcFD, dstFD := openDir(t, srcDir), openDir(t, dstDir)
+
+			if tc.swapSrc {
+				if err := os.Rename(srcDir, srcDir+"-held"); err != nil {
+					t.Fatalf("rename: %v", err)
+				}
+				mustMkdir(t, srcDir)
+				seedFile(t, src, "decoy")
+			} else {
+				if err := os.Rename(dstDir, dstDir+"-held"); err != nil {
+					t.Fatalf("rename: %v", err)
+				}
+				if err := os.Symlink(outside, dstDir); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+			}
+
+			step, _, err := MoveNoReplaceAt(srcFD, dstFD, src, dst, MoveLifecycle{})
+			if step != ParentSyncStep || !errors.Is(err, ErrParentMoved) {
+				t.Fatalf("step, err = %q, %v; want the post-rename parent guard", step, err)
+			}
+			heldSrc := srcDir
+			if tc.swapSrc {
+				heldSrc = srcDir + "-held"
+				if got := readBack(t, src); string(got) != "decoy" {
+					t.Fatalf("replacement source = %q, want the decoy untouched", got)
+				}
+			}
+			if got := readBack(t, filepath.Join(heldSrc, "f.txt")); string(got) != "payload" {
+				t.Fatalf("held source = %q, want the entry compensated back into the held parent", got)
+			}
+			if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+				t.Fatalf("outside holds %d entries, want none", len(entries))
+			}
+			if _, err := os.Lstat(filepath.Join(dstDir+"-held", "f.txt")); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("held destination entry: %v, want none after compensation", err)
+			}
+		})
+	}
+}
+
+func TestMoveNoReplaceAt_LifecycleOrderAndBorrowedDescriptors(t *testing.T) {
+	cases := []struct {
+		name      string
+		swapAfter bool
+		existing  bool
+		want      []string
+	}{
+		{"success", false, false, []string{"before", "rename", "after"}},
+		{"rename failure", false, true, []string{"before", "rename", "after"}},
+		{"parent-check failure", true, false, []string{"before", "rename", "rename", "after"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			srcDir := filepath.Join(root, "srcdir")
+			dstDir := filepath.Join(root, "dstdir")
+			mustMkdir(t, srcDir)
+			mustMkdir(t, dstDir)
+			src := filepath.Join(srcDir, "f.txt")
+			dst := filepath.Join(dstDir, "f.txt")
+			seedFile(t, src, "payload")
+			if tc.existing {
+				seedFile(t, dst, "occupied")
+			}
+			srcFD, dstFD := openDir(t, srcDir), openDir(t, dstDir)
+
+			var order []string
+			defer SetRenameNoReplaceAtForTest(func(a int, b string, c int, d string) error {
+				order = append(order, "rename")
+				return renameNoReplaceAtSyscall(a, b, c, d)
+			})()
+			if tc.swapAfter {
+				defer SetBeforeMoveRenameForTest(func() {
+					if err := os.Rename(dstDir, dstDir+"-moved"); err != nil {
+						t.Fatalf("swap: %v", err)
+					}
+					mustMkdir(t, dstDir)
+				})()
+			}
+
+			_, _, err := MoveNoReplaceAt(srcFD, dstFD, src, dst, MoveLifecycle{
+				BeforeRename: func(s, d *os.File) error {
+					if s != srcFD || d != dstFD {
+						t.Fatal("BeforeRename was not handed the held parents")
+					}
+					order = append(order, "before")
+					return nil
+				},
+				AfterRename: func(s, d *os.File) {
+					if _, err := s.Stat(); err != nil {
+						t.Fatalf("source parent unusable in AfterRename: %v", err)
+					}
+					if _, err := d.Stat(); err != nil {
+						t.Fatalf("destination parent unusable in AfterRename: %v", err)
+					}
+					order = append(order, "after")
+				},
+			})
+			if (err == nil) != (!tc.existing && !tc.swapAfter) {
+				t.Fatalf("err = %v for %s", err, tc.name)
+			}
+			if len(order) != len(tc.want) {
+				t.Fatalf("order = %v, want %v", order, tc.want)
+			}
+			for i := range order {
+				if order[i] != tc.want[i] {
+					t.Fatalf("order = %v, want %v", order, tc.want)
+				}
+			}
+			if _, err := srcFD.Stat(); err != nil {
+				t.Fatalf("source parent closed by the helper: %v", err)
+			}
+			if _, err := dstFD.Stat(); err != nil {
+				t.Fatalf("destination parent closed by the helper: %v", err)
+			}
+		})
+	}
+}

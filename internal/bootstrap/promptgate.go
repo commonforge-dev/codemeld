@@ -9,10 +9,15 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path/filepath"
+	"strconv"
 
+	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/tui"
 )
@@ -115,11 +120,8 @@ type PromptDisplay struct {
 }
 
 func exceptionalAuthority(req permissions.MatchRequest, mc permissions.ModeContext) string {
-	if !mc.ExecutionConstrained || mc.Mode != string(mode.AutoEdits) || (req.Kind != matchKindDirect && req.Kind != matchKindLiteral) {
+	if !mc.ExecutionConstrained || !mc.SettingsBroken || mc.Mode != string(mode.AutoEdits) || (req.Kind != matchKindDirect && req.Kind != matchKindLiteral) {
 		return ""
-	}
-	if !mc.SettingsBroken {
-		return permissions.SandboxedAutoEditsAuthority(req, mc)
 	}
 	authority, _ := permissions.ClassifyExceptional(req, mc)
 	return authority
@@ -189,16 +191,29 @@ func newPromptGate() *promptGate {
 // upfront ctx check makes an already-cancelled caller deterministic — a bare select
 // could otherwise still take a free permit when both cases are ready.
 func (g *promptGate) acquire(ctx context.Context) error {
+	return g.acquireUntil(ctx, nil)
+}
+
+func (g *promptGate) acquireUntil(ctx context.Context, ended <-chan struct{}) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	select {
+	case <-ended:
+		return errAppShuttingDown
+	default:
 	}
 	select {
 	case g.slot <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-ended:
+		return errAppShuttingDown
 	}
 }
+
+var errAppShuttingDown = errors.New("bootstrap: the app is shutting down")
 
 // release frees the prompt permit for the next waiter. It is called via defer after
 // a successful acquire so a prompt error never strands the permit.
@@ -214,6 +229,14 @@ type PromptGateBuilder struct {
 	gate            *promptGate
 	show            promptShower
 	showIndependent independentShower
+	showNetwork     func(ctx context.Context, host, port string, projectChoice bool) (tui.PromptOption, error)
+	whileRunning    func(func()) bool
+	ended           <-chan struct{}
+
+	projectTrusted     bool
+	projectRoot        string
+	globalSettingsPath string
+	persistGrant       func(global bool, g config.DomainGrant) error
 }
 
 // NewPromptGateBuilder returns a builder whose closures drive the real prompt UI
@@ -223,14 +246,101 @@ type PromptGateBuilder struct {
 func NewPromptGateBuilder(app *tui.App) *PromptGateBuilder {
 	b := newPromptGateBuilder(app.PromptUser)
 	b.showIndependent = app.PromptIndependent
+	b.showNetwork = app.PromptNetwork
+	b.whileRunning = app.WhileRunning
+	b.ended = app.Done()
 	return b
+}
+
+func (b *PromptGateBuilder) AskNetwork(ctx context.Context, host, port string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+	if err := b.gate.acquireUntil(ctx, b.ended); err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	defer b.gate.release()
+	if covered() {
+		return netproxy.DecisionOnce, nil
+	}
+	opt, err := b.showNetwork(ctx, host, port, b.projectTrusted)
+	if err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	var d netproxy.Decision
+	switch opt {
+	case tui.OptionDeny:
+		return netproxy.DecisionDeny, nil
+	case tui.OptionAllowOnce:
+		d = netproxy.DecisionOnce
+	case tui.OptionAllowSession:
+		d = netproxy.DecisionSession
+	case tui.OptionAllowProject, tui.OptionAllowGlobal:
+		global := opt == tui.OptionAllowGlobal
+		if !global && !b.projectTrusted {
+			return netproxy.DecisionDeny, errors.New("bootstrap: the network prompt did not offer allow in this project")
+		}
+		if err := b.live(ctx); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		if err := saveNetworkGrant(host, port, func(g config.DomainGrant) error { return b.persistGrant(global, g) }); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		if err := b.live(ctx); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		d = netproxy.DecisionSession
+	default:
+		return netproxy.DecisionDeny, fmt.Errorf("bootstrap: unknown network prompt option %d", opt)
+	}
+	if !b.whileRunning(func() { accept(d) }) {
+		return netproxy.DecisionDeny, errAppShuttingDown
+	}
+	return d, nil
+}
+
+func (b *PromptGateBuilder) live(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-b.ended:
+		return errAppShuttingDown
+	default:
+		return nil
+	}
+}
+
+func (b *PromptGateBuilder) saveDomainGrant(global bool, g config.DomainGrant) error {
+	if global {
+		if !filepath.IsAbs(b.globalSettingsPath) {
+			return errors.New("bootstrap: no global settings file to save the network grant in")
+		}
+		_, _, err := config.Persist(b.globalSettingsPath, config.KeyDomainGrants, g)
+		return err
+	}
+	return persistLocalDomainGrant(b.projectRoot, g)
+}
+
+func persistLocalDomainGrant(projectRoot string, g config.DomainGrant) error {
+	if !filepath.IsAbs(projectRoot) {
+		return errors.New("bootstrap: no project root to save the network grant in")
+	}
+	_, _, _, err := config.PersistLocal(projectRoot, config.KeyDomainGrants, g)
+	return err
+}
+
+func saveNetworkGrant(host, port string, persist func(config.DomainGrant) error) error {
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("bootstrap: network port %q is not a number", port)
+	}
+	return persist(config.DomainGrant{Host: host, Port: n})
 }
 
 // newPromptGateBuilder is the shared core and the test seam: it binds the gate to
 // an arbitrary prompt shower so the mapping, serialization, and cancel-while-
 // waiting behavior can be exercised with a fake instead of a terminal-driven App.
 func newPromptGateBuilder(show promptShower) *PromptGateBuilder {
-	b := &PromptGateBuilder{gate: newPromptGate(), show: show}
+	b := &PromptGateBuilder{gate: newPromptGate(), show: show, whileRunning: func(f func()) bool { f(); return true }}
+	b.persistGrant = b.saveDomainGrant
 	// A builder bound to a bare single-prompt shower still owes one decision per call, so it
 	// asks for each in turn instead of reusing one answer for the whole group.
 	b.showIndependent = func(reqs []tui.PromptRequest) ([]tui.PromptDecision, error) {

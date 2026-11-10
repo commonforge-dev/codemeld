@@ -3,29 +3,41 @@
 package bootstrap
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
+	"golang.org/x/sys/unix"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/enforce"
+	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
+	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/vcs"
 )
 
@@ -102,8 +114,8 @@ func TestConfinedRunner_AutoProjectSymlinkExclusionsThroughTheRealHelper(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf := launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
-		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil)
+	conf := withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
 	forward := &helperForwardingRunner{bin: bin}
 	confined := &confinedRunner{inner: forward, conf: conf, cap: 4096}
 	write := func(t *testing.T, target string) runner.RunResult {
@@ -199,8 +211,8 @@ func liveRealHelperConfinement(t *testing.T, home, project, tmpDir, yaml string)
 		t.Fatal(err)
 	}
 	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
-	return launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
-		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil)
+	return withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
 }
 
 func TestConfinedRunner_AutoWritableFolderFollowsTheLiveSettingsThroughTheRealHelper(t *testing.T) {
@@ -598,8 +610,8 @@ func TestConfinedRunner_GitRunsWithABlockedGlobalConfigThroughTheRealHelper(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf := launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
-		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, entries)}, nil)
+	conf := withSessionProxy(t, launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
+		mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home, securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, entries)}, nil))
 	confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
 	run := func(script string) runner.RunResult {
 		t.Helper()
@@ -701,7 +713,133 @@ func TestConfinedRunner_HelperNeverRunsAnInfocmpPlantedOnTheFriendlyLookupPath(t
 	}
 }
 
-const planTempReplacedNote = "codemeld: the session's private temp folder was moved or replaced since codemeld created it; " +
+func TestConfinedRunner_HelperRunsNoProgramFromTheLookupPathBeforeConfinement(t *testing.T) {
+	origPATH := os.Getenv("PATH")
+	home, project, bin := realConfinementHost(t)
+	base := filepath.Dir(project)
+	canary, markers, tmpDir := filepath.Join(base, "canary"), filepath.Join(base, "markers"), filepath.Join(base, "tmp")
+	for _, dir := range []string{canary, markers, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := filepath.Join(base, "canary-fake")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n: > '"+markers+"'/\"${0##*/}\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	names := lookupPathExecutables(origPATH + string(os.PathListSeparator) + runner.FixedPATH)
+	names["infocmp"] = true
+	other := ""
+	for name := range names {
+		if err := os.Symlink(fake, filepath.Join(canary, name)); err != nil {
+			t.Fatal(err)
+		}
+		if name != "infocmp" {
+			other = name
+		}
+	}
+	if other == "" {
+		t.Fatal("no executable found on PATH or runner.FixedPATH besides the infocmp canary")
+	}
+	readMarkers := func() []string {
+		t.Helper()
+		entries, err := os.ReadDir(markers)
+		if err != nil {
+			t.Fatalf("read marker folder: %v", err)
+		}
+		var got []string
+		for _, e := range entries {
+			got = append(got, e.Name())
+		}
+		return got
+	}
+
+	for _, name := range []string{"infocmp", other} {
+		_ = exec.Command(filepath.Join(canary, name)).Run()
+	}
+	if got := readMarkers(); !slices.Equal(got, slices.Sorted(slices.Values([]string{"infocmp", other}))) {
+		t.Fatalf("unconfined canary markers = %q; want infocmp and %s", got, other)
+	}
+	clearMarkers := func(names []string) {
+		t.Helper()
+		for _, name := range names {
+			if err := os.Remove(filepath.Join(markers, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	clearMarkers([]string{"infocmp", other})
+
+	t.Setenv("PATH", canary+string(os.PathListSeparator)+origPATH)
+	cache, err := config.NewCache(map[string]any{}, project, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := newSessionTempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owned.removeAndRelease() })
+
+	for _, tc := range []struct {
+		mode   mode.Mode
+		tmpDir string
+	}{{mode.Plan, owned.path}, {mode.AutoEdits, tmpDir}} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			conf := launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tc.tmpDir,
+				mode.NewActiveState(tc.mode, mode.SourceDefault), cache, home, securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil)
+			conf.own(owned)
+			if first, _, _ := strings.Cut(conf.lookupPath, string(os.PathListSeparator)); first != canary {
+				t.Fatalf("lookup path = %q, want %s first", conf.lookupPath, canary)
+			}
+			confined := &confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"/bin/sh", "-c", `printf %s "$TERM"`}, Cwd: project})
+			if got := readMarkers(); len(got) > 0 {
+				t.Errorf("programs run from the lookup PATH before confinement: %q", got)
+				clearMarkers(got)
+			}
+			if err != nil || ctx.Err() != nil || res.ExitCode != 0 || string(res.Stdout) != "dumb" {
+				t.Fatalf("confined TERM print: %v, %v; exit %d stdout %q stderr %q; want 0 and dumb", err, ctx.Err(), res.ExitCode, res.Stdout, res.Stderr)
+			}
+		})
+	}
+}
+
+func lookupPathExecutables(path string) map[string]bool {
+	names := map[string]bool{}
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if info, err := os.Stat(filepath.Join(dir, e.Name())); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+				names[e.Name()] = true
+			}
+		}
+	}
+	return names
+}
+
+func TestLookupPathExecutables_EmptyComponentScansTheCurrentDirectory(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "codemeld-cwd-only-program"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+	for _, path := range []string{"/usr/bin::/bin", ":/usr/bin", "/usr/bin:"} {
+		if !lookupPathExecutables(path)["codemeld-cwd-only-program"] {
+			t.Errorf("PATH %q: current-directory executable missing from the inventory", path)
+		}
+	}
+}
+
+const planTempReplacedNote ="codemeld: the session's private temp folder was moved or replaced since codemeld created it; " +
 	"Plan commands run without it. Restart codemeld to get a new one."
 
 func planRealHelperRunner(t *testing.T, home, project, bin string, cache *config.Cache) (*confinedRunner, *sessionTempDir) {
@@ -1065,7 +1203,7 @@ func TestConfinedRunner_ExternalGitStoresStayReadOnlyThroughTheRealHelper(t *tes
 			hook := filepath.Join(store, "hooks", "pre-commit")
 			write(t, hook, "orig")
 			conf := liveRealHelperConfinement(t, home, project, tmpDir, writableFoldersYAML(writable, free))
-			p, err := conf.policy(conf.mode(), conf.tmpDir, "", conf.blocked.Current(), false)
+			p, err := conf.policy(conf.mode(), conf.tmpDir, conf.blocked.Current(), false)
 			if err != nil || !slices.Contains(p.NoWritePaths, store) {
 				t.Fatalf("policy no-write paths = %q, %v; want %s among them", p.NoWritePaths, err, store)
 			}
@@ -1165,5 +1303,1444 @@ func TestConfinedRunner_StatusWorksWithReadOnlyStoresThroughTheRealHelper(t *tes
 				t.Fatalf("confined %q: exit %d stdout %q stderr %q; want 0 and %q", tc.status, res.ExitCode, res.Stdout, res.Stderr, tc.want)
 			}
 		})
+	}
+}
+
+func TestRunHeadless_ConfinedShellExpandsPathnamePatternsThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if _, err := runner.ResolveOnPath("sh", runner.FixedPATH); err != nil {
+		t.Fatalf("sh absent from %s: %v", runner.FixedPATH, err)
+	}
+	if err := os.Mkdir(filepath.Join(project, "dir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"a.md": "x1\n", "b.md": "x2\n"} {
+		if err := os.WriteFile(filepath.Join(project, "dir", name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matches := []string{"dir/a.md:1:x1", "dir/b.md:1:x2"}
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
+		for _, tc := range []struct {
+			command string
+			matched bool
+		}{
+			{"grep -n x dir/*.md", true},
+			{"grep -n x dir/?.md", true},
+			{"grep -n x dir/[ab].md", true},
+			{"ls | grep -n x dir/*.md", true},
+			{"ls; grep -n x dir/*.md", true},
+			{"true && grep -n x dir/*.md", true},
+			{"false || grep -n x dir/*.md", true},
+			{"false && grep -n x dir/*.md", false},
+			{"true || grep -n x dir/*.md", false},
+		} {
+			t.Run(string(m)+"/"+tc.command, func(t *testing.T) {
+				run := &helperForwardingRunner{bin: bin}
+				result := headlessResult(t, project, mode.NewActiveState(m, mode.SourceDefault))
+				result.Home, result.ConfigLayerPaths = home, []string{SettingsPath(home)}
+				result.Config["confinement"] = map[string]any{"program_lookup": "strict"}
+				runHeadlessShell(t, result, run, tc.command)
+
+				if len(run.specs) != 1 || !slices.Equal(run.specs[0].Argv[3:], []string{"-c", tc.command}) {
+					t.Fatalf("inner runs = %+v, want one sh -c %q through the helper", run.specs, tc.command)
+				}
+				ends := decodeDiskEvents[events.ToolExecEnd](t, readSessionFile(t, result.Session.Path()), events.KindToolExecEnd)
+				if len(ends) != 1 {
+					t.Fatalf("tool_exec_end = %+v, want one", ends)
+				}
+				for _, match := range matches {
+					if strings.Contains(ends[0].Stdout, match) != tc.matched {
+						t.Fatalf("stdout = %q, stderr = %q; want %q present = %v", ends[0].Stdout, ends[0].Stderr, match, tc.matched)
+					}
+				}
+			})
+		}
+	}
+}
+
+func setupDescriptors(t *testing.T, pid string) map[string]string {
+	t.Helper()
+	dir := filepath.Join("/proc", pid, "fd")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[string]string{}
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join(dir, e.Name())); err == nil {
+			held[e.Name()] = target
+		}
+	}
+	return held
+}
+
+func heldSetupEnds(t *testing.T, baseline map[string]bool) []string {
+	t.Helper()
+	var extra []string
+	for _, target := range setupDescriptors(t, "self") {
+		if (strings.HasPrefix(target, "socket:") || strings.Contains(target, "seccomp")) && !baseline[target] {
+			extra = append(extra, target)
+		}
+	}
+	return extra
+}
+
+func setupBaseline(t *testing.T) map[string]bool {
+	t.Helper()
+	baseline := map[string]bool{}
+	for _, target := range setupDescriptors(t, "self") {
+		baseline[target] = true
+	}
+	return baseline
+}
+
+func brokerConfinement(t *testing.T) (conf *confinement, project, writable, bin string) {
+	t.Helper()
+	conf, project, writable, bin = unstartedBrokerConfinement(t)
+	startedSessionProxy(t, conf)
+	return conf, project, writable, bin
+}
+
+func unstartedBrokerConfinement(t *testing.T) (conf *confinement, project, writable, bin string) {
+	t.Helper()
+	home, project, bin := realConfinementHost(t)
+	if _, err := runner.ResolveOnPath("sh", runner.FixedPATH); err != nil {
+		t.Fatalf("sh absent from %s: %v", runner.FixedPATH, err)
+	}
+	base := filepath.Dir(project)
+	writable, tmpDir := filepath.Join(base, "writable"), filepath.Join(base, "tmp")
+	for _, dir := range []string{writable, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf = liveRealHelperConfinement(t, home, project, tmpDir, writableFoldersYAML(writable))
+	conf.broker = enforce.BrokerSlice
+	return conf, project, writable, bin
+}
+
+func startedSessionProxy(t *testing.T, conf *confinement) netip.AddrPort {
+	t.Helper()
+	withSessionProxy(t, conf)
+	endpoint, err := conf.proxy.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return endpoint
+}
+
+func swapRelease(t *testing.T, release func(*os.File) error) {
+	t.Helper()
+	old := releaseHelper
+	releaseHelper = release
+	t.Cleanup(func() { releaseHelper = old })
+}
+
+func helperChildren(t *testing.T) []string {
+	t.Helper()
+	tasks, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []string
+	for _, task := range tasks {
+		b, _ := os.ReadFile(filepath.Join("/proc/self/task", task.Name(), "children"))
+		for _, pid := range strings.Fields(string(b)) {
+			cmdline, _ := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
+			if slices.Contains(strings.Split(string(cmdline), "\x00"), enforce.HelperCommand) {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
+}
+
+const listOwnDescriptors = `for f in /proc/$$/fd/*; do readlink "$f" || :; done`
+
+func TestConfinedRunner_BrokerLaunchHoldsTheTargetUntilReleaseThroughTheRealHelper(t *testing.T) {
+	conf, project, writable, bin := brokerConfinement(t)
+	reached, gate := make(chan struct{}, 2), make(chan struct{})
+	openGate := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(openGate)
+	swapRelease(t, func(f *os.File) error {
+		reached <- struct{}{}
+		<-gate
+		return enforce.ReleaseHelper(f)
+	})
+	forward := &helperForwardingRunner{bin: bin}
+	confined := &confinedRunner{inner: forward, conf: conf, cap: 4096}
+	baseline := setupBaseline(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	finish := filepath.Join(writable, "finish")
+	script := `cat > /dev/null; ` + listOwnDescriptors + ` > "$1.tmp" && mv "$1.tmp" "$1"; while [ ! -e "$2" ]; do sleep 0.05; done`
+	markers := []string{filepath.Join(writable, "a"), filepath.Join(writable, "b")}
+	type outcome struct {
+		res runner.RunResult
+		err error
+	}
+	done := make(chan outcome, len(markers))
+	for i, marker := range markers {
+		var stdin []byte
+		if i == 0 {
+			stdin = bytes.Repeat([]byte("x"), 1<<20)
+		}
+		go func() {
+			res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", script, "sh", marker, finish},
+				Cwd: project, Stdin: stdin})
+			done <- outcome{res, err}
+		}()
+	}
+	for range markers {
+		select {
+		case <-reached:
+		case got := <-done:
+			t.Fatalf("launch returned before reaching release: %v, exit %d stderr %q", got.err, got.res.ExitCode, got.res.Stderr)
+		case <-ctx.Done():
+			t.Fatal("no launch reached release")
+		}
+	}
+
+	for _, marker := range markers {
+		if _, err := os.Lstat(marker); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("target ran before release: stat %s = %v", marker, err)
+		}
+	}
+	helpers := helperChildren(t)
+	if len(helpers) != len(markers) {
+		t.Fatalf("helper processes = %v, want %d", helpers, len(markers))
+	}
+	for _, pid := range helpers {
+		fds := setupDescriptors(t, pid)
+		for fd, target := range fds {
+			n, _ := strconv.Atoi(fd)
+			runtimeOwned := target == "anon_inode:[eventpoll]" || target == "anon_inode:[eventfd]" ||
+				strings.HasPrefix(target, "/sys/fs/cgroup/") && strings.HasSuffix(target, "/cpu.max")
+			if fd == "3" && !strings.HasPrefix(target, "socket:") || n > 3 && !runtimeOwned || strings.Contains(target, "seccomp") {
+				t.Errorf("helper %s fd %s = %q; want only stdin, stdout, stderr and the setup channel at 3, no listener", pid, fd, target)
+			}
+		}
+		if _, ok := fds["3"]; !ok {
+			t.Errorf("helper %s has no setup channel at fd 3: %v", pid, fds)
+		}
+	}
+	unrelated, err := runner.DirectExecRunner{}.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"/bin/sh", "-c", listOwnDescriptors}})
+	if err != nil || unrelated.ExitCode != 0 {
+		t.Fatalf("unrelated child: %v, exit %d", err, unrelated.ExitCode)
+	}
+	if out := string(unrelated.Stdout); strings.Contains(out, "socket:") || strings.Contains(out, "seccomp") {
+		t.Errorf("unrelated child inherited a setup descriptor:\n%s", out)
+	}
+
+	openGate()
+	for _, marker := range markers {
+		var listing []byte
+		for ctx.Err() == nil {
+			if listing, err = os.ReadFile(marker); err == nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatalf("target never wrote %s after release: %v", marker, err)
+		}
+		if strings.Contains(string(listing), "socket:") || strings.Contains(string(listing), "seccomp") {
+			t.Errorf("target %s holds a setup descriptor:\n%s", marker, listing)
+		}
+	}
+	for _, target := range heldSetupEnds(t, baseline) {
+		if strings.HasPrefix(target, "socket:") {
+			t.Errorf("codemeld still holds setup channel %s while the target runs", target)
+		}
+	}
+	if err := os.WriteFile(finish, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range markers {
+		got := <-done
+		if got.err != nil || got.res.ExitCode != 0 {
+			t.Errorf("broker launch: %v, exit %d stderr %q", got.err, got.res.ExitCode, got.res.Stderr)
+		}
+	}
+	if extra := heldSetupEnds(t, baseline); len(extra) != 0 {
+		t.Errorf("after the targets exited codemeld still holds %v", extra)
+	}
+}
+
+func TestConfinedRunner_BrokerEarlyCloseStopsTheBrokerWhileTheTargetRunsThroughTheRealHelper(t *testing.T) {
+	conf, project, writable, bin := brokerConfinement(t)
+	forward := &helperForwardingRunner{bin: bin}
+	confined := &confinedRunner{inner: forward, conf: conf, cap: 4096}
+	baseline := setupBaseline(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	marker, finish := filepath.Join(writable, "running"), filepath.Join(writable, "finish")
+	type outcome struct {
+		res runner.RunResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := confined.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+			Argv: []string{"sh", "-c", `: > "$1"; while [ ! -e "$2" ]; do sleep 0.05; done`, "sh", marker, finish}, Cwd: project})
+		done <- outcome{res, err}
+	}()
+	for ctx.Err() == nil {
+		if _, err := os.Lstat(marker); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("target never ran")
+	}
+	forward.mu.Lock()
+	forward.specs[0].Helper.Close()
+	forward.mu.Unlock()
+	if extra := heldSetupEnds(t, baseline); len(extra) != 0 {
+		t.Errorf("Close returned while codemeld still holds %v", extra)
+	}
+	if err := os.WriteFile(finish, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-done; got.err != nil || got.res.ExitCode != 0 {
+		t.Errorf("broker launch: %v, exit %d stderr %q", got.err, got.res.ExitCode, got.res.Stderr)
+	}
+}
+
+func TestConfinedRunner_BrokerHandoffFailureLeavesNothingOpenThroughTheRealHelper(t *testing.T) {
+	refused := errors.New("handoff refused")
+	cases := map[string]func(t *testing.T){
+		"listener receipt": func(t *testing.T) {
+			old := receiveListener
+			receiveListener = func(*os.File, time.Duration) (*os.File, error) { return nil, refused }
+			t.Cleanup(func() { receiveListener = old })
+			swapRelease(t, func(*os.File) error { t.Error("release reached after a failed listener receipt"); return refused })
+		},
+		"release": func(t *testing.T) {
+			swapRelease(t, func(*os.File) error { return refused })
+		},
+	}
+	for name, inject := range cases {
+		t.Run(name, func(t *testing.T) {
+			conf, project, writable, bin := brokerConfinement(t)
+			inject(t)
+			forward := &helperForwardingRunner{bin: bin}
+			confined := &confinedRunner{inner: forward, conf: conf, cap: 4096}
+			baseline := setupBaseline(t)
+			marker := filepath.Join(writable, "ran")
+			done := make(chan error, 1)
+			go func() {
+				_, err := confined.Exec(context.Background(), runner.RunSpec{InvocationID: ids.NewV7(),
+					Argv: []string{"sh", "-c", `echo ran > "$1"`, "sh", marker}, Cwd: project})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if !errors.Is(err, refused) {
+					t.Fatalf("err = %v, want the handoff failure", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("launch did not return after the handoff failed")
+			}
+			if _, err := os.Lstat(marker); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("target ran without release: stat %s = %v", marker, err)
+			}
+			if helpers := helperChildren(t); len(helpers) != 0 {
+				t.Errorf("helper processes left unreaped: %v", helpers)
+			}
+			if extra := heldSetupEnds(t, baseline); len(extra) != 0 {
+				t.Errorf("codemeld still holds %v", extra)
+			}
+			requireOwnerRetired(t, conf, forward.specs[0].Helper)
+		})
+	}
+}
+
+func TestConfinedRunner_BrokerWrapperRefusalClosesTheHelperChannel(t *testing.T) {
+	refused := errors.New("inner refused")
+	wrappers := map[string]func(*confinement, *confineInner, runner.RunSpec) error{
+		"confinedRunner": func(conf *confinement, inner *confineInner, spec runner.RunSpec) error {
+			_, err := (&confinedRunner{inner: inner, conf: conf, cap: 4096}).Exec(context.Background(), spec)
+			return err
+		},
+		"confinedShellRunner": func(conf *confinement, inner *confineInner, spec runner.RunSpec) error {
+			_, err := shellAdapter(conf, inner).Exec(context.Background(), spec)
+			return err
+		},
+	}
+	for name, run := range wrappers {
+		t.Run(name, func(t *testing.T) {
+			conf := &confinement{constrained: true, mode: fixedMode(string(mode.AutoEdits)), lookupPath: programDir(t, "sh"), tmpDir: t.TempDir(),
+				projectRoot: t.TempDir(), blocked: testBlocked(t), broker: enforce.BrokerSlice}
+			startedSessionProxy(t, conf)
+			inner := &confineInner{err: refused}
+			baseline := setupBaseline(t)
+			err := run(conf, inner, runner.RunSpec{InvocationID: ids.NewV7(), Argv: []string{"sh", "-c", "true"}, Cwd: t.TempDir()})
+			if !errors.Is(err, refused) || len(inner.bounded) != 1 || inner.bounded[0].Helper == nil {
+				t.Fatalf("err = %v, inner saw %d specs; want the refusal of one broker-mode spec", err, len(inner.bounded))
+			}
+			if extra := heldSetupEnds(t, baseline); len(extra) != 0 {
+				t.Errorf("codemeld still holds %v after the inner refusal", extra)
+			}
+			requireOwnerRetired(t, conf, inner.bounded[0].Helper)
+		})
+	}
+}
+
+func requireOwnerRetired(t *testing.T, conf *confinement, helper runner.HelperLaunch) {
+	t.Helper()
+	l := helper.(*brokerLaunch)
+	if l.owner == nil || l.owner.Register(netip.MustParseAddrPort("127.0.0.1:65000")) == nil {
+		t.Error("the call's proxy owner still accepts registrations after the launch ended")
+	}
+	if conf.proxy.running() == nil {
+		t.Error("ending the call stopped the session proxy")
+	}
+}
+
+func TestBrokerLaunch_OwnerCleanupIsIdempotentAndKeepsTheSessionProxy(t *testing.T) {
+	conf := &confinement{broker: enforce.BrokerSlice}
+	var spec runner.RunSpec
+	if err := conf.attachBroker(&spec, enforce.BrokerSlice); err == nil || spec.Helper != nil {
+		t.Fatalf("attachBroker without a session proxy = %v, helper %v; want a refusal", err, spec.Helper)
+	}
+	endpoint := startedSessionProxy(t, conf)
+	server := conf.proxy.running()
+	if err := conf.attachBroker(&spec, enforce.BrokerSlice); err != nil {
+		t.Fatal(err)
+	}
+	l := spec.Helper.(*brokerLaunch)
+	used, fresh := netip.MustParseAddrPort("127.0.0.1:65001"), netip.MustParseAddrPort("127.0.0.1:65002")
+	if err := l.owner.Register(used); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	l.Close()
+	requireOwnerRetired(t, conf, l)
+	next := server.NewOwner(nil)
+	defer next.Close()
+	if err := next.Register(used); err == nil {
+		t.Error("a retired call's endpoint registered a new owner")
+	}
+	if err := next.Register(fresh); err != nil {
+		t.Errorf("fresh endpoint after the call ended: %v", err)
+	}
+	if conf.proxy.running() != server {
+		t.Error("the session proxy changed after the call ended")
+	}
+	c, err := net.DialTimeout("tcp", endpoint.String(), time.Second)
+	if err != nil {
+		t.Fatalf("the session proxy stopped accepting after the call ended: %v", err)
+	}
+	_ = c.Close()
+}
+
+func TestBrokerLaunch_BothSetupEndsAreCloseOnExec(t *testing.T) {
+	var spec runner.RunSpec
+	if err := (&confinement{}).attachBroker(&spec, enforce.BrokerFull); err != nil {
+		t.Fatal(err)
+	}
+	defer spec.Helper.Close()
+	l := spec.Helper.(*brokerLaunch)
+	for name, f := range map[string]*os.File{"codemeld end": l.own, "helper end": l.helper} {
+		rc, err := f.SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var flags int
+		var ferr error
+		if err := rc.Control(func(fd uintptr) { flags, ferr = unix.FcntlInt(fd, unix.F_GETFD, 0) }); err != nil || ferr != nil {
+			t.Fatal(err, ferr)
+		}
+		if flags&unix.FD_CLOEXEC == 0 {
+			t.Errorf("%s flags %#x, want FD_CLOEXEC", name, flags)
+		}
+	}
+}
+
+type proxyStarts struct {
+	mu    sync.Mutex
+	addrs []string
+}
+
+func (p *proxyStarts) record(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.addrs = append(p.addrs, addr)
+}
+
+func (p *proxyStarts) list() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.addrs)
+}
+
+func swapProxyStart(t *testing.T, before func() error) *proxyStarts {
+	t.Helper()
+	starts := &proxyStarts{}
+	real := startSessionProxy
+	startSessionProxy = func(allow []string) (*netproxy.Server, string, error) {
+		if before != nil {
+			if err := before(); err != nil {
+				starts.record("")
+				return nil, "", err
+			}
+		}
+		server, addr, err := real(allow)
+		starts.record(addr)
+		return server, addr, err
+	}
+	t.Cleanup(func() { startSessionProxy = real })
+	return starts
+}
+
+func requireProxyClosed(t *testing.T, addr string) {
+	t.Helper()
+	if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		_ = c.Close()
+		t.Fatalf("the session proxy at %s still accepts connections", addr)
+	}
+}
+
+var conflictingProxyEnv = []string{"HTTPS_PROXY=http://inherited:1", "https_proxy=http://inherited:1", "NO_PROXY=example.com",
+	"ALL_PROXY=socks5://inherited:1", "all_proxy=socks5://inherited:1"}
+
+func requireProxyRouteEnv(t *testing.T, env []string, proxyURL string) {
+	t.Helper()
+	for name, want := range map[string]string{"HTTPS_PROXY": proxyURL, "HTTP_PROXY": proxyURL, "https_proxy": proxyURL, "http_proxy": proxyURL,
+		"NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"} {
+		if got := envNamed(env, name); !slices.Equal(got, []string{name + "=" + want}) {
+			t.Errorf("%s entries = %q, want exactly %s=%s", name, got, name, want)
+		}
+	}
+	for _, name := range []string{"ALL_PROXY", "all_proxy"} {
+		if got := envNamed(env, name); len(got) != 0 {
+			t.Errorf("%s entries = %q, want none", name, got)
+		}
+	}
+}
+
+func requireInheritedProxyEnv(t *testing.T, env []string) {
+	t.Helper()
+	for _, e := range conflictingProxyEnv {
+		name, _, _ := strings.Cut(e, "=")
+		if got := envNamed(env, name); !slices.Equal(got, []string{e}) {
+			t.Errorf("%s entries = %q, want the inherited %s unchanged", name, got, e)
+		}
+	}
+	for _, name := range []string{"HTTP_PROXY", "http_proxy", "no_proxy"} {
+		if got := envNamed(env, name); len(got) != 0 {
+			t.Errorf("%s entries = %q, want none", name, got)
+		}
+	}
+}
+
+func proxyRouteConfinement(t *testing.T, resolution enforce.Resolution, m mode.Mode, programs ...string) (*confinement, string) {
+	t.Helper()
+	home, project := canonicalTempDir(t), canonicalTempDir(t)
+	cache, err := config.NewCache(map[string]any{}, project, nil, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := withSessionTemp(t, launchConfinement(resolution, "", mode.NewActiveState(m, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: testBlocked(t)}, slices.Clone(conflictingProxyEnv)))
+	t.Cleanup(conf.proxy.stop)
+	conf.lookupPath = programDir(t, programs...)
+	return conf, project
+}
+
+var slicePassed = enforce.Resolution{Capability: enforce.Constrained, SelfTestPassed: true, SliceSelfTestPassed: true}
+
+func TestLaunchConfinement_SandboxedPlanAndAutoEditsTakeTheProxyRoute(t *testing.T) {
+	filtered := slicePassed
+	filtered.SliceSelfTestPassed = false
+	for _, tc := range []struct {
+		name       string
+		m          mode.Mode
+		resolution enforce.Resolution
+		argv       []string
+		authority  string
+		proxy      bool
+	}{
+		{"plan", mode.Plan, slicePassed, []string{"mytool"}, "", true},
+		{"plan network command", mode.Plan, slicePassed, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, true},
+		{"plan no-socket fallback", mode.Plan, filtered, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, false},
+		{"build", mode.Build, slicePassed, []string{"mytool"}, "", false},
+		{"network command", mode.AutoEdits, slicePassed, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, true},
+		{"file deletion", mode.AutoEdits, slicePassed, []string{"rm", "x"}, "file deletion", true},
+		{"no-socket fallback", mode.AutoEdits, filtered, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, false},
+		{"unrecognized command", mode.AutoEdits, slicePassed, []string{"mytool"}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			starts := swapProxyStart(t, nil)
+			conf, project := proxyRouteConfinement(t, tc.resolution, tc.m, "mytool", "curl", "rm")
+			authority, _ := permissions.ExceptionalAuthority(tc.argv)
+			if authority != tc.authority {
+				t.Fatalf("authority = %q, want %q", authority, tc.authority)
+			}
+			inner := &confineInner{}
+			spec := confinedSpec(project, tc.argv...)
+			spec.ExceptionalAuthority = authority
+			if _, err := (&confinedRunner{inner: inner, conf: conf, cap: 4096}).Exec(context.Background(), spec); err != nil {
+				t.Fatal(err)
+			}
+			if tc.m == mode.Build {
+				if len(inner.execs) != 1 || len(inner.bounded) != 0 || inner.execs[0].Helper != nil || len(inner.execs[0].Env) != 0 {
+					t.Fatalf("build: inner saw %+v, want one unchanged unconfined spec", inner.execs)
+				}
+			} else {
+				if len(inner.bounded) != 1 {
+					t.Fatalf("inner saw %d confined specs", len(inner.bounded))
+				}
+				got := inner.bounded[0]
+				policy, _ := decodeFrame(t, got.Stdin)
+				if (policy.Broker == enforce.BrokerSlice) != tc.proxy || (got.Helper != nil) != tc.proxy || policy.ExceptionalAuthority != "" {
+					t.Errorf("broker %q, helper channel %v, authority %q; want the proxy route %v and no authority", policy.Broker, got.Helper != nil, policy.ExceptionalAuthority, tc.proxy)
+				}
+				if tc.proxy {
+					addrs := starts.list()
+					if len(addrs) != 1 || !strings.HasPrefix(addrs[0], "127.0.0.1:") {
+						t.Fatalf("proxy starts = %q, want one loopback proxy", addrs)
+					}
+					requireProxyRouteEnv(t, got.Env, "http://"+addrs[0])
+				} else {
+					requireInheritedProxyEnv(t, got.Env)
+				}
+			}
+			if !tc.proxy && len(starts.list()) != 0 {
+				t.Errorf("proxy starts = %q, want none off the proxy route", starts.list())
+			}
+		})
+	}
+}
+
+func TestConfinedRunner_ProxyRouteRefusesCommandProxyAssignments(t *testing.T) {
+	swapProxyStart(t, nil)
+	for _, assignment := range []string{"HTTPS_PROXY=http://evil:1", "NO_PROXY=*", "ALL_PROXY=socks5://evil:1"} {
+		conf, project := proxyRouteConfinement(t, slicePassed, mode.AutoEdits, "mytool")
+		inner := &confineInner{}
+		spec := confinedSpec(project, "mytool")
+		spec.Assignments = []string{assignment}
+		_, err := (&confinedRunner{inner: inner, conf: conf, cap: 4096}).Exec(context.Background(), spec)
+		if envErr := (*runner.EnvAssignmentError)(nil); !errors.As(err, &envErr) || inner.calls() != 0 {
+			t.Errorf("%s: err = %v, inner saw %d calls; want the assignment refused before launch", assignment, err, inner.calls())
+		}
+	}
+}
+
+func TestConfinedRunner_DispatcherCopiesShareOneSessionProxy(t *testing.T) {
+	reached, gate := make(chan struct{}, 1), make(chan struct{})
+	starts := swapProxyStart(t, func() error {
+		reached <- struct{}{}
+		<-gate
+		return nil
+	})
+	conf, project := proxyRouteConfinement(t, slicePassed, mode.AutoEdits, "mytool")
+	child := *conf
+	inners := []*confineInner{{}, {}}
+	done := make(chan error, 2)
+	for i, c := range []*confinement{conf, &child} {
+		go func() {
+			_, err := (&confinedRunner{inner: inners[i], conf: c, cap: 4096}).Exec(context.Background(), confinedSpec(project, "mytool"))
+			done <- err
+		}()
+	}
+	<-reached
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	again := &confineInner{}
+	if _, err := (&confinedRunner{inner: again, conf: &child, cap: 4096}).Exec(context.Background(), confinedSpec(project, "mytool")); err != nil {
+		t.Fatal(err)
+	}
+	addrs := starts.list()
+	if len(addrs) != 1 {
+		t.Fatalf("proxy starts = %q, want exactly one for the session", addrs)
+	}
+	for _, inner := range append(inners, again) {
+		if len(inner.bounded) != 1 || !slices.Equal(envNamed(inner.bounded[0].Env, "HTTP_PROXY"), []string{"HTTP_PROXY=http://" + addrs[0]}) {
+			t.Fatalf("specs = %+v, want each run pointed at the one session proxy %s", inner.bounded, addrs[0])
+		}
+	}
+
+	if err := conf.cleanupAll(); err != nil {
+		t.Fatal(err)
+	}
+	requireProxyClosed(t, addrs[0])
+	late := &confineInner{}
+	if _, err := (&confinedRunner{inner: late, conf: &child, cap: 4096}).Exec(context.Background(), confinedSpec(project, "mytool")); err == nil || late.calls() != 0 {
+		t.Fatalf("run after cleanup: err = %v, inner saw %d calls; want a refusal before launch", err, late.calls())
+	}
+	if n := len(starts.list()); n != 1 {
+		t.Fatalf("proxy starts = %d after cleanup, want still 1", n)
+	}
+}
+
+func TestSessionProxy_CleanupWithoutTempFoldersStopsTheRunningProxy(t *testing.T) {
+	starts := swapProxyStart(t, nil)
+	conf := &confinement{}
+	conf.own(nil)
+	if conf.owned != nil {
+		t.Fatal("own(nil) created temp-folder ownership")
+	}
+	endpoint, err := conf.proxy.start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := conf.proxy.start(); err != nil || again != endpoint {
+		t.Fatalf("second start = %v, %v; want the running %v", again, err, endpoint)
+	}
+	if err := conf.cleanupAll(); err != nil {
+		t.Fatal(err)
+	}
+	requireProxyClosed(t, endpoint.String())
+	if _, err := conf.proxy.start(); !errors.Is(err, errSessionProxyStopped) || len(starts.list()) != 1 {
+		t.Fatalf("start after cleanup = %v with %d starts; want the stopped refusal and no new start", err, len(starts.list()))
+	}
+}
+
+func TestSessionProxy_CleanupRacingABlockedFirstStartJoinsIt(t *testing.T) {
+	for _, first := range []string{"parent", "child copy"} {
+		t.Run(first, func(t *testing.T) {
+			reached, gate := make(chan struct{}, 1), make(chan struct{})
+			starts := swapProxyStart(t, func() error {
+				reached <- struct{}{}
+				<-gate
+				return nil
+			})
+			conf := &confinement{}
+			conf.own(nil)
+			child := *conf
+			starter, waiter := conf, &child
+			if first == "child copy" {
+				starter, waiter = waiter, starter
+			}
+			results := make(chan error, 2)
+			start := func(c *confinement) {
+				_, err := c.proxy.start()
+				results <- err
+			}
+			go start(starter)
+			<-reached
+			go start(waiter)
+			cleaned := make(chan error, 1)
+			go func() { cleaned <- conf.cleanupAll() }()
+			select {
+			case err := <-cleaned:
+				t.Fatalf("cleanup returned %v while the first start was still running", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(gate)
+			if err := <-cleaned; err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if err := <-results; !errors.Is(err, errSessionProxyStopped) {
+					t.Errorf("start racing cleanup = %v, want the stopped refusal", err)
+				}
+			}
+			addrs := starts.list()
+			if len(addrs) != 1 {
+				t.Fatalf("proxy starts = %q, want one", addrs)
+			}
+			requireProxyClosed(t, addrs[0])
+			if conf.decide(netip.MustParseAddrPort(addrs[0])) {
+				t.Error("the decider admits the stopped proxy's endpoint")
+			}
+			if _, err := child.proxy.start(); !errors.Is(err, errSessionProxyStopped) || len(starts.list()) != 1 {
+				t.Errorf("start after cleanup = %v with %d starts; want the stopped refusal and no new start", err, len(starts.list()))
+			}
+		})
+	}
+}
+
+func TestSessionProxy_CleanupRefusesHelperStartupThatRacesIt(t *testing.T) {
+	conf := &confinement{}
+	startedSessionProxy(t, conf)
+	var spec runner.RunSpec
+	if err := conf.attachBroker(&spec, enforce.BrokerSlice); err != nil {
+		t.Fatal(err)
+	}
+	defer spec.Helper.Close()
+	conf.proxy.stop()
+	if err := spec.Helper.Started(); !errors.Is(err, errSessionProxyStopped) {
+		t.Errorf("helper startup after cleanup = %v, want the stopped refusal", err)
+	}
+	var later runner.RunSpec
+	if err := conf.attachBroker(&later, enforce.BrokerFull); !errors.Is(err, errSessionProxyStopped) || later.Helper != nil {
+		t.Errorf("broker launch after cleanup = %v, helper %v; want the stopped refusal", err, later.Helper)
+	}
+}
+
+func TestSessionProxy_CleanupHoldsTheListenerUntilAnAdmittedConnectEndsThroughTheRealHelper(t *testing.T) {
+	conf, project, _, bin := unstartedBrokerConfinement(t)
+	endpoint := startedSessionProxy(t, conf)
+	admitted, resume := make(chan struct{}), make(chan struct{})
+	resumeOnce := sync.OnceFunc(func() { close(resume) })
+	t.Cleanup(resumeOnce)
+	admits, pause := conf.decide, sync.OnceFunc(func() { close(admitted); <-resume })
+	conf.decide = func(dest netip.AddrPort) bool {
+		ok := admits(dest)
+		if ok {
+			pause()
+		}
+		return ok
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ran := make(chan struct{})
+	go func() {
+		defer close(ran)
+		_, _ = (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+			Argv: []string{os.Args[0], "-test.run=^TestConfinedConnectChild$", "--", endpoint.String()}, Cwd: project})
+	}()
+	select {
+	case <-admitted:
+	case <-ctx.Done():
+		t.Fatal("the child's connect to the proxy endpoint was never admitted")
+	}
+	cleaned := make(chan struct{})
+	go func() {
+		defer close(cleaned)
+		_ = conf.cleanupAll()
+	}()
+	for admits(endpoint) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ln, err := net.Listen("tcp4", endpoint.String()); err == nil {
+		_ = ln.Close()
+		t.Fatal("the proxy endpoint could be rebound while an admitted connect was still pending")
+	}
+	select {
+	case <-cleaned:
+		t.Fatal("cleanup returned while an admitted connect was still pending")
+	default:
+	}
+	resumeOnce()
+	select {
+	case <-cleaned:
+	case <-ctx.Done():
+		t.Fatal("cleanup never returned after the admitted connect ended")
+	}
+	requireProxyClosed(t, endpoint.String())
+	<-ran
+}
+
+func TestConfinedRunner_ProxyStartFailureLaunchesNothing(t *testing.T) {
+	refused := errors.New("proxy refused")
+	starts := swapProxyStart(t, func() error { return refused })
+	conf, project := proxyRouteConfinement(t, slicePassed, mode.AutoEdits, "mytool")
+	for range 2 {
+		inner := &confineInner{}
+		if _, err := (&confinedRunner{inner: inner, conf: conf, cap: 4096}).Exec(context.Background(), confinedSpec(project, "mytool")); !errors.Is(err, refused) || inner.calls() != 0 {
+			t.Fatalf("err = %v, inner saw %d calls; want the proxy failure and no launch", err, inner.calls())
+		}
+	}
+	if n := len(starts.list()); n != 1 {
+		t.Errorf("proxy starts = %d, want the one failed start shared by later runs", n)
+	}
+}
+
+func TestConfinedConnectChild(t *testing.T) {
+	i := slices.Index(os.Args, "--")
+	if i < 0 || i+1 >= len(os.Args) {
+		t.Skip("runs only as a confined child")
+	}
+	switch os.Args[i+1] {
+	case "env":
+		for _, e := range os.Environ() {
+			fmt.Println(e)
+		}
+		return
+	case "hold":
+		holdProxyConnection(os.Args[i+2], os.Args[i+3], os.Args[i+4], os.Args[i+5])
+		return
+	case "short":
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+		if err != nil {
+			fmt.Printf("socket %d\n", err)
+			return
+		}
+		defer func() { _ = unix.Close(fd) }()
+		addr := [3]byte{}
+		_, _, e := unix.Syscall(unix.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&addr[0])), uintptr(len(addr)))
+		fmt.Printf("connect %d\n", e)
+		return
+	case "unix":
+		fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			fmt.Printf("socket %d\n", err)
+			return
+		}
+		_ = unix.Close(fd)
+		fmt.Println("socket created")
+		return
+	case "get":
+		host := "example.com"
+		if len(os.Args) > i+2 {
+			host = os.Args[i+2]
+		}
+		resp, err := http.Get("http://" + host + "/")
+		if err != nil {
+			fmt.Printf("get %v\n", err)
+			return
+		}
+		_ = resp.Body.Close()
+		fmt.Printf("status %d refused %q\n", resp.StatusCode, resp.Header.Get("X-Proxy-Refused"))
+		return
+	}
+	dest := netip.MustParseAddrPort(os.Args[i+1])
+	family := unix.AF_INET
+	if dest.Addr().Is4In6() {
+		family = unix.AF_INET6
+	}
+	fd, err := unix.Socket(family, unix.SOCK_STREAM, 0)
+	if err != nil {
+		fmt.Printf("socket %d\n", err)
+		return
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var sa unix.Sockaddr = &unix.SockaddrInet4{Port: int(dest.Port()), Addr: dest.Addr().As4()}
+	if family == unix.AF_INET6 {
+		sa = &unix.SockaddrInet6{Port: int(dest.Port()), Addr: dest.Addr().As16()}
+	}
+	if err := unix.Connect(fd, sa); err != nil {
+		fmt.Printf("connect %d\n", err)
+		return
+	}
+	fmt.Println("connected")
+}
+
+func holdProxyConnection(marker, gate, result, target string) {
+	report := func(msg string) {
+		_ = os.WriteFile(result+".tmp", []byte(msg), 0o600)
+		_ = os.Rename(result+".tmp", result)
+	}
+	c, err := net.Dial("tcp", strings.TrimPrefix(os.Getenv("HTTP_PROXY"), "http://"))
+	if err != nil {
+		report("dial " + err.Error())
+		return
+	}
+	defer func() { _ = c.Close() }()
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		report("marker " + err.Error())
+		return
+	}
+	for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(gate); err == nil {
+			break
+		}
+	}
+	_, werr := fmt.Fprintf(c, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	line, rerr := bufio.NewReader(c).ReadString('\n')
+	report(fmt.Sprintf("write %v read %q err %v", werr, line, rerr))
+}
+
+func waitForFile(t *testing.T, ctx context.Context, path string) []byte {
+	t.Helper()
+	for ctx.Err() == nil {
+		if b, err := os.ReadFile(path); err == nil {
+			return b
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never appeared", path)
+	return nil
+}
+
+func TestConfinedRunner_ProxyConnectionsEndWithTheirCommandThroughTheRealHelper(t *testing.T) {
+	conf, project, writable, bin := brokerConfinement(t)
+	server := conf.proxy.running()
+	upstream, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = upstream.Close() }()
+	var dialed atomic.Int32
+	go func() {
+		for {
+			c, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			dialed.Add(1)
+			_ = c.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	const script = `"$0" -test.run='^TestConfinedConnectChild$' -- hold "$1" "$2" "$3" "$4" </dev/null >/dev/null 2>&1 &
+while [ ! -e "$5" ]; do sleep 0.05; done`
+	file := func(name string) string { return filepath.Join(writable, name) }
+	run := func(c *confinement, n, until string) (runner.RunResult, error) {
+		return (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: c, cap: 4096}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+			Argv: []string{"sh", "-c", script, os.Args[0], file("connected" + n), file("gate" + n), file("result" + n), upstream.Addr().String(), until},
+			Cwd:  project})
+	}
+
+	child := *conf
+	overlapping := make(chan error, 1)
+	go func() {
+		res, err := run(&child, "2", file("finish2"))
+		if err == nil && res.ExitCode != 0 {
+			err = fmt.Errorf("exit %d stderr %q", res.ExitCode, res.Stderr)
+		}
+		overlapping <- err
+	}()
+	waitForFile(t, ctx, file("connected2"))
+	if res, err := run(conf, "1", file("connected1")); err != nil || res.ExitCode != 0 {
+		t.Fatalf("background-child call: %v, exit %d stderr %q", err, res.ExitCode, res.Stderr)
+	}
+	for _, n := range []string{"1", "2"} {
+		if err := os.WriteFile(file("gate"+n), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := string(waitForFile(t, ctx, file("result1"))); !strings.Contains(got, `read ""`) || strings.Contains(got, "timeout") {
+		t.Errorf("background child after its call ended: %s; want its proxy connection closed unanswered", got)
+	}
+	if got := string(waitForFile(t, ctx, file("result2"))); !strings.Contains(got, `read "HTTP/1.1 403 `) {
+		t.Errorf("overlapping call's child: %s; want its connection still served", got)
+	}
+	if r := server.Refusals(); len(r) != 1 {
+		t.Errorf("refusals %+v, want only the overlapping call's request parsed", r)
+	}
+	if err := os.WriteFile(file("finish2"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-overlapping; err != nil {
+		t.Fatalf("overlapping call: %v", err)
+	}
+
+	res, err := (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 1 << 16}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+		Argv: []string{os.Args[0], "-test.run=^TestConfinedConnectChild$", "--", "get"}, Cwd: project})
+	if err != nil || !strings.HasPrefix(string(res.Stdout), "status 403 ") {
+		t.Fatalf("later call: %v, stdout %q stderr %q; want a request served by the same session proxy", err, res.Stdout, res.Stderr)
+	}
+	if r := server.Refusals(); len(r) != 2 || conf.proxy.running() != server {
+		t.Errorf("refusals %+v; want the later call's request handled by the same session proxy", r)
+	}
+	if n := dialed.Load(); n != 0 {
+		t.Errorf("the fixture upstream was dialed %d times", n)
+	}
+}
+
+func TestConfinedRunner_ProxyAskerFromTheConfinementThroughTheRealHelper(t *testing.T) {
+	conf, project, writable, bin := unstartedBrokerConfinement(t)
+	file := func(name string) string { return filepath.Join(writable, name) }
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	var mu sync.Mutex
+	var asked []string
+	conf.proxyAsker = func(askCtx context.Context, host, port string, _ func() bool, _ func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		mu.Lock()
+		asked = append(asked, net.JoinHostPort(host, port))
+		first := len(asked) == 1
+		mu.Unlock()
+		if !first {
+			return netproxy.DecisionDeny, nil
+		}
+		if err := os.WriteFile(file("asked"), nil, 0o600); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		select {
+		case <-askCtx.Done():
+		case <-ctx.Done():
+		}
+		return netproxy.DecisionSession, nil
+	}
+	if err := os.WriteFile(file("gate"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const script = `"$0" -test.run='^TestConfinedConnectChild$' -- hold "$1" "$2" "$3" "$4" </dev/null >/dev/null 2>&1 &
+while [ ! -e "$5" ]; do sleep 0.05; done`
+	res, err := (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+		Argv: []string{"sh", "-c", script, os.Args[0], file("connected"), file("gate"), file("result"), "example.com", file("asked")},
+		Cwd:  project})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("call that ends while asked: %v, exit %d stderr %q", err, res.ExitCode, res.Stderr)
+	}
+	if got := string(waitForFile(t, ctx, file("result"))); strings.Contains(got, "timeout") {
+		t.Errorf("background child after its call ended: %s; want its proxy connection closed", got)
+	}
+	server := conf.proxy.running()
+	if r := server.Refusals(); len(r) != 1 || r[0] != (netproxy.Refusal{Host: "example.com", Port: "80", Reason: "not approved (command ended)"}) {
+		t.Fatalf("refusals %+v, want the ended call's request refused not approved (command ended)", r)
+	}
+
+	res, err = (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 1 << 16}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+		Argv: []string{os.Args[0], "-test.run=^TestConfinedConnectChild$", "--", "get"}, Cwd: project})
+	if err != nil || firstLine(string(res.Stdout)) != `status 403 refused "not approved (denied)"` {
+		t.Fatalf("later call: %v, stdout %q stderr %q; want the confinement's asker asked again and denying", err, res.Stdout, res.Stderr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(asked, []string{"example.com:80", "example.com:80"}) {
+		t.Fatalf("asked %q; want the ended call's late answer to store no approval", asked)
+	}
+}
+
+func TestConfinedRunner_ProxyRouteRefusalsStayWithTheirCallThroughTheRealHelper(t *testing.T) {
+	conf, project, writable, bin := brokerConfinement(t)
+	file := func(name string) string { return filepath.Join(writable, name) }
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	other, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	otherPort := strconv.Itoa(other.Addr().(*net.TCPAddr).Port)
+	const script = `for step in "$@"; do
+case "$step" in
+wait:*) : > "${step#wait:}.ready"; while [ ! -e "${step#wait:}" ]; do sleep 0.05; done ;;
+*) "$0" -test.run='^TestConfinedConnectChild$' -- $step >/dev/null ;;
+esac
+done`
+	run := func(c *confinement, steps ...string) []netproxy.Refusal {
+		forward := &helperForwardingRunner{bin: bin}
+		res, err := (&confinedRunner{inner: forward, conf: c, cap: 1 << 16}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+			Argv: append([]string{"sh", "-c", script, os.Args[0]}, steps...), Cwd: project})
+		if err != nil || res.ExitCode != 0 {
+			t.Errorf("call %q: %v, exit %d stderr %q", steps, err, res.ExitCode, res.Stderr)
+			return nil
+		}
+		forward.mu.Lock()
+		helper := forward.specs[0].Helper
+		forward.mu.Unlock()
+		h, ok := helper.(interface{ refusals() []netproxy.Refusal })
+		if !ok {
+			t.Errorf("call %q: helper %T has no refusal accessor", steps, helper)
+			return nil
+		}
+		got := h.refusals()
+		if len(got) > 0 {
+			h.refusals()[0].Host = "changed"
+		}
+		helper.Close()
+		if again := h.refusals(); !slices.Equal(again, got) {
+			t.Errorf("call %q: a repeated read after a second Close returned %+v, first %+v", steps, again, got)
+		}
+		return got
+	}
+	noOne := func(host string) netproxy.Refusal {
+		return netproxy.Refusal{Host: host, Port: "80", Reason: "not approved (no one to ask)"}
+	}
+	direct := func(host string) netproxy.Refusal {
+		return netproxy.Refusal{Host: host, Port: otherPort, Reason: "direct connection not allowed (use the proxy)"}
+	}
+	notTCP := netproxy.Refusal{Reason: "not a TCP connect"}
+	check := func(what string, got, want []netproxy.Refusal) {
+		t.Helper()
+		if !slices.Equal(got, want) {
+			t.Errorf("%s refusals:\n got %+v\nwant %+v", what, got, want)
+		}
+	}
+
+	check("first sequential call", run(conf, "get a.test", "127.0.0.1:"+otherPort, "short"),
+		[]netproxy.Refusal{noOne("a.test"), direct("127.0.0.1"), notTCP})
+	check("second sequential call", run(conf, "get b.test", "1.1.1.1:"+otherPort),
+		[]netproxy.Refusal{noOne("b.test"), direct("1.1.1.1")})
+
+	child := *conf
+	overlapping := make(chan []netproxy.Refusal, 1)
+	go func() {
+		overlapping <- run(&child, "get c.test", "127.0.0.1:"+otherPort, "wait:"+file("gate"), "get c2.test")
+	}()
+	waitForFile(t, ctx, file("gate.ready"))
+	check("call inside the overlap", run(conf, "get d.test", "1.1.1.1:"+otherPort),
+		[]netproxy.Refusal{noOne("d.test"), direct("1.1.1.1")})
+	if err := os.WriteFile(file("gate"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check("overlapping call", <-overlapping,
+		[]netproxy.Refusal{noOne("c.test"), noOne("c2.test"), direct("127.0.0.1")})
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
+}
+
+func TestConfinedRunner_SliceResultStaysWithItsSessionThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	if !resolution.SliceSelfTestPassed {
+		t.Skip("unverified: the slice self-test did not pass on this host")
+	}
+	starts := swapProxyStart(t, nil)
+	base := filepath.Dir(project)
+	sliced := liveRealHelperConfinement(t, home, project, filepath.Join(base, "tmp-sliced"), writableFoldersYAML())
+	failed := resolution
+	failed.SliceSelfTestPassed = false
+	swapResolveExecutionCapability(t, failed)
+	filtered := liveRealHelperConfinement(t, home, project, filepath.Join(base, "tmp-filtered"), writableFoldersYAML())
+	for _, conf := range []*confinement{sliced, filtered} {
+		if err := os.MkdirAll(conf.tmpDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		conf.inherited = slices.Clone(conflictingProxyEnv)
+	}
+
+	other, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	var accepted atomic.Int32
+	go func() {
+		for {
+			c, err := other.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			_ = c.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	run := func(conf *confinement, arg string) (string, runner.RunSpec) {
+		t.Helper()
+		forward := &helperForwardingRunner{bin: bin}
+		res, err := (&confinedRunner{inner: forward, conf: conf, cap: 1 << 16}).Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(),
+			Argv: []string{os.Args[0], "-test.run=^TestConfinedConnectChild$", "--", arg}, Cwd: project})
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("confined child %s: %v, exit %d stderr %q", arg, err, res.ExitCode, res.Stderr)
+		}
+		spec := forward.specs[0]
+		if (spec.Helper != nil) != (conf == sliced) || spec.Argv[1] != enforce.HelperCommand {
+			t.Errorf("sliced %v: helper channel %v, argv %q", conf == sliced, spec.Helper != nil, spec.Argv)
+		}
+		return string(res.Stdout), spec
+	}
+
+	out, _ := run(sliced, "env")
+	env := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	proxyURL, _ := strings.CutPrefix(slices.Concat(envNamed(env, "HTTP_PROXY"), []string{""})[0], "HTTP_PROXY=")
+	port, ok := strings.CutPrefix(proxyURL, "http://127.0.0.1:")
+	if _, err := strconv.ParseUint(port, 10, 16); !ok || err != nil {
+		t.Fatalf("HTTP_PROXY = %q, want http://127.0.0.1:<port>", proxyURL)
+	}
+	requireProxyRouteEnv(t, env, proxyURL)
+	out, _ = run(filtered, "env")
+	requireInheritedProxyEnv(t, strings.Split(strings.TrimSuffix(out, "\n"), "\n"))
+
+	connected, refused := "connected", fmt.Sprintf("connect %d", syscall.EPERM)
+	for _, tc := range []struct {
+		conf *confinement
+		dest string
+		want string
+	}{
+		{sliced, "127.0.0.1:" + port, connected},
+		{sliced, "[::ffff:127.0.0.1]:" + port, connected},
+		{sliced, other.Addr().String(), refused},
+		{sliced, "1.1.1.1:" + port, refused},
+		{filtered, "127.0.0.1:" + port, fmt.Sprintf("socket %d", syscall.EPERM)},
+		{filtered, other.Addr().String(), fmt.Sprintf("socket %d", syscall.EPERM)},
+	} {
+		if got, _ := run(tc.conf, tc.dest); firstLine(got) != tc.want {
+			t.Errorf("sliced %v to %s: child printed %q, want first line %q", tc.conf == sliced, tc.dest, got, tc.want)
+		}
+	}
+	if got, _ := run(sliced, "get"); firstLine(got) != `status 403 refused "not approved (no one to ask)"` {
+		t.Errorf("request through the session proxy printed %q, want a 403 no-one-to-ask refusal", got)
+	}
+	if n := accepted.Load(); n != 0 {
+		t.Errorf("the other loopback listener accepted %d connections from confined children", n)
+	}
+	if addrs := starts.list(); len(addrs) != 1 || addrs[0] != "127.0.0.1:"+port {
+		t.Errorf("proxy starts = %q, want the one session proxy at 127.0.0.1:%s", addrs, port)
+	}
+}
+
+func TestConfinedRunner_ProxyRouteFailureNoteNamesItsRefusalsThroughTheRealHelper(t *testing.T) {
+	conf, project, writable, bin := brokerConfinement(t)
+	server := conf.proxy.running()
+	file := func(name string) string { return filepath.Join(writable, name) }
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	other, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Close() }()
+	otherAddr := other.Addr().String()
+	const script = `for step in "$@"; do
+case "$step" in
+wait:*) : > "${step#wait:}.ready"; while [ ! -e "${step#wait:}" ]; do sleep 0.05; done ;;
+quiet:*) "$0" -test.run='^TestConfinedConnectChild$' -- ${step#quiet:} >/dev/null 2>&1 ;;
+*) "$0" -test.run='^TestConfinedConnectChild$' -- $step ;;
+esac
+done
+exit 1`
+	spec := func(steps ...string) runner.RunSpec {
+		return runner.RunSpec{InvocationID: ids.NewV7(), Argv: append([]string{"sh", "-c", script, os.Args[0]}, steps...), Cwd: project}
+	}
+	run := func(c *confinement, steps ...string) runner.RunResult {
+		res, err := (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: c, cap: 1 << 16}).Exec(ctx, spec(steps...))
+		if err != nil || res.ExitCode != 1 {
+			t.Errorf("call %q: %v, exit %d stderr %q", steps, err, res.ExitCode, res.Stderr)
+		}
+		return res
+	}
+	noOne := func(host string) string { return refusedLine(host+":80", "not approved (no one to ask)") }
+	note := func(lines ...string) string { return strings.Join(lines, "\n") + "\n" + confinedFailureNote }
+	check := func(what string, res runner.RunResult, want string) {
+		t.Helper()
+		if string(res.Stderr) != want {
+			t.Errorf("%s stderr:\n got %q\nwant %q", what, res.Stderr, want)
+		}
+	}
+
+	first := run(conf, "quiet:get a.test", otherAddr)
+	check("first call", first, note(noOne("a.test"), refusedLine(otherAddr, "direct connection not allowed (use the proxy)")))
+	if want := fmt.Sprintf("connect %d", syscall.EPERM); firstLine(string(first.Stdout)) != want {
+		t.Errorf("first call stdout = %q, want the direct connect refused %q", first.Stdout, want)
+	}
+	check("sequential call after a refusal", run(conf, "quiet:get b.test"), note(noOne("b.test")))
+
+	child := *conf
+	overlapping := make(chan runner.RunResult, 1)
+	go func() { overlapping <- run(&child, "quiet:get c.test", "wait:"+file("gate")) }()
+	waitForFile(t, ctx, file("gate.ready"))
+	check("call inside the overlap", run(conf, "quiet:get d.test"), note(noOne("d.test")))
+	if err := os.WriteFile(file("gate"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check("overlapping call", <-overlapping, note(noOne("c.test")))
+
+	store := mkStore(t)
+	shell := &shellEventRunner{inner: &helperForwardingRunner{bin: bin}, active: func() *sessions.Store { return store }, cap: 1 << 16}
+	res, err := execNoted(&confinedShellRunner{events: shell, conf: conf}, spec("quiet:get e.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("shell call in a session", res, note(noOne("e.test")))
+	if ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd); len(ends) != 1 || ends[0].Stderr != string(res.Stderr) {
+		t.Errorf("tool_exec_end = %+v, want the returned stderr %q", ends, res.Stderr)
+	}
+	if conf.proxy.running() != server {
+		t.Error("the session proxy changed; want the one proxy kept across every call")
+	}
+}
+
+func TestConfinedRunner_SandboxedNetworkCommandTakesTheProxyRouteThroughTheRealHelper(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T) (*confinement, string, string){
+		"auto_edits": func(t *testing.T) (*confinement, string, string) {
+			conf, project, _, bin := brokerConfinement(t)
+			return conf, project, bin
+		},
+		"plan": func(t *testing.T) (*confinement, string, string) {
+			home, project, bin := realConfinementHost(t)
+			cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			confined, _ := planRealHelperRunner(t, home, project, bin, cache)
+			confined.conf.broker = enforce.BrokerSlice
+			startedSessionProxy(t, confined.conf)
+			return confined.conf, project, bin
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conf, project, bin := setup(t)
+			other, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = other.Close() }()
+			otherAddr := other.Addr().String()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			run := func(arg string, cap int) runner.RunResult {
+				t.Helper()
+				spec := runner.RunSpec{InvocationID: ids.NewV7(), Cwd: project, ExceptionalAuthority: enforce.NetworkAccessAuthority,
+					Argv: []string{"sh", "-c", `"$0" -test.run='^TestConfinedConnectChild$' -- "$1"; exit 1`, os.Args[0], arg}}
+				res, err := (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: cap}).Exec(ctx, spec)
+				if err != nil || res.ExitCode != 1 {
+					t.Fatalf("child %s: %v, exit %d stderr %q", arg, err, res.ExitCode, res.Stderr)
+				}
+				return res
+			}
+			eperm := func(call string) string { return fmt.Sprintf("%s %d", call, syscall.EPERM) }
+
+			direct := run(otherAddr, 4096)
+			if firstLine(string(direct.Stdout)) != eperm("connect") {
+				t.Errorf("direct connect stdout = %q, want %q", direct.Stdout, eperm("connect"))
+			}
+			if want := refusedLine(otherAddr, "direct connection not allowed (use the proxy)") + "\n" + confinedFailureNote; string(direct.Stderr) != want {
+				t.Errorf("direct connect stderr:\n got %q\nwant %q", direct.Stderr, want)
+			}
+
+			fits := len("\n"+confinedFailureNote) + len(wantProxyRouteNote) + 1
+			for cap, want := range map[int]string{fits: wantProxyRouteNote + "\n" + confinedFailureNote, fits - 1: confinedFailureNote} {
+				res := run("unix", cap)
+				if firstLine(string(res.Stdout)) != eperm("socket") {
+					t.Errorf("cap %d: unix socket stdout = %q, want %q", cap, res.Stdout, eperm("socket"))
+				}
+				if string(res.Stderr) != want {
+					t.Errorf("cap %d: unix socket stderr:\n got %q\nwant %q", cap, res.Stderr, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLaunchConfinement_OnlyTheProxyRouteAddsRefusalLines(t *testing.T) {
+	filtered := slicePassed
+	filtered.SliceSelfTestPassed = false
+	record := []netproxy.Refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	generic := "boom\n" + confinedFailureNote
+	refused := "boom\n" + refusedLine("a.test:80", "not approved (no one to ask)") + "\n" + confinedFailureNote
+	for _, tc := range []struct {
+		name       string
+		m          mode.Mode
+		resolution enforce.Resolution
+		argv       []string
+		want       string
+	}{
+		{"plan", mode.Plan, slicePassed, []string{"mytool"}, refused},
+		{"build", mode.Build, slicePassed, []string{"mytool"}, "boom"},
+		{"network command", mode.AutoEdits, slicePassed, []string{"curl", "https://example.com/"}, refused},
+		{"no-socket fallback", mode.AutoEdits, filtered, []string{"mytool"}, generic},
+		{"proxy route", mode.AutoEdits, slicePassed, []string{"mytool"}, refused},
+	} {
+		authority, _ := permissions.ExceptionalAuthority(tc.argv)
+		adapters := map[string]func(*confinement, runner.RunSpec) (runner.RunResult, error){
+			"vcs": func(c *confinement, spec runner.RunSpec) (runner.RunResult, error) {
+				return (&confinedRunner{inner: &confineInner{exitCode: 1, stderr: []byte("boom")}, conf: c, cap: 4096}).Exec(context.Background(), spec)
+			},
+			"bash": func(c *confinement, spec runner.RunSpec) (runner.RunResult, error) {
+				return execNoted(&confinedShellRunner{events: &shellEventRunner{inner: &confineInner{exitCode: 1, stderr: []byte("boom")}, cap: 4096}, conf: c}, spec)
+			},
+		}
+		for name, exec := range adapters {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				swapProxyStart(t, nil)
+				reads := swapInvocationRefusals(t, record)
+				conf, project := proxyRouteConfinement(t, tc.resolution, tc.m, "mytool", "curl")
+				spec := confinedSpec(project, tc.argv...)
+				spec.ExceptionalAuthority = authority
+				res, err := exec(conf, spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(res.Stderr) != tc.want {
+					t.Fatalf("stderr = %q, want %q", res.Stderr, tc.want)
+				}
+				if wantReads := map[bool]int{true: 1}[tc.want == refused]; reads.count() != wantReads {
+					t.Fatalf("refusals read %d times, want %d", reads.count(), wantReads)
+				}
+			})
+		}
 	}
 }

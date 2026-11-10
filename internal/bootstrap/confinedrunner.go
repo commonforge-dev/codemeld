@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,6 +21,7 @@ import (
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/mode"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/vcs"
@@ -37,6 +40,145 @@ type confinement struct {
 	owned       *ownedTempDirs
 	inherited   []string
 	warning     string
+	broker      string
+	decide      func(netip.AddrPort) bool
+	proxy       *sessionProxy
+	proxyAsker  netproxy.Asker
+	grants      []string
+}
+
+type proxyState int
+
+const (
+	proxyIdle proxyState = iota
+	proxyStarting
+	proxyRunning
+	proxyFailed
+)
+
+type sessionProxy struct {
+	mu       sync.Mutex
+	changed  *sync.Cond
+	state    proxyState
+	closed   bool
+	server   *netproxy.Server
+	endpoint netip.AddrPort
+	err      error
+	launches map[launchStopper]struct{}
+	allow    []string
+}
+
+type launchStopper interface{ stopBroker() }
+
+var errSessionProxyStopped = errors.New("codemeld confinement: the session network proxy has stopped")
+
+var startSessionProxy = func(allow []string) (*netproxy.Server, string, error) {
+	server, err := netproxy.New(allow)
+	if err != nil {
+		return nil, "", err
+	}
+	addr, err := server.Start()
+	if err != nil {
+		server.Stop()
+		return nil, "", err
+	}
+	return server, addr, nil
+}
+
+func newSessionProxy(allow []string) *sessionProxy {
+	p := &sessionProxy{allow: allow}
+	p.changed = sync.NewCond(&p.mu)
+	return p
+}
+
+func (p *sessionProxy) start() (netip.AddrPort, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for p.state == proxyStarting {
+		p.changed.Wait()
+	}
+	switch {
+	case p.closed:
+		return netip.AddrPort{}, errSessionProxyStopped
+	case p.state == proxyRunning:
+		return p.endpoint, nil
+	case p.state == proxyFailed:
+		return netip.AddrPort{}, p.err
+	}
+	p.state = proxyStarting
+	p.mu.Unlock()
+	server, addr, err := startSessionProxy(p.allow)
+	var endpoint netip.AddrPort
+	if err == nil {
+		if endpoint, err = netip.ParseAddrPort(addr); err != nil {
+			server.Stop()
+		}
+	}
+	p.mu.Lock()
+	defer p.changed.Broadcast()
+	if err != nil {
+		p.state, p.err = proxyFailed, fmt.Errorf("codemeld confinement: start the session network proxy: %w", err)
+		return netip.AddrPort{}, p.err
+	}
+	p.state, p.server, p.endpoint = proxyRunning, server, endpoint
+	if p.closed {
+		return netip.AddrPort{}, errSessionProxyStopped
+	}
+	return endpoint, nil
+}
+
+func (p *sessionProxy) admits(dest netip.AddrPort) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state == proxyRunning && !p.closed && dest == p.endpoint
+}
+
+func (p *sessionProxy) running() *netproxy.Server {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.state != proxyRunning || p.closed {
+		return nil
+	}
+	return p.server
+}
+
+func (p *sessionProxy) track(l launchStopper) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return errSessionProxyStopped
+	}
+	if p.launches == nil {
+		p.launches = map[launchStopper]struct{}{}
+	}
+	p.launches[l] = struct{}{}
+	return nil
+}
+
+func (p *sessionProxy) untrack(l launchStopper) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.launches, l)
+}
+
+func (p *sessionProxy) stop() {
+	p.mu.Lock()
+	p.closed = true
+	for p.state == proxyStarting {
+		p.changed.Wait()
+	}
+	server := p.server
+	p.server = nil
+	launches := p.launches
+	p.launches = nil
+	p.mu.Unlock()
+	// The listener must outlive every broker that may still connect to an endpoint it admitted.
+	for l := range launches {
+		l.stopBroker()
+	}
+	if server != nil {
+		server.Stop()
+	}
 }
 
 type ownedTempDirs struct {
@@ -45,6 +187,10 @@ type ownedTempDirs struct {
 }
 
 func (c *confinement) own(dir *sessionTempDir) {
+	if c.proxy == nil {
+		c.proxy = newSessionProxy(c.grants)
+		c.decide = c.proxy.admits
+	}
 	if dir == nil {
 		return
 	}
@@ -114,6 +260,9 @@ func (c *confinement) takeCleanupWarning() string {
 }
 
 func (c *confinement) cleanupAll() error {
+	if c.proxy != nil {
+		c.proxy.stop()
+	}
 	if c.owned == nil {
 		return nil
 	}
@@ -149,7 +298,7 @@ func (c *confinement) resolve(ctx context.Context) (current, tmpDir string, conf
 	return current, "", true, fmt.Errorf("bootstrap: confined run refused for unrecognized mode %q", current)
 }
 
-func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permissions.BlockedPaths) (runner.RunSpec, error) {
+func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permissions.BlockedPaths, proxyURL string) (runner.RunSpec, error) {
 	home := c.home
 	if home == "" {
 		home = blocked.Home()
@@ -168,10 +317,17 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permi
 	if err != nil {
 		return runner.RunSpec{}, err
 	}
+	if proxyURL != "" {
+		env = append(env, "HTTPS_PROXY="+proxyURL, "HTTP_PROXY="+proxyURL, "https_proxy="+proxyURL, "http_proxy="+proxyURL,
+			"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1")
+	}
 	set := make(map[string]bool, len(env))
 	for _, e := range env {
 		name, _, _ := strings.Cut(e, "=")
 		set[name] = true
+	}
+	if proxyURL != "" {
+		set["ALL_PROXY"], set["all_proxy"] = true, true
 	}
 	var launchTemp string
 	if tmpDir != "" {
@@ -179,6 +335,8 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permi
 			launchTemp, _ = reachableDir(abs)
 		}
 	}
+	gitBlocked := gitGlobalConfigBlocked(home, blocked)
+	set["GIT_CONFIG_GLOBAL"] = set["GIT_CONFIG_GLOBAL"] || gitBlocked
 	merged := make([]string, 0, len(c.inherited)+len(env)+1)
 	for _, e := range c.inherited {
 		if name, value, _ := strings.Cut(e, "="); !set[name] {
@@ -189,7 +347,7 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permi
 		}
 	}
 	env = append(merged, env...)
-	if gitGlobalConfigBlocked(home, blocked) {
+	if gitBlocked {
 		env = append(env, "GIT_CONFIG_GLOBAL=/dev/null")
 	}
 	prepared := cloneSpec(spec)
@@ -254,30 +412,52 @@ func gitGlobalConfigBlocked(home string, blocked *permissions.BlockedPaths) bool
 	return global || xdg
 }
 
-func (c *confinement) confine(spec runner.RunSpec, current, tmpDir string, storesWritable bool) (runner.RunSpec, error) {
+func (c *confinement) confine(ctx context.Context, spec runner.RunSpec, current, tmpDir string, storesWritable bool) (runner.RunSpec, bool, error) {
+	// A child's VCS actions run through the parent's registered runner and confinement, so only the call can say it is a child's.
+	if c.proxyAsker != nil && vcs.ChildInvocationID(ctx) != "" {
+		child := *c
+		child.proxyAsker = nil
+		c = &child
+	}
 	blocked := c.blocked.Current()
-	prepared, err := c.prepare(spec, tmpDir, blocked)
+	policy, err := c.policy(current, tmpDir, blocked, storesWritable)
 	if err != nil {
-		return runner.RunSpec{}, err
+		return runner.RunSpec{}, false, err
+	}
+	var proxyURL string
+	if policy.Broker == enforce.BrokerSlice {
+		if c.proxy == nil {
+			return runner.RunSpec{}, false, errors.New("codemeld confinement: no session network proxy for this run")
+		}
+		endpoint, err := c.proxy.start()
+		if err != nil {
+			return runner.RunSpec{}, false, err
+		}
+		proxyURL = "http://" + endpoint.String()
+	}
+	prepared, err := c.prepare(spec, tmpDir, blocked, proxyURL)
+	if err != nil {
+		return runner.RunSpec{}, false, err
 	}
 	// The helper is this binary, whose package init resolves TERM through infocmp on the unconfined launch PATH; RunHelper restores TERM=dumb.
 	if i := slices.Index(prepared.Env, "TERM=dumb"); i >= 0 {
 		prepared.Env[i] = "TERM="
 	}
-	policy, err := c.policy(current, tmpDir, spec.ExceptionalAuthority, blocked, storesWritable)
-	if err != nil {
-		return runner.RunSpec{}, err
-	}
 	var frame bytes.Buffer
 	if err := enforce.WritePolicyFrame(&frame, policy); err != nil {
-		return runner.RunSpec{}, fmt.Errorf("codemeld confinement: policy frame: %w", err)
+		return runner.RunSpec{}, false, fmt.Errorf("codemeld confinement: policy frame: %w", err)
 	}
 	prepared.Argv = append([]string{"/proc/self/exe", enforce.HelperCommand}, prepared.Argv...)
 	prepared.Stdin = append(frame.Bytes(), prepared.Stdin...)
-	return prepared, nil
+	if policy.Broker != enforce.BrokerNone {
+		if err := c.attachBroker(&prepared, policy.Broker); err != nil {
+			return runner.RunSpec{}, false, err
+		}
+	}
+	return prepared, policy.Broker == enforce.BrokerSlice, nil
 }
 
-func (c *confinement) policy(current, tmpDir, authority string, blocked *permissions.BlockedPaths, storesWritable bool) (enforce.Policy, error) {
+func (c *confinement) policy(current, tmpDir string, blocked *permissions.BlockedPaths, storesWritable bool) (enforce.Policy, error) {
 	p := enforce.Policy{Mode: current, BlockedPaths: blocked.Forms()}
 	skills, err := c.skillsReadRoots(blocked)
 	if err != nil {
@@ -293,6 +473,9 @@ func (c *confinement) policy(current, tmpDir, authority string, blocked *permiss
 			return enforce.Policy{}, err
 		}
 		p.TmpDir = tmpDir
+		if c.broker == enforce.BrokerSlice {
+			p.Broker = enforce.BrokerSlice
+		}
 		return p, nil
 	}
 	if mode.Mode(current) != mode.AutoEdits {
@@ -349,9 +532,7 @@ func (c *confinement) policy(current, tmpDir, authority string, blocked *permiss
 			return enforce.Policy{}, err
 		}
 	}
-	if authority == enforce.NetworkAccessAuthority {
-		p.ExceptionalAuthority = authority
-	}
+	p.Broker = c.broker
 	return p, nil
 }
 
@@ -481,15 +662,18 @@ func (r *confinedRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.
 	if !ok {
 		return runner.RunResult{}, errors.New("bootstrap: inner runner cannot bound command output")
 	}
-	prepared, err := r.conf.confine(spec, current, tmpDir, r.storesWritable)
+	prepared, proxyRoute, err := r.conf.confine(ctx, spec, current, tmpDir, r.storesWritable)
 	if err != nil {
 		return runner.RunResult{}, err
+	}
+	if prepared.Helper != nil {
+		defer prepared.Helper.Close()
 	}
 	res, err := bounded.ExecBounded(ctx, prepared, r.cap)
 	if err != nil {
 		return res, err
 	}
-	return noteConfinedFailure(res, r.cap), nil
+	return noteConfinedFailure(res, r.cap, confinedFailureOf(res, proxyRoute, prepared.Helper)), nil
 }
 
 const confinedFailureNote = "codemeld: this command ran inside the confinement boundary; a failure may be a boundary denial and may have left partial changes; codemeld did not re-run it outside the boundary."
@@ -498,29 +682,101 @@ func confinedRunFailed(res runner.RunResult) bool {
 	return res.ExitCode != 0 && res.LaunchErrCategory == ""
 }
 
-func noteConfinedFailure(res runner.RunResult, cap int) runner.RunResult {
+const proxyRouteNote = "codemeld: this command ran on the proxy route; tools that do not use HTTPS_PROXY/HTTP_PROXY, including ssh, scp and SSH URLs, get no network; use Build mode for those."
+
+type confinedFailure struct {
+	proxyRoute bool
+	lines      []string
+}
+
+var invocationRefusals = func(helper runner.HelperLaunch) []netproxy.Refusal {
+	h, ok := helper.(interface{ refusals() []netproxy.Refusal })
+	if !ok {
+		return nil
+	}
+	helper.Close()
+	return h.refusals()
+}
+
+func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.HelperLaunch) *confinedFailure {
 	if !confinedRunFailed(res) {
+		return nil
+	}
+	f := &confinedFailure{proxyRoute: proxyRoute}
+	if !proxyRoute {
+		return f
+	}
+	for _, r := range invocationRefusals(helper) {
+		if r.Host != "" && r.Port != "" {
+			f.addLine(strings.ToValidUTF8(fmt.Sprintf("codemeld: network refused: %s (%s)", net.JoinHostPort(r.Host, r.Port), r.Reason), "\uFFFD"))
+		}
+	}
+	return f
+}
+
+func (f *confinedFailure) addLine(line string) {
+	if !slices.Contains(f.lines, line) {
+		f.lines = append(f.lines, line)
+	}
+}
+
+func (f *confinedFailure) merge(g *confinedFailure) {
+	f.proxyRoute = f.proxyRoute || g.proxyRoute
+	for _, line := range g.lines {
+		f.addLine(line)
+	}
+}
+
+func (f *confinedFailure) additions(room int) string {
+	if len(f.lines) == 0 {
+		if f.proxyRoute && len(proxyRouteNote)+1 <= room {
+			return proxyRouteNote + "\n"
+		}
+		return ""
+	}
+	var b strings.Builder
+	shown := 0
+	for _, line := range f.lines {
+		if b.Len()+len(line)+1 > room {
+			break
+		}
+		b.WriteString(line + "\n")
+		shown++
+	}
+	if omitted := len(f.lines) - shown; omitted > 0 {
+		if marker := fmt.Sprintf("codemeld: %d more network refusals omitted.\n", omitted); b.Len()+len(marker) <= room {
+			b.WriteString(marker)
+		}
+	}
+	return b.String()
+}
+
+func noteConfinedFailure(res runner.RunResult, cap int, f *confinedFailure) runner.RunResult {
+	if f == nil {
 		return res
 	}
 	total := max(res.StderrTotal, int64(len(res.Stderr)))
-	kept := rawPrefixWithin(res.Stderr, cap-len("\n"+confinedFailureNote))
-	res.Stderr = withConfinedFailureNote(kept)
-	res.StderrTotal = total + int64(len(res.Stderr)-len(kept))
+	var kept int
+	res.Stderr, kept = withConfinedFailure(res.Stderr, cap, f)
+	res.StderrTotal = total + int64(len(res.Stderr)-kept)
 	return res
 }
 
-func keepConfinedFailureNote(stderr []byte, cap int) []byte {
-	if len(rawPrefixWithin(stderr, cap)) == len(stderr) {
-		return stderr
+func withConfinedFailure(stderr []byte, cap int, f *confinedFailure) ([]byte, int) {
+	avail := cap - len("\n"+confinedFailureNote)
+	minKeep := 0
+	if len(rawPrefixWithin(stderr, avail)) > 0 {
+		for len(rawPrefixWithin(stderr, minKeep)) == 0 {
+			minKeep++
+		}
 	}
-	return withConfinedFailureNote(rawPrefixWithin(stderr, cap-len("\n"+confinedFailureNote)))
-}
-
-func withConfinedFailureNote(kept []byte) []byte {
-	if len(kept) > 0 && kept[len(kept)-1] != '\n' {
-		kept = append(slices.Clip(kept), '\n')
+	add := f.additions(avail - minKeep)
+	kept := rawPrefixWithin(stderr, avail-len(add))
+	out := slices.Clip(kept)
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		out = append(out, '\n')
 	}
-	return append(slices.Clip(kept), confinedFailureNote...)
+	return append(append(out, add...), confinedFailureNote...), len(kept)
 }
 
 // rawPrefixWithin keeps raw bytes rather than their model-input form so that a dropped tail still
@@ -576,10 +832,10 @@ func (r *confinedRunner) Pipeline(ctx context.Context, specs []runner.RunSpec, m
 }
 
 type confinedShellRunner struct {
-	events       *shellEventRunner
-	conf         *confinement
-	pending      *confinedPipeline
-	failureNoted bool
+	events  *shellEventRunner
+	conf    *confinement
+	pending *confinedPipeline
+	failure *confinedFailure
 }
 
 type confinedPipeline struct {
@@ -589,6 +845,11 @@ type confinedPipeline struct {
 
 func (r *confinedShellRunner) NewInvocationID() string { return r.events.NewInvocationID() }
 
+func (r *confinedShellRunner) Confined(ctx context.Context) (bool, error) {
+	_, _, confined, err := r.conf.resolve(ctx)
+	return confined, err
+}
+
 func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
 	current, tmpDir, confined, err := r.conf.resolve(ctx)
 	if err != nil {
@@ -597,13 +858,21 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 	if !confined {
 		return r.events.Exec(ctx, spec)
 	}
-	prepared, err := r.conf.confine(spec, current, tmpDir, false)
+	prepared, proxyRoute, err := r.conf.confine(ctx, spec, current, tmpDir, false)
 	if err != nil {
 		return runner.RunResult{}, err
 	}
-	res, err := r.events.execBoundedPrepared(ctx, spec, prepared, r.events.cap, true)
-	if err == nil && confinedRunFailed(res) {
-		r.failureNoted = true
+	if prepared.Helper != nil {
+		defer prepared.Helper.Close()
+	}
+	res, failure, err := r.events.execBoundedPrepared(ctx, spec, prepared, r.events.cap, func(res runner.RunResult) *confinedFailure {
+		return confinedFailureOf(res, proxyRoute, prepared.Helper)
+	})
+	if err == nil && failure != nil {
+		if r.failure == nil {
+			r.failure = &confinedFailure{}
+		}
+		r.failure.merge(failure)
 	}
 	return res, err
 }

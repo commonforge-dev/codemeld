@@ -17,6 +17,8 @@ const blockedPathsKey = "blocked_paths"
 
 const writableFoldersKey = "writable_folders"
 
+const domainGrantsKey = "domain_grants"
+
 // composeMergeMapKeys are the top-level keys whose values are merged by subkey
 // (nearest-wins per subkey). Every other top-level key is replaced
 // wholesale by the nearer layer, and `permissions`, `declared_commands`,
@@ -50,6 +52,9 @@ func Compose(globalLayer, projectLayer map[string]any, localLayer ...map[string]
 	if err := composeBlockedPaths(layers, composed); err != nil {
 		return nil, err
 	}
+	if err := composeDomainGrants(globalLayer, local, composed); err != nil {
+		return nil, err
+	}
 
 	for _, k := range unionKeys(layers) {
 		if k == "permissions" {
@@ -58,7 +63,7 @@ func Compose(globalLayer, projectLayer map[string]any, localLayer ...map[string]
 		if k == declaredCommandsKey {
 			continue // handled by composeDeclaredCommands
 		}
-		if k == blockedPathsKey || k == writableFoldersKey {
+		if k == blockedPathsKey || k == writableFoldersKey || k == domainGrantsKey {
 			continue
 		}
 		var current any
@@ -140,6 +145,25 @@ func composeBlockedPaths(layers []map[string]any, composed map[string]any) error
 	}
 	if present {
 		composed[blockedPathsKey] = deepCopyValue(concat)
+	}
+	return nil
+}
+
+// The project layer is left out: a committed settings file must not grant network access on the
+// machine of whoever clones the repository.
+func composeDomainGrants(globalLayer, localLayer, composed map[string]any) error {
+	var concat []any
+	present := false
+	for _, layer := range []map[string]any{globalLayer, localLayer} {
+		list, has, err := layerList(layer, domainGrantsKey)
+		if err != nil {
+			return err
+		}
+		present = present || has
+		concat = slices.Concat(concat, list)
+	}
+	if present {
+		composed[domainGrantsKey] = deepCopyValue(concat)
 	}
 	return nil
 }

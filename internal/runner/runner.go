@@ -39,6 +39,14 @@ type RunSpec struct {
 	// Stdin is fed to the process standard input; nil or empty means the process gets no input.
 	Stdin                []byte
 	ExceptionalAuthority string
+	Helper               HelperLaunch
+}
+
+// HelperLaunch.Close must be idempotent: the runner and the wrapper that prepared the spec both call it.
+type HelperLaunch interface {
+	HelperChannel() *os.File
+	Started() error
+	Close()
 }
 
 // RunResult is the outcome of a completed invocation, including launch failures. A non-nil Exec
@@ -152,8 +160,12 @@ func (DirectExecRunner) NewInvocationID() string {
 // a non-zero exit status — returns a RunResult with the captured streams, the process exit code,
 // an empty LaunchErrCategory, and a nil error. A launch failure before the process starts returns
 // ExitCode -1, empty streams, and a LaunchErrCategory classified from the OS error. A non-nil
-// error is returned only for invalid input, in which case the RunResult is unusable.
+// error is returned only for invalid input or a failed helper setup, in which case the RunResult is
+// unusable.
 func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, error) {
+	if spec.Helper != nil {
+		defer spec.Helper.Close()
+	}
 	if !ids.IsValidV7(spec.InvocationID) {
 		return RunResult{}, fmt.Errorf("runner: invalid invocation id %q", spec.InvocationID)
 	}
@@ -167,6 +179,7 @@ func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, erro
 		cmd.Dir = spec.Cwd
 	}
 	cmd.Env = commandEnv(spec.Env, spec.InvocationID)
+	passHelperChannel(cmd, spec.Helper)
 	if len(spec.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(spec.Stdin)
 	}
@@ -176,14 +189,19 @@ func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, erro
 
 	start := time.Now()
 	err := cmd.Start()
+	var setupErr error
 	if err == nil {
 		inv.started(ctx, cmd.Process.Pid)
+		setupErr = helperStarted(spec.Helper, inv)
 		inv.awaitExit()
 		err = cmd.Wait()
 		inv.exited()
 		inv.finish()
 	}
 	duration := time.Since(start)
+	if setupErr != nil {
+		return RunResult{}, setupErr
+	}
 
 	res := RunResult{
 		InvocationID: spec.InvocationID,
@@ -206,6 +224,9 @@ func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, erro
 }
 
 func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCapture int) (RunResult, error) {
+	if spec.Helper != nil {
+		defer spec.Helper.Close()
+	}
 	if !ids.IsValidV7(spec.InvocationID) {
 		return RunResult{}, fmt.Errorf("runner: invalid invocation id %q", spec.InvocationID)
 	}
@@ -218,6 +239,7 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 		cmd.Dir = spec.Cwd
 	}
 	cmd.Env = commandEnv(spec.Env, spec.InvocationID)
+	passHelperChannel(cmd, spec.Helper)
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		return RunResult{}, fmt.Errorf("runner: capture setup: %w", err)
@@ -271,12 +293,16 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 			feedStdin(inW, spec.Stdin)
 		}()
 	}
+	setupErr := helperStarted(spec.Helper, inv)
 	inv.awaitExit()
 	waitErr := cmd.Wait()
 	inv.exited()
 	wg.Wait()
 	inv.finish()
 	duration := time.Since(start)
+	if setupErr != nil {
+		return RunResult{}, setupErr
+	}
 
 	if stdoutCap.err != nil || stderrCap.err != nil {
 		return RunResult{}, fmt.Errorf("runner: output capture: %w", errors.Join(stdoutCap.err, stderrCap.err))
@@ -305,6 +331,11 @@ func (DirectExecRunner) PreflightPipeline(_ context.Context, specs []RunSpec) er
 // SIGPIPE and the downstream stage sees EOF on stdin and still runs. Every started process is waited
 // on and every goroutine joined before returning, on every path.
 func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCapture int) ([]PipelineResult, error) {
+	for _, spec := range specs {
+		if spec.Helper != nil {
+			defer spec.Helper.Close()
+		}
+	}
 	if err := validatePipelineSpecs(specs); err != nil {
 		return nil, err
 	}
@@ -322,11 +353,13 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		return results, fmt.Errorf("runner: pipeline setup: %w", err)
 	}
 
+	stageCtx, cancelStages := context.WithCancel(ctx)
+	defer cancelStages()
 	cmds := make([]*exec.Cmd, n)
 	invs := make([]*invocation, n)
 	starts := make([]time.Time, n)
 	for i, spec := range specs {
-		cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
+		cmd := exec.CommandContext(stageCtx, spec.Argv[0], spec.Argv[1:]...)
 		if spec.Cwd != "" {
 			cmd.Dir = spec.Cwd
 		}
@@ -336,13 +369,14 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		}
 		cmd.Stdout = pipes[i].outW
 		cmd.Stderr = pipes[i].errW
+		passHelperChannel(cmd, spec.Helper)
 		invs[i] = killGroupOnCancel(cmd, spec.InvocationID, pipes[i].out, pipes[i].errR, pipes[i].inW)
 
 		starts[i] = time.Now()
 		if err := cmd.Start(); err != nil {
 			results[i].LaunchErrCategory = classifyLaunchErr(err)
 		} else {
-			invs[i].started(ctx, cmd.Process.Pid)
+			invs[i].started(stageCtx, cmd.Process.Pid)
 			cmds[i] = cmd
 		}
 		// The parent's copies of the ends the child now owns must go immediately: while the parent
@@ -357,6 +391,7 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 
 	stdoutCap := make([]capture, n)
 	stderrCap := make([]capture, n)
+	setupErrs := make([]error, n)
 	var wg sync.WaitGroup
 	if pipes[0].inW != nil {
 		wg.Add(1)
@@ -385,6 +420,9 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if setupErrs[i] = helperStarted(specs[i].Helper, invs[i]); setupErrs[i] != nil {
+				cancelStages()
+			}
 			invs[i].awaitExit()
 			waitErr := cmds[i].Wait()
 			invs[i].exited()
@@ -409,7 +447,31 @@ func (DirectExecRunner) Pipeline(ctx context.Context, specs []RunSpec, maxCaptur
 		results[i].StderrTotal = stderrCap[i].total
 	}
 
-	return results, pipelineFailure(ctx.Err(), results, stdoutCap, stderrCap)
+	err = pipelineFailure(ctx.Err(), results, stdoutCap, stderrCap)
+	for i, setupErr := range setupErrs {
+		if setupErr != nil {
+			results[i].PipelineErrCategory = PipelineFailureInternal
+			err = errors.Join(err, fmt.Errorf("runner: stage %d: %w", i, setupErr))
+		}
+	}
+	return results, err
+}
+
+func passHelperChannel(cmd *exec.Cmd, helper HelperLaunch) {
+	if helper != nil {
+		cmd.ExtraFiles = []*os.File{helper.HelperChannel()}
+	}
+}
+
+func helperStarted(helper HelperLaunch, inv *invocation) error {
+	if helper == nil {
+		return nil
+	}
+	if err := helper.Started(); err != nil {
+		_ = inv.cancel()
+		return fmt.Errorf("runner: helper setup: %w", err)
+	}
+	return nil
 }
 
 func pipelineFailure(ctxErr error, results []PipelineResult, stdoutCap, stderrCap []capture) error {

@@ -662,3 +662,93 @@ func TestLayerIsInMemoryOnly(t *testing.T) {
 		t.Fatalf("DedupKey = %+v, want two copies differing only in Layer to share it", other.DedupKey())
 	}
 }
+
+func TestEntry_HomeStateCompoundSubjectRoundTrips(t *testing.T) {
+	sc, ok := RecognizeSimpleCompoundForGrant(canon(t, `sh -c "cat '~/f' -n ; echo done"`))
+	if !ok {
+		t.Fatalf("RecognizeSimpleCompoundForGrant: not simple")
+	}
+	encoded := stageGrant(t, sc, map[int]string{0: PrefixSubject("cat", []string{"~/f"})})
+	if !strings.HasPrefix(encoded, "compound/v2 W ") {
+		t.Fatalf("encoded = %q, want the home-state compound form", encoded)
+	}
+	e := PermissionEntry{Kind: "literal", Subject: encoded, PathScope: "/home/u/proj", GrantKind: "folder", ArgumentHash: literalHash(encoded)}
+	out, err := MarshalEntry(e)
+	if err != nil {
+		t.Fatalf("MarshalEntry() = %v, want nil", err)
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal(out, &raw); err != nil {
+		t.Fatalf("yaml.Unmarshal round trip error: %v\n%s", err, out)
+	}
+	got, err := ParseEntry(raw, "settings.yaml", 0)
+	if err != nil {
+		t.Fatalf("ParseEntry(round-tripped home-state compound) = %v, want nil", err)
+	}
+	if got != e {
+		t.Fatalf("round trip changed the entry:\n got %+v\nwant %+v", got, e)
+	}
+}
+
+func TestParseEntry_RejectsMalformedHomeStateCompound(t *testing.T) {
+	for _, subject := range []string{
+		"compound/v2 W cat x ; echo done",
+		"compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{}, []int{})) + " ; echo done",
+		"compound/v2 W " + ShellQuote(testHomeEnvelope(t, "git '~/f'", []int{}, []int{1})) + " ; echo done",
+		"compound/v2 W cat '~/f' ; " + ShellQuote(testHomeEnvelope(t, "cat '$HOME'", []int{}, []int{1})),
+	} {
+		raw := map[string]any{
+			"kind": "literal", "subject": subject, "path_scope": "/home/u/proj", "grant_kind": "folder", "argument_hash": literalHash(subject),
+		}
+		if _, err := ParseEntry(raw, "settings.yaml", 0); err == nil {
+			t.Errorf("ParseEntry(%q) = ok, want rejection at load", subject)
+		}
+	}
+}
+
+func TestParseEntry_HomeStateCompoundRequiresCanonicalSpelling(t *testing.T) {
+	const source = `sh -c "cat '~/f' ; echo done"`
+	grant := stageGrant(t, recognizedForGrant(t, source), nil)
+	parse := func(subject string) error {
+		_, err := ParseEntry(map[string]any{
+			"kind": "literal", "subject": subject, "path_scope": "/home/u/proj", "grant_kind": "folder", "argument_hash": literalHash(subject),
+		}, "settings.yaml", 0)
+		return err
+	}
+	if err := parse(grant); err != nil {
+		t.Fatalf("ParseEntry(canonical %q): %v", grant, err)
+	}
+	if !literalCompoundMatches(t, source, grant) {
+		t.Fatalf("canonical %q does not match %q", grant, source)
+	}
+	for _, subject := range []string{
+		grant + " ",
+		grant + "\t",
+		strings.Replace(grant, " ; ", "  ; ", 1),
+		strings.Replace(grant, " ; ", " ;  ", 1),
+		strings.Replace(grant, " ; ", "; ", 1),
+		strings.Replace(grant, " W ", " W  ", 1),
+	} {
+		if parse(subject) == nil {
+			t.Errorf("ParseEntry(%q) = ok, want rejection of a non-canonical spelling", subject)
+		}
+		if literalCompoundMatches(t, source, subject) {
+			t.Errorf("non-canonical %q matched %q", subject, source)
+		}
+	}
+}
+
+func TestParseEntry_NonHomeCompoundKeepsBytes(t *testing.T) {
+	for _, subject := range []string{"compound/v1 W cat :* ; echo done", "compound/v1 B cat x :* && wc -l"} {
+		raw := map[string]any{
+			"kind": "literal", "subject": subject, "path_scope": "/home/u/proj", "grant_kind": "folder", "argument_hash": literalHash(subject),
+		}
+		got, err := ParseEntry(raw, "settings.yaml", 0)
+		if err != nil {
+			t.Fatalf("ParseEntry(%q): %v", subject, err)
+		}
+		if got.Subject != subject || got.ArgumentHash != literalHash(subject) {
+			t.Fatalf("ParseEntry(%q) = %+v, want subject and hash unchanged", subject, got)
+		}
+	}
+}

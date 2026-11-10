@@ -58,7 +58,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.10"
+var codemeldVersion = "Beta 0.4.11"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -204,6 +204,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	authorizer.executionConstrained = execution.SelfTestPassed
 	authorizer.blocked = guard.Blocked
 	authorizer.systemOne = systemOne
+	conf.proxyAsker = authorizer.prompts.AskNetwork
 	for _, row := range launchRows {
 		authorizer.grants.addRow(row)
 	}
@@ -728,7 +729,11 @@ func launchPermissionRows(layers []securitystate.LayerSnapshot) ([]tui.Permissio
 // launch and a resume both reach it through StartTUI, so both carry the same run-fixed trust
 // decision to every prompt.
 func newInteractiveAuthorizer(app *tui.App, cache *config.Cache, result *BootstrapResult, modeActive *mode.ActiveState) *productionAuthorizer {
-	authorizer := newProductionAuthorizer(app, cache, permissions.NewTurnCache(), NewPromptGateBuilder(app), result.Home, result.LaunchDir, modeActive)
+	prompts := NewPromptGateBuilder(app)
+	prompts.projectTrusted = result.TrustDecision.Trusted
+	prompts.projectRoot = cache.ProjectRoot()
+	prompts.globalSettingsPath = SettingsPath(result.Home)
+	authorizer := newProductionAuthorizer(app, cache, permissions.NewTurnCache(), prompts, result.Home, result.LaunchDir, modeActive)
 	authorizer.display.projectUntrusted = !result.TrustDecision.Trusted
 	authorizer.display.projectApproved = vcsTemplatesApproved(result.TrustDecision)
 	return authorizer
@@ -1525,6 +1530,10 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 	if cache.ProgramLookup() == "strict" {
 		lookupPath = runner.FixedPATH
 	}
+	broker := enforce.BrokerNone
+	if resolution.SliceSelfTestPassed {
+		broker = enforce.BrokerSlice
+	}
 	return &confinement{
 		constrained: resolution.SelfTestPassed,
 		mode: func() string {
@@ -1539,5 +1548,7 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 		lookupSet:   true,
 		tmpDir:      tmpDir,
 		inherited:   inherited,
+		broker:      broker,
+		grants:      cache.DomainGrants(),
 	}
 }

@@ -3,6 +3,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -53,8 +54,8 @@ const (
 
 // PromptOption identifies one grant option. The iota order is the fixed
 // top-to-bottom order of promptOptionsInOrder, so the cursor's initial position and
-// the rendered list order both derive from it; OptionAllowProject is host-only and
-// is listed in hostOptionsInOrder instead.
+// the rendered list order both derive from it; OptionAllowProject is listed only in
+// the host and network option tables.
 type PromptOption int
 
 const (
@@ -983,6 +984,7 @@ func (a *App) awaitPromptDecision(req PromptRequest) PromptDecision {
 		}
 		a.promptOpen = true
 		a.promptDecisionCh = decisionCh
+		a.network = nil
 		a.removePromptChoosers()
 		if a.pages.HasPage(promptBasePage) {
 			a.pages.RemovePage(promptBasePage)
@@ -995,18 +997,173 @@ func (a *App) awaitPromptDecision(req PromptRequest) PromptDecision {
 }
 
 func (a *App) closePromptOverlay() {
-	a.app.QueueUpdateDraw(func() {
-		a.promptOpen = false
-		a.promptDecisionCh = nil
-		a.removePromptChoosers()
-		a.pages.RemovePage(promptBasePage)
-		if a.promptPrev != nil {
-			a.app.SetFocus(a.promptPrev)
-		} else {
-			a.app.SetFocus(a.input)
+	a.app.QueueUpdateDraw(a.unmountPrompt)
+}
+
+func (a *App) unmountPrompt() {
+	a.promptOpen = false
+	a.promptDecisionCh = nil
+	a.network = nil
+	a.removePromptChoosers()
+	a.pages.RemovePage(promptBasePage)
+	if a.promptPrev != nil {
+		a.app.SetFocus(a.promptPrev)
+	} else {
+		a.app.SetFocus(a.input)
+	}
+	a.promptPrev = nil
+}
+
+type networkPrompt struct {
+	ctx        context.Context
+	host, port string
+	project    bool
+	answer     chan PromptOption
+	withdrawn  bool
+}
+
+var networkOptionsInOrder = []promptOptionRow{
+	{OptionAllowOnce, "allow this once"},
+	{OptionAllowSession, "allow for this session"},
+	{OptionAllowGlobal, "allow everywhere — global settings"},
+	{OptionDeny, "deny"},
+}
+
+var networkProjectOptionsInOrder = []promptOptionRow{
+	{OptionAllowOnce, "allow this once"},
+	{OptionAllowSession, "allow for this session"},
+	{OptionAllowProject, "allow in this project"},
+	{OptionAllowGlobal, "allow everywhere — global settings"},
+	{OptionDeny, "deny"},
+}
+
+var errPromptShutdown = errors.New("tui: the app is shutting down")
+
+func (a *App) PromptNetwork(ctx context.Context, host, port string, projectChoice bool) (PromptOption, error) {
+	if a.shuttingDown() {
+		return OptionDeny, errPromptShutdown
+	}
+	if err := ctx.Err(); err != nil {
+		return OptionDeny, err
+	}
+	p := &networkPrompt{ctx: ctx, host: host, port: port, project: projectChoice, answer: make(chan PromptOption, 1)}
+	// QueueUpdateDraw blocks until the loop runs it, and /exit's turn drain can occupy the loop.
+	go a.app.QueueUpdateDraw(func() { a.showNetworkPrompt(p) })
+	select {
+	case opt := <-p.answer:
+		if a.shuttingDown() {
+			return OptionDeny, errPromptShutdown
 		}
-		a.promptPrev = nil
+		return opt, nil
+	case <-a.lifecycle:
+		return OptionDeny, errPromptShutdown
+	case <-ctx.Done():
+	}
+	withdrawn := make(chan struct{})
+	go a.app.QueueUpdateDraw(func() {
+		a.withdrawNetworkPrompt(p)
+		close(withdrawn)
 	})
+	select {
+	case <-withdrawn:
+	case <-a.lifecycle:
+	}
+	return OptionDeny, ctx.Err()
+}
+
+func (a *App) shuttingDown() bool {
+	select {
+	case <-a.lifecycle:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *App) showNetworkPrompt(p *networkPrompt) {
+	if !a.networkPromptValid(p) || p.withdrawn {
+		return
+	}
+	overlay, list := a.buildNetworkPrompt(p)
+	if !a.promptOpen {
+		a.promptPrev = a.app.GetFocus()
+	}
+	a.promptOpen = true
+	a.network = p
+	a.pages.AddPage(promptBasePage, wrapOverlayPage(overlay), true, true)
+	a.app.SetFocus(list)
+}
+
+func (a *App) withdrawNetworkPrompt(p *networkPrompt) {
+	p.withdrawn = true
+	if a.network == p {
+		a.unmountPrompt()
+	}
+}
+
+func (a *App) answerNetworkPrompt(p *networkPrompt, opt PromptOption) {
+	if a.network != p || !a.networkPromptValid(p) {
+		return
+	}
+	a.unmountPrompt()
+	p.answer <- opt
+}
+
+func (a *App) networkPromptValid(p *networkPrompt) bool {
+	return p.ctx.Err() == nil && !a.shuttingDown()
+}
+
+func (a *App) buildNetworkPrompt(p *networkPrompt) (tview.Primitive, *tview.List) {
+	facts := tview.NewTextView()
+	facts.SetDynamicColors(false)
+	facts.SetWrap(true)
+	facts.SetWordWrap(true)
+	lines := []string{
+		"Host: " + permissions.BoundPromptFact(p.host),
+		"Port: " + p.port,
+		"",
+		"The command can send data to this host.",
+		"allow for this session — applies to this exact host and port until codemeld exits.",
+	}
+	options := networkOptionsInOrder
+	if p.project {
+		options = networkProjectOptionsInOrder
+		lines = append(lines, "allow in this project — saves this exact host and port in this project's .codemeld/settings.local.yaml.")
+	}
+	lines = append(lines, "allow everywhere — saves this exact host and port in your global settings for every project.")
+	facts.SetText(strings.Join(lines, "\n"))
+	list := tview.NewList()
+	list.ShowSecondaryText(false)
+	applyPickerListColors(list)
+	list.SetMainTextStyle(tcell.StyleDefault.Bold(true))
+	list.SetSelectedStyle(tcell.StyleDefault.Reverse(true).Bold(true))
+	for _, o := range options {
+		list.AddItem(promptRowLabel(o), "", 0, nil)
+	}
+	list.SetSelectedFunc(func(index int, _ string, _ string, _ rune) {
+		a.answerNetworkPrompt(p, options[index].Option)
+	})
+	list.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch ev.Key() {
+		case tcell.KeyEscape:
+			a.answerNetworkPrompt(p, OptionDeny)
+			return nil
+		case tcell.KeyRune:
+			if index, ok := promptMnemonicIndex(options, ev.Rune()); ok {
+				a.answerNetworkPrompt(p, options[index].Option)
+				return nil
+			}
+		}
+		return ev
+	})
+	body := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(facts, 0, 1, false).
+		AddItem(newPromptDivider(), 1, 0, false).
+		AddItem(list, len(options), 0, true)
+	body.SetBorder(true)
+	body.SetTitle(" network access ")
+	return body, list
 }
 
 // The scope/compound choosers and the Program confirm step are normally torn down before the
@@ -1371,6 +1528,10 @@ func (a *App) completePrompt(decisionCh chan<- PromptDecision, decision PromptDe
 // tool call; denying keeps the command/tool from running and lets the normal
 // permission-decision flow complete.
 func (a *App) dismissPrompt() {
+	if a.network != nil {
+		a.answerNetworkPrompt(a.network, OptionDeny)
+		return
+	}
 	if !a.promptOpen || a.promptDecisionCh == nil {
 		return
 	}

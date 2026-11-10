@@ -373,6 +373,7 @@ func (b generalAgentBinding) deps(reg *tools.Registry, cache *config.Cache, turn
 			if b.confinement != nil {
 				conf := *b.confinement
 				conf.mode = func() string { return childMode }
+				conf.proxyAsker = nil
 				child.confinement = &conf
 			}
 			return child
@@ -1054,8 +1055,8 @@ func (d *productionToolDispatcher) Dispatch(ctx context.Context, call turn.Assem
 		if timedOut {
 			noteRoom = len("\n" + bashTimeoutNote(timeout))
 		}
-		if run.failureNoted {
-			res.Stderr = keepConfinedFailureNote(res.Stderr, d.outputCap-noteRoom)
+		if run.failure != nil {
+			res.Stderr, _ = withConfinedFailure(res.Stderr, d.outputCap-noteRoom, run.failure)
 		}
 		if timedOut {
 			res.Stderr = withBashTimeoutNote(res.Stderr, d.outputCap, bashTimeoutNote(timeout))

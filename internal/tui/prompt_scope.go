@@ -211,7 +211,7 @@ func buildCompoundStageScopeOptions(sc permissions.SimpleCompound) []compoundSta
 	}
 
 	stages := make([]compoundStageScope, 0, len(sc.Stages))
-	for _, stage := range sc.Stages {
+	for i, stage := range sc.Stages {
 		if len(stage) == 0 {
 			// A recognized simple compound never has an empty stage; treat a
 			// malformed one as non-simple and offer no stage options.
@@ -230,6 +230,15 @@ func buildCompoundStageScopeOptions(sc permissions.SimpleCompound) []compoundSta
 			// not be offered for a destructive stage.
 			cs.Options = cs.Options[:1]
 			cs.NoWiden = true
+		}
+		for j := range cs.Options {
+			subject, err := permissions.CompoundStageScopeSubject(sc, i, cs.Options[j].Subject)
+			if err != nil {
+				// An empty stage subject fails encoding, so finalizeCompound stores the concrete
+				// literal instead of a grant pinning a home form with no shell-literal proof.
+				subject = ""
+			}
+			cs.Options[j].Subject = subject
 		}
 		cs.Options[cs.DefaultIdx].Label += scopeRecommendedSuffix
 		stages = append(stages, cs)

@@ -2,6 +2,7 @@ package enforce
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -406,4 +408,293 @@ func TestHelperDescriptorChild(t *testing.T) {
 		return nil
 	}
 	fmt.Printf("fdcheck exit=%d\n", RunHelper([]string{"/bin/true"}))
+}
+
+const handoffFDsEnv = "CODEMELD_TEST_HANDOFF_FDS"
+
+func init() {
+	probes["h-fds"] = probe{1, func(a []string) int {
+		if writeFDLinks(a[0]) != nil {
+			return probeFailed
+		}
+		return probeAllowed
+	}}
+}
+
+func writeFDLinks(path string) error {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return err
+	}
+	var links []string
+	for _, e := range entries {
+		if link, err := os.Readlink("/proc/self/fd/" + e.Name()); err == nil {
+			links = append(links, link)
+		}
+	}
+	return os.WriteFile(path, []byte(strings.Join(links, "\n")), 0o600)
+}
+
+func TestHandoffTargetChild(t *testing.T) {
+	path := os.Getenv(handoffFDsEnv)
+	if path == "" {
+		t.Skip("runs only as the exec target of the broker handoff tests")
+	}
+	if err := writeFDLinks(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type handoffFx struct {
+	bin, work, out string
+	policy         Policy
+	env            []string
+}
+
+var unavailableErrnos = []unix.Errno{unix.ENOSYS, unix.EINVAL, unix.EOPNOTSUPP}
+
+func handoffSetup(t *testing.T) handoffFx {
+	t.Helper()
+	abi, err := landlockABI()
+	for _, e := range unavailableErrnos {
+		if errors.Is(err, e) {
+			t.Skipf("unverified: the kernel lacks landlock: %v", err)
+		}
+	}
+	if err != nil {
+		t.Fatalf("landlock ABI: %v", err)
+	}
+	if abi < 3 {
+		t.Skipf("unverified: landlock ABI %d, want 3", abi)
+	}
+	bin := mxBinary(t)
+	f := mxSetup(t)
+	work, tmp := f.mkdir(t, "work"), f.mkdir(t, "tmp")
+	out := filepath.Join(work, "fds")
+	return handoffFx{
+		bin: bin, work: work, out: out,
+		policy: Policy{Mode: ModeAutoEdits, Broker: BrokerSlice, BlockedPaths: f.blocked(), WriteRoots: []string{work}, TmpDir: tmp},
+		env:    append(f.env(t, work, tmp), handoffFDsEnv+"="+out),
+	}
+}
+
+func (x handoffFx) args(mode string) []string {
+	if mode == ProbeArg {
+		return []string{ProbeArg, "h-fds", x.out}
+	}
+	return []string{x.bin, "-test.run=^TestHandoffTargetChild$"}
+}
+
+func (x handoffFx) targetRan() bool {
+	_, err := os.Stat(x.out)
+	return !errors.Is(err, os.ErrNotExist)
+}
+
+type handoffRun struct {
+	cmd    *exec.Cmd
+	parent *os.File
+	ino    uint64
+	done   chan struct{}
+	stderr bytes.Buffer
+	err    error
+}
+
+func startHandoff(t *testing.T, x handoffFx, p Policy, channel bool, args ...string) *handoffRun {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &handoffRun{parent: os.NewFile(uintptr(fds[0]), "channel"), done: make(chan struct{})}
+	child := os.NewFile(uintptr(fds[1]), "helper channel")
+	var st unix.Stat_t
+	if err := unix.Fstat(fds[1], &st); err != nil {
+		t.Fatal(err)
+	}
+	h.ino = st.Ino
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	h.cmd = exec.CommandContext(ctx, x.bin, append([]string{HelperCommand}, args...)...)
+	h.cmd.Env, h.cmd.Dir, h.cmd.Stdin, h.cmd.Stderr = x.env, x.work, bytes.NewReader(encodedFrame(t, p)), &h.stderr
+	if channel {
+		h.cmd.ExtraFiles = []*os.File{child}
+	}
+	h.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	h.cmd.Cancel = func() error { return syscall.Kill(-h.cmd.Process.Pid, syscall.SIGKILL) }
+	h.cmd.WaitDelay = time.Second
+	err = h.cmd.Start()
+	child.Close()
+	if err != nil {
+		h.parent.Close()
+		cancel()
+		t.Fatal(err)
+	}
+	go func() { h.err = h.cmd.Wait(); close(h.done) }()
+	t.Cleanup(func() { cancel(); <-h.done; h.parent.Close() })
+	return h
+}
+
+func (h *handoffRun) exit(t *testing.T, within time.Duration) int {
+	t.Helper()
+	select {
+	case <-h.done:
+	case <-time.After(within):
+		t.Fatalf("helper still running after %v", within)
+	}
+	var ee *exec.ExitError
+	if errors.As(h.err, &ee) {
+		return ee.ExitCode()
+	}
+	if h.err != nil {
+		t.Fatal(h.err)
+	}
+	return 0
+}
+
+func (h *handoffRun) receive(t *testing.T) *os.File {
+	t.Helper()
+	l, err := ReceiveListener(h.parent, 5*time.Second)
+	if err == nil {
+		t.Cleanup(func() { l.Close() })
+		return l
+	}
+	h.exit(t, 15*time.Second)
+	out := h.stderr.String()
+	for _, e := range unavailableErrnos {
+		if strings.Contains(out, "install seccomp listener filter: "+e.Error()) {
+			t.Skipf("unverified: the kernel refused the seccomp listener filter: %s", out)
+		}
+	}
+	t.Fatalf("receive listener: %v\nhelper: %s", err, out)
+	return nil
+}
+
+func TestRunHelperBrokerHandoff(t *testing.T) {
+	for _, mode := range []string{"exec", ProbeArg} {
+		t.Run(mode, func(t *testing.T) {
+			x := handoffSetup(t)
+			h := startHandoff(t, x, x.policy, true, x.args(mode)...)
+			l := h.receive(t)
+			if flags, err := unix.FcntlInt(l.Fd(), unix.F_GETFD, 0); err != nil || flags&unix.FD_CLOEXEC == 0 {
+				t.Errorf("received listener flags %#x, %v: want FD_CLOEXEC", flags, err)
+			}
+			if link, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", l.Fd())); err != nil || !strings.Contains(link, "seccomp notify") {
+				t.Fatalf("received %q, %v: want a seccomp notify descriptor", link, err)
+			}
+			if n := notifyListeners(t, strconv.Itoa(h.cmd.Process.Pid)); n != 0 {
+				t.Errorf("helper holds %d listener descriptors after its acknowledgement", n)
+			}
+			child := exec.Command("/bin/sleep", "30")
+			if err := child.Start(); err != nil {
+				t.Fatal(err)
+			}
+			inherited := notifyListeners(t, strconv.Itoa(child.Process.Pid))
+			_ = child.Process.Kill()
+			_ = child.Wait()
+			if inherited != 0 {
+				t.Errorf("a codemeld child inherited %d listener descriptors", inherited)
+			}
+			time.Sleep(200 * time.Millisecond)
+			if x.targetRan() {
+				t.Fatal("the target ran before release")
+			}
+			select {
+			case <-h.done:
+				t.Fatalf("helper exited before release: %v\n%s", h.err, h.stderr.String())
+			default:
+			}
+			if err := ReleaseHelper(h.parent); err != nil {
+				t.Fatal(err)
+			}
+			if code := h.exit(t, 15*time.Second); code != 0 {
+				t.Fatalf("exit %d\n%s", code, h.stderr.String())
+			}
+			raw, err := os.ReadFile(x.out)
+			if err != nil || len(raw) == 0 {
+				t.Fatalf("target descriptor list %q: %v", raw, err)
+			}
+			for _, link := range strings.Split(string(raw), "\n") {
+				if link == fmt.Sprintf("socket:[%d]", h.ino) || strings.Contains(link, "seccomp notify") {
+					t.Errorf("target holds %s", link)
+				}
+			}
+		})
+	}
+}
+
+func TestRunHelperBrokerHandoffFailuresNeverRunTarget(t *testing.T) {
+	missing := []string{"/nonexistent/codemeld-target"}
+	for _, c := range []struct {
+		name, mode string
+		channel    bool
+		args       []string
+		parent     func(t *testing.T, h *handoffRun)
+		wait       time.Duration
+		stderr     string
+	}{
+		{"parent closes the channel/exec", "exec", true, nil, func(_ *testing.T, h *handoffRun) { h.parent.Close() }, 15 * time.Second, "seccomp: "},
+		{"parent closes the channel/probe", ProbeArg, true, nil, func(_ *testing.T, h *handoffRun) { h.parent.Close() }, 15 * time.Second, "seccomp: "},
+		{"missing release/exec", "exec", true, nil, func(t *testing.T, h *handoffRun) { h.receive(t).Close(); h.parent.Close() }, 15 * time.Second, "seccomp: await release: "},
+		{"missing release/probe", ProbeArg, true, nil, func(t *testing.T, h *handoffRun) { h.receive(t).Close(); h.parent.Close() }, 15 * time.Second, "seccomp: await release: "},
+		{"no setup channel/exec", "exec", false, nil, nil, 15 * time.Second, "seccomp: send listener: "},
+		{"no setup channel/probe", ProbeArg, false, nil, nil, 15 * time.Second, "seccomp: send listener: "},
+		{"withheld release", "exec", true, nil, func(t *testing.T, h *handoffRun) { h.receive(t).Close() }, 20 * time.Second, "seccomp: await release: " + os.ErrDeadlineExceeded.Error()},
+		{"exec failure", "exec", true, missing, func(t *testing.T, h *handoffRun) {
+			h.receive(t).Close()
+			if err := ReleaseHelper(h.parent); err != nil {
+				t.Fatal(err)
+			}
+		}, 15 * time.Second, "exec: "},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := handoffSetup(t)
+			args := c.args
+			if args == nil {
+				args = x.args(c.mode)
+			}
+			before := notifyListeners(t, "self")
+			h := startHandoff(t, x, x.policy, c.channel, args...)
+			if c.parent != nil {
+				c.parent(t, h)
+			}
+			code := h.exit(t, c.wait)
+			out := h.stderr.String()
+			if code != SetupFailureExitCode || !strings.HasPrefix(out, "codemeld confinement: "+c.stderr) {
+				t.Errorf("exit %d, stderr %q", code, out)
+			}
+			if x.targetRan() {
+				t.Error("the target ran")
+			}
+			if after := notifyListeners(t, "self"); after != before {
+				t.Errorf("%d listener descriptors open after the failed handoff, %d before", after, before)
+			}
+		})
+	}
+}
+
+func TestRunHelperHandoffOnlyForBrokerPolicies(t *testing.T) {
+	x := handoffSetup(t)
+	nonBroker := x.policy
+	nonBroker.Broker = BrokerNone
+	for _, c := range []struct {
+		name, mode string
+		policy     Policy
+	}{
+		{"non-broker probe", ProbeArg, nonBroker},
+		{"control with a broker policy", ControlArg, x.policy},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_ = os.Remove(x.out)
+			h := startHandoff(t, x, c.policy, true, c.mode, "h-fds", x.out)
+			if code := h.exit(t, 15*time.Second); code != probeAllowed {
+				t.Fatalf("exit %d\n%s", code, h.stderr.String())
+			}
+			if !x.targetRan() {
+				t.Error("the probe did not run")
+			}
+			b := make([]byte, 1)
+			if n, _, err := unix.Recvfrom(int(h.parent.Fd()), b, unix.MSG_DONTWAIT); n != 0 || err != nil {
+				t.Errorf("the helper used the channel: %q, %v", b[:n], err)
+			}
+		})
+	}
 }

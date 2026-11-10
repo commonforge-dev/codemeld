@@ -65,10 +65,14 @@ A sandboxed command starts as codemeld's own binary running a hidden helper. The
 policy from its stdin (never the command line, which other processes can read), sets resource
 limits and `no_new_privs`, applies a Landlock ruleset (Landlock ABI 3 or newer) and a seccomp
 filter, then becomes the command. Everything the command starts inherits the restrictions, and
-none can be removed. The command sees codemeld's launch environment minus withheld-authority
-names, secret-looking names and values carrying a URL credential (`runner.InheritedEnvironment`),
-then the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` and
-`LC_ALL`, then the command's own assignments (`confinement.prepare`). An inherited value that
+none can be removed. The command sees codemeld's launch environment minus the fixed-table names,
+secret-looking names and values carrying a URL credential (`runner.InheritedEnvironment`); names
+such as `LD_PRELOAD` or `XDG_CONFIG_HOME` are inherited, and an assignment to them is refused only
+when codemeld parses it from the command (`runner.FixedEnvironment`), not inside shell text run as
+written. Then come the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`,
+`GOCACHE`, `SHELL`, `TERM`, `LANG` and `LC_ALL`, then the command's own assignments, then
+`GIT_CONFIG_GLOBAL=/dev/null` in place of any inherited one when a global git config is blocked
+(`confinement.prepare`). An inherited value that
 resolves to the same folder as codemeld's own temp folder (`os.TempDir()`) is replaced with the
 session temp folder (`namesFolder`).
 
@@ -80,7 +84,11 @@ session temp folder (`namesFolder`).
   numbers, and the helper grants it through a handle it opened and checked (`applyLandlock`). Auto edits may write each top-level entry of the
   project except `.codemeld` (skipping an entry that resolves outside the project, to the project
   itself, into `.codemeld`, or nowhere), the session's private temp folder (given to the command
-  as `TMPDIR` and removed when the session ends), and declared `writable_folders`. Blocked
+  as `TMPDIR`; a headless run attempts to remove it when it returns and reports a failure, a
+  normal interactive exit, even a clean `/exit`, skips that cleanup, and the next Linux launch
+  attempts to remove a recorded folder whose process is gone only when the recorded device, inode
+  and birth time prove codemeld created it, reporting a failure or a folder it cannot prove, so the
+  folder can remain), and declared `writable_folders`. Blocked
   paths, the `.codemeld` folders and, for shell commands, the version history stores below are
   carved out of every write root, and `/dev/shm` itself is never writable. codemeld adds no other temporary write grant: `/tmp` and the `$TMPDIR` codemeld
   was launched with are writable only when an effective declared `writable_folders` entry covers
@@ -102,11 +110,14 @@ session temp folder (`namesFolder`).
   folder under `/dev/shm` is not covered by `/dev` or `/dev/shm`, since `/dev/shm` is carved out
   of them, so it keeps its own grant; its parent stays unwritable (`outerRoots` in
   `internal/enforce/landlock_linux.go`).
-- **Network.** A sandboxed command cannot create a socket that reaches another process. The one
-  socket it may create is a Unix stream or seqpacket socket pair, whose ends connect only to each
+- **Network.** Without the proxy route, a sandboxed command cannot create a socket that reaches
+  another process: the one socket it may create is a Unix stream or seqpacket socket pair, whose ends connect only to each
   other; datagram pairs are denied, with the same pair rule in every seccomp filter
-  (`seccompFilterFor` in `internal/enforce/seccomp_linux.go`). In Auto edits, a network command you
-  approve gets internet sockets for that one command.
+  (`seccompFilterFor` in `internal/enforce/seccomp_linux.go`). When the launch self-test's network
+  check passes, Plan and Auto edits commands may also create TCP sockets, and every `connect()`
+  pauses for codemeld, which makes the connection itself and admits only its session proxy. The
+  proxy asks per destination, admits saved `domain_grants`, and connects only to public addresses
+  that are not this machine's ([Sandboxed network](approvals.md#sandboxed-network)).
 - **Self-test.** At startup the helper runs against a scratch folder and checks each property from
   inside: writes, protected reads, sockets, process, namespace and metadata calls, and the fixed
   environment, which this leg checks against the fixed table alone, never the launch environment
@@ -122,7 +133,7 @@ agents. Build is never sandboxed.
 
 | Startup self-test | Settings file | Recorded capability | Shell commands in Plan and Auto edits |
 |---|---|---|---|
-| passed | valid | `constrained` | sandboxed, no ordinary prompt; in Auto edits, a command with a recognized network stage asks (`SandboxedAutoEditsAuthority`), and file deletion, history rewrites and commands codemeld cannot split run without asking; a rewrite cannot write the history stores under **Version history** above, and a version-control tool write action from a product-authored template runs without asking (`sandboxedVCSWrite`), while customized templates get no routine-write auto-approval; a matching saved grant or turn approval can still cover them (`resolveWithoutPrompt`) |
+| passed | valid | `constrained` | sandboxed, no ordinary prompt; network goes through the session proxy and is approved per destination, never by the program's name; in Auto edits, file deletion, history rewrites and commands codemeld cannot split run without asking; a rewrite cannot write the history stores under **Version history** above, and a version-control tool write action from a product-authored template runs without asking (`sandboxedVCSWrite`), while customized templates get no routine-write auto-approval; a matching saved grant or turn approval can still cover them (`resolveWithoutPrompt`) |
 | passed | broken | `refused` (broken settings) | still sandboxed, every command asks |
 | failed or unsupported | any | `refused` with its reason | unsandboxed, ordinary prompts and Plan refusals |
 
@@ -140,7 +151,7 @@ agents. Build is never sandboxed.
 
 The sandbox does not cover unsandboxed commands, metadata changes in Auto edits, same-user
 signals, `/proc` listings, outside processes watching a write root, output sent to the model
-provider, approved network commands, or kernel bugs; see
+provider, uploads to destinations approved at the proxy, or kernel bugs; see
 [SECURITY.md](../SECURITY.md#what-the-confinement-boundary-does-not-cover).
 
 ## Privacy & Telemetry
@@ -150,7 +161,10 @@ codemeld itself connects only to:
 - the configured model providers, at the base URL you set, for model requests and model discovery;
 - `https://auth.openai.com` and `https://chatgpt.com/backend-api/codex`, only when the ChatGPT
   provider is used;
-- `mcp.exa.ai` for an approved `web_search`, and the page and redirects of an approved `web_fetch`.
+- `mcp.exa.ai` for an approved `web_search`, and the page and redirects of an approved `web_fetch`;
+- for a sandboxed shell command, the host and port it asked for through the session proxy, once a
+  prompt answer or a saved `domain_grants` entry approved it, and only at a public address that is
+  not this machine's. This limit applies only to the proxy, not to the destinations above.
 
 Any other network call codemeld makes itself is a bug. No telemetry exists: no analytics, crash
 reporting, or update checks, so there is no toggle; adding one is a design change that updates

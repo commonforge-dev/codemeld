@@ -156,10 +156,11 @@ promised to finish it and quietly get forgotten.
 2. `mise run oss-secret-scan` — secrets or private-machine paths inside a shipping file.
 3. `go vet ./...` — the standard vet analyzers, run standalone so the release gate does not
    depend on the lint task.
-4. `govulncheck ./...` — the Go vulnerability scanner over the module's reachable code.
+4. `scripts/govulncheck-gate.sh` — runs `govulncheck ./...`, the Go vulnerability scanner over
+   the module's reachable code, and applies the optional exceptions file described below.
 
 The reference check does not wait for release: `mise run check` and `mise run check-race` run it
-too, as their last step. The secret scan and `govulncheck` run only in `release-check`.
+too, as their last step. The secret scan and the vulnerability gate run only in `release-check`.
 
 The first two scan the exact set of files that ship to the public repository. They guard the
 public surface against two things a path-based ignore list cannot catch: a banned reference, or
@@ -173,8 +174,10 @@ scans share one boundary), `scripts/oss-reference-check.sh` with its `.oss-refer
 allowlist, and `scripts/oss-secret-scan.sh`. They are wired as `mise run oss-reference-check`
 (also run by `mise run check` and `mise run check-race`), `mise run oss-secret-scan`, and the
 combined `mise run release-check`; `mise run oss-gate-selftest` exercises both scanners against
-fixtures. `govulncheck` is pinned at `v1.6.0` through mise's Go backend, so `mise install`
-provides it.
+fixtures. `scripts/govulncheck-gate.sh` wraps the vulnerability scan for `release-check`.
+`govulncheck` is pinned at `v1.6.0` through mise's Go backend, so `mise install` provides it;
+the wrapper also needs `jq` on `PATH`, which mise does not install (without it the wrapper stops
+with `govulncheck-gate: jq is required` before scanning).
 
 **What makes the reference check fail**: a shipping file (code or public doc) contains one of
 the token patterns it matches, in three categories:
@@ -231,16 +234,36 @@ shipping file.
 `Printf` format, an unused result, a suspicious struct tag. Fix the reported line; `mise run
 lint` runs the same analyzers, so this rarely fires on its own.
 
-**What makes `govulncheck` fail**: it reports a known vulnerability that your code can actually
-reach, or it cannot consult the vulnerability database. It queries `https://vuln.go.dev` by
-default, so this step needs outbound network access; run the release gate from a machine that
-has it.
+**What makes the vulnerability gate fail**: `govulncheck` reports a symbol-level finding — a
+known vulnerability whose call path reaches a vulnerable function — and its ID has no active
+exception. The gate also fails when `govulncheck` itself fails (for example it cannot consult the
+vulnerability database) or when its JSON output cannot be read or parsed. It queries
+`https://vuln.go.dev` by default, so this step needs outbound network access; run the release
+gate from a machine that has it.
 
 **What to do about a vulnerability**: upgrade the affected dependency to the fixed version
 `govulncheck` names (`go get <module>@<version> && go mod tidy`) and re-run the gate. If the
 finding is in the Go standard library, move to the patched Go release. Do not skip the scan to
-get a release out — the report lists the call path that reaches the vulnerable code, so a
-finding here means the shipped binary is affected.
+get a release out; the scan always runs, with or without exceptions.
+
+**Exceptions**: when a finding cannot be fixed yet, it can be allowed for a short time through
+the file named by `CODEMELD_VULN_EXCEPTIONS`. If the variable is unset or the file does not
+exist, there are no exceptions and the scan still runs. Only the user edits this file, after the
+finding has been discussed. Each non-blank line that is not a `#` comment holds one ID:
+
+```text
+GO-YYYY-NNNN YYYY-MM-DD reason
+```
+
+The date is the day the exception was added; the exception is active through day 7 after it
+(a line dated 2026-11-09 still applies on 2026-11-16) and expired from day 8. The wrapper reads
+the file once per run and validates the whole file before allowing any finding: a malformed
+line, a date that is not a calendar date or is after today, or a second line for the same ID
+fails the gate even when no matching finding exists. A file that exists but cannot be read also
+fails. An expired exception fails the gate only when its finding is present, and the message
+repeats the original reason so it can be reviewed again before the line is re-dated or removed.
+An exception with no matching finding prints `unused exception <id>: remove it` and does not
+fail.
 
 **Why it's gated, and what runs where**: internal tasks cite requirement numbers by convention,
 so without a mechanical backstop the public surface drifts dirty again within days of any
@@ -251,7 +274,7 @@ local grep with no network access, it costs a second, and a banned reference is 
 in the edit that introduced it. So it runs in `check` and `check-race`. The one real cost of that
 move is the `find`-built file list above: an untracked scratch file left under a shipping root
 now fails the everyday gates. The secret scan stays release-only — a private path or credential
-only has to be absent when the project ships — and `govulncheck` stays release-only because it
+only has to be absent when the project ships — and the vulnerability gate stays release-only because it
 needs a network round-trip, which an everyday gate must not depend on.
 
 ## A related habit: helpers only tests use

@@ -1281,6 +1281,9 @@ func permissionSubjectPhrase(e permissions.PermissionEntry) string {
 	if readable, ok := permissions.DirectHomeSubjectReadable(e.Subject); ok {
 		return "run " + readable
 	}
+	if readable, ok := permissions.CompoundSubjectReadable(e.Subject); ok {
+		return "run " + readable
+	}
 	return "run " + e.Subject
 }
 

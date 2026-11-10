@@ -4,6 +4,7 @@ package bootstrap
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -12,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/tui"
 )
@@ -52,6 +55,7 @@ type terminalPrompter struct {
 	// Its false zero value means trusted, so only that production assembly can withhold the
 	// project choice; nothing here may infer trust from the disclosure or the cache.
 	projectUntrusted bool
+	persistGrant     func(config.DomainGrant) error
 
 	runCtx  context.Context
 	readErr error
@@ -66,13 +70,15 @@ type lineRead struct {
 // The single-slot gate is created here, once per run, so every per-request closure Build returns
 // serializes on the same permit.
 func newTerminalPrompter(stdin io.Reader, stderr io.Writer) *terminalPrompter {
-	return &terminalPrompter{
+	p := &terminalPrompter{
 		in:        bufio.NewReader(stdin),
 		out:       stderr,
 		notifyTTY: tui.PromptNotifyTTY(stderr),
 		after:     time.After,
 		gate:      newPromptGate(),
 	}
+	p.persistGrant = func(g config.DomainGrant) error { return persistLocalDomainGrant(p.disclosure.projectRoot, g) }
+	return p
 }
 
 func (p *terminalPrompter) notify() {
@@ -128,6 +134,100 @@ func (p *terminalPrompter) build(req permissions.MatchRequest, disp dispatch.Pro
 		}
 		return outcome, nil
 	}
+}
+
+func (p *terminalPrompter) askNetwork(ctx context.Context, host, port string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+	if err := p.gate.acquire(ctx); err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	defer p.gate.release()
+	if err := p.runEnded(); err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	if covered() {
+		return netproxy.DecisionOnce, nil
+	}
+	if p.readErr != nil {
+		return netproxy.DecisionDeny, p.readErr
+	}
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if p.runCtx != nil {
+		defer context.AfterFunc(p.runCtx, cancel)()
+	}
+	notifier := tui.StartPromptNotifier(readCtx, p.after, p.notify)
+	defer notifier.Stop()
+	p.renderNetwork(host, port)
+	read, err := p.readLine(readCtx)
+	if err == nil && read.err != nil && !errors.Is(read.err, io.EOF) {
+		err = read.err
+	}
+	if err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	var d netproxy.Decision
+	switch strings.ToLower(strings.TrimSpace(read.line)) {
+	case "1", "allow", "allow-once", "once", "o":
+		d = netproxy.DecisionOnce
+	case "3", "session", "allow-session", "s":
+		d = netproxy.DecisionSession
+	case "2", "deny", "d":
+		return netproxy.DecisionDeny, nil
+	case "4", "project", "allow-project", "p":
+		if p.projectUntrusted {
+			return netproxy.DecisionDeny, errors.New("bootstrap: the network prompt did not offer allow in this project")
+		}
+		if err := p.networkLive(ctx); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		if err := saveNetworkGrant(host, port, p.persistGrant); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		if err := p.networkLive(ctx); err != nil {
+			return netproxy.DecisionDeny, err
+		}
+		d = netproxy.DecisionSession
+	default:
+		return netproxy.DecisionDeny, errors.New("bootstrap: the network prompt answer is not one it offered")
+	}
+	if err := p.runEnded(); err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	accept(d)
+	return d, nil
+}
+
+func (p *terminalPrompter) networkLive(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return p.runEnded()
+}
+
+func (p *terminalPrompter) runEnded() error {
+	if p.runCtx == nil {
+		return nil
+	}
+	return p.runCtx.Err()
+}
+
+func (p *terminalPrompter) renderNetwork(host, port string) {
+	p.outMu.Lock()
+	defer p.outMu.Unlock()
+	_, _ = fmt.Fprintln(p.out)
+	_, _ = fmt.Fprintln(p.out, "codemeld: approval required for a network request (nothing pre-authorized it)")
+	_, _ = fmt.Fprintf(p.out, "  host: %s\n", fact(host))
+	_, _ = fmt.Fprintf(p.out, "  port: %s\n", fact(port))
+	_, _ = fmt.Fprintln(p.out, "  the command can send data to this host")
+	_, _ = fmt.Fprintln(p.out, "  [1] allow once          — allow this request; the next request to this host asks again")
+	_, _ = fmt.Fprintln(p.out, "  [2] deny                — refuse this request")
+	_, _ = fmt.Fprintln(p.out, "  [3] allow this session  — allow this host and port until codemeld exits")
+	if p.projectUntrusted {
+		_, _ = fmt.Fprint(p.out, "codemeld: choose 1-3: ")
+		return
+	}
+	_, _ = fmt.Fprintln(p.out, "  [4] allow in this project — save this host and port in this project's .codemeld/settings.local.yaml")
+	_, _ = fmt.Fprint(p.out, "codemeld: choose 1-4: ")
 }
 
 func (p *terminalPrompter) readLine(ctx context.Context) (lineRead, error) {
@@ -333,28 +433,32 @@ func (p *terminalPrompter) readChoice(ctx context.Context, host, fresh bool) (pe
 	if err != nil {
 		return permissions.PromptOutcome{}, err
 	}
+	return p.choiceOf(read, host, fresh), nil
+}
+
+func (p *terminalPrompter) choiceOf(read lineRead, host, fresh bool) permissions.PromptOutcome {
 	choice := strings.ToLower(strings.TrimSpace(read.line))
 	if read.err != nil && choice == "" {
-		return denyOutcome(), nil
+		return denyOutcome()
 	}
 	switch choice {
 	case "1", "allow", "allow-once", "once", "o":
-		return permissions.PromptOutcome{Choice: permissions.PromptAllowOnce}, nil
+		return permissions.PromptOutcome{Choice: permissions.PromptAllowOnce}
 	case "3", "session", "allow-session", "s":
 		if fresh {
-			return denyOutcome(), nil
+			return denyOutcome()
 		}
-		return permissions.PromptOutcome{Choice: permissions.PromptAllowSession}, nil
+		return permissions.PromptOutcome{Choice: permissions.PromptAllowSession}
 	case "4", "project", "allow-project", "p":
 		if fresh || p.projectUntrusted {
-			return denyOutcome(), nil
+			return denyOutcome()
 		}
 		if host {
-			return permissions.PromptOutcome{Choice: permissions.PromptAllowProject}, nil
+			return permissions.PromptOutcome{Choice: permissions.PromptAllowProject}
 		}
-		return permissions.PromptOutcome{Choice: permissions.PromptAllowFolder}, nil
+		return permissions.PromptOutcome{Choice: permissions.PromptAllowFolder}
 	default:
-		return denyOutcome(), nil
+		return denyOutcome()
 	}
 }
 

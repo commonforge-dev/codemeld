@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -118,6 +120,8 @@ type Cache struct {
 
 	writableFolders []string
 
+	domainGrants []string
+
 	modelActive      any
 	hasModelActive   bool
 	modelLastUsed    any
@@ -154,6 +158,10 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 	if err != nil {
 		return nil, err
 	}
+	domainGrants, err := parseDomainGrants(composed)
+	if err != nil {
+		return nil, err
+	}
 
 	c := &Cache{
 		projectRoot:            projectRoot,
@@ -173,6 +181,7 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		programLookup:          nestedStringOr(composed, "confinement", "program_lookup", "friendly"),
 		declaredCommands:       declaredCommands,
 		writableFolders:        parseWritableFolders(composed, projectRoot, home),
+		domainGrants:           domainGrants,
 	}
 	if len(home) > 0 {
 		c.launchHome = home[0]
@@ -316,6 +325,8 @@ func (c *Cache) MaxToolOutputBytes() int { return c.maxToolOutputBytes }
 // VCSPriority returns a copy of the vcs.priority tie-break order
 // (default [git, hg, jj]); mutating it does not change the cache.
 func (c *Cache) VCSPriority() []string { return slices.Clone(c.vcsPriority) }
+
+func (c *Cache) DomainGrants() []string { return slices.Clone(c.domainGrants) }
 
 // VCSForce returns vcs.force, or "" when unset.
 func (c *Cache) VCSForce() string { return c.vcsForce }
@@ -766,6 +777,50 @@ func parseDeclaredCommands(composed map[string]any) ([]permissions.DeclaredComma
 		fmt.Fprintf(os.Stderr, "codemeld: %s\n", notice)
 	}
 	return entries, nil
+}
+
+func parseDomainGrants(composed map[string]any) ([]string, error) {
+	list, _, err := layerList(composed, domainGrantsKey)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	grants := make([]string, 0, len(list))
+	for i, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("config: %s.%d is not a mapping, got %T", domainGrantsKey, i, item)
+		}
+		host, ok := m["host"].(string)
+		if !ok || host == "" {
+			return nil, fmt.Errorf("config: %s.%d host must be a non-empty string", domainGrantsKey, i)
+		}
+		port, ok := domainGrantPort(m["port"])
+		if !ok {
+			return nil, fmt.Errorf("config: %s.%d port must be a whole number from 1 to 65535", domainGrantsKey, i)
+		}
+		grants = append(grants, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return grants, nil
+}
+
+func domainGrantPort(v any) (int, bool) {
+	var f float64
+	switch n := v.(type) {
+	case int:
+		f = float64(n)
+	case int64:
+		f = float64(n)
+	case uint64:
+		f = float64(n)
+	case float64:
+		f = n
+	default:
+		return 0, false
+	}
+	if f != math.Trunc(f) || f < 1 || f > 65535 {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // Never fall back to the ambient home: the floor and ~ expansion must match the launch's resolved home.

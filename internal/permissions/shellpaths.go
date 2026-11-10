@@ -80,6 +80,20 @@ func LiteralRewriteAsks(stage StageNormalization, runDir string) bool {
 	if err != nil || len(raw) != len(stage.Tokens) {
 		return true
 	}
+	return tokensNeedShell(raw, stage, runDir)
+}
+
+// StageNeedsShell inspects only the trailing raw tokens that produced stage.Tokens, so stripped
+// assignments and a normalized env prefix never count.
+func StageNeedsShell(stage StageNormalization, runDir string) bool {
+	raw, err := tokenizeShell(stage.Source)
+	if err != nil || len(raw) < len(stage.Tokens) {
+		return false
+	}
+	return tokensNeedShell(raw[len(raw)-len(stage.Tokens):], stage, runDir)
+}
+
+func tokensNeedShell(raw []ShellToken, stage StageNormalization, runDir string) bool {
 	options := true
 	for i, token := range raw {
 		text := token.Raw

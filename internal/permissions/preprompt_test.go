@@ -430,7 +430,7 @@ func TestPrePromptCheck_ExceptionalActionsKeepTodaysAnswer(t *testing.T) {
 					p := newPreFixture(PromptAllowOnce, map[string]PrePromptResult{r.Req.Subject: allow()})
 					decs := p.mustRun(t, path, r)
 					wantPrompts := 1
-					if constrained && input == "rm x" {
+					if constrained {
 						wantPrompts = 0
 					}
 					if len(p.check.calls) != 0 || p.promptShown() != wantPrompts || decs[0].Outcome != "once" {

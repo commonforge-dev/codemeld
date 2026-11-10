@@ -20,6 +20,9 @@ const (
 	ModeAutoEdits          = "auto_edits"
 	NetworkAccessAuthority = "network access"
 	MaxPolicyFrameBytes    = 64 * 1024
+	BrokerNone             = ""
+	BrokerSlice            = "slice"
+	BrokerFull             = "full"
 )
 
 type Policy struct {
@@ -32,6 +35,7 @@ type Policy struct {
 	TmpDir               string   `json:"tmp_dir"`
 	TmpDirDev            uint64   `json:"tmp_dir_dev"`
 	TmpDirIno            uint64   `json:"tmp_dir_ino"`
+	Broker               string   `json:"broker"`
 }
 
 var errPolicyFrameTooLarge = fmt.Errorf("policy frame exceeds %d bytes", MaxPolicyFrameBytes)
@@ -107,6 +111,9 @@ func (p Policy) validate() error {
 	default:
 		return fmt.Errorf("policy: unknown mode %q", p.Mode)
 	}
+	if err := p.checkBroker(); err != nil {
+		return err
+	}
 	if len(p.BlockedPaths) == 0 {
 		return errors.New("policy: blocked_paths is empty")
 	}
@@ -121,6 +128,24 @@ func (p Policy) validate() error {
 		return checkPolicyPath(p.TmpDir)
 	}
 	return nil
+}
+
+func (p Policy) checkBroker() error {
+	switch p.Broker {
+	case BrokerNone:
+		return nil
+	case BrokerSlice:
+		if (p.Mode != ModeAutoEdits && p.Mode != ModePlan) || p.ExceptionalAuthority != "" {
+			return fmt.Errorf("policy: broker %q requires plan or auto_edits without exceptional_authority", p.Broker)
+		}
+		return nil
+	case BrokerFull:
+		if p.Mode != ModeAutoEdits || p.ExceptionalAuthority != "" {
+			return fmt.Errorf("policy: broker %q requires auto_edits without exceptional_authority", p.Broker)
+		}
+		return nil
+	}
+	return fmt.Errorf("policy: unknown broker %q", p.Broker)
 }
 
 func checkPolicyPath(path string) error {

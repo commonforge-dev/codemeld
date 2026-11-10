@@ -4,6 +4,8 @@
 package permissions
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -970,5 +972,406 @@ func TestMatchesCompoundSubject_UnpinnedHomeFormsKeepMatching(t *testing.T) {
 				t.Fatalf("matchesCompoundSubject(%q, %q) = false, want the unpinned argument covered", tt.request, grant)
 			}
 		})
+	}
+}
+
+func testHomeEnvelope(t *testing.T, scope string, expanding, literal []int) string {
+	t.Helper()
+	payload, err := json.Marshal(struct {
+		Subject   string `json:"subject"`
+		Expanding []int  `json:"expanding"`
+		Literal   []int  `json:"literal"`
+	}{scope, expanding, literal})
+	if err != nil {
+		t.Fatalf("marshal home envelope: %v", err)
+	}
+	return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func recognizedForGrant(t *testing.T, input string) SimpleCompound {
+	t.Helper()
+	sc, ok := RecognizeSimpleCompoundForGrant(canon(t, input))
+	if !ok {
+		t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = not simple, want an accepted literal request", input)
+	}
+	return sc
+}
+
+func stageGrant(t *testing.T, sc SimpleCompound, scopes map[int]string) string {
+	t.Helper()
+	stageSubjects := make([]string, len(sc.Stages))
+	for i, stage := range sc.Stages {
+		scope, ok := scopes[i]
+		if !ok {
+			scope = ExactSubject(stage[0], stage[1:])
+		}
+		ss, err := CompoundStageScopeSubject(sc, i, scope)
+		if err != nil {
+			t.Fatalf("CompoundStageScopeSubject(stage %d, %q): %v", i, scope, err)
+		}
+		stageSubjects[i] = ss
+	}
+	grant, err := EncodeCompoundSubject(sc.Wrapped, stageSubjects, sc.Operators)
+	if err != nil {
+		t.Fatalf("EncodeCompoundSubject(%q): %v", stageSubjects, err)
+	}
+	return grant
+}
+
+func literalCompoundMatches(t *testing.T, request, grant string) bool {
+	t.Helper()
+	return Match(MatchRequest{Kind: subjectKindLiteral, Subject: canon(t, request), PathScope: "/work/proj"},
+		[]PermissionEntry{{Kind: subjectKindLiteral, Subject: grant, PathScope: "/work/proj", GrantKind: grantKindFolder}}).Matched
+}
+
+func TestCompoundHomeGrant_MatchesAcceptedLiteralRequests(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		scopes  map[int]string
+		want    string
+		matches []string
+		refused []string
+	}{
+		{
+			name:    "wrapped ; with a quoted tilde path",
+			source:  `sh -c "cat '~/f' ; echo done"`,
+			want:    "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{}, []int{1})) + " ; echo done",
+			matches: []string{`sh -c 'cat \~/f ; echo done'`, `sh -c 'cat "~/f" ; echo done'`},
+			refused: []string{`sh -c "cat '~/g' ; echo done"`, `sh -c "cat '~/f' && echo done"`, `cat '~/f' 2>/dev/null ; echo done`},
+		},
+		{
+			name:    "wrapped && with an escaped lone home variable",
+			source:  `sh -c 'cat \$HOME && true'`,
+			want:    "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '$HOME'", []int{}, []int{1})) + " && true",
+			matches: []string{`sh -c "cat '\$HOME' && true"`},
+			refused: []string{`sh -c 'cat \$HOME/x && true'`},
+		},
+		{
+			name:    "wrapped | with an escaped home variable path and a null redirect",
+			source:  `sh -c 'cat \$HOME/x 2>/dev/null | wc -l'`,
+			want:    "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '$HOME/x'", []int{}, []int{1})) + " | wc -l",
+			matches: []string{`sh -c 'cat \$HOME/x | wc -l'`, `sh -c 'cat '"'"'$HOME'"'"'/x | wc -l'`},
+			refused: []string{`sh -c 'cat \$HOME/y | wc -l'`, `sh -c 'cat \$HOME/x | wc -c'`},
+		},
+		{
+			name:    "wrapped lone tilde and mixed literal spellings in one stage",
+			source:  `sh -c "cp '~' '~'/a \\\$HOME/b && true"`,
+			want:    "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cp '~' '~/a' '$HOME/b'", []int{}, []int{1, 2, 3})) + " && true",
+			matches: []string{`sh -c "cp \\~ \\~/a '\$HOME/b' && true"`},
+			refused: []string{`sh -c "cp '~' '~'/a '~/b' && true"`},
+		},
+		{
+			name:    "bare redirect-bearing compound",
+			source:  `cat '~/f' 2>/dev/null ; echo done`,
+			want:    "compound/v2 B " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{}, []int{1})) + " ; echo done",
+			matches: []string{`cat \~/f 2> /dev/null ; echo done`, `cat '~/f' ; echo done >/dev/null`},
+			refused: []string{`sh -c "cat '~/f' ; echo done"`, `cat '~/g' 2>/dev/null ; echo done`},
+		},
+		{
+			name:    "pinned prefix keeps its wildcard tail",
+			source:  `sh -c "cat '~/f' -n ; echo done"`,
+			scopes:  map[int]string{0: PrefixSubject("cat", []string{"~/f"})},
+			want:    "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f' :*", []int{}, []int{1})) + " ; echo done",
+			matches: []string{`sh -c "cat '~/f' -n ; echo done"`, `sh -c "cat '~/f' ; echo done"`, `sh -c "cat '~/f' -b x ; echo done"`},
+			refused: []string{`sh -c "cat '~/g' -n ; echo done"`},
+		},
+		{
+			name:    "home pin in a later stage",
+			source:  `sh -c "go build ./... && cat '\$HOME' -n"`,
+			scopes:  map[int]string{1: PrefixSubject("cat", []string{"$HOME"})},
+			want:    "compound/v2 W go build ./... && " + ShellQuote(testHomeEnvelope(t, "cat '$HOME' :*", []int{}, []int{1})),
+			matches: []string{`sh -c "go build ./... && cat '\$HOME' -n"`},
+			refused: []string{`sh -c "go build ./x && cat '\$HOME' -n"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := recognizedForGrant(t, tt.source)
+			grant := stageGrant(t, sc, tt.scopes)
+			if grant != tt.want {
+				t.Fatalf("grant = %q, want %q", grant, tt.want)
+			}
+			if !literalCompoundMatches(t, tt.source, grant) {
+				t.Fatalf("grant %q does not match its own source %q", grant, tt.source)
+			}
+			for _, request := range tt.matches {
+				if !literalCompoundMatches(t, request, grant) {
+					t.Errorf("grant %q does not match the equivalent literal request %q", grant, request)
+				}
+			}
+			for _, request := range tt.refused {
+				if literalCompoundMatches(t, request, grant) {
+					t.Errorf("grant %q matched the differing request %q", grant, request)
+				}
+			}
+		})
+	}
+}
+
+func TestCompoundHomeGrant_MismatchedStoredStateRefused(t *testing.T) {
+	const source = `sh -c "cat '~/f' ; echo done"`
+	sc := recognizedForGrant(t, source)
+	expanding := "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{1}, []int{})) + " ; echo done"
+	if _, err := decodeCompoundSubject(expanding); err != nil {
+		t.Fatalf("decodeCompoundSubject(%q): %v, want the stored expanding state valid", expanding, err)
+	}
+	if literalCompoundMatches(t, source, expanding) {
+		t.Fatalf("expanding stored state %q matched the literal request %q", expanding, source)
+	}
+	if got := stageGrant(t, sc, nil); !literalCompoundMatches(t, source, got) {
+		t.Fatalf("literal stored state %q does not match %q", got, source)
+	}
+}
+
+// These rows check the grant-recognition expansion gate; the state comparison never runs for them.
+func TestCompoundHomeGrant_ExpandingRequestsFailRecognition(t *testing.T) {
+	grants := map[string]string{
+		"~/f":   "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{}, []int{1})) + " ; echo done",
+		"$HOME": "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '$HOME'", []int{}, []int{1})) + " ; echo done",
+		"bare":  "compound/v2 B " + ShellQuote(testHomeEnvelope(t, "cat '$HOME'", []int{}, []int{1})) + " ; echo done",
+	}
+	tests := []struct{ grant, request string }{
+		{"~/f", `sh -c 'cat ~/f ; echo done'`},
+		{"$HOME", `sh -c 'cat $HOME ; echo done'`},
+		{"$HOME", `sh -c 'cat "$HOME" ; echo done'`},
+		{"$HOME", `sh -c "cat \"\$HOME\" ; echo done"`},
+		{"bare", `cat $HOME 2>/dev/null ; echo done`},
+		{"bare", `cat "$HOME" 2>/dev/null ; echo done`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.request, func(t *testing.T) {
+			if _, ok := RecognizeSimpleCompoundForGrant(canon(t, tt.request)); ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = simple, want the expanding request refused", tt.request)
+			}
+			if literalCompoundMatches(t, tt.request, grants[tt.grant]) {
+				t.Fatalf("expanding request %q matched the generalized grant %q", tt.request, grants[tt.grant])
+			}
+		})
+	}
+}
+
+func TestCompoundHomeGrant_OuterWrapperExpansionRefused(t *testing.T) {
+	tests := []struct{ literal, expanding string }{
+		{`sh -c "cat '\$HOME/f' ; echo done"`, `sh -c "cat '$HOME/f' ; echo done"`},
+		{`sh -c "cat '\$HOME/f' 2>/dev/null ; echo done"`, `sh -c "cat '$HOME/f' 2>/dev/null ; echo done"`},
+		{`sh -c "cat '\$HOME/f' ; echo done" 2>/dev/null`, `sh -c "cat '$HOME/f' ; echo done" 2>/dev/null`},
+		{"sh -c \"cat '~/f' ; echo done\" 2>/dev/null", "sh -c \"cat '`printf ~`/f' ; echo done\" 2>/dev/null"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expanding, func(t *testing.T) {
+			grant := stageGrant(t, recognizedForGrant(t, tt.literal), nil)
+			if !literalCompoundMatches(t, tt.literal, grant) {
+				t.Fatalf("grant %q does not match its own literal source %q", grant, tt.literal)
+			}
+			if sc, ok := RecognizeSimpleCompoundForGrant(canon(t, tt.expanding)); ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = %+v, want refusal (the outer shell expands the argument)", tt.expanding, sc)
+			}
+			if literalCompoundMatches(t, tt.expanding, grant) {
+				t.Fatalf("outer-expanding request %q matched the literal grant %q", tt.expanding, grant)
+			}
+		})
+	}
+}
+
+func TestCompoundHomeGrant_DirectRequestNeverConsumesIt(t *testing.T) {
+	grant := stageGrant(t, recognizedForGrant(t, `sh -c "cat '~/f' ; echo done"`), nil)
+	grants := []PermissionEntry{{Kind: subjectKindLiteral, Subject: grant, PathScope: "/work/proj", GrantKind: grantKindFolder}}
+	tokens := []string{"cat", "~/f"}
+	subject, err := DirectStageRequestSubject(tokens, nil, false, []bool{false, false})
+	if err != nil {
+		t.Fatalf("DirectStageRequestSubject: %v", err)
+	}
+	direct := MatchRequest{Kind: subjectKindDirect, Subject: subject, SubjectTokens: tokens, PathScope: "/work/proj"}
+	if Match(direct, grants).Matched {
+		t.Fatalf("direct request %q matched the compound grant %q", subject, grant)
+	}
+}
+
+// A redirect-free bare compound runs stage by stage on the direct route, so production never sends it
+// as a literal request; these rows only prove it carries no shell-literal proof.
+func TestCompoundHomeGrant_BareRedirectFreeHasNoProof(t *testing.T) {
+	grant := "compound/v2 B " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{}, []int{1})) + " ; echo done"
+	for _, request := range []string{`cat '~/f' ; echo done`, `cat ~/f ; echo done`} {
+		t.Run(request, func(t *testing.T) {
+			sc := recognizedForGrant(t, request)
+			if _, err := CompoundStageScopeSubject(sc, 0, ExactSubject("cat", []string{"~/f"})); err == nil {
+				t.Fatalf("CompoundStageScopeSubject built a home-state subject from bare %q without proof", request)
+			}
+			if matchesCompoundSubject(canon(t, request), grant) {
+				t.Fatalf("bare redirect-free %q matched the state-bearing grant %q", request, grant)
+			}
+		})
+	}
+}
+
+func TestCompoundStageScopeSubject(t *testing.T) {
+	proven := recognizedForGrant(t, `sh -c "cat '~/f' ; echo done"`)
+	manual := SimpleCompound{Wrapped: true, Stages: [][]string{{"cat", "~/f"}, {"echo", "done"}}, Operators: []string{";"}}
+	contradictory := proven
+	contradictory.homeExpands = [][]bool{{false, true}, {false, false}}
+	misaligned := proven
+	misaligned.homeExpands = [][]bool{{false}, {false, false}}
+	short := proven
+	short.homeExpands = [][]bool{{false, false}}
+	noHome := recognizedForGrant(t, `sh -c "cat x ; echo done"`)
+	replaced := recognizedForGrant(t, `sh -c "cat '~/f' ; echo done"`)
+	replaced.Stages = [][]string{{"cat", "$HOME/f"}, {"echo", "done"}}
+	mutated := recognizedForGrant(t, `sh -c "cat '~/f' ; echo done"`)
+	mutated.Stages[0][1] = "$HOME/f"
+
+	exact := ExactSubject("cat", []string{"~/f"})
+	refusals := []struct {
+		name  string
+		sc    SimpleCompound
+		stage int
+		scope string
+	}{
+		{"manual value without proof", manual, 0, exact},
+		{"contradictory expanding proof", contradictory, 0, exact},
+		{"proof misaligned with the stage tokens", misaligned, 0, exact},
+		{"proof missing a stage", short, 0, exact},
+		{"same-length stage replacement", replaced, 0, ExactSubject("cat", []string{"$HOME/f"})},
+		{"in-place argument mutation", mutated, 0, ExactSubject("cat", []string{"$HOME/f"})},
+		{"in-place mutation under a prefix scope", mutated, 0, PrefixSubject("cat", []string{"$HOME/f"})},
+		{"negative stage position", proven, -1, exact},
+		{"stage position past the end", proven, 2, exact},
+		{"scope pinning another home path", proven, 0, ExactSubject("cat", []string{"~/g"})},
+		{"scope for another stage", proven, 1, exact},
+		{"non-canonical scope", proven, 0, `cat "~/f"`},
+		{"scope that does not cover the stage", proven, 0, "cat x"},
+		{"envelope as scope", proven, 0, testHomeEnvelope(t, exact, []int{}, []int{1})},
+	}
+	for _, tt := range refusals {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := CompoundStageScopeSubject(tt.sc, tt.stage, tt.scope); err == nil {
+				t.Fatalf("CompoundStageScopeSubject = %q, want an error", got)
+			}
+		})
+	}
+
+	built := []struct {
+		name  string
+		sc    SimpleCompound
+		stage int
+		scope string
+		want  string
+	}{
+		{"exact pin", proven, 0, exact, testHomeEnvelope(t, "cat '~/f'", []int{}, []int{1})},
+		{"pinned prefix", proven, 0, PrefixSubject("cat", []string{"~/f"}), testHomeEnvelope(t, "cat '~/f' :*", []int{}, []int{1})},
+		{"program scope over a home argument", proven, 0, ProgramSubject("cat"), "cat :*"},
+		{"stage without a home argument", proven, 1, "echo done", "echo done"},
+		{"no proof needed without a home pin", manual, 0, "cat :*", "cat :*"},
+		{"no home form anywhere", noHome, 0, "cat x", "cat x"},
+	}
+	for _, tt := range built {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := CompoundStageScopeSubject(tt.sc, tt.stage, tt.scope)
+			if err != nil {
+				t.Fatalf("CompoundStageScopeSubject: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("CompoundStageScopeSubject = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompoundStageScopeSubject_HomeVariablePrefixBoundary(t *testing.T) {
+	sc := recognizedForGrant(t, `sh -c "cat '\$HOME' -n | wc -l"`)
+	got, err := CompoundStageScopeSubject(sc, 0, "cat '$HOME' :*")
+	if err != nil {
+		t.Fatalf("CompoundStageScopeSubject: %v", err)
+	}
+	if want := testHomeEnvelope(t, "cat '$HOME' :*", []int{}, []int{1}); got != want {
+		t.Fatalf("CompoundStageScopeSubject = %q, want %q", got, want)
+	}
+}
+
+func TestCompoundHomeGrant_NoHomePinKeepsV1(t *testing.T) {
+	sc := recognizedForGrant(t, `sh -c "cat '~/f' ; echo done"`)
+	grant := stageGrant(t, sc, map[int]string{0: "cat :*"})
+	if want := "compound/v1 W cat :* ; echo done"; grant != want {
+		t.Fatalf("grant = %q, want the unchanged v1 bytes %q", grant, want)
+	}
+	for _, request := range []string{`sh -c "cat '~/f' ; echo done"`, `sh -c "cat '~/g' -n ; echo done"`} {
+		if !literalCompoundMatches(t, request, grant) {
+			t.Errorf("program-scope grant %q does not cover %q", grant, request)
+		}
+	}
+	plain := stageGrant(t, recognizedForGrant(t, `sh -c "cat x -n ; echo done"`), map[int]string{0: PrefixSubject("cat", []string{"x"})})
+	if want := "compound/v1 W cat x :* ; echo done"; plain != want {
+		t.Fatalf("grant = %q, want %q", plain, want)
+	}
+	if !literalCompoundMatches(t, `sh -c "cat x '~/f' ; echo done"`, plain) {
+		t.Fatalf("prefix grant %q does not cover a home form in its wildcard tail", plain)
+	}
+}
+
+func TestCompoundHomeGrant_LegacyPinRefusedWithProof(t *testing.T) {
+	legacy, err := EncodeCompoundSubject(true, []string{ExactSubject("cat", []string{"~/f"}), "echo done"}, []string{";"})
+	if err != nil {
+		t.Fatalf("EncodeCompoundSubject: %v", err)
+	}
+	if want := "compound/v1 W cat '~/f' ; echo done"; legacy != want {
+		t.Fatalf("legacy grant = %q, want %q", legacy, want)
+	}
+	if _, err := ParseEntry(map[string]any{
+		"kind": "literal", "subject": legacy, "path_scope": "/work/proj", "grant_kind": "folder", "argument_hash": ComputeArgumentHash(legacy),
+	}, "settings.yaml", 0); err != nil {
+		t.Fatalf("ParseEntry(legacy): %v, want it to keep loading unchanged", err)
+	}
+	for _, request := range []string{`sh -c "cat '~/f' ; echo done"`, `sh -c 'cat ~/f ; echo done'`, `cat '~/f' 2>/dev/null ; echo done`} {
+		if literalCompoundMatches(t, request, legacy) {
+			t.Errorf("legacy home pin %q matched %q", legacy, request)
+		}
+	}
+}
+
+func TestDecodeCompoundSubject_MalformedHomeForm(t *testing.T) {
+	const source = `sh -c "cat '~/f' ; echo done"`
+	envelope := testHomeEnvelope(t, "cat '~/f'", []int{}, []int{1})
+	q := ShellQuote(envelope)
+	envPayload, err := EncodeDirectEnvSubject([]string{"A=1"}, false, "cat '~/f'")
+	if err != nil {
+		t.Fatalf("EncodeDirectEnvSubject: %v", err)
+	}
+	under, err := EncodeDirectUnderSubject([]string{"cat", "~/f", "/srv/x"}, 2, "/srv", false)
+	if err != nil {
+		t.Fatalf("EncodeDirectUnderSubject: %v", err)
+	}
+	b64 := func(raw string) string { return "'direct-home/v1 " + base64.RawURLEncoding.EncodeToString([]byte(raw)) }
+	malformed := []struct{ name, subject string }{
+		{"v2 with no home state", "compound/v2 W cat x ; echo done"},
+		{"v2 pinning a home form without state", "compound/v2 W " + q + " ; cat '$HOME'"},
+		{"envelope quoted non-canonically", `compound/v2 W "` + envelope + `" ; echo done`},
+		{"envelope with trailing text", "compound/v2 W " + q + "x ; echo done"},
+		{"envelope beside another token", "compound/v2 W cat " + q + " ; echo done"},
+		{"environment envelope", "compound/v2 W " + ShellQuote(envPayload) + " ; echo done"},
+		{"home envelope around a containment scope", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, under, []int{}, []int{1})) + " ; echo done"},
+		{"home envelope around another envelope", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, envelope, []int{}, []int{1})) + " ; echo done"},
+		{"destructive program inside the envelope", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "rm '~/f'", []int{}, []int{1})) + " ; echo done"},
+		{"missing state position", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{}, []int{})) + " ; echo done"},
+		{"duplicate state position", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f'", []int{1}, []int{1})) + " ; echo done"},
+		{"state on a non-home argument", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, "cat '~/f' x", []int{}, []int{1, 2})) + " ; echo done"},
+		{"unknown envelope field", "compound/v2 W " + ShellQuote(b64(`{"subject":"cat '~/f'","expanding":[],"literal":[1],"extra":1}`)) + " ; echo done"},
+		{"envelope trailing data", "compound/v2 W " + ShellQuote(b64(`{"subject":"cat '~/f'","expanding":[],"literal":[1]}{}`)) + " ; echo done"},
+		{"non-canonical envelope payload", "compound/v2 W " + ShellQuote(b64(`{"literal":[1],"subject":"cat '~/f'","expanding":[]}`)) + " ; echo done"},
+		{"non-canonical inner scope", "compound/v2 W " + ShellQuote(testHomeEnvelope(t, `cat "~/f"`, []int{}, []int{1})) + " ; echo done"},
+		{"unknown compound version", "compound/v3 W " + q + " ; echo done"},
+		{"missing wrapper flag", "compound/v2 " + q + " ; echo done"},
+	}
+	for _, tt := range malformed {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeCompoundSubject(tt.subject); err == nil {
+				t.Fatalf("decodeCompoundSubject(%q) = ok, want rejection", tt.subject)
+			}
+			if literalCompoundMatches(t, source, tt.subject) {
+				t.Fatalf("malformed %q matched %q", tt.subject, source)
+			}
+		})
+	}
+	if _, err := EncodeCompoundSubject(true, []string{envelope, ExactSubject("cat", []string{"$HOME"})}, []string{";"}); err == nil {
+		t.Fatalf("EncodeCompoundSubject mixed a home envelope with an unstated home pin, want an error")
 	}
 }

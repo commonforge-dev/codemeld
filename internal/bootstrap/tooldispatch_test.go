@@ -30,12 +30,14 @@ import (
 	"codemeld.dev/codemeld/internal/agent"
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
+	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/filetools"
 	"codemeld.dev/codemeld/internal/fsutil"
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
+	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/provider"
 	cmdrunner "codemeld.dev/codemeld/internal/runner"
@@ -8619,6 +8621,11 @@ func TestGeneralAgentBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 	launch := string(mode.Build)
 	conf := withSessionTemp(t, &confinement{constrained: true, mode: func() string { return launch }, home: "/launch-home", lookupPath: lookup,
 		projectRoot: "/launch-project", blocked: permissions.NewBlockedPaths("/launch-home", nil)})
+	parentAsked := 0
+	conf.proxyAsker = func(context.Context, string, string, func() bool, func(netproxy.Decision) bool) (netproxy.Decision, error) {
+		parentAsked++
+		return netproxy.DecisionDeny, nil
+	}
 	inner := &confineInner{}
 	childInner := &confineInner{}
 	prevChild := newChildToolRunner
@@ -8635,7 +8642,18 @@ func TestGeneralAgentBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 		t.Fatalf("child confinement = %p, want a copy of %p", child.confinement, conf)
 	}
 	copied := *child.confinement
+	if copied.proxy == nil || copied.proxy != conf.proxy {
+		t.Fatalf("child proxy state = %p, want the parent's %p", copied.proxy, conf.proxy)
+	}
+	if copied.proxyAsker != nil {
+		t.Fatal("the child confinement kept the parent's proxy asker")
+	}
+	if _, _ = conf.proxyAsker(context.Background(), "example.com", "443", nil, nil); parentAsked != 1 {
+		t.Fatal("building the child changed the parent's proxy asker")
+	}
 	copied.mode, conf.mode = nil, nil
+	copied.decide, conf.decide = nil, nil
+	conf.proxyAsker = nil
 	if !reflect.DeepEqual(copied, *conf) {
 		t.Fatalf("child confinement = %+v, want the parent's values %+v", copied, *conf)
 	}
@@ -8661,6 +8679,113 @@ func TestGeneralAgentBinding_ChildConfinementUsesItsFrozenMode(t *testing.T) {
 	wantHelperArgv(t, childInner.bounded[0].Argv, filepath.Join(lookup, "ls"))
 	if policy, _ := decodeFrame(t, childInner.bounded[0].Stdin); policy.Mode != string(mode.Plan) {
 		t.Fatalf("child policy = %+v, want the frozen plan mode", policy)
+	}
+}
+
+func TestGeneralAgentBinding_ChildProxyRequestAsksNoOneThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if !resolveExecutionCapability(enforce.ResolveInput{Home: home}).SliceSelfTestPassed {
+		t.Skip("unverified: the slice self-test did not pass on this host")
+	}
+	writeProjectSettings(t, project, writableFoldersYAML())
+	cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project,
+		[]string{SettingsPath(home), projectSettingsPath(project)}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevChild, prevVCS := newChildToolRunner, newVCSActionRunner
+	newChildToolRunner = func() cmdrunner.Runner { return &helperForwardingRunner{bin: bin} }
+	newVCSActionRunner = func() cmdrunner.Runner { return &helperForwardingRunner{bin: bin} }
+	t.Cleanup(func() { newChildToolRunner, newVCSActionRunner = prevChild, prevVCS })
+	const get = "'-test.run=^TestConfinedConnectChild$' -- get"
+	const approved = "10.0.0.1"
+	lookup, hostFile := t.TempDir(), filepath.Join(t.TempDir(), "host")
+	gitScript := fmt.Sprintf("#!/bin/sh\nread -r host < %s\nexec %s %s \"$host\"\n", hostFile, os.Args[0], get)
+	if err := os.WriteFile(filepath.Join(lookup, "git"), []byte(gitScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, childFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "parent starts the proxy", true: "child starts the proxy"}[childFirst], func(t *testing.T) {
+			tmpDir := filepath.Join(filepath.Dir(project), fmt.Sprintf("tmp-child-first-%v", childFirst))
+			if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			conf := withSessionProxy(t, launchConfinement(resolveExecutionCapability(enforce.ResolveInput{Home: home}), tmpDir,
+				mode.NewActiveState(mode.AutoEdits, mode.SourceDefault), cache, home,
+				securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
+			conf.lookupPath = lookup + ":" + conf.lookupPath
+			var asked atomic.Int32
+			conf.proxyAsker = func(_ context.Context, host, _ string, _ func() bool, _ func(netproxy.Decision) bool) (netproxy.Decision, error) {
+				asked.Add(1)
+				if host == approved {
+					return netproxy.DecisionSession, nil
+				}
+				return netproxy.DecisionDeny, nil
+			}
+			store := mkStore(t)
+			binding := generalAgentBinding{notices: &recordingNotices{}, confinement: conf}
+			guard := mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil)
+			factory := &toolRegistryFactory{active: &ActiveVCS{Template: productVettedGitTemplate(t), RepoRoot: project}}
+			reg, err := realizeToolRegistry(factory, cache, func() *sessions.Store { return store }, home, project, guard, binding)
+			if err != nil {
+				t.Fatalf("realizeToolRegistry: %v", err)
+			}
+			deps := binding.deps(reg, cache, func() *sessions.Store { return store }, home, project, guard)
+			child, ok := deps.NewDispatcher(permissions.ModeContext{Mode: string(mode.AutoEdits), ChildAgent: true, ChildInvocationID: ids.NewV7()}).(*productionToolDispatcher)
+			if !ok {
+				t.Fatal("NewDispatcher did not return a production dispatcher")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			setHost := func(host string) {
+				t.Helper()
+				if err := os.WriteFile(hostFile, []byte(host+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runChild := func(call turn.AssembledToolCall, host, want string) {
+				t.Helper()
+				setHost(host)
+				before := asked.Load()
+				res, err := child.Dispatch(ctx, call)
+				if err != nil || res.Denied || !strings.Contains(res.Content, want) {
+					t.Fatalf("child %s request to %s: %+v, %v; want %s", call.Name, host, res, err, want)
+				}
+				if n := asked.Load(); n != before {
+					t.Fatalf("the child's %s request to %s called the parent's asker (%d calls)", call.Name, host, n-before)
+				}
+			}
+			const noOne = `status 403 refused "not approved (no one to ask)"`
+			runChildren := func() {
+				t.Helper()
+				runChild(bashCall("c1", os.Args[0]+" "+get), "example.com", noOne)
+				runChild(structuredCall("v1", "vcs_status", map[string]any{}), "example.com", noOne)
+			}
+			runParent := func(host, want string) {
+				t.Helper()
+				before := asked.Load()
+				res, err := (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 1 << 16}).Exec(ctx, cmdrunner.RunSpec{InvocationID: ids.NewV7(),
+					Argv: []string{os.Args[0], "-test.run=^TestConfinedConnectChild$", "--", "get", host}, Cwd: project})
+				if out := string(res.Stdout); err != nil || !strings.HasPrefix(out, want) {
+					t.Fatalf("parent request to %s: %v, stdout %q stderr %q; want %s", host, err, res.Stdout, res.Stderr, want)
+				}
+				if n := asked.Load(); n != before+1 {
+					t.Fatalf("the parent's request to %s called its asker %d times, want once", host, n-before)
+				}
+			}
+			if conf.proxy.running() != nil {
+				t.Fatal("the session proxy started before the first command")
+			}
+			if childFirst {
+				runChildren()
+				runParent("example.com", `status 403 refused "not approved (denied)"`)
+			} else {
+				runParent("example.com", `status 403 refused "not approved (denied)"`)
+				runChildren()
+			}
+			runParent(approved, `status 403 refused "not public"`)
+			runChild(structuredCall("v2", "vcs_status", map[string]any{}), approved, `status 403 refused "not public"`)
+		})
 	}
 }
 
@@ -10680,5 +10805,73 @@ func TestProductionDispatcher_OnlyTheVCSRunnerMayWriteTheHistoryStore(t *testing
 	}
 	if policy, _ := decodeFrame(t, shellInner.bounded[0].Stdin); !slices.Equal(policy.NoWritePaths, append(kept, gitStore)) {
 		t.Fatalf("bash no-write paths = %q, want %q", policy.NoWritePaths, append(kept, gitStore))
+	}
+}
+
+func TestProductionDispatcher_ConfinedWildcardFollowsTheCallsPinnedMode(t *testing.T) {
+	const command = "grep -n x dir/*.md"
+	for _, tc := range []struct {
+		live, pinned mode.Mode
+		confined     bool
+	}{
+		{mode.Build, mode.Plan, true},
+		{mode.Build, mode.AutoEdits, true},
+		{mode.Plan, mode.Build, false},
+		{mode.AutoEdits, mode.Build, false},
+	} {
+		t.Run(string(tc.live)+"/"+string(tc.pinned), func(t *testing.T) {
+			h := newPinShellHarness(t, mode.NewActiveState(tc.live, mode.SourceUserCommand), nil, "sh")
+			if _, err := h.d.Dispatch(vcs.WithConfinementMode(context.Background(), string(tc.pinned)), bashCall("c1", command)); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if tc.confined {
+				requireConfinedShellRun(t, h.inner, command)
+				return
+			}
+			if len(h.inner.bounded) != 0 || len(h.inner.execs) != 1 || !slices.Equal(h.inner.execs[0].Argv, []string{"grep", "-n", "x", "dir/*.md"}) {
+				t.Fatalf("bounded = %+v, execs = %+v; want one unconfined run with the literal wildcard argv", h.inner.bounded, h.inner.execs)
+			}
+		})
+	}
+}
+
+func TestProductionDispatcher_ConfinementResolutionErrorStopsTheWildcardCommand(t *testing.T) {
+	h := newPinShellHarness(t, mode.NewActiveState(mode.Plan, mode.SourceUserCommand), nil, "sh")
+	h.d.confinement.mode = nil
+	if _, err := h.d.Dispatch(context.Background(), bashCall("c1", "grep -n x dir/*.md")); err == nil || !strings.Contains(err.Error(), "unrecognized mode") {
+		t.Fatalf("Dispatch error = %v, want the confinement resolution error", err)
+	}
+	if pins := h.spy.recorded(); len(pins) != 0 || h.inner.calls() != 0 {
+		t.Fatalf("authorization calls = %v, runner calls = %d; want none", pins, h.inner.calls())
+	}
+}
+
+func TestGeneralAgentBinding_ChildConfinedWildcardRunsThroughTheShell(t *testing.T) {
+	const command = "grep -n x dir/*.md"
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits, mode.Build} {
+		t.Run(string(m), func(t *testing.T) {
+			cache, home, project, active, modeActive := generalAgentFixture(t)
+			store := mkStore(t)
+			binding := generalAgentTestBinding(active, modeActive)
+			binding.confinement = withSessionTemp(t, &confinement{constrained: true, lookupPath: programDir(t, "sh"), blocked: testBlocked(t), projectRoot: project})
+			deps := binding.deps(tools.NewRegistry(), cache, func() *sessions.Store { return store }, home, project, mustProtectedStatePolicy(t, home, cache.ProjectRoot(), nil))
+			d, ok := deps.NewDispatcher(permissions.ModeContext{Mode: string(m), ChildAgent: true}).(*productionToolDispatcher)
+			if !ok {
+				t.Fatal("NewDispatcher did not return a production dispatcher")
+			}
+			inner := &confineInner{}
+			d.runner = inner
+			got, err := d.Dispatch(context.Background(), bashCall("c1", command))
+			if err != nil || got.Denied {
+				t.Fatalf("Dispatch = %+v, %v; want the command run", got, err)
+			}
+			if m != mode.Build {
+				requireConfinedShellRun(t, inner, command)
+				return
+			}
+			if len(inner.bounded) != 0 || len(inner.execs) != 1 || !slices.Equal(inner.execs[0].Argv, []string{"grep", "-n", "x", "dir/*.md"}) {
+				t.Fatalf("bounded = %+v, execs = %+v; want one unconfined run with the literal wildcard argv", inner.bounded, inner.execs)
+			}
+		})
 	}
 }

@@ -20,3 +20,4 @@ TUI `/help` panel (`internal/tui/help.go`); keep the two in sync when changing e
 | Variable | Effect |
 |----------|--------|
 | `CODEMELD_UPDATE_SNAPSHOTS` | Set to `1` to regenerate the golden snapshot fixtures during `go test` instead of asserting against them (`internal/agentinstr/snapshot_test.go`; see `docs/gated-changes.md`). Not read by the shipped binary. |
+| `CODEMELD_VULN_EXCEPTIONS` | Path to an optional exceptions file for the release vulnerability gate (`scripts/govulncheck-gate.sh`, run by `mise run release-check`; see `docs/gated-changes.md`). Each entry stays active through the seventh day after the date on its line and expires the day after. Unset, or naming a file that does not exist, means no exceptions — the scan still runs. Not read by the shipped binary. |

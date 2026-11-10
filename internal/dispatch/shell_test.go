@@ -5376,3 +5376,395 @@ func TestDispatchShell_HereStringBehindABareLineBreakIsDenied(t *testing.T) {
 		})
 	}
 }
+
+type confinementRunner struct {
+	fakeRunner
+	confined bool
+	err      error
+}
+
+func (r *confinementRunner) Confined(context.Context) (bool, error) { return r.confined, r.err }
+
+func TestDispatchShell_ConfinedShellSyntaxRunsThroughTheShell(t *testing.T) {
+	prependFixturePrograms(t, "grep", "ls", "false")
+	home, cwd := t.TempDir(), mustEval(t, t.TempDir())
+	sub := mkdir(t, filepath.Join(cwd, "sub"))
+	for _, tc := range []struct{ input, scope, literal string }{
+		{"grep -n x dir/*.md", cwd, "grep -n x dir/*.md"},
+		{"grep -n x dir/?.md", cwd, "grep -n x dir/?.md"},
+		{"grep -n x dir/[ab].md", cwd, "grep -n x dir/[ab].md"},
+		{"grep -n x dir/{a,b}.md", cwd, "grep -n x dir/{a,b}.md"},
+		{"FOO=bar grep x dir/*.md", cwd, "FOO=bar grep x dir/*.md"},
+		{"ls | grep x dir/*.md", cwd, "ls | grep x dir/*.md"},
+		{"ls; grep -n x dir/*.md", cwd, "ls; grep -n x dir/*.md"},
+		{"ls && grep -n x dir/*.md", cwd, "ls && grep -n x dir/*.md"},
+		{"false || grep -n x dir/*.md", cwd, "false || grep -n x dir/*.md"},
+		{"grep -n x dir/*.md | ls", cwd, "grep -n x dir/*.md | ls"},
+		{"cd sub && grep -n x dir/*.md", sub, "grep -n x dir/*.md"},
+		{"cd sub && ls && grep -n x dir/*.md", sub, "ls && grep -n x dir/*.md"},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			run := &confinementRunner{confined: true}
+			if _, err := DispatchShell(context.Background(), tc.input, home, cwd, auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(run.calls) != 1 || !slices.Equal(run.calls[0].Argv, []string{"sh", "-c", tc.literal}) || run.calls[0].Cwd != tc.scope {
+				t.Fatalf("runner calls = %+v, want one sh -c %q in %s", run.calls, tc.literal, tc.scope)
+			}
+			if len(auth.requests) != 1 || auth.requests[0].Kind != "literal" || auth.requests[0].PathScope != tc.scope {
+				t.Fatalf("requests = %+v, want one literal request in %s", auth.requests, tc.scope)
+			}
+			if mc := auth.modeCtxs[0]; !mc.LiteralRoute || len(mc.Stages) == 0 {
+				t.Fatalf("mode context = %+v, want the literal route carrying the source stages", mc)
+			}
+			if d := auth.displays[0]; d.Subject != tc.literal || !d.WholeCommand {
+				t.Fatalf("display = %+v, want the whole prefix-stripped command", d)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_ConfinedCommandsWithoutShellSyntaxKeepTheirRoute(t *testing.T) {
+	prependFixturePrograms(t, "grep", "ls")
+	home, cwd := t.TempDir(), mustEval(t, t.TempDir())
+	for _, tc := range []struct {
+		input string
+		argv  [][]string
+	}{
+		{"grep '*' f", [][]string{{"grep", "*", "f"}}},
+		{`grep "a*" f`, [][]string{{"grep", "a*", "f"}}},
+		{"grep -n x f", [][]string{{"grep", "-n", "x", "f"}}},
+		{"FOO=bar grep x f", [][]string{{"grep", "x", "f"}}},
+		{"FOO='a b' grep x f", [][]string{{"grep", "x", "f"}}},
+		{"env FOO='a b' grep x f", [][]string{{"grep", "x", "f"}}},
+		{"ls | grep '*' f", [][]string{{"ls"}, {"grep", "*", "f"}}},
+		{"ls && grep '*' f", [][]string{{"ls"}, {"grep", "*", "f"}}},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			run := &confinementRunner{confined: true}
+			if _, err := DispatchShell(context.Background(), tc.input, home, cwd, auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			got := make([][]string, len(run.calls))
+			for i, call := range run.calls {
+				got[i] = call.Argv
+			}
+			if !reflect.DeepEqual(got, tc.argv) {
+				t.Fatalf("runner argv = %q, want %q", got, tc.argv)
+			}
+			for _, req := range auth.requests {
+				if req.Kind != "direct" {
+					t.Fatalf("requests = %+v, want direct stages only", auth.requests)
+				}
+			}
+		})
+	}
+}
+
+func TestDispatchShell_UnconfinedWildcardKeepsItsArgv(t *testing.T) {
+	prependFixturePrograms(t, "grep", "ls")
+	home, cwd, _, guard := blockedSSHGuard(t)
+	runners := map[string]func() Runner{
+		"unconfined": func() Runner { return &confinementRunner{} },
+		"no query":   func() Runner { return &fakeRunner{} },
+	}
+	for name, newRunner := range runners {
+		t.Run(name, func(t *testing.T) {
+			for input, want := range map[string][]string{
+				"grep -n x dir/*.md":       {"grep", "-n", "x", "dir/*.md"},
+				"ls && grep -n x dir/*.md": {"grep", "-n", "x", "dir/*.md"},
+			} {
+				auth := &recordingPlanAuthorizer{planAuthorizer: planAuthorizer{root: cwd}}
+				run := newRunner()
+				if _, err := DispatchShell(context.Background(), input, home, cwd, auth, run, guard); err != nil {
+					t.Fatalf("%s: DispatchShell: %v", input, err)
+				}
+				var calls []runner.RunSpec
+				switch r := run.(type) {
+				case *confinementRunner:
+					calls = r.calls
+				case *fakeRunner:
+					calls = r.calls
+				}
+				if len(calls) == 0 || !slices.Equal(calls[len(calls)-1].Argv, want) {
+					t.Fatalf("%s: runner calls = %+v, want the last argv %q", input, calls, want)
+				}
+				for _, d := range auth.decisions {
+					if d.Outcome != "once" || !d.ReadOnlyAuto {
+						t.Fatalf("%s: decisions = %+v, want read-only mode auto-allows", input, auth.decisions)
+					}
+				}
+			}
+
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			if _, err := DispatchShell(context.Background(), "grep -n x dir/*.md 2>/dev/null", home, cwd, auth, newRunner(), guard); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(auth.modeCtxs) != 1 || !auth.modeCtxs[0].ShellPathAsk || auth.requests[0].Kind != "literal" {
+				t.Fatalf("authorized = %+v, want one literal request that asks", auth.modeCtxs)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_ConfinementQueryErrorRunsNothing(t *testing.T) {
+	prependFixturePrograms(t, "grep", "ls")
+	boom := errors.New("confinement unresolved")
+	for _, input := range []string{"grep -n x dir/*.md", "ls && grep -n x dir/*.md"} {
+		t.Run(input, func(t *testing.T) {
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			run := &confinementRunner{confined: true, err: boom}
+			if _, err := DispatchShell(context.Background(), input, t.TempDir(), t.TempDir(), auth, run); !errors.Is(err, boom) {
+				t.Fatalf("error = %v, want the confinement error", err)
+			}
+			if len(auth.requests) != 0 || len(run.calls) != 0 {
+				t.Fatalf("authorize calls = %d, runner calls = %d; want 0/0", len(auth.requests), len(run.calls))
+			}
+		})
+	}
+}
+
+func TestDispatchShell_ConfinedRerouteKeepsSourceStageRefusals(t *testing.T) {
+	prependFixturePrograms(t, "cat", "ls", "rm")
+	home, cwd, ssh, guard := blockedSSHGuard(t)
+	for _, input := range []string{"cat ~/.ssh/k*", "ls | cat ~/.ssh/k*", "rm x && cat ~/.ssh/k*", "rm x; cat ~/.ssh/k* | ls"} {
+		t.Run(input, func(t *testing.T) {
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			run := &confinementRunner{confined: true}
+			_, err := DispatchShell(context.Background(), input, home, cwd, auth, run, guard)
+			var refusal *securitystate.Refusal
+			if !errors.As(err, &refusal) || refusal.Entry != ssh {
+				t.Fatalf("error = %v, want a blocked-path refusal for %s", err, ssh)
+			}
+			if len(auth.requests) != 0 || len(run.calls) != 0 {
+				t.Fatalf("authorize calls = %d, runner calls = %d; want 0/0", len(auth.requests), len(run.calls))
+			}
+		})
+	}
+
+	t.Run("a source stage ask reaches the literal request", func(t *testing.T) {
+		auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+		run := &confinementRunner{confined: true}
+		if _, err := DispatchShell(context.Background(), "rm notes && ls ~ dir/*.md", home, cwd, auth, run, guard); err != nil {
+			t.Fatalf("DispatchShell: %v", err)
+		}
+		if len(auth.modeCtxs) != 1 || auth.requests[0].Kind != "literal" || !auth.modeCtxs[0].ShellPathAsk {
+			t.Fatalf("authorized = %+v, want one literal request that asks", auth.modeCtxs)
+		}
+	})
+}
+
+type sandboxedModeAuthorizer struct {
+	mode     string
+	root     string
+	answer   permissions.PromptOutcome
+	prompts  int
+	requests []permissions.MatchRequest
+}
+
+func (a *sandboxedModeAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ PromptDisplay, modeCtx permissions.ModeContext) (permissions.Decision, error) {
+	modeCtx.Mode = a.mode
+	modeCtx.ProjectRoot = a.root
+	modeCtx.ExecutionConstrained = true
+	a.requests = append(a.requests, req)
+	return permissions.Authorize(ctx, req, modeCtx, permissions.AuthorizeDeps{
+		Grants: &grantList{},
+		Cache:  permissions.NewTurnCache(),
+		Prompt: func(context.Context, permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+			a.prompts++
+			return a.answer, nil
+		},
+		EmitPromptShown:   func(_, _, _ string, _ []string, _ permissions.DirectIdentity) error { return nil },
+		EmitDecision:      func(_, _, _, _, _, _ string, _ permissions.DirectIdentity) error { return nil },
+		EmitDecisionGrant: func(_, _, _, _, _, _ string, _ permissions.DirectIdentity) error { return nil },
+		EmitMatched:       func(_, _, _, _, _, _, _, _, _ string) error { return nil },
+	})
+}
+
+type confinedExecRunner struct{ runner.DirectExecRunner }
+
+func (confinedExecRunner) Confined(context.Context) (bool, error) { return true, nil }
+
+func onlyFixturePrograms(t *testing.T, names ...string) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range names {
+		writeFixtureProgram(t, dir, name, "exit 0")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("sh not available: %v", err)
+	}
+	if err := os.Symlink(sh, filepath.Join(dir, "sh")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func TestDispatchShell_SandboxedModesRunUnsplittableCommandsThroughTheShell(t *testing.T) {
+	onlyFixturePrograms(t, "echo", "ls")
+	home, cwd := t.TempDir(), mustEval(t, t.TempDir())
+	sub := mkdir(t, filepath.Join(cwd, "sub"))
+	for _, mode := range []string{"plan", "auto_edits"} {
+		for _, tc := range []struct{ input, scope, literal string }{
+			{"echo $(pwd)", cwd, "echo $(pwd)"},
+			{"echo a\necho b", cwd, "echo a\necho b"},
+			{`for f in a b; do echo "$f"; done`, cwd, `for f in a b; do echo "$f"; done`},
+			{"for f in a b; do echo x; done", cwd, "for f in a b; do echo x; done"},
+			{"echo start && cd sub && ls", cwd, "echo start && cd sub && ls"},
+			{"nosuchprog x", cwd, "nosuchprog x"},
+			{"cd sub && echo $(pwd)", sub, "echo $(pwd)"},
+			{"cd sub && nosuchprog x", sub, "nosuchprog x"},
+		} {
+			t.Run(mode+"/"+tc.input, func(t *testing.T) {
+				auth := &sandboxedModeAuthorizer{mode: mode, root: cwd, answer: permissions.PromptOutcome{Choice: permissions.PromptDeny}}
+				run := &confinementRunner{confined: true}
+				if _, err := DispatchShell(context.Background(), tc.input, home, cwd, auth, run); err != nil {
+					t.Fatalf("DispatchShell: %v", err)
+				}
+				if len(run.calls) != 1 || !slices.Equal(run.calls[0].Argv, []string{"sh", "-c", tc.literal}) || run.calls[0].Cwd != tc.scope {
+					t.Fatalf("runner calls = %+v, want one sh -c %q in %s", run.calls, tc.literal, tc.scope)
+				}
+				if auth.prompts != 0 || len(auth.requests) != 1 || auth.requests[0].Kind != "literal" {
+					t.Fatalf("prompts = %d, requests = %+v; want one literal request and no prompt", auth.prompts, auth.requests)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchShell_SandboxedModesKeepResolvingCommandsOnTheirRoute(t *testing.T) {
+	onlyFixturePrograms(t, "echo", "ls")
+	home, cwd := t.TempDir(), mustEval(t, t.TempDir())
+	sub := mkdir(t, filepath.Join(cwd, "sub"))
+	for _, mode := range []string{"plan", "auto_edits"} {
+		for _, tc := range []struct {
+			input, scope string
+			argv         [][]string
+		}{
+			{"ls -l", cwd, [][]string{{"ls", "-l"}}},
+			{"cd sub && ls", sub, [][]string{{"ls"}}},
+			{"echo a && ls", cwd, [][]string{{"echo", "a"}, {"ls"}}},
+		} {
+			t.Run(mode+"/"+tc.input, func(t *testing.T) {
+				auth := &sandboxedModeAuthorizer{mode: mode, root: cwd}
+				run := &confinementRunner{confined: true}
+				if _, err := DispatchShell(context.Background(), tc.input, home, cwd, auth, run); err != nil {
+					t.Fatalf("DispatchShell: %v", err)
+				}
+				got := make([][]string, len(run.calls))
+				for i, call := range run.calls {
+					got[i] = call.Argv
+					if call.Cwd != tc.scope {
+						t.Fatalf("call %d ran in %s, want %s", i, call.Cwd, tc.scope)
+					}
+				}
+				if !reflect.DeepEqual(got, tc.argv) {
+					t.Fatalf("runner argv = %q, want %q", got, tc.argv)
+				}
+				for _, req := range auth.requests {
+					if req.Kind != "direct" {
+						t.Fatalf("requests = %+v, want direct stages only", auth.requests)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchShell_BuildAndUnsandboxedModesStillRefuseUnsplittableCommands(t *testing.T) {
+	onlyFixturePrograms(t, "echo", "ls")
+	runners := map[string]func() Runner{
+		"unconfined": func() Runner { return &confinementRunner{} },
+		"no query":   func() Runner { return &fakeRunner{} },
+	}
+	cases := []struct{ input, construct, missing string }{
+		{input: "echo $(pwd)", construct: "$()"},
+		{input: "echo a\necho b", construct: "newline"},
+		{input: `for f in a b; do echo "$f"; done`, missing: "for"},
+		{input: "for f in a b; do echo x; done", missing: "for"},
+		{input: "echo start && cd sub && ls", missing: "cd"},
+		{input: "nosuchprog x", missing: "nosuchprog"},
+	}
+	for _, mode := range []string{"build", "plan", "auto_edits"} {
+		for name, newRunner := range runners {
+			for _, tc := range cases {
+				t.Run(mode+"/"+name+"/"+tc.input, func(t *testing.T) {
+					cwd := mustEval(t, t.TempDir())
+					run := newRunner()
+					_, err := DispatchShell(context.Background(), tc.input, t.TempDir(), cwd, modeAuthorizer{mode: mode, root: cwd}, run)
+					var unsupported *UnsupportedConstructError
+					var malformed *MalformedCommandError
+					switch {
+					case tc.construct != "":
+						if !errors.As(err, &unsupported) || unsupported.Construct != tc.construct {
+							t.Fatalf("error = %v, want unsupported_shell_construct: %s", err, tc.construct)
+						}
+					case !errors.As(err, &malformed) || !strings.Contains(err.Error(), fmt.Sprintf("program %q not found", tc.missing)):
+						t.Fatalf("error = %v, want program %q not found", err, tc.missing)
+					}
+					var calls []runner.RunSpec
+					switch r := run.(type) {
+					case *confinementRunner:
+						calls = r.calls
+					case *fakeRunner:
+						calls = r.calls
+					}
+					if len(calls) != 0 {
+						t.Fatalf("runner calls = %+v, want none", calls)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestDispatchShell_SandboxedMissingProgramFailsInTheShell(t *testing.T) {
+	onlyFixturePrograms(t)
+	for _, mode := range []string{"plan", "auto_edits"} {
+		t.Run(mode, func(t *testing.T) {
+			cwd := mustEval(t, t.TempDir())
+			auth := &sandboxedModeAuthorizer{mode: mode, root: cwd}
+			res, err := DispatchShell(context.Background(), "nosuchprog x", t.TempDir(), cwd, auth, confinedExecRunner{})
+			if err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "nosuchprog") || !strings.Contains(string(res.Stderr), "not found") {
+				t.Fatalf("result = exit %d, stderr %q; want the shell's not-found failure", res.ExitCode, res.Stderr)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_SandboxedAutoEditsUnclassifiableLoopGetsNoNetwork(t *testing.T) {
+	onlyFixturePrograms(t, "curl")
+	cwd := mustEval(t, t.TempDir())
+	for _, input := range []string{`for u in a; do curl "$u"; done`, "for u in a; do curl x; done"} {
+		t.Run(input, func(t *testing.T) {
+			auth := &sandboxedModeAuthorizer{mode: "auto_edits", root: cwd, answer: permissions.PromptOutcome{Choice: permissions.PromptDeny}}
+			run := &confinementRunner{confined: true}
+			if _, err := DispatchShell(context.Background(), input, t.TempDir(), cwd, auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if auth.prompts != 0 {
+				t.Fatalf("prompts = %d, want none", auth.prompts)
+			}
+			if len(run.calls) != 1 || !slices.Equal(run.calls[0].Argv, []string{"sh", "-c", input}) || run.calls[0].ExceptionalAuthority != "" {
+				t.Fatalf("runner calls = %+v, want one sh -c run with no exceptional authority", run.calls)
+			}
+		})
+	}
+
+	t.Run("a classifiable network stage runs without a prompt", func(t *testing.T) {
+		auth := &sandboxedModeAuthorizer{mode: "auto_edits", root: cwd, answer: permissions.PromptOutcome{Choice: permissions.PromptDeny}}
+		run := &confinementRunner{confined: true}
+		if _, err := DispatchShell(context.Background(), "curl x && nosuchprog y", t.TempDir(), cwd, auth, run); err != nil {
+			t.Fatalf("DispatchShell: %v", err)
+		}
+		if auth.prompts != 0 || len(run.calls) != 1 || !slices.Equal(run.calls[0].Argv, []string{"sh", "-c", "curl x && nosuchprog y"}) {
+			t.Fatalf("prompts = %d, runner calls = %+v; want no prompt and one sh -c run", auth.prompts, run.calls)
+		}
+	})
+}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,6 +193,113 @@ func TestProbeExitMapping(t *testing.T) {
 	}
 }
 
+func TestTargetExitCountsOnlyEPERM(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{nil, 0},
+		{unix.EPERM, 10},
+		{unix.EACCES, 11},
+		{unix.ECONNREFUSED, 11},
+		{unix.EADDRINUSE, 11},
+	} {
+		if got := targetExit(tc.err); got != tc.want {
+			t.Errorf("targetExit(%v) = %d, want %d", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestTargetFdProbeCountsOnlyEPERM(t *testing.T) {
+	if got := targetFdProbe(-1, unix.EPERM); got != probeDenied {
+		t.Errorf("EPERM: %d, want %d", got, probeDenied)
+	}
+	if got := targetFdProbe(-1, unix.EACCES); got != probeFailed {
+		t.Errorf("EACCES: %d, want %d", got, probeFailed)
+	}
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := targetFdProbe(fd, nil); got != probeAllowed {
+		t.Errorf("created socket: %d, want %d", got, probeAllowed)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Errorf("descriptor %d still open after the probe: %v", fd, err)
+	}
+}
+
+func TestSliceProbesUnrestricted(t *testing.T) {
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	inUse := ln.Addr().String()
+	closed, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := closed.Addr().String()
+	_ = closed.Close()
+	fastOpen := 11
+	if v, err := strconv.Atoi(sysctl("/proc/sys/net/ipv4/tcp_fastopen")); err == nil && v&1 != 0 {
+		fastOpen = 0
+	}
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"tcp-bind", "127.0.0.1:0"}, 0},
+		{[]string{"tcp-bind", inUse}, 11},
+		{[]string{"tcp-bind", "not-an-endpoint"}, 11},
+		{[]string{"tcp-bind", "[::1]:0"}, 11},
+		{[]string{"tcp-listen"}, 0},
+		{[]string{"tcp-fastopen", inUse}, fastOpen},
+		{[]string{"tcp-fastopen", closedAddr}, 11},
+		{[]string{"tcp-connect-main", "not-an-endpoint", "x"}, 11},
+	} {
+		if got := runProbe(&helperState{}, tc.args); got != tc.want {
+			t.Errorf("%v: exit %d, want %d", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestSliceProbesSetupEPERMIsNotDenial(t *testing.T) {
+	mxRequire(t)
+	bin := mxBinary(t)
+	f := mxSetup(t)
+	work, tmp := f.mkdir(t, "work"), f.mkdir(t, "tmp")
+	policy := Policy{Mode: ModeAutoEdits, BlockedPaths: f.blocked(), TmpDir: tmp}
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"socket-inet"}, 10},
+		{[]string{"tcp-connect-main", "127.0.0.1:1", "x"}, 11},
+		{[]string{"tcp-connect-thread", "127.0.0.1:1", "x"}, 11},
+		{[]string{"tcp-bind", "127.0.0.1:0"}, 11},
+		{[]string{"tcp-listen"}, 11},
+		{[]string{"tcp-fastopen", "127.0.0.1:1"}, 11},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		e := startHelperProcess(ctx, append([]string{bin, HelperCommand, ProbeArg}, tc.args...), f.env(t, work, tmp), work, encodedFrame(t, policy))
+		cancel()
+		if e.timedOut || e.signal != 0 || e.code != tc.want {
+			t.Errorf("%v under the no-socket filter: %+v, want exit %d", tc.args, e, tc.want)
+		}
+	}
+}
+
 func TestRunProbeArgumentErrors(t *testing.T) {
 	for _, args := range [][]string{nil, {"bogus", t.TempDir()}, {"write-tmp"}, {"write-tmp", "a", "b"}} {
 		if got := runProbe(&helperState{}, args); got != probeFailed {
@@ -217,7 +325,8 @@ func TestRunProbeRejectsWrongArgumentCounts(t *testing.T) {
 			t.Errorf("runProbe(%q) = %d, want %d", args, got, probeFailed)
 		}
 	}
-	wantCounts := map[string]int{"socket-unix": 0, "chmod": 1, "mount": 1, "environment": 3, "no-new-privs": 0, "clone-newuser": 0}
+	wantCounts := map[string]int{"socket-unix": 0, "chmod": 1, "mount": 1, "environment": 3, "no-new-privs": 0, "clone-newuser": 0,
+		"tcp-connect-main": 2, "tcp-connect-thread": 2, "tcp-bind": 1, "tcp-listen": 0, "tcp-fastopen": 1}
 	for name, n := range wantCounts {
 		if probes[name].n != n {
 			t.Errorf("%s takes %d arguments, want %d", name, probes[name].n, n)
