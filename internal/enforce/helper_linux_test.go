@@ -256,6 +256,19 @@ func TestRunHelperFailingThreadCountNeverExecs(t *testing.T) {
 	}
 }
 
+func TestRunHelperFailingGetrlimitNeverExecs(t *testing.T) {
+	old := getrlimit
+	t.Cleanup(func() { getrlimit = old })
+	getrlimit = func(int, *unix.Rlimit) error { return syscall.EFAULT }
+	calls := recordSteps(t, "", map[string]func(*helperState) error{"rlimits": realStep(t, "rlimits")})
+	stderr := captureStderr(t)
+	code := RunHelper([]string{"/bin/true"})
+	out := stderr()
+	if code != SetupFailureExitCode || !strings.HasPrefix(out, "codemeld confinement: rlimits: ") || slices.Contains(*calls, "exec") {
+		t.Errorf("exit %d, stderr %q, steps %v", code, out, *calls)
+	}
+}
+
 func TestRunHelperRefusesEmptyArgs(t *testing.T) {
 	calls := recordSteps(t, "", nil)
 	stderr := captureStderr(t)

@@ -456,35 +456,8 @@ func TestTreeTool_ContainmentRejections(t *testing.T) {
 // returns the resolved directory as both target and path scope, and InvokeWithResolvedTarget over that
 // resolved target matches the standalone Invoke.
 func TestTreeTool_ResolveTargetScopeAndResolvedInvoke(t *testing.T) {
-	root := t.TempDir()
-	mkdirAll(t, filepath.Join(root, "sub"))
-	writeFile(t, filepath.Join(root, "sub", "a.go"), "package sub\n")
-	tool := newTreeToolIn(t, root)
-
-	target, scope, err := tool.ResolveTarget(map[string]any{"path": "sub"})
-	if err != nil {
-		t.Fatalf("ResolveTarget error = %v", err)
-	}
-	wantDir := eval(t, filepath.Join(root, "sub"))
-	if target != wantDir {
-		t.Fatalf("ResolveTarget target = %q, want resolved %q", target, wantDir)
-	}
-	if scope != wantDir {
-		t.Fatalf("ResolveTarget scope = %q, want the directory itself %q", scope, wantDir)
-	}
-
-	resolvedRes, err := tool.InvokeWithResolvedTarget(context.Background(), map[string]any{"path": "sub"}, target)
-	if err != nil {
-		t.Fatalf("InvokeWithResolvedTarget error = %v", err)
-	}
-	directRes, err := invokeTree(t, tool, map[string]any{"path": "sub"})
-	if err != nil {
-		t.Fatalf("Invoke error = %v", err)
-	}
 	// Default ai layout emits project-relative paths, so a file under the walked subdir is "sub/a.go".
-	if string(resolvedRes.Stdout) != string(directRes.Stdout) || string(resolvedRes.Stdout) != "sub/a.go\n" {
-		t.Fatalf("resolved-target tree = %q, direct tree = %q, want %q", resolvedRes.Stdout, directRes.Stdout, "sub/a.go\n")
-	}
+	assertResolveTargetScopeAndResolvedInvoke(t, func(root string) readNavTool { return newTreeToolIn(t, root) }, "tree", "sub/a.go\n")
 }
 
 // TestTreeTool_ResolvedRootSwappedToSymlinkRejected pins the reuse-at-invoke revalidation: if the

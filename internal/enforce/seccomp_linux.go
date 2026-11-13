@@ -173,13 +173,22 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 	if p.Broker != BrokerNone {
 		full := p.Broker == BrokerFull
 		notify := bpf.RetConstant{Val: unix.SECCOMP_RET_USER_NOTIF}
-		blocks["socket"] = brokerSocketBlock(full, eperm)
+		blocks["socket"] = brokerSocketBlock(p.Broker != BrokerSlice, eperm)
 		blocks["connect"] = []bpf.Instruction{notify}
 		blocks["bind"] = []bpf.Instruction{eperm}
 		blocks["listen"] = []bpf.Instruction{eperm}
 		if full {
 			blocks["bind"] = []bpf.Instruction{notify}
 			blocks["listen"] = []bpf.Instruction{notify}
+			blocks["setsockopt"] = []bpf.Instruction{
+				loadArg(1),
+				bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.SOL_SOCKET, SkipTrue: 3},
+				loadArg(2),
+				bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: unix.SO_REUSEPORT, SkipTrue: 1},
+				eperm,
+				loadNr,
+			}
+			names = append(names, "setsockopt")
 		}
 		for name, flagsArg := range map[string]uint32{"sendto": 3, "sendmsg": 2, "sendmmsg": 3} {
 			blocks[name] = []bpf.Instruction{
@@ -208,7 +217,7 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 	return append(prog, bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW}), nil
 }
 
-func brokerSocketBlock(full bool, eperm bpf.Instruction) []bpf.Instruction {
+func brokerSocketBlock(withUnix bool, eperm bpf.Instruction) []bpf.Instruction {
 	allow := bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW}
 	stripFlags := bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: ^uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)}
 	tcp := []bpf.Instruction{
@@ -222,7 +231,7 @@ func brokerSocketBlock(full bool, eperm bpf.Instruction) []bpf.Instruction {
 		allow,
 	}
 	block := []bpf.Instruction{loadArg(0)}
-	if full {
+	if withUnix {
 		block = append(block, bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.AF_UNIX, SkipTrue: uint8(3 + len(tcp))})
 	}
 	block = append(block,
@@ -230,7 +239,7 @@ func brokerSocketBlock(full bool, eperm bpf.Instruction) []bpf.Instruction {
 		bpf.JumpIf{Cond: bpf.JumpEqual, Val: unix.AF_INET6, SkipTrue: 1},
 		eperm)
 	block = append(block, tcp...)
-	if full {
+	if withUnix {
 		block = append(block,
 			loadArg(1),
 			stripFlags,

@@ -315,21 +315,112 @@ func TestRunProbeRejectsWrongArgumentCounts(t *testing.T) {
 				continue
 			}
 			args := append([]string{name}, slices.Repeat([]string{"/nonexistent-probe-arg"}, n)...)
-			if got := runProbe(&helperState{nproc: 1}, args); got != probeFailed {
+			if got := runProbe(&helperState{rlimitsSet: true}, args); got != probeFailed {
 				t.Errorf("runProbe(%q) = %d, want %d", args, got, probeFailed)
 			}
 		}
 	}
 	for _, args := range [][]string{{"socket-unix", "x"}, {"chmod"}, {"environment", "/h", "/r"}, {"environment", "/h", "/r", "", "x"}, {"rlimits", "x"}} {
-		if got := runProbe(&helperState{nproc: 1}, args); got != probeFailed {
+		if got := runProbe(&helperState{rlimitsSet: true}, args); got != probeFailed {
 			t.Errorf("runProbe(%q) = %d, want %d", args, got, probeFailed)
 		}
 	}
 	wantCounts := map[string]int{"socket-unix": 0, "chmod": 1, "mount": 1, "environment": 3, "no-new-privs": 0, "clone-newuser": 0,
-		"tcp-connect-main": 2, "tcp-connect-thread": 2, "tcp-bind": 1, "tcp-listen": 0, "tcp-fastopen": 1}
+		"tcp-connect-main": 2, "tcp-connect-thread": 2, "tcp-bind": 1, "tcp-listen": 0, "tcp-fastopen": 1,
+		"unix-connect-main": 2, "unix-connect-thread": 2, "tcp-bind-listen-connect-main": 0, "tcp-bind-listen-connect-thread": 0,
+		"unix-bind-main": 1, "unix-bind-thread": 1, "setsockopt-reuseport": 0, "setsockopt-reuseaddr": 0}
 	for name, n := range wantCounts {
 		if probes[name].n != n {
 			t.Errorf("%s takes %d arguments, want %d", name, probes[name].n, n)
+		}
+	}
+}
+
+func TestFullModeProbesUnrestricted(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) int {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], append([]string{HelperCommand, ControlArg}, args...)...)
+		cmd.Stdin = strings.NewReader(string(encodedFrame(t, Policy{Mode: ModePlan, BlockedPaths: []string{"/nonexistent"}})))
+		out, err := cmd.CombinedOutput()
+		var exitErr *exec.ExitError
+		switch {
+		case err == nil:
+			return 0
+		case errors.As(err, &exitErr):
+			return exitErr.ExitCode()
+		}
+		t.Fatalf("%v: %v\n%s", args, err, out)
+		return -1
+	}
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"tcp-bind-listen-connect-main"}, 0},
+		{[]string{"tcp-bind-listen-connect-thread"}, 0},
+		{[]string{"unix-bind-main", filepath.Join(dir, "main")}, 0},
+		{[]string{"unix-bind-thread", filepath.Join(dir, "thread")}, 0},
+		{[]string{"unix-bind-main", filepath.Join(dir, "main")}, 11},
+		{[]string{"unix-bind-thread", filepath.Join(dir, "missing", "s")}, 11},
+		{[]string{"setsockopt-reuseport"}, 0},
+		{[]string{"setsockopt-reuseaddr"}, 0},
+	} {
+		if got := run(tc.args...); got != tc.want {
+			t.Errorf("%v: exit %d, want %d", tc.args, got, tc.want)
+		}
+	}
+	for _, name := range []string{"main", "thread"} {
+		if info, err := os.Stat(filepath.Join(dir, name)); err != nil || info.Mode().Type() != fs.ModeSocket {
+			t.Errorf("unix-bind-%s left no socket file: %v", name, err)
+		}
+	}
+	if os.Geteuid() == 0 {
+		return
+	}
+	locked := filepath.Join(dir, "locked")
+	if err := os.Mkdir(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"unix-bind-main", "unix-bind-thread"} {
+		if got := run(p, filepath.Join(locked, "s")); got != probeDenied {
+			t.Errorf("%s in a read-only folder: exit %d, want %d", p, got, probeDenied)
+		}
+	}
+}
+
+func TestUnixConnectProbesReachAListeningSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.sock")
+	ln := unixDestListen(t, path)
+	for _, p := range []string{"unix-connect-main", "unix-connect-thread"} {
+		if err := ln.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		accepted := make(chan string, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				accepted <- err.Error()
+				return
+			}
+			_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			b, _ := io.ReadAll(c)
+			_ = c.Close()
+			accepted <- string(b)
+		}()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, os.Args[0], HelperCommand, ControlArg, p, path, "payload-"+p)
+		cmd.Stdin = strings.NewReader(string(encodedFrame(t, Policy{Mode: ModePlan, BlockedPaths: []string{"/nonexistent"}})))
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			_ = ln.SetDeadline(time.Now())
+			<-accepted
+			t.Fatalf("%s: %v\n%s", p, err, out)
+		}
+		if got := <-accepted; got != "payload-"+p {
+			t.Errorf("%s: accepted %q", p, got)
 		}
 	}
 }

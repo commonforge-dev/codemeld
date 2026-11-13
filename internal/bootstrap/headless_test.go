@@ -5937,6 +5937,55 @@ func TestRunHeadless_PromptForApprovalGivesTheConfinementTheTerminalNetworkAsker
 	}
 }
 
+func TestRunHeadless_PromptForApprovalGivesTheConfinementTheTerminalConnectAsker(t *testing.T) {
+	for _, prompting := range []bool{true, false} {
+		t.Run(fmt.Sprintf("prompt for approval %v", prompting), func(t *testing.T) {
+			swapResolveExecutionCapability(t, injectedResolution)
+			result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Build, mode.SourceDefault))
+			client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+				return provider.Response{Stream: newStream(contentChunk("ok"), finishChunk("stop"))}, nil
+			}}
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+			var got []connectResult
+			defer swapToolLoop(func(deps turn.Deps, d turn.ToolDispatcher, n int) *turn.ToolLoop {
+				conf := d.(*productionToolDispatcher).confinement
+				conf.approvals = &connectApprovals{held: map[any]*os.File{}}
+				for _, dest := range []string{"192.0.2.7:5432", "/run/app/db.sock"} {
+					step, reason := conf.answerConnect(context.Background(), connectLive, dest, dest, nil)
+					got = append(got, connectResult{step, reason})
+					if !prompting {
+						break
+					}
+				}
+				return turn.NewToolLoop(deps, d, n)
+			})()
+
+			var stdout, stderr bytes.Buffer
+			driver := NewHeadlessDriver("hi", &stdout, &stderr)
+			if prompting {
+				driver.EnablePromptForApproval(strings.NewReader("1\n3\n"))
+			}
+			if err := driver.Run(context.Background(), result); err != nil {
+				t.Fatalf("driver.Run: %v; stderr %q", err, stderr.String())
+			}
+			if !prompting {
+				if !slices.Equal(got, []connectResult{{}}) || strings.Contains(stderr.String(), "approval required") {
+					t.Fatalf("connect = %+v, stderr %q; want an unanswered refusal without a prompt", got, stderr.String())
+				}
+				return
+			}
+			if want := []connectResult{{"prompt once", ""}, {"prompt session", ""}}; !slices.Equal(got, want) {
+				t.Fatalf("connects = %+v, want %+v", got, want)
+			}
+			for _, want := range []string{"destination: 192.0.2.7:5432", "destination: /run/app/db.sock"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+				}
+			}
+		})
+	}
+}
+
 func TestRunHeadless_AFailedCreationRollbackIsRetriedAtExit(t *testing.T) {
 	skipUnlessLinuxTempDirs(t)
 	f := failCreationRollback(t)

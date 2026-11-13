@@ -13,6 +13,7 @@ import (
 	"codemeld.dev/codemeld/internal/paths"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/tools"
+	"golang.org/x/sys/unix"
 )
 
 // ReadTargetOptions configures ResolveReadTarget's argument handling for a specific read-only tool.
@@ -388,4 +389,39 @@ func ResolveReadFile(target string, projectRoot string) (real string, ok bool, r
 		return "", false, "target is not a regular file"
 	}
 	return resolved, true, ""
+}
+
+var beforeNoFollowOpen = func() {}
+
+func openNoFollowUnder(boundary, real string) (*os.File, string) {
+	const changed = "target file or a folder on its path changed after the read check (now a symlink, missing, or a different type); refusing to read"
+	root := normalizeRoot(boundary)
+	rel, err := filepath.Rel(root, real)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, "target is not inside the read boundary; refusing to read"
+	}
+	beforeNoFollowOpen()
+	cur, err := os.OpenFile("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, "cannot open the root folder; refusing to read"
+	}
+	segs := strings.Split(strings.TrimPrefix(filepath.Clean(real), "/"), "/")
+	for i, seg := range segs {
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_DIRECTORY
+		if i == len(segs)-1 {
+			flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
+		}
+		fd, oerr := unix.Openat(int(cur.Fd()), seg, flags, 0)
+		_ = cur.Close()
+		if oerr != nil {
+			return nil, changed
+		}
+		cur = os.NewFile(uintptr(fd), seg)
+	}
+	info, err := cur.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = cur.Close()
+		return nil, changed
+	}
+	return cur, ""
 }

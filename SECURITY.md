@@ -39,7 +39,7 @@ safely.
     run inside a mandatory boundary with no ordinary prompt, and no setting
     turns it off. Plan never changes your files: it may write only `/dev/null`
     and a private temp folder for the session, and reaches the network only
-    through codemeld's session proxy, as Auto edits does (below). A headless
+    through codemeld's session proxy (below). A headless
     run attempts to remove that folder when it returns and reports a failure;
     a normal interactive exit, even a clean `/exit`, skips that cleanup, so the
     folder can remain. The next Linux launch attempts to remove a recorded
@@ -52,10 +52,18 @@ safely.
     declared in `writable_folders`. There, every command runs confined
     without asking, including file deletion such as `rm` and history
     rewrites such as `git rebase`. In Plan and Auto edits a command reaches
-    the network only through codemeld's session proxy, which asks per
+    the network through codemeld's session proxy, which asks per
     destination (host and port) whatever the program's name, admits saved
     `domain_grants`, and connects only to public addresses that are not
-    this machine's; ordinary SSH does not use it and fails, though an SSH client set up to tunnel
+    this machine's. In Plan that is the only route. In Auto edits, when the
+    self-test's connection check also passes, a command can also connect
+    directly to a TCP endpoint or Unix socket that a `connect_grants` entry
+    names or that you allow at the connect prompt; when its listening check
+    passes too, the command can also listen on a loopback TCP port or a Unix
+    socket inside its write roots, and connects without a prompt to a
+    loopback TCP endpoint it bound itself. Ordinary SSH does not
+    use the proxy: it fails in Plan, and in Auto edits unless a connect grant or
+    the connect prompt allows the `IP:port` it connects to, though an SSH client set up to tunnel
     through an HTTP proxy (for example with a `ProxyCommand`) can reach an approved host and port. Shell commands cannot write the Git or Mercurial history
     store of a repository at the project root or at a declared
     `writable_folders` root, including a worktree's `.git` pointer file, so a
@@ -159,6 +167,11 @@ further than described here are still welcome.
   send data to a host and port approved at the proxy or saved in
   `domain_grants`, for as long as the approval lasts. The proxy refuses
   loopback, local-network and this machine's own addresses.
+- **A command's own endpoint stays open to it.** Once an Auto edits command
+  binds a loopback TCP endpoint, whether or not it then listens, connecting to
+  that endpoint is allowed without a prompt for the rest of the command, even
+  after the command closes the socket and another program takes the same
+  endpoint.
 - **Authorized writes can still corrupt.** A command can empty or garble any
   file it may write.
 - **Subfolder swaps around a carved-out path.** When a write folder holds a
@@ -180,6 +193,10 @@ codemeld itself connects only to:
   ChatGPT subscription login;
 - Exa at `mcp.exa.ai` for `web_search`, and the page and redirect hops of a
   `web_fetch`;
+- in Auto edits, for a sandboxed shell command, a TCP endpoint or Unix socket
+  that a `connect_grants` entry names or that the connect prompt allowed, and a
+  loopback TCP endpoint the same command bound; these direct connections can
+  reach this machine and the local network;
 - for a sandboxed shell command, the host and port it asked for through the
   session proxy, once a prompt answer or a saved `domain_grants` entry
   approved it, and only at a public address that is not this machine's. That

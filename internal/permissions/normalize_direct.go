@@ -101,6 +101,9 @@ type StageNormalization struct {
 	// ProgramUnescapedSeparator is true when the program word's source spelling has a `/` that was
 	// bare or quoted rather than backslash-escaped.
 	ProgramUnescapedSeparator bool
+	// ExecProgram, when set, replaces Tokens[0] in runner argv, because the runner may look a bare
+	// Tokens[0] up on a PATH other than the one that collapsed it.
+	ExecProgram string
 	// Source is prompt-only stage text.
 	Source string
 	Reason LiteralReason
@@ -1284,6 +1287,26 @@ func canonicalProgram(arg0 string) string {
 		return base
 	}
 	return arg0
+}
+
+// ResolveRelativeProgram never cleans the folder part before EvalSymlinks, so `link/..` names the
+// physical parent the shell would run from, and it leaves the final name unresolved so names linked
+// to one multi-call binary keep separate grants.
+func ResolveRelativeProgram(program, folder string, keepAbsolute bool) string {
+	sep := strings.LastIndexByte(program, '/')
+	if folder == "" || sep < 0 || filepath.IsAbs(program) {
+		return program
+	}
+	base := strings.TrimSuffix(folder, "/")
+	dir, err := filepath.EvalSymlinks(base + "/" + program[:sep])
+	if err != nil {
+		return base + "/" + program
+	}
+	abs := strings.TrimSuffix(dir, "/") + "/" + program[sep+1:]
+	if keepAbsolute {
+		return abs
+	}
+	return canonicalProgram(abs)
 }
 
 // sameExecutable reports whether two paths name the same file, following

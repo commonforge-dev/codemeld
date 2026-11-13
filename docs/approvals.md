@@ -17,7 +17,7 @@ checks. Switch with `/mode <plan|build|auto-edits>` or shift+tab.
 |---|---|---|---|
 | **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (your files are never changed and network goes only through codemeld's [proxy](#sandboxed-network), approved per destination; commands may write a private temp folder; cleanup is attempted, but the folder may remain); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
 | **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Never sandboxed; asked unless read-only or already approved |
-| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking, except while a settings file is broken; network goes only through codemeld's [proxy](#sandboxed-network), approved per destination; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
+| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking, except while a settings file is broken; network goes through codemeld's [proxy](#sandboxed-network), approved per destination, or through a [direct connection](#connect-grants) a connect grant or the connect prompt allows; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
 
 - Auto edits approves only a target that is inside the project after symlinks are resolved, apart
   from the declared folders in [Writing outside the project](#writing-outside-the-project). A move
@@ -53,8 +53,9 @@ When codemeld asks, you choose one of:
   to you, and the turn stops after that round, so the model gets no further round to try another
   way. Within that round the same request is denied without asking, except the requests that Allow
   once asks every time and a web request on a non-default scheme or port, which are asked again.
-  Deny at the sandboxed network prompt is different: it refuses only that connection
-  ([Sandboxed network](#sandboxed-network)).
+  Deny at the two connection prompts, the sandboxed network prompt and the
+  [connect prompt](#connect-grants), is different: it refuses only that connection and the turn
+  goes on ([Sandboxed network](#sandboxed-network)).
   A refusal by a mode, by the protection of codemeld's settings files and blocked paths, or because
   nobody can approve is different: the model sees it in the next round and may continue another
   way. A file change outside a declared file scope starts as a refusal like yours. The scope comes
@@ -181,7 +182,7 @@ here-string (`jq -n 'input' <<< '1'`, `grep x <<< 'a b'`) is judged by the progr
 no `$`, `\`, backtick, `~`, wildcard, brace or shell operator. Any other word, a descriptor before
 the operator (`0<<<`), a heredoc (`<<`), a here-string with no command before it, or a remaining
 redirection to a file keeps the command a change (`stripClassifierHereStrings`,
-`internal/permissions/planshell.go`). This check removes only here-strings, redirections to
+`internal/permissions/planshell_literal.go`). This check removes only here-strings, redirections to
 `/dev/null` and `2>&1`/`1>&2` (`stripNullRedirects`); the wider redirection removal described below
 applies only to sandboxed commands in Auto edits. The command still runs exactly as written through
 `sh -c`, and an exact approval saved for it still matches only that text, here-string word
@@ -343,9 +344,10 @@ modes either way. A subfolder, a path list or a value that
 does not resolve keeps its inherited value (`namesFolder` in `internal/bootstrap/confinedrunner.go`).
 Name matching cannot catch every secret: one stored under an unusual name, such as `MYAPP_PW2`,
 reaches sandboxed commands. A sandboxed command cannot open a network
-connection itself, but such a secret can still leave through the command's output (which reaches
-the transcript and the model provider), through a destination you approve at the proxy or in
-`domain_grants`, or through a
+connection itself, except one a [connect grant or the connect prompt](#connect-grants) allows, but
+such a secret can still leave through the command's output (which reaches
+the transcript and the model provider), through a destination you approve at the proxy, at the
+connect prompt, in `domain_grants` or in `connect_grants`, or through a
 program outside the sandbox that watches a folder the command can write. Build mode runs approved
 commands with codemeld's full environment (`commandEnv` in `internal/runner/descendants_linux.go`).
 When the launch self-test passed, the `execution_capability` record written when codemeld starts
@@ -366,11 +368,13 @@ file is gone, the same loss an overwrite causes. If a settings
 file breaks after the self-test passed, every sandboxed command asks until it is fixed, and a file
 deletion, history rewrite or network program is asked with allow once or deny only
 (`exceptionalAuthority`, `internal/bootstrap/promptgate.go`). An approved command still reaches the
-network only through the proxy.
+network only as described under [Sandboxed network](#sandboxed-network).
 
 <a id="sandboxed-network"></a>**Sandboxed network.** A sandboxed Plan or Auto edits command reaches
-the network only through codemeld's session proxy, whatever the program's name: `curl`, `git fetch`
-over HTTPS, `go mod download` and an unknown script are treated alike. The proxy decides each
+the network only through codemeld's session proxy, or in Auto edits through a
+[direct connection](#connect-grants) a connect grant or the connect prompt allows, whatever the
+program's name: `curl`, `git fetch` over HTTPS, `go mod download` and an unknown script are treated
+alike. The proxy decides each
 destination, a host and port, on its own. It admits one that this session already approved or that a
 saved grant covers, and otherwise asks:
 
@@ -380,20 +384,23 @@ saved grant covers, and otherwise asks:
   `.codemeld/settings.local.yaml`. Offered only in an approved project.
 - **allow everywhere — global settings**: saves the host and port in
   `~/.codemeld/global/settings.yaml` for every project. Offered only in the terminal UI.
-- **deny**: refuses this connection only. Unlike Deny at other prompts, it is not recorded in the
-  session and the turn goes on: the command sees the refusal, and the model may try something else,
-  which asks again.
+- **deny**: refuses this connection only, and the turn goes on: the command sees the refusal, and
+  the model may try something else, which asks again. Unlike a deny at the
+  [connect prompt](#connect-grants), which is recorded, it is not recorded in the session.
 
 The proxy connects only to public internet addresses that are not this machine's own, even for an
-approved or saved destination; loopback and local-network addresses are refused. When a command
+approved or saved destination; loopback and local-network addresses are refused. A connect grant or
+connect-prompt approval for an `IP:port`, such as `127.0.0.1:5432`, is a direct connection that does
+not use the proxy, so it can reach this machine or the local network. When a command
 fails, its output ends with a `codemeld: network refused: <host>:<port> (<reason>)` line for each
-destination the proxy refused, as many as fit the output limit, then a count of any left out if that
+refused destination, as many as fit the output limit, then a count of any left out if that
 fits too, then codemeld's general note about the sandbox (`confinedFailureOf`,
 `internal/bootstrap/confinedrunner.go`). Only tools that use `HTTPS_PROXY` or `HTTP_PROXY`, or are
-set up to tunnel through an HTTP proxy, get network: ordinary SSH does not go through the proxy, so a
-sandboxed `ssh`, `scp` or SSH-URL `git` connection fails; use Build mode for it. An SSH client set up
+set up to tunnel through an HTTP proxy, get network through it: ordinary SSH does not go through the
+proxy, so a sandboxed `ssh`, `scp` or SSH-URL `git` connection fails unless a connect grant or the
+connect prompt allows the `IP:port` it connects to; otherwise use Build mode for it. An SSH client set up
 to tunnel through an HTTP proxy, for example with a `ProxyCommand`, can reach an approved host and
-port. When the proxy refused nothing and there is room, the
+port. When no destination was refused and there is room, the
 failure note says this instead of listing destinations. If the launch self-test's network check does not pass, sandboxed commands get no network at
 all. File deletion and history-rewrite rules are not changed by any of this. Build mode and hosts
 without the sandbox do not use the proxy: an allowed command there has your account's full network
@@ -413,6 +420,63 @@ repository cannot grant itself a destination. There are no wildcards and no defa
 saved grant, delete its entry from the file. Grants are read once when the session starts: an entry
 added or removed by hand takes effect in the next session, and removing one does not undo this
 session's copy or an approval already given for the session.
+
+<a id="connect-grants"></a>**Direct connections.** In Auto edits, when the launch self-test's
+connection check also passed (`connectSelfTest` in `internal/enforce/capability.go`,
+`launchConfinement` in `internal/bootstrap/starttui.go`), codemeld checks every connection a
+sandboxed command opens itself (`ConnectRules` in `internal/enforce/broker_linux.go`). Plan commands
+never get this. A TCP connection is allowed when it goes to the session proxy or to an endpoint a
+connect grant names; a Unix socket connection is allowed when a connect grant names that socket.
+When the listening check passed too (`fullSelfTest` in `internal/enforce/capability.go`), a command
+can bind and listen on a loopback TCP port or a Unix socket inside its write roots (`bindOrListen` in
+`internal/enforce/broker_linux.go`), and a connection to a TCP endpoint the same command bound is
+allowed without a prompt (`own listener`); otherwise bind and listen are refused (`seccompFilterFor`
+in `internal/enforce/seccomp_linux.go`). A Unix socket the command bound gets no such allowance: connecting to it follows the Unix socket
+rules here. The
+own-port allowance lasts for the rest of the command: if the command closes its listener and another
+program takes the same port, a connection to that port is still allowed without a prompt. Anything
+else asks at the connect prompt, in the terminal
+UI and in a headless run with `--prompt-for-approval`:
+
+- **allow this once**: this connection only.
+- **allow for this session**: the same `IP:port`, or the same socket file, until codemeld exits. A
+  socket re-created at the same path asks again.
+- **deny**: refuses this connection only; the command sees the refusal and the turn goes on. The
+  denial is recorded in the session.
+
+No choice saves a grant. A headless run without `--prompt-for-approval` and a command run by a child
+agent are not asked: the connection is refused. A connection that is neither TCP nor to a Unix
+socket path, such as UDP, and one whose destination codemeld cannot inspect or resolve, is refused
+without asking. Every decision for a shell command is written to the session; see
+[Sessions](sessions.md). Connection decisions made during a version-control tool action, such as a
+hook that connects, are not recorded yet (`confinedRunner.Exec` in
+`internal/bootstrap/confinedrunner.go`).
+
+Some Unix sockets are always denied: no prompt, and no grant opens them (`denyListPaths` in
+`internal/enforce/denylist_linux.go`). They are the systemd user manager
+(`/run/user/<uid>/systemd/private`), the D-Bus buses (`/run/user/<uid>/bus`,
+`/run/dbus/system_bus_socket` and any socket path in `DBUS_SESSION_BUS_ADDRESS`), Docker
+(`/run/docker.sock`, `/run/user/<uid>/docker.sock`), the SSH agent named by `SSH_AUTH_SOCK`,
+gpg-agent (`/run/user/<uid>/gnupg/S.*`), and every abstract Unix address. The variables are read
+from codemeld's own environment. The check compares the socket file itself, so another path or link
+to the same socket is denied too.
+
+Connect grants are the `connect_grants` key, a list of destinations:
+
+```yaml
+connect_grants:
+  - 127.0.0.1:5432
+  - /run/postgresql/.s.PGSQL.5432
+```
+
+Each entry is a TCP endpoint written `IP:port` (IPv6 in brackets), with no host names, or an
+absolute Unix socket path (`parseConnectGrants` in `internal/config/cache.go`). codemeld reads it
+from the same two files as `domain_grants`, combines both lists, and ignores it in the committed
+`.codemeld/settings.yaml`. Grants are read once when the session starts and are added or removed
+only by editing the file. A socket grant works only when its path, followed through any links, leads
+to the very socket the command connects to and no step of it is, or is inside, one of the command's
+write roots or its temp folder, including a read-only exception inside a write root (`pathGrant`);
+otherwise the connection asks as if there were no grant.
 
 **Without the sandbox** (Build mode, or a host where the self-test did not pass) a command runs with
 your account's full authority once it is allowed. Plan refuses every command that is not proven
@@ -457,7 +521,8 @@ denial stays, and any failure or pause note is added to its reason
   exits before starting without one. Its choices are allow once, deny, allow for this session, and
   allow in this project (offered only for an approved project), for tool, web and
   [network](#sandboxed-network) prompts alike. It never offers a global approval, so the network
-  prompt's *allow everywhere* is terminal-UI only.
+  prompt's *allow everywhere* is terminal-UI only. The [connect prompt](#connect-grants) offers only
+  allow once, deny and allow for this session.
 - Without `--prompt-for-approval`, a sandboxed command's connection to a destination that no saved
   grant or session approval covers is refused.
 - `--files-authorized <path>` and `--files-authorized-delete <path>` (repeat each once per path)

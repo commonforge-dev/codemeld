@@ -3456,3 +3456,110 @@ func TestTerminalPrompter_CancellationDuringAProjectWriteIsNotAccepted(t *testin
 		})
 	}
 }
+
+func terminalConnectConfinement(p *terminalPrompter) *confinement {
+	return &confinement{connectAsker: p.askConnect, approvals: &connectApprovals{held: map[any]*os.File{}}}
+}
+
+func answerConnectAsync(c *confinement, key any, dest string) <-chan connectResult {
+	done := make(chan connectResult, 1)
+	go func() {
+		step, reason := c.answerConnect(context.Background(), connectLive, key, dest, nil)
+		done <- connectResult{step, reason}
+	}()
+	return done
+}
+
+func awaitConnect(t *testing.T, done <-chan connectResult) connectResult {
+	t.Helper()
+	select {
+	case r := <-done:
+		return r
+	case <-time.After(2 * time.Second):
+		t.Fatal("the connect prompt never returned")
+		return connectResult{}
+	}
+}
+
+func TestTerminalPrompter_ConnectPromptNamesTheDestinationAndOffersOnceDenySession(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  connectResult
+	}{
+		{"1\n", connectResult{"prompt once", ""}},
+		{"3\n", connectResult{"prompt session", ""}},
+		{"2\n", connectResult{"", "not approved (denied)"}},
+		{"4\n", connectResult{"", "not approved (prompt failed)"}},
+		{"", connectResult{"", "not approved (prompt failed)"}},
+	} {
+		var out bytes.Buffer
+		p := newTerminalPrompter(strings.NewReader(tc.input), &out)
+		if got := awaitConnect(t, answerConnectAsync(terminalConnectConfinement(p), "db", "/run/app/db.sock")); got != tc.want {
+			t.Fatalf("input %q = %+v, want %+v", tc.input, got, tc.want)
+		}
+		got := out.String()
+		for _, want := range []string{"destination: /run/app/db.sock", "[1] allow once", "[2] deny", "[3] allow this session", "codemeld: choose 1-3: "} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("connect prompt missing %q:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "[4]") {
+			t.Fatalf("connect prompt offers a fourth choice:\n%s", got)
+		}
+	}
+}
+
+func TestTerminalPrompter_ConnectPromptShowsTheWholeLongDestinationWithControlsEscaped(t *testing.T) {
+	prefix := "/" + strings.Repeat("d", 150) + "/"
+	for _, tc := range []struct{ dest, want string }{
+		{prefix + "one\x1b[2J.sock", "  destination: " + prefix + "one\\x1B[2J.sock\n"},
+		{prefix + "two\r\n\u009b.sock", "  destination: " + prefix + "two\\x0D\\x0A\\u009B.sock\n"},
+	} {
+		var out bytes.Buffer
+		p := newTerminalPrompter(strings.NewReader("2\n"), &out)
+		awaitConnect(t, answerConnectAsync(terminalConnectConfinement(p), "db", tc.dest))
+		if got := out.String(); !strings.Contains(got, tc.want) || strings.ContainsAny(got, "\x1b\r\u009b") {
+			t.Fatalf("connect prompt for %q lacks %q or carries a raw control:\n%q", tc.dest, tc.want, got)
+		}
+	}
+}
+
+func TestTerminalPrompter_AQueuedConnectToASessionApprovedDestinationIsNotAskedAgain(t *testing.T) {
+	var out bytes.Buffer
+	in := newSteppedReader("3\n")
+	t.Cleanup(in.releaseAbandoned)
+	p := newTerminalPrompter(in, &out)
+	c := terminalConnectConfinement(p)
+
+	first := answerConnectAsync(c, "db", "192.0.2.7:5432")
+	in.awaitBlocked(t)
+	queued := answerConnectAsync(c, "db", "192.0.2.7:5432")
+	requireStillQueued(t, queued)
+	in.release()
+	if got := awaitConnect(t, first); got != (connectResult{"prompt session", ""}) {
+		t.Fatalf("first connect = %+v, want the session answer", got)
+	}
+	if got := awaitConnect(t, queued); got != (connectResult{"session approval", ""}) {
+		t.Fatalf("queued connect = %+v, want the stored session approval", got)
+	}
+	if n := strings.Count(promptOutput(p, &out), "approval required"); n != 1 {
+		t.Fatalf("%d prompts rendered, want one", n)
+	}
+}
+
+func TestTerminalPrompter_ConnectPromptWithdrawnWhenTheSessionEndsRefusesAsSessionEnded(t *testing.T) {
+	var out bytes.Buffer
+	in := newSteppedReader("1\n")
+	t.Cleanup(in.releaseAbandoned)
+	p := newTerminalPrompter(in, &out)
+	runCtx, endRun := context.WithCancel(context.Background())
+	defer endRun()
+	p.runCtx = runCtx
+
+	pending := answerConnectAsync(terminalConnectConfinement(p), "db", "192.0.2.7:5432")
+	in.awaitBlocked(t)
+	endRun()
+	if got := awaitConnect(t, pending); got != (connectResult{"", "not approved (session ended)"}) {
+		t.Fatalf("connect = %+v, want not approved (session ended)", got)
+	}
+}

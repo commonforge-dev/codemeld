@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2353,4 +2354,187 @@ func TestPromptGateNetworkAsker_ShutdownDuringASavedWriteReturnsAndIsNotAccepted
 		t.Fatalf("DomainGrants() = %q, want the grant the write already published", got)
 	}
 	requireAskedAgain(t, server, endpoint, "127.0.0.1")
+}
+
+func connectGateConfinement(b *PromptGateBuilder) *confinement {
+	return &confinement{connectAsker: b.AskConnect, approvals: &connectApprovals{held: map[any]*os.File{}}}
+}
+
+type connectResult struct{ step, reason string }
+
+func connectLive() bool { return true }
+
+func TestPromptGateConnectAsker_AnswerForADeadRequestIsNotStored(t *testing.T) {
+	key := netip.MustParseAddrPort("127.0.0.1:5432")
+	answers := []tui.PromptOption{tui.OptionAllowSession, tui.OptionAllowOnce}
+	shown := 0
+	b := newPromptGateBuilder(nil)
+	b.showConnect = func(context.Context, string) (tui.PromptOption, error) {
+		shown++
+		return answers[shown-1], nil
+	}
+	c := connectGateConfinement(b)
+	if step, _ := c.answerConnect(context.Background(), func() bool { return false }, key, key.String(), nil); step != "" {
+		t.Errorf("session answer for a request that ended: admitted by %q, want refused", step)
+	}
+	if c.approvals.covers(key) {
+		t.Error("the session answer for a request that ended was stored")
+	}
+	step, reason := c.answerConnect(context.Background(), connectLive, key, key.String(), nil)
+	if got := (connectResult{step, reason}); got != (connectResult{"prompt once", ""}) || shown != 2 {
+		t.Errorf("next connect after the late answer: %+v after %d prompts, want asked again and admitted once", got, shown)
+	}
+}
+
+func TestPromptGateConnectAsker_AnswersBehaveAsNamed(t *testing.T) {
+	db, cache := netip.MustParseAddrPort("127.0.0.1:5432"), netip.MustParseAddrPort("[::1]:6379")
+	answers := []struct {
+		opt tui.PromptOption
+		err error
+	}{{tui.OptionAllowOnce, nil}, {tui.OptionAllowSession, nil}, {tui.OptionDeny, nil}, {tui.OptionDeny, errors.New("boom")}, {tui.OptionAllowProject, nil}}
+	var shown []string
+	b := newPromptGateBuilder(nil)
+	b.showConnect = func(_ context.Context, dest string) (tui.PromptOption, error) {
+		if len(shown) == len(answers) {
+			t.Fatalf("asked for %s after the scripted answers ran out", dest)
+		}
+		shown = append(shown, dest)
+		return answers[len(shown)-1].opt, answers[len(shown)-1].err
+	}
+	c := connectGateConfinement(b)
+	handle, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	holds := 0
+	hold := func() (*os.File, error) { holds++; return handle, nil }
+	for i, tc := range []struct {
+		key  netip.AddrPort
+		want connectResult
+	}{
+		{db, connectResult{"prompt once", ""}},
+		{db, connectResult{"prompt session", ""}},
+		{db, connectResult{"session approval", ""}},
+		{cache, connectResult{"", "not approved (denied)"}},
+		{cache, connectResult{"", "not approved (prompt failed)"}},
+		{cache, connectResult{"", "not approved (prompt failed)"}},
+	} {
+		step, reason := c.answerConnect(context.Background(), connectLive, tc.key, tc.key.String(), hold)
+		if got := (connectResult{step, reason}); got != tc.want {
+			t.Errorf("connect %d to %s: got %+v, want %+v", i+1, tc.key, got, tc.want)
+		}
+	}
+	if want := []string{"127.0.0.1:5432", "127.0.0.1:5432", "[::1]:6379", "[::1]:6379", "[::1]:6379"}; !slices.Equal(shown, want) {
+		t.Errorf("prompts shown for %q, want %q", shown, want)
+	}
+	if holds != 1 {
+		t.Errorf("handles held %d times, want once for the session answer", holds)
+	}
+	if err := c.cleanupAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("after session cleanup closing the held handle returned %v, want it already closed", err)
+	}
+}
+
+func TestPromptGateConnectAsker_PromptsWaitTheirTurnWhileAdmittedConnectsProceed(t *testing.T) {
+	db, cache, approved := netip.MustParseAddrPort("127.0.0.1:5432"), netip.MustParseAddrPort("127.0.0.1:6379"), netip.MustParseAddrPort("127.0.0.1:8080")
+	entered, release := make(chan string, 3), make(chan struct{})
+	b := newPromptGateBuilder(nil)
+	b.showConnect = func(_ context.Context, dest string) (tui.PromptOption, error) {
+		entered <- dest
+		<-release
+		if dest == db.String() {
+			return tui.OptionAllowSession, nil
+		}
+		return tui.OptionAllowOnce, nil
+	}
+	c := connectGateConfinement(b)
+	c.approvals.add(approved, nil)
+	connect := func(key netip.AddrPort) <-chan connectResult {
+		out := make(chan connectResult, 1)
+		go func() {
+			step, reason := c.answerConnect(context.Background(), connectLive, key, key.String(), nil)
+			out <- connectResult{step, reason}
+		}()
+		return out
+	}
+	await := func(what string, ch <-chan connectResult) connectResult {
+		t.Helper()
+		select {
+		case r := <-ch:
+			return r
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not finish", what)
+		}
+		return connectResult{}
+	}
+	first := connect(db)
+	if got := <-entered; got != db.String() {
+		t.Fatalf("first prompt for %s, want %s", got, db)
+	}
+	queuedSame, queuedOther := connect(db), connect(cache)
+	if got := await("the session-approved connect", connect(approved)); got != (connectResult{"session approval", ""}) {
+		t.Errorf("session-approved connect while a prompt waits: %+v, want admitted by session approval", got)
+	}
+	select {
+	case dest := <-entered:
+		t.Fatalf("a second prompt for %s was shown while the first was pending", dest)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	for what, tc := range map[string]struct {
+		ch   <-chan connectResult
+		want connectResult
+	}{
+		"first":                        {first, connectResult{"prompt session", ""}},
+		"queued same destination":      {queuedSame, connectResult{"session approval", ""}},
+		"queued different destination": {queuedOther, connectResult{"prompt once", ""}},
+	} {
+		if got := await(what, tc.ch); got != tc.want {
+			t.Errorf("%s: %+v, want %+v", what, got, tc.want)
+		}
+	}
+	if got := <-entered; got != cache.String() || len(entered) != 0 {
+		t.Errorf("second prompt for %s with %d more, want exactly one more prompt for %s", got, len(entered), cache)
+	}
+}
+
+func TestPromptGateConnectAsker_WithdrawnPromptsRefuseWithTheirReason(t *testing.T) {
+	key := netip.MustParseAddrPort("127.0.0.1:5432")
+	t.Run("command ended", func(t *testing.T) {
+		entered := make(chan struct{})
+		b := newPromptGateBuilder(nil)
+		b.showConnect = func(ctx context.Context, _ string) (tui.PromptOption, error) {
+			close(entered)
+			<-ctx.Done()
+			return tui.OptionDeny, ctx.Err()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan connectResult, 1)
+		go func() {
+			step, reason := connectGateConfinement(b).answerConnect(ctx, connectLive, key, key.String(), nil)
+			done <- connectResult{step, reason}
+		}()
+		<-entered
+		cancel()
+		if got := <-done; got != (connectResult{"", "not approved (command ended)"}) {
+			t.Errorf("withdrawn prompt: %+v, want not approved (command ended)", got)
+		}
+		waitSlotFree(t, b)
+	})
+	t.Run("session ended", func(t *testing.T) {
+		b := newPromptGateBuilder(nil)
+		b.showConnect = func(context.Context, string) (tui.PromptOption, error) {
+			t.Error("prompted after the session ended")
+			return tui.OptionAllowOnce, nil
+		}
+		ended := make(chan struct{})
+		close(ended)
+		b.ended = ended
+		if step, reason := connectGateConfinement(b).answerConnect(context.Background(), connectLive, key, key.String(), nil); step != "" || reason != "not approved (session ended)" {
+			t.Errorf("connect after the session ended: step %q reason %q, want not approved (session ended)", step, reason)
+		}
+	})
 }

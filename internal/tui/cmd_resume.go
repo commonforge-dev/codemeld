@@ -432,6 +432,26 @@ func runResumeSwitch(cmdCtx CommandContext, deps ResumeDeps, prior *sessions.Sto
 		}()
 	}
 
+	// Another codemeld may have written the file before the lock was taken, so every write below uses this read.
+	locked, lockedOlder, lockedCat, lerr := deps.Loader.Load(entry)
+	var abortText string
+	switch {
+	case lerr != nil:
+		abortText = resumeLoadFailureNotice(entry.ID, lockedCat)
+	case lockedOlder:
+		abortText = fmt.Sprintf("session %s: cannot load chosen session: its schema changed while taking its lock", entry.ID)
+	case locked.Path() != target.Path():
+		abortText = fmt.Sprintf("session %s: cannot load chosen session: it moved from %s to %s while taking its lock", entry.ID, target.Path(), locked.Path())
+	}
+	if abortText != "" {
+		cmdCtx.Notice(abortText)
+		if aerr := cmdCtx.AppendSlashCommand(OutcomeError, abortText); aerr != nil {
+			return "", aerr
+		}
+		return "", cmdCtx.FlushActive()
+	}
+	target = locked
+
 	var lbHandleErr error
 	lbWriteHandled := false
 	lberr := events.EmitLaunchBegan(ctx, target, "resume", func(c fserrors.Category, r sessions.WriteReason, e error) {

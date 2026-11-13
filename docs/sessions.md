@@ -821,6 +821,39 @@ Compare `sha256` with the content you expect rather than with whatever the path 
   get the content, so a load never reaches the model without its record. A tool that has no
   session to write to records nothing and still reads.
 
+## Connection decisions: what a `connect_decision` record shows
+
+When codemeld checks a sandboxed command's own connections ([direct connections](approvals.md#connect-grants),
+Auto edits only), it writes the outcomes when the command finishes: one `connect_decision` record
+per distinct outcome, with how many times it happened (`recordConnectDecisions` in
+`internal/bootstrap/confinedrunner.go`). Plan commands, and runs where that check is off, write
+none. `codemeld sessions show --kind connect_decision <id|path>` prints each record as a line
+(`connectDecisionText` in `internal/cli/sessions.go`):
+
+```text
+connect 127.0.0.1:3128 allowed by proxy (3 times)
+connect /tmp/a.sock allowed by prompt once
+connect [::1]:5432 denied: direct connection not allowed (use the proxy)
+how to grant: add [::1]:5432 to connect_grants in ~/.codemeld/global/settings.yaml or .codemeld/settings.local.yaml
+connect /home/u/.ssh/agent denied: always denied: /home/u/.ssh/agent
+how to grant: it is always denied; no grant opens it
+```
+
+- **Allowed** names what let the connection through: `proxy`, `own listener` (a TCP endpoint the
+  same command bound, `stepOwnListener` in `internal/enforce/broker_linux.go`), `grant`, `session approval` (an earlier *allow for this session*), or
+  `prompt once` / `prompt session` (an answer at the connect prompt). A `proxy` line names the
+  session proxy's own address, not the host the proxy then reached.
+- **Denied** gives the reason and a `how to grant` line. A deny answered at the prompt reads
+  `not approved (denied)`. For a Unix socket the hint adds that a saved grant works only for a
+  socket outside the command's write roots.
+- **The destination** is an `IP:port`, a Unix socket's resolved path (the path as given when
+  codemeld could not resolve it, `connectUnix` in `internal/enforce/broker_linux.go`), `@name` for
+  an abstract socket, or `(unknown)` when no destination was recorded (`UnknownDestination` in
+  `internal/events/payloads.go`). A UDP socket is normally refused when it is created
+  (`brokerSocketBlock` in `internal/enforce/seccomp_linux.go`), so it leaves no record.
+- With `--json`, a record a person answered at the connect prompt also carries `answer`: `once`,
+  `session` or `deny`.
+
 ## Why this doc has no field tables
 
 Enumerating every event and its fields here would duplicate `payloads.go` and drift out of date

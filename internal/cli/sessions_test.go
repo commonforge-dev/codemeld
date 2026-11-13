@@ -1065,6 +1065,84 @@ func TestSessionsShow_KindFilterSelectsSkillLoads(t *testing.T) {
 	}
 }
 
+func TestSessionsShow_RendersConnectDecisionsWithAGrantHintOnDenial(t *testing.T) {
+	const (
+		grantFiles = " to connect_grants in ~/.codemeld/global/settings.yaml or .codemeld/settings.local.yaml"
+		unixNote   = "; a saved grant works only for a socket outside the command's write roots, otherwise allow it when asked (in the TUI or with --prompt-for-approval)"
+	)
+	path := filepath.Join(t.TempDir(), "fixture.json")
+	sess := buildFixtureSession("/some/folder")
+	sess.Records = append(sess.Records,
+		eventRecord("connect_decision", map[string]any{"destination": "127.0.0.1:3128", "decision": "allowed", "step": "proxy", "count": 3}),
+		eventRecord("connect_decision", map[string]any{"destination": "/tmp/a.sock", "decision": "allowed", "step": "prompt once", "answer": "once", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "[::1]:5432", "decision": "denied", "reason": "direct connection not allowed (use the proxy)", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "/run/docker.sock", "decision": "denied", "reason": "not approved (denied)", "answer": "deny", "count": 2}),
+		eventRecord("connect_decision", map[string]any{"destination": "/home/u/.ssh/agent", "decision": "denied", "reason": "always denied: /home/u/.ssh/agent", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "(unknown)", "decision": "denied", "reason": "connect not inspectable", "count": 1}),
+	)
+	writeFixtureSession(t, path, sess)
+
+	out := runShow(t, path, "--kind", "connect_decision")
+	for _, want := range []string{
+		"    connect 127.0.0.1:3128 allowed by proxy (3 times)\n",
+		"    connect /tmp/a.sock allowed by prompt once\n",
+		"    connect [::1]:5432 denied: direct connection not allowed (use the proxy)\n    how to grant: add [::1]:5432" + grantFiles + "\n",
+		"    connect /run/docker.sock denied: not approved (denied) (2 times)\n    how to grant: add /run/docker.sock" + grantFiles + unixNote + "\n",
+		"    connect /home/u/.ssh/agent denied: always denied: /home/u/.ssh/agent\n    how to grant: it is always denied; no grant opens it\n",
+		"    connect (unknown) denied: connect not inspectable\n    how to grant: the destination could not be read, so no grant names it\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("show output missing %q:\n%s", want, out)
+		}
+	}
+	if got := strings.Count(out, "kind=connect_decision"); got != 6 {
+		t.Errorf("connect_decision records = %d, want 6:\n%s", got, out)
+	}
+	if strings.Count(out, "how to grant:") != 4 {
+		t.Errorf("want a grant hint on each of the four denials only:\n%s", out)
+	}
+}
+
+func TestSessionsShow_ConnectDecisionEscapesControlsAndRecommendsOnlyGrantableDestinations(t *testing.T) {
+	const grantFiles = " to connect_grants in ~/.codemeld/global/settings.yaml or .codemeld/settings.local.yaml"
+	path := filepath.Join(t.TempDir(), "fixture.json")
+	sess := buildFixtureSession("/some/folder")
+	sess.Records = append(sess.Records,
+		eventRecord("connect_decision", map[string]any{"destination": "@x\x1b[2J\ry", "decision": "allowed", "step": "grant", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "@a\x1b[2J\rb\nc\u009bd", "decision": "denied", "reason": "bad\x1b[1A\nfake", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "/run/\x1b]x.sock", "decision": "denied", "reason": "not approved (denied)", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "missing.sock", "decision": "denied", "reason": "not granted", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "127.0.0.1:0", "decision": "denied", "reason": "not granted", "count": 1}),
+		eventRecord("connect_decision", map[string]any{"destination": "192.0.2.7:5432", "decision": "denied", "reason": "not granted", "count": 1}),
+	)
+	writeFixtureSession(t, path, sess)
+
+	out := runShow(t, path, "--kind", "connect_decision")
+	for _, bad := range []string{"\x1b", "\r", "\u009b"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("show output carries control %q:\n%q", bad, out)
+		}
+	}
+	ungrantable := "\n    how to grant: the recorded destination is not an IP:port endpoint or an absolute socket path, so it cannot be saved as a grant\n"
+	for _, want := range []string{
+		"\n    connect @x\\x1B[2J\\x0Dy allowed by grant\n",
+		"\n    connect @a\\x1B[2J\\x0Db\\x0Ac\\u009Bd denied: bad\\x1B[1A\\x0Afake" + ungrantable,
+		"\n    connect /run/\\x1B]x.sock denied: not approved (denied)\n    how to grant: add /run/\\x1B]x.sock" + grantFiles + ";",
+		"\n    connect missing.sock denied: not granted" + ungrantable,
+		"\n    connect 127.0.0.1:0 denied: not granted" + ungrantable,
+		"\n    connect 192.0.2.7:5432 denied: not granted\n    how to grant: add 192.0.2.7:5432" + grantFiles + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("show output missing %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"add missing.sock", "add 127.0.0.1:0"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("show output recommends an ungrantable entry %q:\n%s", unwanted, out)
+		}
+	}
+}
+
 func TestSessionsShow_TurnFilter(t *testing.T) {
 	path, turnA, turnB := turnFixture(t)
 
@@ -4152,6 +4230,7 @@ func TestSessionsHelp(t *testing.T) {
 				"records: <selected> of <total>",
 				"Each skill load is a skill_loaded event",
 				"--kind skill_loaded lists only the skill loads.",
+				"connect_decision event", "denial adds a 'how to grant' line. --kind connect_decision lists only those.",
 			},
 		},
 		{

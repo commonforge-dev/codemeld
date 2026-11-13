@@ -7,6 +7,12 @@ import (
 	"codemeld.dev/codemeld/internal/runner"
 )
 
-func (c *confinement) attachBroker(*runner.RunSpec, string) error {
+type sessionDenyList struct{}
+
+func newSessionDenyList() *sessionDenyList { return nil }
+
+func (*sessionDenyList) Close() {}
+
+func (c *confinement) attachBroker(*runner.RunSpec, enforce.Policy) error {
 	return enforce.ErrBrokerUnsupported
 }

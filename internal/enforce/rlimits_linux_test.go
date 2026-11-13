@@ -2,45 +2,204 @@ package enforce
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
 
+func stubRlimits(t *testing.T, threads uint64, inherited map[int]unix.Rlimit) map[int]unix.Rlimit {
+	t.Helper()
+	oldSet, oldGet, oldCount := setrlimit, getrlimit, countUserThreads
+	t.Cleanup(func() { setrlimit, getrlimit, countUserThreads = oldSet, oldGet, oldCount })
+	countUserThreads = func() (uint64, error) { return threads, nil }
+	getrlimit = func(resource int, l *unix.Rlimit) error { *l = inherited[resource]; return nil }
+	set := map[int]unix.Rlimit{}
+	setrlimit = func(resource int, l *unix.Rlimit) error { set[resource] = *l; return nil }
+	return set
+}
+
 func TestApplyRlimitsSetsOnlyFsizeAndNproc(t *testing.T) {
-	oldSet, oldCount := setrlimit, countUserThreads
-	t.Cleanup(func() { setrlimit, countUserThreads = oldSet, oldCount })
-	countUserThreads = func() (uint64, error) { return 300, nil }
-	got := map[int]unix.Rlimit{}
-	setrlimit = func(resource int, l *unix.Rlimit) error { got[resource] = *l; return nil }
-	nproc, err := applyRlimits()
-	if err != nil || nproc != 4396 {
-		t.Fatalf("applyRlimits() = %d, %v", nproc, err)
+	inf := uint64(unix.RLIM_INFINITY)
+	set := stubRlimits(t, 300, map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: inf, Max: inf}, unix.RLIMIT_NPROC: {Cur: 100000, Max: inf}})
+	fsize, nproc, err := applyRlimits()
+	wantFsize, wantNproc := unix.Rlimit{Cur: 8 << 30, Max: 8 << 30}, unix.Rlimit{Cur: 4396, Max: 4396}
+	if err != nil || fsize != wantFsize || nproc != wantNproc {
+		t.Fatalf("applyRlimits() = %v, %v, %v", fsize, nproc, err)
 	}
-	want := map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 8 << 30, Max: 8 << 30}, unix.RLIMIT_NPROC: {Cur: 4396, Max: 4396}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("set %v, want %v", got, want)
+	want := map[int]unix.Rlimit{unix.RLIMIT_FSIZE: wantFsize, unix.RLIMIT_NPROC: wantNproc}
+	if !reflect.DeepEqual(set, want) {
+		t.Errorf("set %v, want %v", set, want)
+	}
+}
+
+func TestApplyRlimitsNeverRaisesInheritedLimits(t *testing.T) {
+	inf := uint64(unix.RLIM_INFINITY)
+	for name, tc := range map[string]struct{ inherited, want map[int]unix.Rlimit }{
+		"both below requested": {
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 1 << 20, Max: 1 << 30}, unix.RLIMIT_NPROC: {Cur: 500, Max: 1000}},
+			want:      map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 1 << 20, Max: 1 << 30}, unix.RLIMIT_NPROC: {Cur: 500, Max: 1000}},
+		},
+		"only soft below requested": {
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 1 << 30, Max: inf}, unix.RLIMIT_NPROC: {Cur: 1000, Max: inf}},
+			want:      map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 1 << 30, Max: 8 << 30}, unix.RLIMIT_NPROC: {Cur: 1000, Max: 4396}},
+		},
+		"hard equal to requested": {
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 8 << 30, Max: 8 << 30}, unix.RLIMIT_NPROC: {Cur: 4396, Max: 4396}},
+			want:      map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 8 << 30, Max: 8 << 30}, unix.RLIMIT_NPROC: {Cur: 4396, Max: 4396}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			set := stubRlimits(t, 300, tc.inherited)
+			fsize, nproc, err := applyRlimits()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[int]unix.Rlimit{unix.RLIMIT_FSIZE: fsize, unix.RLIMIT_NPROC: nproc}
+			if !reflect.DeepEqual(got, tc.want) || !reflect.DeepEqual(set, tc.want) {
+				t.Errorf("returned %v, set %v, want %v", got, set, tc.want)
+			}
+			for r, l := range set {
+				if l.Cur > tc.inherited[r].Cur || l.Max > tc.inherited[r].Max || l.Cur > l.Max {
+					t.Errorf("resource %d: set %v above inherited %v", r, l, tc.inherited[r])
+				}
+			}
+		})
 	}
 }
 
 func TestApplyRlimitsReportsFailures(t *testing.T) {
-	oldSet, oldCount := setrlimit, countUserThreads
-	t.Cleanup(func() { setrlimit, countUserThreads = oldSet, oldCount })
+	oldSet, oldGet, oldCount := setrlimit, getrlimit, countUserThreads
+	t.Cleanup(func() { setrlimit, getrlimit, countUserThreads = oldSet, oldGet, oldCount })
 	setrlimit = func(int, *unix.Rlimit) error { return nil }
+	getrlimit = func(_ int, l *unix.Rlimit) error { *l = unix.Rlimit{Cur: 1, Max: 1}; return nil }
 	countUserThreads = func() (uint64, error) { return 0, syscall.EACCES }
-	if _, err := applyRlimits(); !errors.Is(err, syscall.EACCES) {
+	if _, _, err := applyRlimits(); !errors.Is(err, syscall.EACCES) {
 		t.Errorf("count failure: err = %v", err)
 	}
 	countUserThreads = func() (uint64, error) { return 1, nil }
 	setrlimit = func(int, *unix.Rlimit) error { return syscall.EPERM }
-	if _, err := applyRlimits(); !errors.Is(err, syscall.EPERM) {
+	if _, _, err := applyRlimits(); !errors.Is(err, syscall.EPERM) {
 		t.Errorf("setrlimit failure: err = %v", err)
 	}
+	setrlimit = func(int, *unix.Rlimit) error { return nil }
+	for resource, name := range map[int]string{unix.RLIMIT_FSIZE: "RLIMIT_FSIZE", unix.RLIMIT_NPROC: "RLIMIT_NPROC"} {
+		getrlimit = func(r int, l *unix.Rlimit) error {
+			if r == resource {
+				return syscall.EFAULT
+			}
+			*l = unix.Rlimit{Cur: 1, Max: 1}
+			return nil
+		}
+		if _, _, err := applyRlimits(); !errors.Is(err, syscall.EFAULT) || !strings.HasPrefix(err.Error(), name+": ") {
+			t.Errorf("%s getrlimit failure: err = %v", name, err)
+		}
+	}
+}
+
+func TestRlimitsProbeChecksRecordedValues(t *testing.T) {
+	old := getrlimit
+	t.Cleanup(func() { getrlimit = old })
+	installed := map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 1 << 20, Max: 1 << 30}, unix.RLIMIT_NPROC: {Cur: 500, Max: 1000}}
+	getrlimit = func(r int, l *unix.Rlimit) error { *l = installed[r]; return nil }
+	fsize, nproc := installed[unix.RLIMIT_FSIZE], installed[unix.RLIMIT_NPROC]
+	if got := rlimitsProbe(fsize, nproc); got != probeAllowed {
+		t.Errorf("clamped values: probe = %d, want %d", got, probeAllowed)
+	}
+	for name, tc := range map[string]struct{ fsize, nproc unix.Rlimit }{
+		"fsize soft":   {unix.Rlimit{Cur: 1 << 30, Max: 1 << 30}, nproc},
+		"fsize hard":   {unix.Rlimit{Cur: 1 << 20, Max: 8 << 30}, nproc},
+		"nproc soft":   {fsize, unix.Rlimit{Cur: 1000, Max: 1000}},
+		"nproc hard":   {fsize, unix.Rlimit{Cur: 500, Max: 4396}},
+		"nproc zero":   {fsize, unix.Rlimit{}},
+	} {
+		if got := rlimitsProbe(tc.fsize, tc.nproc); got != probeFailed {
+			t.Errorf("%s differs: probe = %d, want %d", name, got, probeFailed)
+		}
+	}
+}
+
+func TestRlimitsProbeAcceptsRecordedZeroLimits(t *testing.T) {
+	stubRlimits(t, 300, map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 1 << 20, Max: 1 << 30}, unix.RLIMIT_NPROC: {}})
+	s := &helperState{}
+	if err := realStep(t, "rlimits")(s); err != nil {
+		t.Fatal(err)
+	}
+	if s.nproc != (unix.Rlimit{}) {
+		t.Fatalf("recorded nproc %v, want zero", s.nproc)
+	}
+	if got := runProbe(s, []string{"rlimits"}); got != probeAllowed {
+		t.Errorf("recorded zero NPROC: probe = %d, want %d", got, probeAllowed)
+	}
+}
+
+func TestRlimitsProbeFailsWhenNotRecorded(t *testing.T) {
+	stubRlimits(t, 300, map[int]unix.Rlimit{})
+	if got := runProbe(&helperState{}, []string{"rlimits"}); got != probeFailed {
+		t.Errorf("unrecorded state with zero limits: probe = %d, want %d", got, probeFailed)
+	}
+	setrlimit = func(int, *unix.Rlimit) error { return syscall.EPERM }
+	s := &helperState{}
+	if err := realStep(t, "rlimits")(s); err == nil {
+		t.Fatal("setup succeeded with setrlimit failing")
+	}
+	if got := runProbe(s, []string{"rlimits"}); got != probeFailed {
+		t.Errorf("after failed setup: probe = %d, want %d", got, probeFailed)
+	}
+}
+
+const rlimitChildEnv = "CODEMELD_TEST_RLIMIT_CHILD"
+
+func TestRunHelperKeepsLowerInheritedRlimits(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRlimitClampChild$", "-test.v")
+	cmd.Env = append(os.Environ(), rlimitChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "rlimit child ran") {
+		t.Fatalf("child: %v\n%s", err, out)
+	}
+}
+
+func TestRlimitClampChild(t *testing.T) {
+	if os.Getenv(rlimitChildEnv) == "" {
+		t.Skip("runs only as the child of TestRunHelperKeepsLowerInheritedRlimits")
+	}
+	n, err := userThreadCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowered := map[int]unix.Rlimit{}
+	for r, l := range map[int]unix.Rlimit{unix.RLIMIT_FSIZE: {Cur: 512 << 20, Max: 1 << 30}, unix.RLIMIT_NPROC: {Cur: n + 500, Max: n + 1000}} {
+		var cur unix.Rlimit
+		if err := unix.Getrlimit(r, &cur); err != nil {
+			t.Fatal(err)
+		}
+		l = unix.Rlimit{Cur: min(l.Cur, cur.Cur), Max: min(l.Max, cur.Max)}
+		if err := unix.Setrlimit(r, &l); err != nil {
+			t.Fatal(err)
+		}
+		lowered[r] = l
+	}
+	steps := helperSteps
+	t.Cleanup(func() { helperSteps = steps })
+	helperSteps = slices.DeleteFunc(slices.Clone(steps), func(s helperStep) bool { return s.name != "rlimits" })
+	if code := RunHelper([]string{ProbeArg, "rlimits"}); code != probeAllowed {
+		t.Fatalf("RunHelper = %d, want %d", code, probeAllowed)
+	}
+	for r, want := range lowered {
+		var got unix.Rlimit
+		if err := unix.Getrlimit(r, &got); err != nil || got != want {
+			t.Errorf("resource %d after setup = %v, %v, want inherited %v", r, got, err, want)
+		}
+	}
+	fmt.Println("rlimit child ran")
 }
 
 func dirEntries(t *testing.T, names ...string) []os.DirEntry {

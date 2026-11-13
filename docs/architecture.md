@@ -115,7 +115,14 @@ session temp folder (`namesFolder`).
   other; datagram pairs are denied, with the same pair rule in every seccomp filter
   (`seccompFilterFor` in `internal/enforce/seccomp_linux.go`). When the launch self-test's network
   check passes, Plan and Auto edits commands may also create TCP sockets, and every `connect()`
-  pauses for codemeld, which makes the connection itself and admits only its session proxy. The
+  pauses for codemeld, which makes the connection itself (`internal/enforce/broker_linux.go`). What
+  it admits depends on the broker mode: `slice` admits only the session proxy; `connect` also admits
+  a TCP endpoint or Unix socket a connect grant or the connect prompt allows (`ConnectRules`);
+  `full` also lets the command bind and listen on a loopback TCP port or a Unix socket inside its
+  write roots (`bindOrListen`), and admits without a prompt a connection to a TCP endpoint the same
+  command bound. Plan always gets `slice`; Auto edits gets `full`, `connect` or `slice`, the furthest
+  of the chained self-tests that passed (`launchConfinement` in `internal/bootstrap/starttui.go`,
+  `confinement.policy` in `internal/bootstrap/confinedrunner.go`). The
   proxy asks per destination, admits saved `domain_grants`, and connects only to public addresses
   that are not this machine's ([Sandboxed network](approvals.md#sandboxed-network)).
 - **Self-test.** At startup the helper runs against a scratch folder and checks each property from

@@ -31,19 +31,30 @@ var (
 	}
 )
 
-func applyRlimits() (uint64, error) {
+func applyRlimits() (fsize, nproc unix.Rlimit, err error) {
 	n, err := countUserThreads()
 	if err != nil {
-		return 0, fmt.Errorf("count threads: %w", err)
+		return fsize, nproc, fmt.Errorf("count threads: %w", err)
 	}
-	nproc := n + nprocHeadroom
-	if err := setrlimit(unix.RLIMIT_FSIZE, &unix.Rlimit{Cur: fsizeLimit, Max: fsizeLimit}); err != nil {
-		return 0, fmt.Errorf("RLIMIT_FSIZE: %w", err)
+	if fsize, err = lowerRlimit(unix.RLIMIT_FSIZE, fsizeLimit); err != nil {
+		return fsize, nproc, fmt.Errorf("RLIMIT_FSIZE: %w", err)
 	}
-	if err := setrlimit(unix.RLIMIT_NPROC, &unix.Rlimit{Cur: nproc, Max: nproc}); err != nil {
-		return 0, fmt.Errorf("RLIMIT_NPROC: %w", err)
+	if nproc, err = lowerRlimit(unix.RLIMIT_NPROC, n+nprocHeadroom); err != nil {
+		return fsize, nproc, fmt.Errorf("RLIMIT_NPROC: %w", err)
 	}
-	return nproc, nil
+	return fsize, nproc, nil
+}
+
+func lowerRlimit(resource int, want uint64) (unix.Rlimit, error) {
+	var l unix.Rlimit
+	if err := getrlimit(resource, &l); err != nil {
+		return unix.Rlimit{}, err
+	}
+	l = unix.Rlimit{Cur: min(want, l.Cur), Max: min(want, l.Max)}
+	if err := setrlimit(resource, &l); err != nil {
+		return unix.Rlimit{}, err
+	}
+	return l, nil
 }
 
 func userThreadCount() (uint64, error) {

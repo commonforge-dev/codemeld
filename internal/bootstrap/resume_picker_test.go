@@ -65,7 +65,9 @@ type recordingResumeLoader struct {
 }
 
 func (l *recordingResumeLoader) Load(e tui.ResumeEntry) (*sessions.Store, bool, fserrors.Category, error) {
-	l.at = l.ord.tick()
+	if at := l.ord.tick(); l.at == 0 {
+		l.at = at
+	}
 	return l.inner.Load(e)
 }
 

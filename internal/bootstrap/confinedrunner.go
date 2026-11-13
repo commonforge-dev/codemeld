@@ -28,23 +28,130 @@ import (
 )
 
 type confinement struct {
-	constrained bool
-	mode        func() string
-	home        string
-	projectRoot string
-	writable    *writableFoldersReader
-	blocked     *permissions.BlockedPaths
-	lookupPath  string
-	lookupSet   bool
-	tmpDir      string
-	owned       *ownedTempDirs
-	inherited   []string
-	warning     string
-	broker      string
-	decide      func(netip.AddrPort) bool
-	proxy       *sessionProxy
-	proxyAsker  netproxy.Asker
-	grants      []string
+	constrained   bool
+	mode          func() string
+	home          string
+	projectRoot   string
+	writable      *writableFoldersReader
+	blocked       *permissions.BlockedPaths
+	lookupPath    string
+	lookupSet     bool
+	tmpDir        string
+	owned         *ownedTempDirs
+	inherited     []string
+	warning       string
+	broker        string
+	decide        func(netip.AddrPort) bool
+	proxy         *sessionProxy
+	proxyAsker    netproxy.Asker
+	connectAsker  connectAsker
+	grants        []string
+	connectGrants []string
+	deny          *sessionDenyList
+	approvals     *connectApprovals
+}
+
+type connectAsker func(ctx context.Context, dest string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error)
+
+const (
+	connectSessionApproval = "session approval"
+	connectPromptOnce      = "prompt once"
+	connectPromptSession   = "prompt session"
+	connectDenied          = "not approved (denied)"
+)
+
+type connectApprovals struct {
+	mu     sync.Mutex
+	closed bool
+	held   map[any]*os.File
+}
+
+func (a *connectApprovals) covers(key any) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.held[key]
+	return ok
+}
+
+func (a *connectApprovals) add(key any, hold func() (*os.File, error)) bool {
+	var f *os.File
+	if hold != nil {
+		var err error
+		if f, err = hold(); err != nil {
+			return false
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.held[key]; ok || a.closed {
+		if f != nil {
+			_ = f.Close()
+		}
+		return !a.closed
+	}
+	a.held[key] = f
+	return true
+}
+
+func (a *connectApprovals) close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.closed = true
+	for _, f := range a.held {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
+	a.held = nil
+}
+
+func (c *confinement) answerConnect(ctx context.Context, live func() bool, key any, dest string, hold func() (*os.File, error)) (step, reason string) {
+	if c.approvals.covers(key) {
+		return connectSessionApproval, ""
+	}
+	if c.connectAsker == nil {
+		return "", ""
+	}
+	var mu sync.Mutex
+	covered, returned, accepted := false, false, netproxy.DecisionDeny
+	accept := func(d netproxy.Decision) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case returned || ctx.Err() != nil || !live() || (d != netproxy.DecisionOnce && d != netproxy.DecisionSession):
+			return false
+		case accepted != netproxy.DecisionDeny:
+			return d == accepted
+		case d == netproxy.DecisionSession && !c.approvals.add(key, hold):
+			return false
+		}
+		accepted = d
+		return true
+	}
+	d, err := c.connectAsker(ctx, dest, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		covered = covered || c.approvals.covers(key)
+		return covered
+	}, accept)
+	mu.Lock()
+	defer mu.Unlock()
+	returned = true
+	switch {
+	case accepted == netproxy.DecisionSession:
+		return connectPromptSession, ""
+	case accepted == netproxy.DecisionOnce:
+		return connectPromptOnce, ""
+	case covered:
+		return connectSessionApproval, ""
+	case ctx.Err() != nil:
+		return "", "not approved (command ended)"
+	case errors.Is(err, errAppShuttingDown):
+		return "", "not approved (session ended)"
+	case err == nil && d == netproxy.DecisionDeny:
+		return "", connectDenied
+	}
+	return "", "not approved (prompt failed)"
 }
 
 type proxyState int
@@ -190,6 +297,10 @@ func (c *confinement) own(dir *sessionTempDir) {
 	if c.proxy == nil {
 		c.proxy = newSessionProxy(c.grants)
 		c.decide = c.proxy.admits
+		if c.broker == enforce.BrokerConnect || c.broker == enforce.BrokerFull {
+			c.deny = newSessionDenyList()
+			c.approvals = &connectApprovals{held: map[any]*os.File{}}
+		}
 	}
 	if dir == nil {
 		return
@@ -262,6 +373,12 @@ func (c *confinement) takeCleanupWarning() string {
 func (c *confinement) cleanupAll() error {
 	if c.proxy != nil {
 		c.proxy.stop()
+	}
+	if c.deny != nil {
+		c.deny.Close()
+	}
+	if c.approvals != nil {
+		c.approvals.close()
 	}
 	if c.owned == nil {
 		return nil
@@ -414,9 +531,9 @@ func gitGlobalConfigBlocked(home string, blocked *permissions.BlockedPaths) bool
 
 func (c *confinement) confine(ctx context.Context, spec runner.RunSpec, current, tmpDir string, storesWritable bool) (runner.RunSpec, bool, error) {
 	// A child's VCS actions run through the parent's registered runner and confinement, so only the call can say it is a child's.
-	if c.proxyAsker != nil && vcs.ChildInvocationID(ctx) != "" {
+	if (c.proxyAsker != nil || c.connectAsker != nil) && vcs.ChildInvocationID(ctx) != "" {
 		child := *c
-		child.proxyAsker = nil
+		child.proxyAsker, child.connectAsker = nil, nil
 		c = &child
 	}
 	blocked := c.blocked.Current()
@@ -424,8 +541,9 @@ func (c *confinement) confine(ctx context.Context, spec runner.RunSpec, current,
 	if err != nil {
 		return runner.RunSpec{}, false, err
 	}
+	proxyRoute := policy.Broker != enforce.BrokerNone
 	var proxyURL string
-	if policy.Broker == enforce.BrokerSlice {
+	if proxyRoute {
 		if c.proxy == nil {
 			return runner.RunSpec{}, false, errors.New("codemeld confinement: no session network proxy for this run")
 		}
@@ -450,11 +568,11 @@ func (c *confinement) confine(ctx context.Context, spec runner.RunSpec, current,
 	prepared.Argv = append([]string{"/proc/self/exe", enforce.HelperCommand}, prepared.Argv...)
 	prepared.Stdin = append(frame.Bytes(), prepared.Stdin...)
 	if policy.Broker != enforce.BrokerNone {
-		if err := c.attachBroker(&prepared, policy.Broker); err != nil {
+		if err := c.attachBroker(&prepared, policy); err != nil {
 			return runner.RunSpec{}, false, err
 		}
 	}
-	return prepared, policy.Broker == enforce.BrokerSlice, nil
+	return prepared, proxyRoute, nil
 }
 
 func (c *confinement) policy(current, tmpDir string, blocked *permissions.BlockedPaths, storesWritable bool) (enforce.Policy, error) {
@@ -473,7 +591,7 @@ func (c *confinement) policy(current, tmpDir string, blocked *permissions.Blocke
 			return enforce.Policy{}, err
 		}
 		p.TmpDir = tmpDir
-		if c.broker == enforce.BrokerSlice {
+		if c.broker != enforce.BrokerNone {
 			p.Broker = enforce.BrokerSlice
 		}
 		return p, nil
@@ -689,8 +807,12 @@ type confinedFailure struct {
 	lines      []string
 }
 
-var invocationRefusals = func(helper runner.HelperLaunch) []netproxy.Refusal {
-	h, ok := helper.(interface{ refusals() []netproxy.Refusal })
+type refusal struct {
+	Host, Port, Path, Reason string
+}
+
+var invocationRefusals = func(helper runner.HelperLaunch) []refusal {
+	h, ok := helper.(interface{ refusals() []refusal })
 	if !ok {
 		return nil
 	}
@@ -707,8 +829,12 @@ func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.Help
 		return f
 	}
 	for _, r := range invocationRefusals(helper) {
+		dest := r.Path
 		if r.Host != "" && r.Port != "" {
-			f.addLine(strings.ToValidUTF8(fmt.Sprintf("codemeld: network refused: %s (%s)", net.JoinHostPort(r.Host, r.Port), r.Reason), "\uFFFD"))
+			dest = net.JoinHostPort(r.Host, r.Port)
+		}
+		if dest != "" {
+			f.addLine(strings.ToValidUTF8(fmt.Sprintf("codemeld: network refused: %s (%s)", dest, r.Reason), "\uFFFD"))
 		}
 	}
 	return f
@@ -874,7 +1000,31 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 		}
 		r.failure.merge(failure)
 	}
+	if recErr := r.recordConnectDecisions(prepared.Helper); recErr != nil {
+		err = errors.Join(err, recErr)
+	}
 	return res, err
+}
+
+func (r *confinedShellRunner) recordConnectDecisions(helper runner.HelperLaunch) error {
+	h, ok := helper.(interface {
+		connectDecisions() []events.ConnectDecision
+	})
+	if !ok || r.events.active == nil {
+		return nil
+	}
+	store := r.events.active()
+	if store == nil {
+		return nil
+	}
+	helper.Close()
+	var errs []error
+	for _, d := range h.connectDecisions() {
+		if _, err := events.Append(store, d); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (r *confinedShellRunner) PreflightPipeline(ctx context.Context, specs []runner.RunSpec) error {

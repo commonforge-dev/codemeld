@@ -4,9 +4,9 @@ package filetools
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -133,7 +133,7 @@ func (t *ReadImageTool) resolveAndReadImage(resolvedTarget string) (mime string,
 	if ignored {
 		return "", nil, fmt.Errorf("path is excluded by codemeldignore")
 	}
-	data, err = readCappedImageBytes(real)
+	data, err = readCappedImageBytes(boundary, real)
 	if err != nil {
 		return "", nil, err
 	}
@@ -157,10 +157,10 @@ func (t *ReadImageTool) displayPath(real string) string {
 // replace the file at the same path and prove no later step reads it again.
 var afterImageCapture = func() {}
 
-func readCappedImageBytes(real string) ([]byte, error) {
-	f, err := os.Open(real)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open image: %w", err)
+func readCappedImageBytes(boundary, real string) ([]byte, error) {
+	f, reason := openNoFollowUnder(boundary, real)
+	if f == nil {
+		return nil, errors.New(reason)
 	}
 	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(io.LimitReader(f, maxReadImageBytes+1))

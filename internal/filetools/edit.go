@@ -194,17 +194,22 @@ type editPlan struct {
 // it in-band and the model can correct itself rather than aborting the turn. It reads the target by
 // pathname and so is the preview-only planner; apply plans through planEditAt instead, because a
 // pathname read between authorization and publication can be redirected to a different file.
-func planEdit(target string, args map[string]any) (editPlan, *tools.Result) {
+func planEdit(boundary, target string, args map[string]any) (editPlan, *tools.Result) {
 	oldText, newText, refusal := editArgs(args)
 	if refusal != nil {
 		return editPlan{}, refusal
 	}
 
-	info, err := os.Stat(target)
+	f, reason := openNoFollowUnder(boundary, target)
+	if f == nil {
+		return failPlan("cannot read the target file: " + reason)
+	}
+	defer f.Close() //nolint:errcheck // read-only descriptor; the contents are already read
+	info, err := f.Stat()
 	if err != nil {
 		return failPlan("cannot read the target file's metadata: " + err.Error())
 	}
-	data, err := os.ReadFile(target)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return failPlan("cannot read the target file: " + err.Error())
 	}
@@ -311,8 +316,12 @@ func renderEditPatch(target string, plan editPlan) (string, error) {
 	return udiff.ToUnified(target, target, plan.original, udiff.Lines(plan.original, plan.updated), previewContextLines)
 }
 
-func (*EditTool) Preview(target string, args map[string]any) (string, *tools.Result) {
-	plan, refusal := planEdit(target, args)
+func (t *EditTool) Preview(target string, args map[string]any) (string, *tools.Result) {
+	boundary := t.projectRoot
+	if t.OutOfRootScope(filepath.Dir(target)) {
+		boundary = filepath.Dir(target)
+	}
+	plan, refusal := planEdit(boundary, target, args)
 	if refusal != nil {
 		return "", refusal
 	}

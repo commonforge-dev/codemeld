@@ -2318,18 +2318,28 @@ func TestPrepareTool_GeneralAgentDeleteDeclarationSurvivesAMutatingAuthorizer(t 
 }
 
 func TestPrepareTool_GeneralAgentDeleteFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
+	assertGeneralAgentFormKeepsOmittedApartFromSuppliedEmpty(t, "GeneralAgentDelete", "delete",
+		func(fd *fakeGeneralAgentTool, m map[string]bool) { fd.remove = m },
+		func(m permissions.ModeContext) map[string]bool { return m.GeneralAgentDelete },
+		func(fd *fakeGeneralAgentTool) map[string]bool { return fd.invokedRemove })
+}
+
+func assertGeneralAgentFormKeepsOmittedApartFromSuppliedEmpty[K comparable](t *testing.T, modeField, invokedKind string,
+	set func(*fakeGeneralAgentTool, map[K]bool), modeForm func(permissions.ModeContext) map[K]bool, invokedForm func(*fakeGeneralAgentTool) map[K]bool) {
+	t.Helper()
 	for _, tc := range []struct {
 		name    string
-		remove  map[string]bool
+		form    map[K]bool
 		wantNil bool
 	}{
 		{"omitted", nil, true},
-		{"supplied empty", map[string]bool{}, false},
+		{"supplied empty", map[K]bool{}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			cwd := t.TempDir()
-			fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, remove: tc.remove}
+			fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}}
+			set(fd, tc.form)
 			reg := tools.NewRegistry()
 			if err := reg.Register(tools.BuiltinSource, fd); err != nil {
 				t.Fatalf("Register: %v", err)
@@ -2339,14 +2349,14 @@ func TestPrepareTool_GeneralAgentDeleteFormKeepsOmittedApartFromSuppliedEmpty(t 
 				t.Fatalf("PrepareTool: %v", err)
 			}
 			_, _, modeCtx := prepared.authorizationInputs()
-			if got := modeCtx.GeneralAgentDelete == nil; got != tc.wantNil || len(modeCtx.GeneralAgentDelete) != 0 {
-				t.Fatalf("mode context GeneralAgentDelete = %#v, want nil=%v and empty", modeCtx.GeneralAgentDelete, tc.wantNil)
+			if got := modeForm(modeCtx); (got == nil) != tc.wantNil || len(got) != 0 {
+				t.Fatalf("mode context %s = %#v, want nil=%v and empty", modeField, got, tc.wantNil)
 			}
 			if _, err := InvokeDecided(context.Background(), prepared, grantDecision()); err != nil {
 				t.Fatalf("InvokeDecided: %v", err)
 			}
-			if got := fd.invokedRemove == nil; got != tc.wantNil {
-				t.Fatalf("invoked delete declaration = %#v, want nil=%v", fd.invokedRemove, tc.wantNil)
+			if got := invokedForm(fd); (got == nil) != tc.wantNil {
+				t.Fatalf("invoked %s declaration = %#v, want nil=%v", invokedKind, got, tc.wantNil)
 			}
 		})
 	}
@@ -3476,38 +3486,10 @@ func TestPrepareTool_GeneralAgentMovePairsSurviveAMutatingCaller(t *testing.T) {
 }
 
 func TestPrepareTool_GeneralAgentMoveFormKeepsOmittedApartFromSuppliedEmpty(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		moves   map[permissions.MovePair]bool
-		wantNil bool
-	}{
-		{"omitted", nil, true},
-		{"supplied empty", map[permissions.MovePair]bool{}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			cwd := t.TempDir()
-			fd := &fakeGeneralAgentTool{name: "general_agent", instruction: "do it", declared: map[string]bool{filepath.Join(cwd, "a.txt"): true}, moves: tc.moves}
-			reg := tools.NewRegistry()
-			if err := reg.Register(tools.BuiltinSource, fd); err != nil {
-				t.Fatalf("Register: %v", err)
-			}
-			prepared, err := PrepareTool(context.Background(), "general_agent", generalAgentArgs(), home, cwd, reg)
-			if err != nil {
-				t.Fatalf("PrepareTool: %v", err)
-			}
-			_, _, modeCtx := prepared.authorizationInputs()
-			if got := modeCtx.GeneralAgentMoves == nil; got != tc.wantNil || len(modeCtx.GeneralAgentMoves) != 0 {
-				t.Fatalf("mode context GeneralAgentMoves = %#v, want nil=%v and empty", modeCtx.GeneralAgentMoves, tc.wantNil)
-			}
-			if _, err := InvokeDecided(context.Background(), prepared, grantDecision()); err != nil {
-				t.Fatalf("InvokeDecided: %v", err)
-			}
-			if got := fd.invokedMoves == nil; got != tc.wantNil {
-				t.Fatalf("invoked move declaration = %#v, want nil=%v", fd.invokedMoves, tc.wantNil)
-			}
-		})
-	}
+	assertGeneralAgentFormKeepsOmittedApartFromSuppliedEmpty(t, "GeneralAgentMoves", "move",
+		func(fd *fakeGeneralAgentTool, m map[permissions.MovePair]bool) { fd.moves = m },
+		func(m permissions.ModeContext) map[permissions.MovePair]bool { return m.GeneralAgentMoves },
+		func(fd *fakeGeneralAgentTool) map[permissions.MovePair]bool { return fd.invokedMoves })
 }
 
 func TestPrepareTool_GeneralAgentDirectoriesSurviveAMutatingCaller(t *testing.T) {

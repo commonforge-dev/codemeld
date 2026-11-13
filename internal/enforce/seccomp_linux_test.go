@@ -313,18 +313,20 @@ func TestInstallSeccompPassesTSYNC(t *testing.T) {
 }
 
 var (
-	seccompSlice = Policy{Mode: ModeAutoEdits, BlockedPaths: []string{"/home/u/.codemeld"}, TmpDir: "/tmp/t", Broker: "slice"}
-	seccompFull  = Policy{Mode: ModeAutoEdits, BlockedPaths: []string{"/home/u/.codemeld"}, TmpDir: "/tmp/t", Broker: "full"}
-	retNotify    = uint32(unix.SECCOMP_RET_USER_NOTIF)
+	seccompSlice   = Policy{Mode: ModeAutoEdits, BlockedPaths: []string{"/home/u/.codemeld"}, TmpDir: "/tmp/t", Broker: "slice"}
+	seccompFull    = Policy{Mode: ModeAutoEdits, BlockedPaths: []string{"/home/u/.codemeld"}, TmpDir: "/tmp/t", Broker: "full"}
+	seccompConnect = Policy{Mode: ModeAutoEdits, BlockedPaths: []string{"/home/u/.codemeld"}, TmpDir: "/tmp/t", Broker: "connect"}
+	seccompBrokers = map[string]Policy{"slice": seccompSlice, "full": seccompFull, "connect": seccompConnect}
+	retNotify      = uint32(unix.SECCOMP_RET_USER_NOTIF)
 )
 
-func brokerSocketAllowed(full bool, family, typ, proto uint64) bool {
+func brokerSocketAllowed(mode string, family, typ, proto uint64) bool {
 	base := uint32(typ) &^ (unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)
 	switch uint32(family) {
 	case unix.AF_INET, unix.AF_INET6:
 		return base == unix.SOCK_STREAM && (uint32(proto) == 0 || uint32(proto) == unix.IPPROTO_TCP)
 	case unix.AF_UNIX:
-		return full && (base == unix.SOCK_STREAM || base == unix.SOCK_SEQPACKET) && uint32(proto) == 0
+		return mode != "slice" && (base == unix.SOCK_STREAM || base == unix.SOCK_SEQPACKET) && uint32(proto) == 0
 	}
 	return false
 }
@@ -334,14 +336,14 @@ func TestSeccompBrokerSocketMatrix(t *testing.T) {
 	types := []uint64{unix.SOCK_STREAM, unix.SOCK_SEQPACKET, unix.SOCK_DGRAM, unix.SOCK_RAW, unix.SOCK_STREAM | 0x100, 1<<32 | unix.SOCK_STREAM}
 	protos := []uint64{0, unix.IPPROTO_TCP, unix.IPPROTO_SCTP, unix.IPPROTO_MPTCP, unix.IPPROTO_UDP, 1<<32 | unix.IPPROTO_TCP}
 	for _, info := range seccompArches {
-		for name, full := range map[string]bool{"slice": false, "full": true} {
-			v := newSeccompVM(t, map[bool]Policy{false: seccompSlice, true: seccompFull}[full], info)
+		for name, p := range seccompBrokers {
+			v := newSeccompVM(t, p, info)
 			for _, family := range families {
 				for _, typ := range types {
 					for _, flags := range []uint64{0, unix.SOCK_NONBLOCK, unix.SOCK_CLOEXEC, unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC} {
 						for _, proto := range protos {
 							want := retEPERM
-							if brokerSocketAllowed(full, family, typ|flags, proto) {
+							if brokerSocketAllowed(name, family, typ|flags, proto) {
 								want = retAllow
 							}
 							if got := v.run("socket", family, typ|flags, proto); got != want {
@@ -357,7 +359,7 @@ func TestSeccompBrokerSocketMatrix(t *testing.T) {
 
 func TestSeccompBrokerCallsAndPreservedDenials(t *testing.T) {
 	for _, info := range seccompArches {
-		for name, p := range map[string]Policy{"slice": seccompSlice, "full": seccompFull} {
+		for name, p := range seccompBrokers {
 			v := newSeccompVM(t, p, info)
 			bindListen := retEPERM
 			if name == "full" {
@@ -442,7 +444,7 @@ func TestSeccompPlanSliceKeepsPlanDenials(t *testing.T) {
 
 func TestSeccompBrokerFastOpen(t *testing.T) {
 	for _, info := range seccompArches {
-		for name, p := range map[string]Policy{"slice": seccompSlice, "full": seccompFull} {
+		for name, p := range seccompBrokers {
 			v := newSeccompVM(t, p, info)
 			for call, flagsArg := range map[string]int{"sendto": 3, "sendmsg": 2, "sendmmsg": 3} {
 				for flags, want := range map[uint64]uint32{
@@ -474,17 +476,48 @@ func TestSeccompBrokerFastOpen(t *testing.T) {
 	}
 }
 
+func TestSeccompBrokerSetsockopt(t *testing.T) {
+	const solSocket, soReuseaddr, soReuseport, ipprotoTCP = 1, 2, 15, 6
+	policies := map[string]Policy{"auto": seccompAuto, "network": seccompNetwork}
+	maps.Copy(policies, seccompBrokers)
+	for _, info := range seccompArches {
+		for name, p := range policies {
+			v := newSeccompVM(t, p, info)
+			reuseport := retAllow
+			if name == "full" {
+				reuseport = retEPERM
+			}
+			for _, tc := range []struct {
+				level, opt uint64
+				want       uint32
+			}{
+				{solSocket, soReuseport, reuseport},
+				{1<<32 | solSocket, 1<<32 | soReuseport, reuseport},
+				{solSocket, soReuseaddr, retAllow},
+				{ipprotoTCP, soReuseport, retAllow},
+				{soReuseport, solSocket, retAllow},
+			} {
+				if got := v.run("setsockopt", 3, tc.level, tc.opt, 0, 4); got != tc.want {
+					t.Errorf("%s %s setsockopt(3, %#x, %#x): ret %#x, want %#x", info.Name, name, tc.level, tc.opt, got, tc.want)
+				}
+			}
+		}
+	}
+}
+
 func TestSeccompBrokerRejectsBadPolicies(t *testing.T) {
 	network, plan, unknown := seccompFull, seccompFull, seccompSlice
 	network.ExceptionalAuthority = NetworkAccessAuthority
 	plan.Mode, plan.TmpDir = ModePlan, ""
-	unknown.Broker = "connect"
+	unknown.Broker = "bind"
+	connectNetwork, connectPlan := network, plan
+	connectNetwork.Broker, connectPlan.Broker = "connect", "connect"
 	oldLoad, oldListener := loadSeccomp, loadSeccompListener
 	t.Cleanup(func() { loadSeccomp, loadSeccompListener = oldLoad, oldListener })
 	loads := 0
 	loadSeccomp = func(uintptr, *unix.SockFprog) error { loads++; return nil }
 	loadSeccompListener = func(uintptr, *unix.SockFprog) (int, error) { loads++; return 7, nil }
-	for name, p := range map[string]Policy{"network": network, "plan": plan, "unknown": unknown} {
+	for name, p := range map[string]Policy{"network": network, "plan": plan, "unknown": unknown, "connect network": connectNetwork, "connect plan": connectPlan} {
 		for _, info := range seccompArches {
 			if _, err := seccompFilterFor(p, info); err == nil {
 				t.Errorf("%s: %s filter constructed", name, info.Name)
@@ -497,7 +530,7 @@ func TestSeccompBrokerRejectsBadPolicies(t *testing.T) {
 			t.Errorf("%s: installSeccomp accepted", name)
 		}
 	}
-	for name, p := range map[string]Policy{"slice": seccompSlice, "full": seccompFull} {
+	for name, p := range seccompBrokers {
 		if err := installSeccomp(p); err == nil {
 			t.Errorf("installSeccomp accepted %s", name)
 		}
@@ -524,7 +557,7 @@ func TestInstallSeccompListenerFlagsAndErrors(t *testing.T) {
 		}
 	}
 	wantFlags := []uintptr{unix.SECCOMP_FILTER_FLAG_NEW_LISTENER | unix.SECCOMP_FILTER_FLAG_TSYNC | unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH}
-	for _, p := range []Policy{seccompSlice, seccompFull} {
+	for _, p := range seccompBrokers {
 		loadSeccompListener = result(0, nil)
 		if fd, err := installSeccompListener(p); fd != 0 || err != nil {
 			t.Errorf("%s: install = %d, %v; want descriptor 0", p.Broker, fd, err)
@@ -556,7 +589,7 @@ type seccompKernelCase struct {
 	call func() error
 }
 
-func seccompKernelCases(full bool) []seccompKernelCase {
+func seccompKernelCases(mode string) []seccompKernelCase {
 	verdict := map[bool]string{true: "allow", false: "deny"}
 	var cases []seccompKernelCase
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6, unix.AF_UNIX, unix.AF_NETLINK, unix.AF_PACKET} {
@@ -566,7 +599,7 @@ func seccompKernelCases(full bool) []seccompKernelCase {
 			for _, proto := range []int{0, unix.IPPROTO_TCP, unix.IPPROTO_SCTP} {
 				cases = append(cases, seccompKernelCase{
 					fmt.Sprintf("socket(%d,%#x,%d)", family, typ, proto),
-					verdict[brokerSocketAllowed(full, uint64(family), uint64(typ), uint64(proto))], 0,
+					verdict[brokerSocketAllowed(mode, uint64(family), uint64(typ), uint64(proto))], 0,
 					func() error {
 						fd, err := unix.Socket(family, typ, proto)
 						if err == nil {
@@ -626,7 +659,7 @@ func seccompKernelCases(full bool) []seccompKernelCase {
 	}
 	abstract := &unix.SockaddrUnix{Name: "@codemeld-seccomp-listener-test"}
 	bindListen, bindNr, listenNr := "deny", 0, 0
-	if full {
+	if mode == "full" {
 		bindListen, bindNr, listenNr = "pause", unix.SYS_BIND, unix.SYS_LISTEN
 	}
 	cases = append(cases,
@@ -647,7 +680,7 @@ func seccompKernelCases(full bool) []seccompKernelCase {
 		})},
 		seccompKernelCase{"sendmmsg plain", "allow", 0, with(unix.AF_UNIX, func(fd int) error { return sendmmsg(fd, nil, 0) })},
 	)
-	if full {
+	if mode != "slice" {
 		cases = append(cases, seccompKernelCase{"connect unix socket", "pause", unix.SYS_CONNECT, func() error {
 			fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 			if err != nil {
@@ -704,8 +737,7 @@ func TestSeccompListenerChild(t *testing.T) {
 		send(fmt.Sprintf("tsync=%s fd=%d sync=%v", errno(err), fd, err != nil && strings.Contains(err.Error(), "synchronize")), nil)
 		return
 	}
-	full := mode == "full"
-	fd, err := installSeccompListener(map[bool]Policy{false: seccompSlice, true: seccompFull}[full])
+	fd, err := installSeccompListener(seccompBrokers[mode])
 	if err != nil {
 		send("install="+errno(err), nil)
 		return
@@ -719,7 +751,7 @@ func TestSeccompListenerChild(t *testing.T) {
 	if n, err := unix.Read(3, buf); err != nil || string(buf[:n]) != "go" {
 		t.Fatalf("waiting for go: %q %v", buf[:n], err)
 	}
-	for _, c := range seccompKernelCases(full) {
+	for _, c := range seccompKernelCases(mode) {
 		send(seccompVerdict(c.call())+" "+c.name, nil)
 	}
 	send("done", nil)
@@ -848,7 +880,7 @@ func (c *seccompListenerChild) fatalf(t *testing.T, format string, args ...any) 
 }
 
 func TestSeccompListenerKernelVariants(t *testing.T) {
-	for _, mode := range []string{"slice", "full"} {
+	for _, mode := range []string{"slice", "full", "connect"} {
 		t.Run(mode, func(t *testing.T) {
 			c, msg, listener := startSeccompListenerChild(t, mode)
 			if listener < 0 {
@@ -922,7 +954,7 @@ func TestSeccompListenerKernelVariants(t *testing.T) {
 			if notifyErr != nil {
 				c.fatalf(t, "broker: %v", notifyErr)
 			}
-			cases, wantPaused := seccompKernelCases(mode == "full"), []int{}
+			cases, wantPaused := seccompKernelCases(mode), []int{}
 			for _, kc := range cases {
 				if kc.want == "pause" {
 					wantPaused = append(wantPaused, kc.nr)

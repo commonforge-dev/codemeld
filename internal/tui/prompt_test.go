@@ -4958,3 +4958,166 @@ func TestPromptNetwork_ProjectChoiceFollowsTheRunTrustAndGlobalStaysOffered(t *t
 		})
 	}
 }
+
+func TestPromptConnect_ShowsTheDestinationAndOnlyOnceSessionDeny(t *testing.T) {
+	a := New(nil)
+	h := startPromptLoop(t, a)
+	defer func() {
+		a.app.Stop()
+		<-h.errc
+	}()
+	call := make(chan networkCall, 1)
+	go func() {
+		opt, err := a.PromptConnect(context.Background(), "/run/app/db.sock")
+		call <- networkCall{opt, err}
+	}()
+	waitOnLoop(t, a, "connect prompt", func() bool { return a.network != nil && a.pages.HasPage(promptBasePage) })
+	text := screenTextSync(a, h.screen)
+	for _, want := range []string{"Destination: /run/app/db.sock", "allow this [o]nce", "allow for this [s]ession", "[d]eny"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("connect prompt lacks %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"[p]roject", "[g]lobal", "Host:"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("connect prompt shows %q:\n%s", unwanted, text)
+		}
+	}
+	h.key(tcell.KeyEscape)
+	if got := awaitNetworkCall(t, a, call); got.err != nil || got.opt != OptionDeny {
+		t.Fatalf("Esc = %+v, want deny", got)
+	}
+}
+
+func TestPromptConnect_ALongDestinationIsShownWholeEscapedAndPagedToItsSuffix(t *testing.T) {
+	prefix := "/" + strings.Repeat("d", 150) + "/"
+	endsOnAStepMultiple := false
+	for _, tc := range []struct {
+		token, other string
+		middle       int
+	}{{"one", "two", 0}, {"two", "one", 0}, {"one", "two", 8}, {"one", "two", 16}, {"one", "two", 24}, {"one", "two", 32}, {"one", "two", 40}, {"one", "two", 48}} {
+		t.Run(fmt.Sprintf("%s-%d", tc.token, tc.middle), func(t *testing.T) {
+			a := New(nil)
+			h := startPromptLoop(t, a)
+			defer func() {
+				a.app.Stop()
+				<-h.errc
+			}()
+			h.screen.SetSize(40, 10)
+			var segments []string
+			middle := ""
+			for i := range tc.middle {
+				seg := fmt.Sprintf("m%02d", i)
+				segments = append(segments, seg)
+				middle += seg + " "
+			}
+			dest := prefix + "\x1b[2J\u009b" + middle + strings.Repeat(tc.token, 30)
+			call := make(chan networkCall, 1)
+			go func() {
+				opt, err := a.PromptConnect(context.Background(), dest)
+				call <- networkCall{opt, err}
+			}()
+			waitOnLoop(t, a, "connect prompt", func() bool { return a.network != nil && a.pages.HasPage(promptBasePage) })
+			var facts *tview.TextView
+			a.app.QueueUpdate(func() {
+				if bg, ok := a.pages.GetPage(promptBasePage).(*overlayBackground); ok {
+					if flex, ok := bg.inner.(*tview.Flex); ok {
+						facts, _ = flex.GetItem(0).(*tview.TextView)
+					}
+				}
+			})
+			if facts == nil {
+				t.Fatal("connect prompt does not expose its facts as the first overlay item")
+			}
+			var text string
+			a.app.QueueUpdate(func() { text = facts.GetText(false) })
+			if want := "Destination: " + prefix + "\\x1B[2J\\u009B" + middle + strings.Repeat(tc.token, 30) + "\n"; !strings.HasPrefix(text, want) {
+				t.Fatalf("facts = %q, want the whole escaped destination %q", text, want)
+			}
+			suffix := strings.Repeat(tc.token, 3)
+			atOpen := readScreenSync(t, a, h.screen)
+			if strings.Contains(atOpen, suffix) || !strings.Contains(atOpen, "Destination:") {
+				t.Fatalf("test premise broken: the suffix must start off-screen below a visible destination line:\n%s", atOpen)
+			}
+			offset := func() (row, height int) {
+				a.app.QueueUpdate(func() {
+					row, _ = facts.GetScrollOffset()
+					_, _, _, height = facts.GetInnerRect()
+				})
+				return row, height
+			}
+			seen := map[string]bool{}
+			note := func(screen string) {
+				for _, seg := range segments {
+					if strings.Contains(screen, seg) {
+						seen[seg] = true
+					}
+				}
+			}
+			unseen := func() []string {
+				var missing []string
+				for _, seg := range segments {
+					if !seen[seg] {
+						missing = append(missing, seg)
+					}
+				}
+				return missing
+			}
+			page := func(key tcell.Key) (int, string) {
+				h.key(key)
+				settleKeys(h, 0)
+				screen := readScreenSync(t, a, h.screen)
+				row, _ := offset()
+				return row, screen
+			}
+			note(atOpen)
+			last, height := offset()
+			if tc.middle > 0 && height >= promptInfoScrollStep {
+				t.Fatalf("test premise broken: the facts pane must be shorter than the %d-row step, got %d", promptInfoScrollStep, height)
+			}
+			found := false
+			for range 60 {
+				row, screen := page(tcell.KeyPgDn)
+				note(screen)
+				found = found || strings.Contains(screen, suffix)
+				if row == last {
+					break
+				}
+				last = row
+			}
+			got := readScreenSync(t, a, h.screen)
+			if !found || strings.Contains(got, strings.Repeat(tc.other, 3)) || !strings.Contains(got, "[d]eny") {
+				t.Fatalf("paging did not reach the %q suffix with the choices still shown:\n%s", tc.token, got)
+			}
+			if missing := unseen(); len(missing) > 0 {
+				t.Fatalf("paging down skipped destination segments %v", missing)
+			}
+			if tc.middle > 0 && last%promptInfoScrollStep == 0 {
+				endsOnAStepMultiple = true
+			}
+			seen = map[string]bool{}
+			note(got)
+			for last > 0 {
+				row, screen := page(tcell.KeyPgUp)
+				note(screen)
+				if row == last {
+					t.Fatalf("PgUp stuck at row %d", row)
+				}
+				last = row
+			}
+			if missing := unseen(); len(missing) > 0 {
+				t.Fatalf("paging up skipped destination segments %v", missing)
+			}
+			if strings.ContainsAny(got, "\x1b\u009b") {
+				t.Fatalf("connect prompt drew a raw control:\n%q", got)
+			}
+			h.key(tcell.KeyEscape)
+			if got := awaitNetworkCall(t, a, call); got.err != nil || got.opt != OptionDeny {
+				t.Fatalf("Esc = %+v, want deny", got)
+			}
+		})
+	}
+	if !endsOnAStepMultiple {
+		t.Fatalf("test premise broken: no case ends paging on a multiple of the %d-row step", promptInfoScrollStep)
+	}
+}

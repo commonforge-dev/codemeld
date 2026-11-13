@@ -141,6 +141,15 @@ func TestSubmitBoundary_EffortRejectEventIsDurableOnDisk(t *testing.T) {
 // cancellation is the only reason the flush fails. It fails if persist.go ignores a
 // ReasonNone flush failure and proceeds to the settings writes and ApplyUserSelection.
 func TestSubmitBoundary_EffortCancelledFlushRejectsAndPersistsNothing(t *testing.T) {
+	assertCancelledFlushRejectsAndPersistsNothing(t, "/effort high",
+		func(ctx context.Context, app *tui.App, cache *config.Cache, active *model.ActiveState, home string) map[string]tui.HandlerFunc {
+			return map[string]tui.HandlerFunc{"effort": tui.NewEffortHandler(newEffortDeps(ctx, app, cache, active, home))}
+		})
+}
+
+func assertCancelledFlushRejectsAndPersistsNothing(t *testing.T, input string,
+	handlers func(ctx context.Context, app *tui.App, cache *config.Cache, active *model.ActiveState, home string) map[string]tui.HandlerFunc) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	projectRoot := t.TempDir()
@@ -151,11 +160,10 @@ func TestSubmitBoundary_EffortCancelledFlushRejectsAndPersistsNothing(t *testing
 	app.SetCommandFlush(newCommandFlush(ctx, app))
 	active := selectedState() // openai/gpt-5.5/medium, source resume
 
-	effortDeps := newEffortDeps(ctx, app, providerCache(t, projectRoot), active, home)
-	reg := tui.BuildRegistry(map[string]tui.HandlerFunc{"effort": tui.NewEffortHandler(effortDeps)})
+	reg := tui.BuildRegistry(handlers(ctx, app, providerCache(t, projectRoot), active, home))
 
-	if tui.NewSubmitFunc(reg, app, nil)("/effort high") {
-		t.Fatal("/effort high on a cancelled run context must be rejected (retain), not accepted")
+	if tui.NewSubmitFunc(reg, app, nil)(input) {
+		t.Fatalf("%s on a cancelled run context must be rejected (retain), not accepted", input)
 	}
 	if _, err := os.Stat(filepath.Join(projectRoot, ".codemeld", "settings.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("model.active must be absent after a non-write flush failure; stat err = %v", err)

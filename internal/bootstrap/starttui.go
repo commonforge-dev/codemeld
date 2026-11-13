@@ -58,7 +58,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.11"
+var codemeldVersion = "Beta 0.4.12"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -205,6 +205,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	authorizer.blocked = guard.Blocked
 	authorizer.systemOne = systemOne
 	conf.proxyAsker = authorizer.prompts.AskNetwork
+	conf.connectAsker = authorizer.prompts.AskConnect
 	for _, row := range launchRows {
 		authorizer.grants.addRow(row)
 	}
@@ -1531,7 +1532,12 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 		lookupPath = runner.FixedPATH
 	}
 	broker := enforce.BrokerNone
-	if resolution.SliceSelfTestPassed {
+	switch {
+	case resolution.SliceSelfTestPassed && resolution.ConnectSelfTestPassed && resolution.FullSelfTestPassed:
+		broker = enforce.BrokerFull
+	case resolution.SliceSelfTestPassed && resolution.ConnectSelfTestPassed:
+		broker = enforce.BrokerConnect
+	case resolution.SliceSelfTestPassed:
 		broker = enforce.BrokerSlice
 	}
 	return &confinement{
@@ -1540,15 +1546,16 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 			m, _ := modeActive.Current()
 			return string(m)
 		},
-		home:        home,
-		projectRoot: cache.ProjectRoot(),
-		writable:    newWritableFoldersReader(cache),
-		blocked:     guard.Blocked,
-		lookupPath:  lookupPath,
-		lookupSet:   true,
-		tmpDir:      tmpDir,
-		inherited:   inherited,
-		broker:      broker,
-		grants:      cache.DomainGrants(),
+		home:          home,
+		projectRoot:   cache.ProjectRoot(),
+		writable:      newWritableFoldersReader(cache),
+		blocked:       guard.Blocked,
+		lookupPath:    lookupPath,
+		lookupSet:     true,
+		tmpDir:        tmpDir,
+		inherited:     inherited,
+		broker:        broker,
+		grants:        cache.DomainGrants(),
+		connectGrants: cache.ConnectGrants(),
 	}
 }

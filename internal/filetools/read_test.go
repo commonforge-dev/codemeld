@@ -475,3 +475,33 @@ func TestReadTool_BinaryDetection(t *testing.T) {
 		})
 	}
 }
+
+func TestReadTool_SymlinkSwappedAfterCheckRefused(t *testing.T) {
+	for _, tc := range symlinkSwapCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := t.TempDir()
+			writeFile(t, filepath.Join(outside, "f"), "OUTSIDE-SECRET\n")
+			if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			writeFile(t, filepath.Join(root, "sub", "f"), "inside\n")
+			path, target := tc.pick(root, outside)
+			calls := swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, path, target) })
+
+			res, err := invokeRead(t, newReadToolIn(t, root), map[string]any{"path": "sub/f"})
+			if err != nil {
+				t.Fatalf("Invoke error = %v", err)
+			}
+			if *calls != 1 {
+				t.Fatalf("swap ran %d times, want 1", *calls)
+			}
+			if res.ExitCode == 0 {
+				t.Fatalf("read after a symlink swap = exit 0 (%q), want a refusal", res.Stdout)
+			}
+			if strings.Contains(string(res.Stdout)+string(res.Stderr), "OUTSIDE-SECRET") {
+				t.Fatalf("read returned the symlink target's bytes: stdout %q stderr %q", res.Stdout, res.Stderr)
+			}
+		})
+	}
+}

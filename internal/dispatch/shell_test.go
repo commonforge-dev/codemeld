@@ -4660,14 +4660,132 @@ func TestDispatchShell_RelativeProgramPathRunsFromTheStageFolderNotPath(t *testi
 	if err != nil {
 		t.Fatalf("DispatchShell: %v", err)
 	}
-	if len(auth.requests) != 1 || len(auth.requests[0].SubjectTokens) == 0 || auth.requests[0].SubjectTokens[0] != "bin/tool" {
-		t.Fatalf("authorize requests = %+v, want one whose subject starts with bin/tool", auth.requests)
+	stageTool := sub + "/bin/tool"
+	if len(auth.requests) != 1 || len(auth.requests[0].SubjectTokens) == 0 || auth.requests[0].SubjectTokens[0] != stageTool {
+		t.Fatalf("authorize requests = %+v, want one whose subject starts with %s", auth.requests, stageTool)
 	}
 	if strings.TrimSpace(string(res.Stdout)) != "stage" {
 		t.Fatalf("stdout = %q, want the stage folder's bin/tool to run", res.Stdout)
 	}
 	if len(run.calls) != 1 || run.calls[0].Cwd != sub || !reflect.DeepEqual(run.calls[0].Argv, []string{"bin/tool"}) {
 		t.Fatalf("runner calls = %+v, want one bin/tool run in %q", run.calls, sub)
+	}
+}
+
+func TestDispatchShell_RelativeProgramSharesTheBareNameSubjectWhenPathFindsTheSameFile(t *testing.T) {
+	proc := mustEval(t, t.TempDir())
+	home := t.TempDir()
+	folder := proc + "/helpers"
+	writeFixtureProgram(t, folder, "tool", `exit 0`)
+	t.Setenv("PATH", folder+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, input := range []string{"cd helpers && ./tool a", "cd helpers && " + folder + "/tool a", "tool a"} {
+		t.Run(input, func(t *testing.T) {
+			auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"tool a": {decision: grantDecision()}}}
+			run := &fakeRunner{}
+			if _, err := DispatchShell(context.Background(), input, home, proc, auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(auth.requests) != 1 || !reflect.DeepEqual(auth.requests[0].SubjectTokens, []string{"tool", "a"}) {
+				t.Fatalf("authorize requests = %+v, want one with tokens [tool a]", auth.requests)
+			}
+			if len(run.calls) != 1 || filepath.Base(run.calls[0].Argv[0]) != "tool" {
+				t.Fatalf("runner calls = %+v, want one tool run", run.calls)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_RelativeProgramRunsTheFolderFileUnderStrictLookup(t *testing.T) {
+	if _, err := runner.ResolveOnPath("ls", runner.FixedPATH); err != nil {
+		t.Skip("no ls on the fixed PATH")
+	}
+	proc := mustEval(t, t.TempDir())
+	home := t.TempDir()
+	folder := proc + "/helpers"
+	writeFixtureProgram(t, folder, "ls", `exit 0`)
+	writeFixtureProgram(t, folder, "onlyhere", `exit 0`)
+	t.Setenv("PATH", folder+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, tc := range []struct {
+		input    string
+		subjects [][]string
+	}{
+		{"./ls a", [][]string{{"ls", "a"}}},
+		{"./onlyhere a", [][]string{{"onlyhere", "a"}}},
+		{"./ls a && ./onlyhere b", [][]string{{"ls", "a"}, {"onlyhere", "b"}}},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			run := &fakeRunner{}
+			if _, err := DispatchShell(context.Background(), tc.input, home, folder, auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(auth.requests) != len(tc.subjects) || len(run.calls) != len(tc.subjects) {
+				t.Fatalf("authorize requests = %+v, runner calls = %+v, want %d of each", auth.requests, run.calls, len(tc.subjects))
+			}
+			for i, want := range tc.subjects {
+				if !reflect.DeepEqual(auth.requests[i].SubjectTokens, want) {
+					t.Fatalf("request %d tokens = %v, want %v", i, auth.requests[i].SubjectTokens, want)
+				}
+				resolved, err := runner.ResolveOnPath(run.calls[i].Argv[0], runner.FixedPATH)
+				if err != nil {
+					t.Fatalf("ResolveOnPath(%q): %v", run.calls[i].Argv[0], err)
+				}
+				if !filepath.IsAbs(resolved) {
+					resolved = filepath.Join(run.calls[i].Cwd, resolved)
+				}
+				if wantFile := folder + "/" + want[0]; resolved != wantFile {
+					t.Fatalf("call %d argv %v resolves to %q under strict lookup, want %q", i, run.calls[i].Argv, resolved, wantFile)
+				}
+			}
+		})
+	}
+}
+
+func TestDispatchShell_RelativeProgramKeepsItsAbsolutePathWhenTheStageSetsPath(t *testing.T) {
+	proc := mustEval(t, t.TempDir())
+	home := t.TempDir()
+	writeFixtureProgram(t, proc, "tool", `exit 0`)
+	t.Setenv("PATH", proc+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+	run := &fakeRunner{}
+	if _, err := DispatchShell(context.Background(), "PATH="+proc+" ./tool", home, proc, auth, run); err != nil {
+		t.Fatalf("DispatchShell: %v", err)
+	}
+	want := []string{proc + "/tool"}
+	if len(auth.requests) != 1 || !reflect.DeepEqual(auth.requests[0].SubjectTokens, want) {
+		t.Fatalf("authorize requests = %+v, want one with tokens %v", auth.requests, want)
+	}
+	if len(run.calls) != 1 || !reflect.DeepEqual(run.calls[0].Argv, []string{"./tool"}) {
+		t.Fatalf("runner calls = %+v, want one ./tool run", run.calls)
+	}
+}
+
+func TestDispatchShell_RelativeProgramThroughASymlinkRunsThePhysicalParent(t *testing.T) {
+	root := mustEval(t, t.TempDir())
+	home := t.TempDir()
+	folder := root + "/f"
+	writeFixtureProgram(t, folder, "tool", `echo lexical`)
+	writeFixtureProgram(t, root+"/other/inner", "keep", `exit 0`)
+	writeFixtureProgram(t, root+"/other", "tool", `echo physical`)
+	if err := os.Symlink(root+"/other/inner", folder+"/link"); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+	run := &recordingExecRunner{}
+	res, err := DispatchShell(context.Background(), "./link/../tool", home, folder, auth, run)
+	if err != nil {
+		t.Fatalf("DispatchShell: %v", err)
+	}
+	want := []string{root + "/other/tool"}
+	if len(auth.requests) != 1 || !reflect.DeepEqual(auth.requests[0].SubjectTokens, want) {
+		t.Fatalf("authorize requests = %+v, want one with tokens %v", auth.requests, want)
+	}
+	if strings.TrimSpace(string(res.Stdout)) != "physical" {
+		t.Fatalf("stdout = %q, want the file the relative invocation selects", res.Stdout)
 	}
 }
 
@@ -4679,7 +4797,7 @@ func TestDispatchShell_BareProgramGrantCoversNoRelativeSpelling(t *testing.T) {
 	t.Setenv("PATH", proc+string(os.PathListSeparator)+filepath.Join(proc, "bin"))
 	t.Chdir(proc)
 
-	for _, input := range []string{"./tool", "bin/tool", "bin/../bin/tool", `"bin/tool"`, `bin\/tool`} {
+	for _, input := range []string{"bin/tool", "bin/../bin/tool", `"bin/tool"`, `bin\/tool`} {
 		t.Run(input, func(t *testing.T) {
 			auth := &fakeAuthorizer{
 				bySubject: map[string]authBehavior{"tool": {decision: grantDecision()}},

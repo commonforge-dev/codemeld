@@ -6,10 +6,13 @@ package filetools
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // readOpts is the read tool's mode: a path is required.
@@ -731,6 +734,110 @@ func TestResolveReadFile(t *testing.T) {
 			}
 			if reason == "" {
 				t.Fatalf("reason empty, want a non-empty rejection reason for %s", tc.name)
+			}
+		})
+	}
+}
+
+func swapBeforeNoFollowOpen(t *testing.T, swap func()) *int {
+	t.Helper()
+	orig := beforeNoFollowOpen
+	t.Cleanup(func() { beforeNoFollowOpen = orig })
+	calls := 0
+	beforeNoFollowOpen = func() {
+		calls++
+		swap()
+	}
+	return &calls
+}
+
+type symlinkSwapCase struct {
+	name string
+	pick func(root, outside string) (path, target string)
+}
+
+var symlinkSwapCases = []symlinkSwapCase{
+	{"file", func(root, outside string) (string, string) {
+		return filepath.Join(root, "sub", "f"), filepath.Join(outside, "f")
+	}},
+	{"folder", func(root, outside string) (string, string) {
+		return filepath.Join(root, "sub"), outside
+	}},
+}
+
+func TestOpenNoFollowUnder_RefusesPathOutsideBoundary(t *testing.T) {
+	boundary := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	writeFile(t, outside, "secret\n")
+	for _, p := range []string{outside, boundary, filepath.Join(boundary, "..", filepath.Base(outside))} {
+		f, reason := openNoFollowUnder(boundary, p)
+		if f != nil {
+			_ = f.Close()
+			t.Fatalf("openNoFollowUnder(%q, %q) opened a file, want a refusal", boundary, p)
+		}
+		if reason == "" {
+			t.Fatalf("openNoFollowUnder(%q, %q) reason empty, want a refusal reason", boundary, p)
+		}
+	}
+}
+
+func TestOpenNoFollowUnder_FIFORefusedWithoutBlocking(t *testing.T) {
+	boundary := t.TempDir()
+	fifo := filepath.Join(boundary, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+	done := make(chan *os.File, 1)
+	go func() {
+		f, _ := openNoFollowUnder(boundary, fifo)
+		done <- f
+	}()
+	select {
+	case f := <-done:
+		if f != nil {
+			_ = f.Close()
+			t.Fatal("openNoFollowUnder opened a FIFO, want a refusal")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("openNoFollowUnder blocked opening a FIFO with no writer")
+	}
+}
+
+func TestOpenNoFollowUnder_BoundaryOrParentSwappedAfterCheckRefused(t *testing.T) {
+	for _, swapped := range []string{"boundary", "parent"} {
+		t.Run(swapped, func(t *testing.T) {
+			tmp, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatalf("EvalSymlinks: %v", err)
+			}
+			parent := filepath.Join(tmp, "parent")
+			boundary := filepath.Join(parent, "boundary")
+			outside := filepath.Join(tmp, "outside")
+			path, outsideDir := boundary, outside
+			if swapped == "parent" {
+				path, outsideDir = parent, filepath.Join(outside, "boundary")
+			}
+			for _, dir := range []string{boundary, outsideDir} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+			}
+			real := filepath.Join(boundary, "f")
+			writeFile(t, real, "inside\n")
+			writeFile(t, filepath.Join(outsideDir, "f"), "OUTSIDE-SECRET\n")
+			calls := swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, path, outside) })
+
+			f, reason := openNoFollowUnder(boundary, real)
+			if *calls != 1 {
+				t.Fatalf("swap ran %d times, want 1", *calls)
+			}
+			if f != nil {
+				got, _ := io.ReadAll(f)
+				_ = f.Close()
+				t.Fatalf("openNoFollowUnder opened a file after the %s was swapped (content %q), want a refusal", swapped, got)
+			}
+			if reason == "" {
+				t.Fatal("reason empty, want a refusal reason")
 			}
 		})
 	}

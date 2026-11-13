@@ -23,11 +23,13 @@ type Leg struct {
 }
 
 type Resolution struct {
-	Capability          Capability
-	Reason              string
-	Legs                []Leg
-	SelfTestPassed      bool
-	SliceSelfTestPassed bool
+	Capability            Capability
+	Reason                string
+	Legs                  []Leg
+	SelfTestPassed        bool
+	SliceSelfTestPassed   bool
+	ConnectSelfTestPassed bool
+	FullSelfTestPassed    bool
 }
 
 type ResolveInput struct {
@@ -36,6 +38,14 @@ type ResolveInput struct {
 }
 
 var goarch = runtime.GOARCH
+
+var connectSelfTest = func(string, string) (passed bool, reason string) {
+	return false, "connect self-test: " + ErrBrokerUnsupported.Error()
+}
+
+var fullSelfTest = func(string, string) (passed bool, reason string) {
+	return false, "full self-test: " + ErrBrokerUnsupported.Error()
+}
 
 func Resolve(in ResolveInput) Resolution {
 	return resolveFor(runtime.GOOS, in)
@@ -79,6 +89,12 @@ func resolveLinux(in ResolveInput) Resolution {
 	}
 	r.Capability, r.SelfTestPassed = Constrained, true
 	r.SliceSelfTestPassed, _ = sliceSelfTest(home, exe)
+	if r.SliceSelfTestPassed {
+		r.ConnectSelfTestPassed, _ = connectSelfTest(home, exe)
+	}
+	if r.ConnectSelfTestPassed {
+		r.FullSelfTestPassed, _ = fullSelfTest(home, exe)
+	}
 	return r
 }
 

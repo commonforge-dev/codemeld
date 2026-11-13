@@ -241,6 +241,14 @@ func TestValidate_Accepts(t *testing.T) {
 `,
 		},
 		{
+			"connect_grants endpoints and socket paths",
+			`connect_grants:
+  - 127.0.0.1:5436
+  - "[::1]:5436"
+  - /run/postgresql/.s.PGSQL.5432
+`,
+		},
+		{
 			"writable_folders shape only, no path rules",
 			`writable_folders:
   - /data/x
@@ -824,6 +832,9 @@ func TestValidate_Rejects(t *testing.T) {
 `,
 			"blocked_paths",
 		},
+		{"connect_grants scalar", "connect_grants: 127.0.0.1:5436\n", "connect_grants"},
+		{"connect_grants non-string entry", "connect_grants:\n  - 5436\n", "connect_grants.0"},
+		{"connect_grants empty entry", "connect_grants:\n  - \"\"\n", "connect_grants.0"},
 		{
 			"writable_folders scalar",
 			`writable_folders: /data/x

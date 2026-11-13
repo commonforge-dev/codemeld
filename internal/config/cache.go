@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -122,6 +123,8 @@ type Cache struct {
 
 	domainGrants []string
 
+	connectGrants []string
+
 	modelActive      any
 	hasModelActive   bool
 	modelLastUsed    any
@@ -162,6 +165,10 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 	if err != nil {
 		return nil, err
 	}
+	connectGrants, err := parseConnectGrants(composed)
+	if err != nil {
+		return nil, err
+	}
 
 	c := &Cache{
 		projectRoot:            projectRoot,
@@ -182,6 +189,7 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		declaredCommands:       declaredCommands,
 		writableFolders:        parseWritableFolders(composed, projectRoot, home),
 		domainGrants:           domainGrants,
+		connectGrants:          connectGrants,
 	}
 	if len(home) > 0 {
 		c.launchHome = home[0]
@@ -327,6 +335,8 @@ func (c *Cache) MaxToolOutputBytes() int { return c.maxToolOutputBytes }
 func (c *Cache) VCSPriority() []string { return slices.Clone(c.vcsPriority) }
 
 func (c *Cache) DomainGrants() []string { return slices.Clone(c.domainGrants) }
+
+func (c *Cache) ConnectGrants() []string { return slices.Clone(c.connectGrants) }
 
 // VCSForce returns vcs.force, or "" when unset.
 func (c *Cache) VCSForce() string { return c.vcsForce }
@@ -799,6 +809,26 @@ func parseDomainGrants(composed map[string]any) ([]string, error) {
 			return nil, fmt.Errorf("config: %s.%d port must be a whole number from 1 to 65535", domainGrantsKey, i)
 		}
 		grants = append(grants, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return grants, nil
+}
+
+func parseConnectGrants(composed map[string]any) ([]string, error) {
+	list, _, err := layerList(composed, connectGrantsKey)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	grants := make([]string, 0, len(list))
+	for i, item := range list {
+		s, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("config: %s.%d is not a string, got %T", connectGrantsKey, i, item)
+		}
+		ap, perr := netip.ParseAddrPort(s)
+		if (perr != nil || ap.Port() == 0) && !filepath.IsAbs(s) {
+			return nil, fmt.Errorf("config: %s.%d must be an IP:port endpoint or an absolute socket path, got %q", connectGrantsKey, i, s)
+		}
+		grants = append(grants, s)
 	}
 	return grants, nil
 }

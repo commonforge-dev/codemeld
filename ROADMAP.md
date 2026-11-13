@@ -3,7 +3,6 @@
 ## Future work
 ### 2027
 - Mac - currently compiles, but not tested
-- Sandboxed commands can connect to local services you approve, such as a database or a test's own server
 
 ### 2026
 - FreeBSD
@@ -13,6 +12,9 @@
 ## Ongoing
 
 ## Completed
+- **0.4.12 Beta — November 2026:**
+  - Sandboxed commands can connect to local services you approve, such as a database or a test's own server
+  - Fix for the v0.4.11 known issue with switching sessions, and a partial fix for the one with reading files
 - **0.4.11 Beta — November 2026:**
   - Sandboxed shell commands with wildcards (such as *.go) run instead of being refused
   - Sandboxed shell commands with $(), heredocs, for/while loops and cd run instead of being refused

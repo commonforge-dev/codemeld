@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -417,6 +418,17 @@ func TestValidateLocalSettingsBytes_AcceptsDomainGrants(t *testing.T) {
 	}
 	if _, ok := raw["domain_grants"]; !ok {
 		t.Fatalf("raw = %v, want domain_grants preserved", raw)
+	}
+}
+
+func TestValidateLocalSettingsBytes_AcceptsConnectGrants(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.local.yaml")
+	raw, cat, err := ValidateLocalSettingsBytes([]byte("connect_grants:\n  - 127.0.0.1:5436\n"), path)
+	if cat != LoadOK || err != nil {
+		t.Fatalf("cat = %q, err = %v; want LoadOK and nil", cat, err)
+	}
+	if !reflect.DeepEqual(raw["connect_grants"], []any{"127.0.0.1:5436"}) {
+		t.Fatalf("raw = %v, want connect_grants preserved", raw)
 	}
 }
 

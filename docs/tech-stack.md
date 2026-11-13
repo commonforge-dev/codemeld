@@ -48,23 +48,24 @@ strictly optional: the feature degrades to a friendly notice when none is instal
 
 ### Build & test commands
 
-Use the mise tasks, not raw `go`/`golangci-lint` invocations — they encode the correct flags:
+Use the mise tasks, not raw `go`/`golangci-lint` invocations: they encode the correct flags. Run
+`mise tasks` to list them with a one-line description each. This section covers only what that
+listing does not show.
 
-- `mise run build` — builds `./cmd/codemeld` into a `./codemeld` static binary at the repo root (`CGO_ENABLED=0`)
-- `mise run test` — `go test -race ./...` (race detector; cgo defaults on, which `-race` requires)
-- `mise run test-fast` — `go test ./...` (no race detector; faster, reuses the normal build cache)
-- `mise run test-pkg <packages> [go test flags]` — `go test` on only the packages given, e.g. `mise run test-pkg ./internal/ids -run TestNewV7`; fails without arguments. Put package paths before any `go test` flags. For testing one package while other work is in progress, not a gate
-- `mise run fuzz-slash` — `go test ./internal/tui -run=^$ -fuzz=FuzzSlashParse -fuzztime=30s` (local slash-parser fuzz run; future hosted CI should call this task once an external CI runner is chosen)
-- `mise run vet` — `go vet ./...`
-- `mise run lint` — `golangci-lint run` (includes the `govet` analyzers, so it subsumes `mise run vet`)
-- `mise run fmt` — `gofmt -w .`
-- `mise run check-dev` — lint → `test-fast` → `wiring-stub-check`, fail-fast. The iterative review-fix/dev loop; it deliberately skips `deadcode-check` so deadcode does not become a repeated review-round penalty.
-- `mise run check` — lint → `test-fast` → `deadcode-check` → `wiring-stub-check` → `oss-reference-check`, fail-fast. The final local gate before proposing a code change. It omits a separate `go vet` (lint already runs govet) and skips the race detector to stay fast.
-- `mise run snapshot-update` — `CODEMELD_UPDATE_SNAPSHOTS=1 go test ./internal/agentinstr/...`: the one command that rewrites the system-prompt golden fixtures. It fails on purpose after rewriting them; review the diff, then run `mise run check`. See gate 1 in `docs/gated-changes.md`.
-- `mise run check-race` — lint → `test` (race) → `deadcode-check` → `wiring-stub-check` → `oss-reference-check`, fail-fast. The authoritative gate; run it once at the integration boundary, before pushing.
-- `mise run release-check` — the **release** gate: runs `oss-reference-check` → `oss-secret-scan` → `go vet ./...` → `govulncheck ./...` through `scripts/govulncheck-gate.sh`, fail-fast, so the first failing check stops the rest. Only the secret scan and the vulnerability gate are exclusive to it; the reference check already ran in `check` / `check-race`. `go vet` runs standalone here so the release gate does not lean on the lint task, and `govulncheck` checks the module against the Go vulnerability database; `CODEMELD_VULN_EXCEPTIONS` can name an optional exceptions file whose entries stay active through the seventh day after their date. Run it before exporting to the public repo. `mise run oss-gate-selftest` exercises the scanners against fixtures.
+Which gate to run when, each fail-fast:
 
-So race coverage moves from every dev iteration to the integration boundary: a data race surfaces when work is integrated rather than on each local gate, but still before it leaves `main/`. Static reachability and the shipping-set reference check run in `check` and `check-race`; all three gates call `wiring-stub-check`, but the real stale-stub check runs only in the development tree, where a development-only mise overlay that does not ship replaces it. In the public tree `wiring-stub-check` is an intentionally inactive step that does nothing.
+- `mise run check-dev` while iterating on review fixes. It skips `deadcode-check` so deadcode does
+  not become a repeated review-round penalty.
+- `mise run check` before proposing a code change. It skips the race detector to stay fast, and runs
+  no separate `go vet` because `lint` already runs the `govet` analyzers.
+- `mise run check-race` once at the integration boundary, before pushing. The authoritative gate.
+- `mise run release-check` before exporting to the public repo. It runs `go vet` itself so the
+  release gate does not lean on `lint`.
+
+`mise run test-pkg` takes package paths before any `go test` flags and fails without arguments; it is
+for testing one package while other work is in progress, not a gate.
+
+Race coverage therefore sits at the integration boundary, not every dev iteration: a data race surfaces when work is integrated rather than on each local gate, but still before it leaves `main/`. Static reachability and the shipping-set reference check run in `check` and `check-race`; all three gates call `wiring-stub-check`, but the real stale-stub check runs only in the development tree, where a development-only mise overlay that does not ship replaces it. In the public tree `wiring-stub-check` is an intentionally inactive step that does nothing.
 
 The two open-source scans are split by what they cost to run. `oss-reference-check` is a local scan over the shipping-file list (grep, plus a small awk lexer that pulls the comment text out of Go files), so it runs in `check` and `check-race` as well as `release-check`: it fails if a shipping file reintroduces an internal requirement-number tag, a pointer to internal-only files, or a task or ADR id (in Go files, only in comments), and keeping it in the everyday gates stops that drift at the edit that caused it rather than at release. `oss-secret-scan` stays release-only — it fails on credential-shaped values, session-dump paths, or private developer-machine paths inside a shipping file, and those only have to be absent when the project ships. Both read one shared shipping-file list (`scripts/oss-shipping-files.sh`) so they cannot drift. That list is built with `find` over the shipping roots rather than from the VCS manifest, so an untracked scratch file under one of them is scanned like a committed one. See `docs/gated-changes.md` for the fix steps.
 

@@ -7753,6 +7753,38 @@ func TestStartTUI_EventLoopReturnWithAPendingNetworkPromptCleansUpWithoutAUIAckn
 	}
 }
 
+func TestStartTUI_ConnectAskerReachesTheConnectPrompt(t *testing.T) {
+	l := startLiveStartTUI(t, &BootstrapResult{Home: t.TempDir(), LaunchDir: "/launch", Session: mkStore(t)})
+	l.conf.approvals = &connectApprovals{held: map[any]*os.File{}}
+	for _, tc := range []struct {
+		dest string
+		key  rune
+		want connectResult
+	}{
+		{"192.0.2.7:5432", 'o', connectResult{"prompt once", ""}},
+		{"/run/app/db.sock", 's', connectResult{"prompt session", ""}},
+	} {
+		done := answerConnectAsync(l.conf, tc.dest, tc.dest)
+		waitScreen(t, l.app, l.screen, "Destination: "+tc.dest, true)
+		l.screen.InjectKey(tcell.KeyRune, tc.key, tcell.ModNone)
+		if got := awaitConnect(t, done); got != tc.want {
+			t.Fatalf("connect to %s = %+v, want %+v", tc.dest, got, tc.want)
+		}
+	}
+	done := answerConnectAsync(l.conf, "/run/app/cache.sock", "/run/app/cache.sock")
+	waitScreen(t, l.app, l.screen, "Destination: /run/app/cache.sock", true)
+	l.app.BeginShutdown()
+	if got := awaitConnect(t, done); got != (connectResult{"", "not approved (session ended)"}) {
+		t.Fatalf("connect prompt open when the app closed = %+v, want not approved (session ended)", got)
+	}
+	if err := l.screen.PostEvent(tcell.NewEventError(errors.New("terminal lost"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.awaitReturn(t); err == nil || !strings.Contains(err.Error(), "TUI run failed") {
+		t.Fatalf("StartTUI error = %v, want the event loop's failure", err)
+	}
+}
+
 func TestStartTUI_SavedNetworkAnswersWriteToTheRunsTargets(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

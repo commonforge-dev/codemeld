@@ -69,8 +69,10 @@ var probes = map[string]probe{
 		}
 		return probeAllowed
 	}},
-	"tcp-connect-main":   {2, tcpConnectMainProbe},
-	"tcp-connect-thread": {2, tcpConnectThreadProbe},
+	"tcp-connect-main":    {2, connectMainProbe(tcpSocket)},
+	"tcp-connect-thread":  {2, connectThreadProbe(tcpSocket)},
+	"unix-connect-main":   {2, connectMainProbe(unixSocket)},
+	"unix-connect-thread": {2, connectThreadProbe(unixSocket)},
 	"tcp-bind": {1, func(a []string) int {
 		fd, sa, err := tcpSocket(a[0])
 		if err != nil {
@@ -87,6 +89,12 @@ var probes = map[string]probe{
 		defer func() { _ = unix.Close(fd) }()
 		return targetExit(unix.Listen(fd, 1))
 	}},
+	"tcp-bind-listen-connect-main":   {0, onMainThread(bindListenConnect)},
+	"tcp-bind-listen-connect-thread": {0, onOtherThread(bindListenConnect)},
+	"unix-bind-main":                 {1, onMainThread(unixBind)},
+	"unix-bind-thread":               {1, onOtherThread(unixBind)},
+	"setsockopt-reuseport":           {0, setsockoptProbe(unix.SO_REUSEPORT)},
+	"setsockopt-reuseaddr":           {0, setsockoptProbe(unix.SO_REUSEADDR)},
 	"tcp-fastopen": {1, func(a []string) int {
 		fd, sa, err := tcpSocket(a[0])
 		if err != nil {
@@ -159,31 +167,106 @@ func targetExit(err error) int {
 	}
 }
 
-func tcpConnectMainProbe(a []string) int {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	return tcpConnectAs(true, a)
+func unixSocket(path string) (int, unix.Sockaddr, error) {
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	return fd, &unix.SockaddrUnix{Name: path}, err
 }
 
-func tcpConnectThreadProbe(a []string) int {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if unix.Gettid() != unix.Getpid() {
+func connectMainProbe(open func(string) (int, unix.Sockaddr, error)) func([]string) int {
+	return onMainThread(func(a []string) int { return connectAs(open, true, a) })
+}
+
+func connectThreadProbe(open func(string) (int, unix.Sockaddr, error)) func([]string) int {
+	return onOtherThread(func(a []string) int { return connectAs(open, false, a) })
+}
+
+func onMainThread(run func([]string) int) func([]string) int {
+	return func(a []string) int {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if unix.Gettid() != unix.Getpid() {
+			return probeFailed
+		}
+		return run(a)
+	}
+}
+
+func onOtherThread(run func([]string) int) func([]string) int {
+	return func(a []string) int {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if unix.Gettid() != unix.Getpid() {
+			return probeFailed
+		}
+		got := make(chan int)
+		go func() {
+			runtime.LockOSThread()
+			if unix.Gettid() == unix.Getpid() {
+				got <- probeFailed
+				return
+			}
+			got <- run(a)
+		}()
+		return <-got
+	}
+}
+
+func bindListenConnect([]string) int {
+	fd, sa, err := tcpSocket("127.0.0.1:0")
+	if err != nil {
 		return probeFailed
 	}
-	got := make(chan int)
-	go func() {
-		runtime.LockOSThread()
-		got <- tcpConnectAs(false, a)
-	}()
-	return <-got
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Bind(fd, sa); err != nil {
+		return targetExit(err)
+	}
+	if err := unix.Listen(fd, 1); err != nil {
+		return targetExit(err)
+	}
+	local, err := unix.Getsockname(fd)
+	if err != nil {
+		return probeFailed
+	}
+	peer, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return probeFailed
+	}
+	defer func() { _ = unix.Close(peer) }()
+	return targetExit(unix.Connect(peer, local))
 }
 
-func tcpConnectAs(leader bool, a []string) int {
+func unixBind(a []string) int {
+	fd, sa, err := unixSocket(a[0])
+	if err != nil {
+		return probeFailed
+	}
+	defer func() { _ = unix.Close(fd) }()
+	switch err := unix.Bind(fd, sa); {
+	case err == nil:
+		return probeAllowed
+	case errors.Is(err, unix.EACCES):
+		return probeDenied
+	default:
+		return probeFailed
+	}
+}
+
+func setsockoptProbe(opt int) func([]string) int {
+	return func([]string) int {
+		fd, _, err := tcpSocket("127.0.0.1:0")
+		if err != nil {
+			return probeFailed
+		}
+		defer func() { _ = unix.Close(fd) }()
+		return targetExit(unix.SetsockoptInt(fd, unix.SOL_SOCKET, opt, 1))
+	}
+}
+
+func connectAs(open func(string) (int, unix.Sockaddr, error), leader bool, a []string) int {
 	if (unix.Gettid() == unix.Getpid()) != leader {
 		return probeFailed
 	}
-	fd, sa, err := tcpSocket(a[0])
+	fd, sa, err := open(a[0])
 	if err != nil {
 		return probeFailed
 	}
@@ -383,10 +466,10 @@ func runProbe(s *helperState, args []string) int {
 		return probeFailed
 	}
 	if args[0] == "rlimits" {
-		if len(args) != 1 {
+		if len(args) != 1 || !s.rlimitsSet {
 			return probeFailed
 		}
-		return rlimitsProbe(s.nproc)
+		return rlimitsProbe(s.fsize, s.nproc)
 	}
 	p, ok := probes[args[0]]
 	if !ok || len(args)-1 != p.n {
@@ -406,13 +489,10 @@ func probeExit(err error) int {
 	}
 }
 
-func rlimitsProbe(nproc uint64) int {
-	if nproc == 0 {
-		return probeFailed
-	}
-	for resource, want := range map[int]uint64{unix.RLIMIT_FSIZE: fsizeLimit, unix.RLIMIT_NPROC: nproc} {
+func rlimitsProbe(fsize, nproc unix.Rlimit) int {
+	for resource, want := range map[int]unix.Rlimit{unix.RLIMIT_FSIZE: fsize, unix.RLIMIT_NPROC: nproc} {
 		var got unix.Rlimit
-		if err := getrlimit(resource, &got); err != nil || got.Cur != want || got.Max != want {
+		if err := getrlimit(resource, &got); err != nil || got != want {
 			return probeFailed
 		}
 	}

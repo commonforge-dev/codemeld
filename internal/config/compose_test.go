@@ -662,3 +662,28 @@ func TestCompose_EmptyLocalDomainGrantsKeepGlobalOnes(t *testing.T) {
 		t.Fatalf("domain_grants = %#v, want %#v", got["domain_grants"], want)
 	}
 }
+
+func TestCompose_ConnectGrantsComeFromGlobalAndLocalOnly(t *testing.T) {
+	global := map[string]any{"connect_grants": []any{"127.0.0.1:5436"}}
+	project := map[string]any{"connect_grants": []any{"/project/socket"}}
+	local := map[string]any{"connect_grants": []any{"/run/postgresql/.s.PGSQL.5432"}}
+
+	got, err := Compose(global, project, local)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	want := []any{"127.0.0.1:5436", "/run/postgresql/.s.PGSQL.5432"}
+	if !reflect.DeepEqual(got["connect_grants"], want) {
+		t.Fatalf("connect_grants = %#v, want %#v", got["connect_grants"], want)
+	}
+}
+
+func TestCompose_CommittedConnectGrantsAloneAreDropped(t *testing.T) {
+	got, err := Compose(nil, map[string]any{"connect_grants": []any{"/project/socket"}}, nil)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	if v, ok := got["connect_grants"]; ok {
+		t.Fatalf("connect_grants = %#v, want the committed project list dropped", v)
+	}
+}

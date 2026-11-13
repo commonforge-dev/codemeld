@@ -83,6 +83,38 @@ func applyLandlock(p Policy) error {
 	return restrictPaths(opts...)
 }
 
+func restrictThreadMakeSock(rules []pathRule) error {
+	rs, err := llsys.LandlockCreateRuleset(&llsys.RulesetAttr{HandledAccessFS: llsys.AccessFSMakeSock}, 0)
+	if err != nil {
+		return fmt.Errorf("landlock_create_ruleset: %w", err)
+	}
+	defer func() { _ = unix.Close(rs) }()
+	for _, r := range rules {
+		if r.Access&llsys.AccessFSMakeSock == 0 {
+			continue
+		}
+		fd, err := unix.Open(r.Path, unix.O_PATH|unix.O_CLOEXEC, 0)
+		if err == unix.ENOENT {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("open %s: %w", r.Path, err)
+		}
+		err = llsys.LandlockAddPathBeneathRule(rs, &llsys.PathBeneathAttr{AllowedAccess: llsys.AccessFSMakeSock, ParentFd: fd}, 0)
+		_ = unix.Close(fd)
+		if err != nil {
+			return fmt.Errorf("landlock_add_rule %s: %w", r.Path, err)
+		}
+	}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("no_new_privs: %w", err)
+	}
+	if err := llsys.LandlockRestrictSelf(rs, 0); err != nil {
+		return fmt.Errorf("landlock_restrict_self: %w", err)
+	}
+	return nil
+}
+
 const tmpReplacedNote = "codemeld: the session's private temp folder was moved or replaced since codemeld created it; Plan commands run without it. Restart codemeld to get a new one."
 
 type heldTmp struct {

@@ -38,9 +38,11 @@ func legForCall(probe string, p Policy) string {
 func stubStarter(t *testing.T, result func(mode, leg string) helperExit) *[]helperCall {
 	t.Helper()
 	t.Setenv("TMPDIR", t.TempDir())
-	old, oldSlice := startHelper, sliceSelfTest
-	t.Cleanup(func() { startHelper, sliceSelfTest = old, oldSlice })
+	old, oldSlice, oldConnect, oldFull := startHelper, sliceSelfTest, connectSelfTest, fullSelfTest
+	t.Cleanup(func() { startHelper, sliceSelfTest, connectSelfTest, fullSelfTest = old, oldSlice, oldConnect, oldFull })
 	sliceSelfTest = func(string, string) (bool, string) { return false, "test: slice check stubbed" }
+	connectSelfTest = func(string, string) (bool, string) { return false, "test: connect check stubbed" }
+	fullSelfTest = func(string, string) (bool, string) { return false, "test: full check stubbed" }
 	var calls []helperCall
 	startHelper = func(_ context.Context, argv, env []string, dir string, frame []byte) helperExit {
 		p, err := ReadPolicyFrame(bytes.NewReader(frame))

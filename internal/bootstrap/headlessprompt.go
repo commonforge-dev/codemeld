@@ -197,6 +197,70 @@ func (p *terminalPrompter) askNetwork(ctx context.Context, host, port string, co
 	return d, nil
 }
 
+func (p *terminalPrompter) askConnect(ctx context.Context, dest string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+	var ended <-chan struct{}
+	if p.runCtx != nil {
+		ended = p.runCtx.Done()
+	}
+	if err := p.gate.acquireUntil(ctx, ended); err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	defer p.gate.release()
+	if p.runEnded() != nil {
+		return netproxy.DecisionDeny, errAppShuttingDown
+	}
+	if covered() {
+		return netproxy.DecisionOnce, nil
+	}
+	if p.readErr != nil {
+		return netproxy.DecisionDeny, p.readErr
+	}
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if p.runCtx != nil {
+		defer context.AfterFunc(p.runCtx, cancel)()
+	}
+	notifier := tui.StartPromptNotifier(readCtx, p.after, p.notify)
+	defer notifier.Stop()
+	p.renderConnect(dest)
+	read, err := p.readLine(readCtx)
+	if p.runEnded() != nil {
+		return netproxy.DecisionDeny, errAppShuttingDown
+	}
+	if err == nil && read.err != nil && !errors.Is(read.err, io.EOF) {
+		err = read.err
+	}
+	if err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	var d netproxy.Decision
+	switch strings.ToLower(strings.TrimSpace(read.line)) {
+	case "1", "allow", "allow-once", "once", "o":
+		d = netproxy.DecisionOnce
+	case "3", "session", "allow-session", "s":
+		d = netproxy.DecisionSession
+	case "2", "deny", "d":
+		return netproxy.DecisionDeny, nil
+	default:
+		return netproxy.DecisionDeny, errors.New("bootstrap: the connect prompt answer is not one it offered")
+	}
+	accept(d)
+	return d, nil
+}
+
+func (p *terminalPrompter) renderConnect(dest string) {
+	p.outMu.Lock()
+	defer p.outMu.Unlock()
+	_, _ = fmt.Fprintln(p.out)
+	_, _ = fmt.Fprintln(p.out, "codemeld: approval required for a connection (nothing pre-authorized it)")
+	_, _ = fmt.Fprintf(p.out, "  destination: %s\n", permissions.SingleLineControlEscape(dest))
+	_, _ = fmt.Fprintln(p.out, "  the command can send data to this destination")
+	_, _ = fmt.Fprintln(p.out, "  [1] allow once          — allow this connection; the next connection here asks again")
+	_, _ = fmt.Fprintln(p.out, "  [2] deny                — refuse this connection")
+	_, _ = fmt.Fprintln(p.out, "  [3] allow this session  — allow this destination until codemeld exits")
+	_, _ = fmt.Fprint(p.out, "codemeld: choose 1-3: ")
+}
+
 func (p *terminalPrompter) networkLive(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err

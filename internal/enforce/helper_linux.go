@@ -17,9 +17,11 @@ var (
 )
 
 type helperState struct {
-	args   []string
-	policy Policy
-	nproc  uint64
+	args       []string
+	policy     Policy
+	fsize      unix.Rlimit
+	nproc      unix.Rlimit
+	rlimitsSet bool
 }
 
 type helperStep struct {
@@ -30,7 +32,11 @@ type helperStep struct {
 var helperSteps = []helperStep{
 	{"lock thread", func(*helperState) error { lockOSThread(); return nil }},
 	{"policy frame", func(s *helperState) (err error) { s.policy, err = ReadPolicyFrame(os.Stdin); return err }},
-	{"rlimits", func(s *helperState) (err error) { s.nproc, err = applyRlimits(); return err }},
+	{"rlimits", func(s *helperState) (err error) {
+		s.fsize, s.nproc, err = applyRlimits()
+		s.rlimitsSet = err == nil
+		return err
+	}},
 	{"no_new_privs", func(*helperState) error {
 		if _, _, errno := allThreadsSyscall(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
 			return errno

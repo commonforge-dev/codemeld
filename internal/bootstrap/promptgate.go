@@ -230,6 +230,7 @@ type PromptGateBuilder struct {
 	show            promptShower
 	showIndependent independentShower
 	showNetwork     func(ctx context.Context, host, port string, projectChoice bool) (tui.PromptOption, error)
+	showConnect     func(ctx context.Context, dest string) (tui.PromptOption, error)
 	whileRunning    func(func()) bool
 	ended           <-chan struct{}
 
@@ -247,6 +248,7 @@ func NewPromptGateBuilder(app *tui.App) *PromptGateBuilder {
 	b := newPromptGateBuilder(app.PromptUser)
 	b.showIndependent = app.PromptIndependent
 	b.showNetwork = app.PromptNetwork
+	b.showConnect = app.PromptConnect
 	b.whileRunning = app.WhileRunning
 	b.ended = app.Done()
 	return b
@@ -289,6 +291,40 @@ func (b *PromptGateBuilder) AskNetwork(ctx context.Context, host, port string, c
 		d = netproxy.DecisionSession
 	default:
 		return netproxy.DecisionDeny, fmt.Errorf("bootstrap: unknown network prompt option %d", opt)
+	}
+	if !b.whileRunning(func() { accept(d) }) {
+		return netproxy.DecisionDeny, errAppShuttingDown
+	}
+	return d, nil
+}
+
+func (b *PromptGateBuilder) AskConnect(ctx context.Context, dest string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error) {
+	if err := b.gate.acquireUntil(ctx, b.ended); err != nil {
+		return netproxy.DecisionDeny, err
+	}
+	defer b.gate.release()
+	if covered() {
+		return netproxy.DecisionOnce, nil
+	}
+	opt, err := b.showConnect(ctx, dest)
+	if err != nil {
+		select {
+		case <-b.ended:
+			return netproxy.DecisionDeny, errAppShuttingDown
+		default:
+		}
+		return netproxy.DecisionDeny, err
+	}
+	var d netproxy.Decision
+	switch opt {
+	case tui.OptionDeny:
+		return netproxy.DecisionDeny, nil
+	case tui.OptionAllowOnce:
+		d = netproxy.DecisionOnce
+	case tui.OptionAllowSession:
+		d = netproxy.DecisionSession
+	default:
+		return netproxy.DecisionDeny, fmt.Errorf("bootstrap: the connect prompt did not offer option %d", opt)
 	}
 	if !b.whileRunning(func() { accept(d) }) {
 		return netproxy.DecisionDeny, errAppShuttingDown

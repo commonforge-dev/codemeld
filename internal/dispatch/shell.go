@@ -271,6 +271,7 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 		}
 		return tools.Result{}, err
 	}
+	resolveStagePrograms(split.Stages, scope)
 
 	modeCtx := permissions.ModeContext{
 		Class:        permissions.ClassMutating,
@@ -288,6 +289,7 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 	}
 	if split.LiteralRoute {
 		if wrapped, stages, operators, ok := permissions.SimpleCompoundStages(split.LiteralInput); ok && !wrapped && onlyStagedOperators(operators) {
+			resolveStagePrograms(stages, scope)
 			reroute, err := confinedStagesNeedShell(ctx, runner, stages, scope, home)
 			if err != nil {
 				return tools.Result{}, err
@@ -805,6 +807,20 @@ func stageProgramResolves(stage permissions.StageNormalization, program string, 
 	return err == nil
 }
 
+func resolveStagePrograms(stages []permissions.StageNormalization, scope string) {
+	for i := range stages {
+		stage := &stages[i]
+		if len(stage.Tokens) == 0 {
+			continue
+		}
+		resolved := permissions.ResolveRelativeProgram(stage.Tokens[0], scope, stage.ClearEnvironment || assignsPath(stage.Assignments))
+		if resolved != stage.Tokens[0] {
+			stage.ExecProgram = stage.Tokens[0]
+			stage.Tokens[0] = resolved
+		}
+	}
+}
+
 func assignsPath(assignments []string) bool {
 	return slices.ContainsFunc(assignments, func(a string) bool { return strings.HasPrefix(a, "PATH=") })
 }
@@ -1028,20 +1044,23 @@ func onlyStagedOperators(operators []string) bool {
 // literal token, which fails as it did before) so an unresolved home never yields a bare-root path.
 // A stage with no expandable token returns stage.Tokens unchanged.
 func execArgv(stage permissions.StageNormalization, home string) []string {
-	if home == "" {
-		return stage.Tokens
+	argv := stage.Tokens
+	copied := false
+	if stage.ExecProgram != "" && len(argv) > 0 {
+		argv = append([]string{stage.ExecProgram}, argv[1:]...)
+		copied = true
 	}
-	var argv []string
-	for i := range stage.Tokens {
+	if home == "" {
+		return argv
+	}
+	for i := range argv {
 		if i < len(stage.ExecForms) && stage.ExecForms[i].Expand {
-			if argv == nil {
-				argv = append([]string(nil), stage.Tokens...)
+			if !copied {
+				argv = append([]string(nil), argv...)
+				copied = true
 			}
 			argv[i] = home + stage.ExecForms[i].Suffix
 		}
-	}
-	if argv == nil {
-		return stage.Tokens
 	}
 	return argv
 }

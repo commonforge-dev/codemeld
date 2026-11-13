@@ -51,27 +51,48 @@ func TestResolveNamesTheFirstMismatchedLeg(t *testing.T) {
 func TestResolveRecordsTheSliceCheckApartFromTheBaseResult(t *testing.T) {
 	withArch(t, "amd64")
 	type call struct{ home, exe string }
-	stubSlice := func(t *testing.T, passed bool) *[]call {
+	stubCheck := func(t *testing.T, check *func(string, string) (bool, string), passed bool) *[]call {
 		var calls []call
-		setVar(t, &sliceSelfTest, func(home, exe string) (bool, string) {
+		setVar(t, check, func(home, exe string) (bool, string) {
 			calls = append(calls, call{home, exe})
 			if passed {
 				return true, ""
 			}
-			return false, "slice self-test: tcp-connect-main: helper exit 1, want 0"
+			return false, "self-test: helper exit 1, want 0"
 		})
 		return &calls
 	}
-	for _, passed := range []bool{true, false} {
+	for _, c := range []struct{ slice, connect, full, wantConnect, wantFull bool }{
+		{slice: true, connect: true, full: true, wantConnect: true, wantFull: true},
+		{slice: true, connect: true, full: false, wantConnect: true, wantFull: false},
+		{slice: true, connect: false, full: true, wantConnect: false, wantFull: false},
+		{slice: false, connect: true, full: true, wantConnect: false, wantFull: false},
+		{slice: false, connect: false, full: false, wantConnect: false, wantFull: false},
+	} {
 		stubStarter(t, expectedExit)
-		calls := stubSlice(t, passed)
+		calls := stubCheck(t, &sliceSelfTest, c.slice)
+		connectCalls := stubCheck(t, &connectSelfTest, c.connect)
+		fullCalls := stubCheck(t, &fullSelfTest, c.full)
 		home := homeWithCodemeld(t)
 		got := resolveFor("linux", ResolveInput{Home: home + "/.", HelperExecutable: "/opt/codemeld"})
-		if got.Capability != Constrained || !got.SelfTestPassed || got.Reason != "" || got.SliceSelfTestPassed != passed {
-			t.Errorf("slice check passed=%v: Resolve() = %+v, want the base Constrained result with slice %v", passed, got, passed)
+		if got.Capability != Constrained || !got.SelfTestPassed || got.Reason != "" || got.SliceSelfTestPassed != c.slice || got.ConnectSelfTestPassed != c.wantConnect || got.FullSelfTestPassed != c.wantFull {
+			t.Errorf("%+v: Resolve() = %+v, want the base Constrained result with slice %v, connect %v, full %v", c, got, c.slice, c.wantConnect, c.wantFull)
 		}
 		if want := []call{{home, "/opt/codemeld"}}; !slices.Equal(*calls, want) {
-			t.Errorf("slice check passed=%v: calls = %v, want %v", passed, *calls, want)
+			t.Errorf("%+v: slice calls = %v, want %v", c, *calls, want)
+		}
+		var wantConnectCalls, wantFullCalls []call
+		if c.slice {
+			wantConnectCalls = []call{{home, "/opt/codemeld"}}
+		}
+		if c.wantConnect {
+			wantFullCalls = []call{{home, "/opt/codemeld"}}
+		}
+		if !slices.Equal(*connectCalls, wantConnectCalls) {
+			t.Errorf("%+v: connect calls = %v, want %v", c, *connectCalls, wantConnectCalls)
+		}
+		if !slices.Equal(*fullCalls, wantFullCalls) {
+			t.Errorf("%+v: full calls = %v, want %v", c, *fullCalls, wantFullCalls)
 		}
 	}
 
@@ -81,14 +102,16 @@ func TestResolveRecordsTheSliceCheckApartFromTheBaseResult(t *testing.T) {
 		}
 		return expectedExit(mode, leg)
 	})
-	calls := stubSlice(t, true)
+	calls := stubCheck(t, &sliceSelfTest, true)
+	connectCalls := stubCheck(t, &connectSelfTest, true)
+	fullCalls := stubCheck(t, &fullSelfTest, true)
 	got := resolveFor("linux", ResolveInput{Home: homeWithCodemeld(t)})
-	if got.Capability != Refused || got.SelfTestPassed || got.SliceSelfTestPassed || len(*calls) != 0 {
-		t.Errorf("base failure: Resolve() = %+v after %d slice checks, want Refused with no slice check", got, len(*calls))
+	if got.Capability != Refused || got.SelfTestPassed || got.SliceSelfTestPassed || got.ConnectSelfTestPassed || got.FullSelfTestPassed || len(*calls) != 0 || len(*connectCalls) != 0 || len(*fullCalls) != 0 {
+		t.Errorf("base failure: Resolve() = %+v after %d slice and %d connect checks, want Refused with neither check", got, len(*calls), len(*connectCalls))
 	}
 	for _, goos := range []string{"darwin", "freebsd", "windows"} {
-		if got := resolveFor(goos, ResolveInput{Home: homeWithCodemeld(t)}); got.SliceSelfTestPassed || len(*calls) != 0 {
-			t.Errorf("%s: Resolve() = %+v after %d slice checks", goos, got, len(*calls))
+		if got := resolveFor(goos, ResolveInput{Home: homeWithCodemeld(t)}); got.SliceSelfTestPassed || got.ConnectSelfTestPassed || got.FullSelfTestPassed || len(*calls) != 0 || len(*connectCalls) != 0 || len(*fullCalls) != 0 {
+			t.Errorf("%s: Resolve() = %+v after %d slice and %d connect checks", goos, got, len(*calls), len(*connectCalls))
 		}
 	}
 }

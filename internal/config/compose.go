@@ -19,6 +19,8 @@ const writableFoldersKey = "writable_folders"
 
 const domainGrantsKey = "domain_grants"
 
+const connectGrantsKey = "connect_grants"
+
 // composeMergeMapKeys are the top-level keys whose values are merged by subkey
 // (nearest-wins per subkey). Every other top-level key is replaced
 // wholesale by the nearer layer, and `permissions`, `declared_commands`,
@@ -52,8 +54,10 @@ func Compose(globalLayer, projectLayer map[string]any, localLayer ...map[string]
 	if err := composeBlockedPaths(layers, composed); err != nil {
 		return nil, err
 	}
-	if err := composeDomainGrants(globalLayer, local, composed); err != nil {
-		return nil, err
+	for _, k := range []string{domainGrantsKey, connectGrantsKey} {
+		if err := composeUserGrants(k, globalLayer, local, composed); err != nil {
+			return nil, err
+		}
 	}
 
 	for _, k := range unionKeys(layers) {
@@ -63,7 +67,7 @@ func Compose(globalLayer, projectLayer map[string]any, localLayer ...map[string]
 		if k == declaredCommandsKey {
 			continue // handled by composeDeclaredCommands
 		}
-		if k == blockedPathsKey || k == writableFoldersKey || k == domainGrantsKey {
+		if k == blockedPathsKey || k == writableFoldersKey || k == domainGrantsKey || k == connectGrantsKey {
 			continue
 		}
 		var current any
@@ -151,11 +155,11 @@ func composeBlockedPaths(layers []map[string]any, composed map[string]any) error
 
 // The project layer is left out: a committed settings file must not grant network access on the
 // machine of whoever clones the repository.
-func composeDomainGrants(globalLayer, localLayer, composed map[string]any) error {
+func composeUserGrants(key string, globalLayer, localLayer, composed map[string]any) error {
 	var concat []any
 	present := false
 	for _, layer := range []map[string]any{globalLayer, localLayer} {
-		list, has, err := layerList(layer, domainGrantsKey)
+		list, has, err := layerList(layer, key)
 		if err != nil {
 			return err
 		}
@@ -163,7 +167,7 @@ func composeDomainGrants(globalLayer, localLayer, composed map[string]any) error
 		concat = slices.Concat(concat, list)
 	}
 	if present {
-		composed[domainGrantsKey] = deepCopyValue(concat)
+		composed[key] = deepCopyValue(concat)
 	}
 	return nil
 }

@@ -124,37 +124,10 @@ func TestSubmitBoundary_ModelRejectEventIsDurableOnDisk(t *testing.T) {
 // retained. The store path is writable, so cancellation is the only flush failure.
 // It fails if persist.go proceeds past a ReasonNone flush failure.
 func TestSubmitBoundary_ModelCancelledFlushRejectsAndPersistsNothing(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	projectRoot := t.TempDir()
-	home := t.TempDir()
-	store := mkStore(t)
-	app := tui.New(nil)
-	app.SetActiveStore(store)
-	app.SetCommandFlush(newCommandFlush(ctx, app))
-	active := selectedState() // openai/gpt-5.5/medium, source resume
-
-	modelDeps := newModelDeps(ctx, app, providerCache(t, projectRoot), active, home)
-	reg := tui.BuildRegistry(map[string]tui.HandlerFunc{"model": tui.NewModelHandler(modelDeps)})
-
-	if tui.NewSubmitFunc(reg, app, nil)("/model gpt-5.5-pro") {
-		t.Fatal("/model gpt-5.5-pro on a cancelled run context must be rejected (retain), not accepted")
-	}
-	if _, err := os.Stat(filepath.Join(projectRoot, ".codemeld", "settings.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("model.active must be absent after a non-write flush failure; stat err = %v", err)
-	}
-	if _, err := os.Stat(config.LocalSettingsPath(projectRoot)); !os.IsNotExist(err) {
-		t.Fatalf("local model.active must be absent after a non-write flush failure; stat err = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, ".codemeld", "global", "settings.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("model.last_used must be absent after a non-write flush failure; stat err = %v", err)
-	}
-	if _, err := os.Stat(store.Path()); !os.IsNotExist(err) {
-		t.Fatalf("session file must be absent after a cancelled flush; stat err = %v", err)
-	}
-	if _, src, _ := active.Current(); src != model.SourceResume {
-		t.Fatalf("active source = %q, want resume (no picker transition on a non-write flush failure)", src)
-	}
+	assertCancelledFlushRejectsAndPersistsNothing(t, "/model gpt-5.5-pro",
+		func(ctx context.Context, app *tui.App, cache *config.Cache, active *model.ActiveState, home string) map[string]tui.HandlerFunc {
+			return map[string]tui.HandlerFunc{"model": tui.NewModelHandler(newModelDeps(ctx, app, cache, active, home))}
+		})
 }
 
 func TestModelHandler_UnsupportedId_RejectedNoApply(t *testing.T) {

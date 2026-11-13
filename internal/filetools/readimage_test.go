@@ -340,3 +340,35 @@ func TestReadImageTool_UnknownArgRejected(t *testing.T) {
 		t.Fatalf("refusal = %q, want it to name the unexpected argument", res.Stderr)
 	}
 }
+
+func TestReadImageTool_SymlinkSwappedAfterCheckRefused(t *testing.T) {
+	secret := append(imageBytes("png"), []byte("OUTSIDE-SECRET")...)
+	for _, tc := range symlinkSwapCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool, project := newImageTool(t)
+			outside := t.TempDir()
+			if err := os.WriteFile(filepath.Join(outside, "f"), secret, 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if err := os.Mkdir(filepath.Join(project, "sub"), 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(project, "sub", "f"), imageBytes("gif"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			path, target := tc.pick(project, outside)
+			calls := swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, path, target) })
+
+			stdout, stderr, exit, image := invokeImage(t, tool, "sub/f")
+			if *calls != 1 {
+				t.Fatalf("swap ran %d times, want 1", *calls)
+			}
+			if exit == 0 || image != "" {
+				t.Fatalf("read_image after a symlink swap = (exit %d, image %q), want a refusal with no image", exit, image)
+			}
+			if strings.Contains(stdout+stderr, "OUTSIDE-SECRET") {
+				t.Fatalf("read_image returned the symlink target's bytes: stdout %q stderr %q", stdout, stderr)
+			}
+		})
+	}
+}

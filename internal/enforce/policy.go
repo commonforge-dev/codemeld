@@ -23,6 +23,7 @@ const (
 	BrokerNone             = ""
 	BrokerSlice            = "slice"
 	BrokerFull             = "full"
+	BrokerConnect          = "connect"
 )
 
 type Policy struct {
@@ -139,7 +140,7 @@ func (p Policy) checkBroker() error {
 			return fmt.Errorf("policy: broker %q requires plan or auto_edits without exceptional_authority", p.Broker)
 		}
 		return nil
-	case BrokerFull:
+	case BrokerFull, BrokerConnect:
 		if p.Mode != ModeAutoEdits || p.ExceptionalAuthority != "" {
 			return fmt.Errorf("policy: broker %q requires auto_edits without exceptional_authority", p.Broker)
 		}

@@ -320,6 +320,65 @@ func TestNormalizeDirectStage_OnlyAnAbsoluteProgramPathBecomesItsBareName(t *tes
 	}
 }
 
+func TestResolveRelativeProgram(t *testing.T) {
+	root := mustEval(t, t.TempDir())
+	f := root + "/f"
+	other := root + "/other"
+	for _, dir := range []string{f + "/sub", other + "/inner"} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+	}
+	writeExecutable(t, f+"/x")
+	writeExecutable(t, f+"/sub/x")
+	writeExecutable(t, other+"/x")
+	if err := os.Symlink(other+"/inner", f+"/link"); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	normalize := func(t *testing.T, stage, folder string, keepAbsolute bool) []string {
+		t.Helper()
+		got, err := NormalizeDirectStage(stage, StageSolo)
+		if err != nil {
+			t.Fatalf("NormalizeDirectStage(%q): %v", stage, err)
+		}
+		got.Tokens[0] = ResolveRelativeProgram(got.Tokens[0], folder, keepAbsolute)
+		return got.Tokens
+	}
+
+	t.Run("relative, absolute and bare spellings share tokens when PATH finds the same file", func(t *testing.T) {
+		t.Setenv("PATH", f)
+		for _, stage := range []string{"./x a", f + "/x a", "x a"} {
+			if got := normalize(t, stage, f, false); !equalStrings(got, []string{"x", "a"}) {
+				t.Fatalf("%q from %s = %v, want [x a]", stage, f, got)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name         string
+		path         string
+		stage        string
+		folder       string
+		keepAbsolute bool
+		want         string
+	}{
+		{"not on PATH becomes absolute", other, "./x", f, false, f + "/x"},
+		{"subfolder names its own file", f, "./x", f + "/sub", false, f + "/sub/x"},
+		{"no folder keeps the typed program", f, "./x", "", false, "./x"},
+		{"dot-dot after a symlink is resolved physically", root, "./link/../x", f, false, other + "/x"},
+		{"keepAbsolute skips the bare-name rewrite", f, "./x", f, true, f + "/x"},
+		{"unresolvable folder part is pinned to the folder as typed", f, "./missing/../x", f, false, f + "/./missing/../x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", tc.path)
+			if got := normalize(t, tc.stage, tc.folder, tc.keepAbsolute); !equalStrings(got, []string{tc.want}) {
+				t.Fatalf("%q from %q = %v, want [%s]", tc.stage, tc.folder, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeDirectStage_CommandLookupTakesDirectRoute(t *testing.T) {
 	dir := t.TempDir()
 	magick := filepath.Join(dir, "magick")

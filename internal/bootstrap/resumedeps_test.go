@@ -1265,6 +1265,52 @@ func (s readOnlyTargetSwitch) Activate(target *sessions.Store) (string, error) {
 	return s.resumeSwitch.Activate(target)
 }
 
+type writeBeforeLockSwitch struct {
+	*resumeSwitch
+	write func()
+}
+
+func (s writeBeforeLockSwitch) Switch(target, prior *sessions.Store) error {
+	s.write()
+	return s.resumeSwitch.Switch(target, prior)
+}
+
+func TestResume_KeepsARecordWrittenBeforeTheLock(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	canonical, err := sessions.CanonicalizeFolder(cwd)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	other, err := sessions.EnsureSession(home, canonical, testStart, nil)
+	if err != nil {
+		t.Fatalf("ensure session: %v", err)
+	}
+	mustFlush(t, other)
+	app := tui.New(nil)
+	prior := storeAt(t, filepath.Join(t.TempDir(), "prior.json"), "01890000-0000-7000-8000-000000000701", "/proj")
+	mustFlush(t, prior)
+	app.SetActiveStore(prior)
+
+	deps := newResumeDeps(context.Background(), app, &BootstrapResult{Home: home, LaunchDir: cwd}, &resumeLockHolder{}, providerCache(t, t.TempDir()), selectedState(), fixedRecorder(injectedResolution), nil)
+	deps.Lister = resumeAbortLister{entry: tui.ResumeEntry{ID: other.SessionID()}}
+	deps.Picker = resumeAbortPicker{}
+	deps.Switch = writeBeforeLockSwitch{resumeSwitch: deps.Switch.(*resumeSwitch), write: func() {
+		if _, err := events.Append(other, events.ExecutionCapability{Capability: "refused", Reason: "written-by-other-instance"}); err != nil {
+			t.Fatal(err)
+		}
+		mustFlush(t, other)
+	}}
+
+	submitResume(app, deps)
+
+	if app.ActiveStore().SessionID() != other.SessionID() {
+		t.Fatal("active store was not switched to the chosen session")
+	}
+	assertFileContains(t, other.Path(), "written-by-other-instance")
+	assertFileContains(t, other.Path(), events.KindLaunchBegan)
+}
+
 func TestResume_AppendsTheLaunchCapabilityToTheTarget(t *testing.T) {
 	app, _, target := resumeStores(t)
 	earlier := events.ExecutionCapability{Capability: "refused", Reason: "earlier launch"}

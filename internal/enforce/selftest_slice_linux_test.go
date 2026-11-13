@@ -53,9 +53,9 @@ func init() {
 		worker := make(chan int)
 		go func() {
 			runtime.LockOSThread()
-			worker <- tcpConnectAs(true, []string{a[0], "x"})
+			worker <- connectAs(tcpSocket, true, []string{a[0], "x"})
 		}()
-		fmt.Printf("identity main-as-worker=%d worker-as-main=%d\n", tcpConnectAs(false, []string{a[0], "x"}), <-worker)
+		fmt.Printf("identity main-as-worker=%d worker-as-main=%d\n", connectAs(tcpSocket, false, []string{a[0], "x"}), <-worker)
 		return probeAllowed
 	}}
 }
@@ -248,7 +248,7 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 	}()
 	connects := slices.Clone(sliceSteps[:2])
 	exitStep := func(code string) sliceStep {
-		return sliceStep{probe: "s-exit", want: probeDenied, args: func(netip.AddrPort, string) []string { return []string{code} }}
+		return sliceStep{probe: "s-exit", want: probeDenied, args: func(stepTargets, string) []string { return []string{code} }}
 	}
 	injected := errors.New("injected")
 	unrecordedBroker := func(t *testing.T) {
@@ -256,8 +256,8 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 			return StartBroker(l, func(d netip.AddrPort) bool { return d.Addr().IsLoopback() })
 		})
 	}
-	directPayload := func(dest netip.AddrPort, token string) []string {
-		if c, err := net.Dial("tcp4", dest.String()); err == nil {
+	directPayload := func(to stepTargets, token string) []string {
+		if c, err := net.Dial("tcp4", to.tcp.String()); err == nil {
 			_, _ = c.Write([]byte(token))
 			_ = c.Close()
 		}
@@ -287,16 +287,16 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 		{name: "release", setup: func(t *testing.T) {
 			setVar(t, &sliceRelease, func(*os.File) error { return injected })
 		}, reason: "tcp-connect-main: release: injected"},
-		{name: "connect refused by the decider", steps: []sliceStep{{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: func(_ netip.AddrPort, token string) []string {
+		{name: "connect refused by the decider", steps: []sliceStep{{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: func(_ stepTargets, token string) []string {
 			return []string{closedPort.String(), token}
 		}}}, reason: "tcp-connect-main: helper exit 10, want 0"},
-		{name: "nothing accepted", steps: []sliceStep{{probe: "s-exit", want: probeAllowed, payload: true, args: func(netip.AddrPort, string) []string { return []string{"0"} }}},
+		{name: "nothing accepted", steps: []sliceStep{{probe: "s-exit", want: probeAllowed, payload: true, args: func(stepTargets, string) []string { return []string{"0"} }}},
 			reason: "s-exit: no accepted connection carried the helper's payload"},
-		{name: "wrong payload", steps: []sliceStep{{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: func(dest netip.AddrPort, token string) []string {
-			return []string{dest.String(), "other-" + token}
+		{name: "wrong payload", steps: []sliceStep{{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: func(to stepTargets, token string) []string {
+			return []string{to.tcp.String(), "other-" + token}
 		}}}, reason: "tcp-connect-thread: no accepted connection carried the helper's payload"},
-		{name: "unexpected peer", steps: []sliceStep{{probe: "s-exit", want: probeAllowed, payload: true, args: func(dest netip.AddrPort, _ string) []string {
-			if c, err := net.Dial("tcp4", dest.String()); err == nil {
+		{name: "unexpected peer", steps: []sliceStep{{probe: "s-exit", want: probeAllowed, payload: true, args: func(to stepTargets, _ string) []string {
+			if c, err := net.Dial("tcp4", to.tcp.String()); err == nil {
 				_, _ = c.Write([]byte("intruder"))
 				_ = c.Close()
 			}
@@ -308,7 +308,7 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 			reason: "tcp-connect-thread: the broker never handled a connect to the expected endpoint"},
 		{name: "direct connect with the payload", steps: []sliceStep{{probe: "s-exit", want: probeAllowed, payload: true, args: directPayload}},
 			reason: "s-exit: the broker never handled a connect to the expected endpoint"},
-		{name: "denial EACCES from the socket call", steps: append(slices.Clone(connects), sliceStep{probe: "s-socket-errno", want: probeDenied, args: func(netip.AddrPort, string) []string {
+		{name: "denial EACCES from the socket call", steps: append(slices.Clone(connects), sliceStep{probe: "s-socket-errno", want: probeDenied, args: func(stepTargets, string) []string {
 			return []string{strconv.Itoa(int(unix.EACCES))}
 		}}), reason: "s-socket-errno: helper exit 11, want 10"},
 		{name: "denial allowed", steps: append(slices.Clone(connects), exitStep("0")), reason: "s-exit: helper exit 0, want 10"},
@@ -364,5 +364,147 @@ func TestSliceSelfTestConcurrentChecksStayIsolated(t *testing.T) {
 		if r.passed != wantPass || (wantPass && r.reason != "") || (!wantPass && !strings.HasPrefix(r.reason, "slice self-test: tcp-connect-main: start helper: ")) {
 			t.Errorf("check %d (%s) = %v, %q", i, exes[i], r.passed, r.reason)
 		}
+	}
+}
+
+func TestConnectSelfTestPassesInRealHelper(t *testing.T) {
+	home, bin := sliceHome(t)
+	withoutLeaks(t, func() {
+		passed, reason := connectSelfTest(home, bin)
+		sliceUnverified(t, reason)
+		if !passed || reason != "" {
+			t.Fatalf("connect check = %v, %q", passed, reason)
+		}
+	})
+	var got []string
+	for _, s := range connectSteps {
+		var args []string
+		if s.args != nil {
+			args = s.args(stepTargets{tcp: netip.MustParseAddrPort("127.0.0.1:9"), granted: "/g", ungranted: "/u"}, "tok")
+		}
+		got = append(got, fmt.Sprintf("%s=%d %v payload=%v", s.probe, s.want, args, s.payload))
+	}
+	want := []string{
+		"tcp-connect-main=0 [127.0.0.1:9 tok] payload=true",
+		"tcp-connect-thread=0 [127.0.0.1:9 tok] payload=true",
+		"tcp-bind=10 [127.0.0.1:0] payload=false",
+		"tcp-listen=10 [] payload=false",
+		"socket-unix=0 [] payload=false",
+		"tcp-fastopen=10 [127.0.0.1:9] payload=false",
+		"unix-connect-main=0 [/g tok] payload=true",
+		"unix-connect-thread=0 [/g tok] payload=true",
+		"unix-connect-main=10 [@codemeld-connect-self-test tok] payload=false",
+		"unix-connect-thread=10 [@codemeld-connect-self-test tok] payload=false",
+		"unix-connect-main=10 [/u tok] payload=false",
+		"unix-connect-thread=10 [/u tok] payload=false",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("steps\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestConnectSelfTestFailuresAreUnavailable(t *testing.T) {
+	home, bin := sliceHome(t)
+	setVar(t, &selfTestTimeout, 2*time.Second)
+	for _, c := range []struct {
+		name   string
+		steps  []sliceStep
+		reason string
+	}{
+		{name: "unix socket expected denied", steps: []sliceStep{{probe: "socket-unix", want: probeDenied}},
+			reason: "socket-unix: helper exit 0, want 10"},
+		{name: "ungranted unix connect expected allowed", steps: []sliceStep{{probe: "unix-connect-main", want: probeAllowed, payload: true, unix: true, args: ungrantedAndToken}},
+			reason: "unix-connect-main: helper exit 10, want 0"},
+		{name: "abstract unix connect expected allowed", steps: []sliceStep{{probe: "unix-connect-thread", want: probeAllowed, payload: true, unix: true, args: abstractAndToken}},
+			reason: "unix-connect-thread: helper exit 10, want 0"},
+		{name: "wrong unix payload", steps: []sliceStep{{probe: "unix-connect-main", want: probeAllowed, payload: true, unix: true, args: func(to stepTargets, token string) []string {
+			return []string{to.granted, "other-" + token}
+		}}}, reason: "unix-connect-main: no accepted connection carried the helper's payload"},
+		{name: "nothing accepted on the unix listener", steps: []sliceStep{{probe: "s-exit", want: probeAllowed, payload: true, unix: true, args: func(stepTargets, string) []string { return []string{"0"} }}},
+			reason: "s-exit: no accepted connection carried the helper's payload"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			setVar(t, &connectSteps, c.steps)
+			withoutLeaks(t, func() {
+				passed, reason := runConnectSelfTest(home, bin)
+				sliceUnverified(t, reason)
+				if passed || !strings.HasPrefix(reason, "connect self-test: "+c.reason) {
+					t.Errorf("connect check = %v, %q; want unavailable with %q", passed, reason, c.reason)
+				}
+			})
+		})
+	}
+}
+
+func TestFullSelfTestPassesInRealHelper(t *testing.T) {
+	home, bin := sliceHome(t)
+	withoutLeaks(t, func() {
+		passed, reason := fullSelfTest(home, bin)
+		sliceUnverified(t, reason)
+		if !passed || reason != "" {
+			t.Fatalf("full check = %v, %q", passed, reason)
+		}
+	})
+	var got []string
+	for _, s := range fullSteps {
+		var args []string
+		if s.args != nil {
+			args = s.args(stepTargets{tcp: netip.MustParseAddrPort("127.0.0.1:9"), granted: "/g", ungranted: "/u", tmp: "/w/tmp", root: "/w"}, "tok")
+		}
+		got = append(got, fmt.Sprintf("%s=%d %v payload=%v", s.probe, s.want, args, s.payload))
+	}
+	want := []string{
+		"tcp-connect-main=0 [127.0.0.1:9 tok] payload=true",
+		"tcp-connect-thread=0 [127.0.0.1:9 tok] payload=true",
+		"socket-unix=0 [] payload=false",
+		"tcp-fastopen=10 [127.0.0.1:9] payload=false",
+		"unix-connect-main=0 [/g tok] payload=true",
+		"unix-connect-thread=0 [/g tok] payload=true",
+		"unix-connect-main=10 [@codemeld-connect-self-test tok] payload=false",
+		"unix-connect-thread=10 [@codemeld-connect-self-test tok] payload=false",
+		"unix-connect-main=10 [/u tok] payload=false",
+		"unix-connect-thread=10 [/u tok] payload=false",
+		"tcp-bind-listen-connect-main=0 [] payload=false",
+		"tcp-bind-listen-connect-thread=0 [] payload=false",
+		"unix-bind-main=0 [/w/tmp/s] payload=false",
+		"unix-bind-thread=0 [/w/tmp/s] payload=false",
+		"unix-bind-main=10 [/w/s] payload=false",
+		"setsockopt-reuseport=10 [] payload=false",
+		"setsockopt-reuseaddr=0 [] payload=false",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("steps\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestFullSelfTestFailuresAreUnavailable(t *testing.T) {
+	home, bin := sliceHome(t)
+	setVar(t, &selfTestTimeout, 2*time.Second)
+	for _, c := range []struct {
+		name   string
+		steps  []sliceStep
+		reason string
+	}{
+		{name: "bind and listen expected denied", steps: []sliceStep{{probe: "tcp-bind-listen-connect-thread", want: probeDenied}},
+			reason: "tcp-bind-listen-connect-thread: helper exit 0, want 10"},
+		{name: "unix bind outside the write root expected allowed", steps: []sliceStep{{probe: "unix-bind-main", want: probeAllowed, args: socketInRoot}},
+			reason: "unix-bind-main: helper exit 10, want 0"},
+		{name: "unix bind inside the write root expected denied", steps: []sliceStep{{probe: "unix-bind-thread", want: probeDenied, args: socketInTmp}},
+			reason: "unix-bind-thread: helper exit 0, want 10"},
+		{name: "SO_REUSEPORT expected allowed", steps: []sliceStep{{probe: "setsockopt-reuseport", want: probeAllowed}},
+			reason: "setsockopt-reuseport: helper exit 10, want 0"},
+		{name: "SO_REUSEADDR expected denied", steps: []sliceStep{{probe: "setsockopt-reuseaddr", want: probeDenied}},
+			reason: "setsockopt-reuseaddr: helper exit 0, want 10"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			setVar(t, &fullSteps, c.steps)
+			withoutLeaks(t, func() {
+				passed, reason := runFullSelfTest(home, bin)
+				sliceUnverified(t, reason)
+				if passed || !strings.HasPrefix(reason, "full self-test: "+c.reason) {
+					t.Errorf("full check = %v, %q; want unavailable with %q", passed, reason, c.reason)
+				}
+			})
+		})
 	}
 }

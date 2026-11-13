@@ -21,24 +21,94 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type stepTargets struct {
+	tcp                netip.AddrPort
+	granted, ungranted string
+	tmp, root          string
+}
+
 type sliceStep struct {
 	probe   string
 	want    int
 	payload bool
-	args    func(dest netip.AddrPort, token string) []string
+	unix    bool
+	args    func(to stepTargets, token string) []string
 }
 
-func endpointAndToken(dest netip.AddrPort, token string) []string {
-	return []string{dest.String(), token}
+func endpointAndToken(to stepTargets, token string) []string {
+	return []string{to.tcp.String(), token}
+}
+
+func grantedAndToken(to stepTargets, token string) []string {
+	return []string{to.granted, token}
+}
+
+func ungrantedAndToken(to stepTargets, token string) []string {
+	return []string{to.ungranted, token}
+}
+
+func abstractAndToken(_ stepTargets, token string) []string {
+	return []string{"@codemeld-connect-self-test", token}
+}
+
+func endpoint(to stepTargets, _ string) []string {
+	return []string{to.tcp.String()}
+}
+
+func loopbackAnyPort(stepTargets, string) []string {
+	return []string{"127.0.0.1:0"}
+}
+
+func socketInTmp(to stepTargets, _ string) []string {
+	return []string{filepath.Join(to.tmp, "s")}
+}
+
+func socketInRoot(to stepTargets, _ string) []string {
+	return []string{filepath.Join(to.root, "s")}
 }
 
 var sliceSteps = []sliceStep{
 	{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: endpointAndToken},
-	{probe: "tcp-bind", want: probeDenied, args: func(netip.AddrPort, string) []string { return []string{"127.0.0.1:0"} }},
+	{probe: "tcp-bind", want: probeDenied, args: loopbackAnyPort},
 	{probe: "tcp-listen", want: probeDenied},
 	{probe: "socket-unix", want: probeDenied},
-	{probe: "tcp-fastopen", want: probeDenied, args: func(dest netip.AddrPort, _ string) []string { return []string{dest.String()} }},
+	{probe: "tcp-fastopen", want: probeDenied, args: endpoint},
+}
+
+var connectSteps = []sliceStep{
+	{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: endpointAndToken},
+	{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: endpointAndToken},
+	{probe: "tcp-bind", want: probeDenied, args: loopbackAnyPort},
+	{probe: "tcp-listen", want: probeDenied},
+	{probe: "socket-unix", want: probeAllowed},
+	{probe: "tcp-fastopen", want: probeDenied, args: endpoint},
+	{probe: "unix-connect-main", want: probeAllowed, payload: true, unix: true, args: grantedAndToken},
+	{probe: "unix-connect-thread", want: probeAllowed, payload: true, unix: true, args: grantedAndToken},
+	{probe: "unix-connect-main", want: probeDenied, args: abstractAndToken},
+	{probe: "unix-connect-thread", want: probeDenied, args: abstractAndToken},
+	{probe: "unix-connect-main", want: probeDenied, args: ungrantedAndToken},
+	{probe: "unix-connect-thread", want: probeDenied, args: ungrantedAndToken},
+}
+
+var fullSteps = []sliceStep{
+	{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: endpointAndToken},
+	{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: endpointAndToken},
+	{probe: "socket-unix", want: probeAllowed},
+	{probe: "tcp-fastopen", want: probeDenied, args: endpoint},
+	{probe: "unix-connect-main", want: probeAllowed, payload: true, unix: true, args: grantedAndToken},
+	{probe: "unix-connect-thread", want: probeAllowed, payload: true, unix: true, args: grantedAndToken},
+	{probe: "unix-connect-main", want: probeDenied, args: abstractAndToken},
+	{probe: "unix-connect-thread", want: probeDenied, args: abstractAndToken},
+	{probe: "unix-connect-main", want: probeDenied, args: ungrantedAndToken},
+	{probe: "unix-connect-thread", want: probeDenied, args: ungrantedAndToken},
+	{probe: "tcp-bind-listen-connect-main", want: probeAllowed},
+	{probe: "tcp-bind-listen-connect-thread", want: probeAllowed},
+	{probe: "unix-bind-main", want: probeAllowed, args: socketInTmp},
+	{probe: "unix-bind-thread", want: probeAllowed, args: socketInTmp},
+	{probe: "unix-bind-main", want: probeDenied, args: socketInRoot},
+	{probe: "setsockopt-reuseport", want: probeDenied},
+	{probe: "setsockopt-reuseaddr", want: probeAllowed},
 }
 
 var (
@@ -47,43 +117,85 @@ var (
 	sliceRelease     = ReleaseHelper
 )
 
+func init() { connectSelfTest, fullSelfTest = runConnectSelfTest, runFullSelfTest }
+
 func runSliceSelfTest(home, exe string) (passed bool, reason string) {
+	return runBrokerSelfTest(home, exe, BrokerSlice, sliceSteps)
+}
+
+func runConnectSelfTest(home, exe string) (passed bool, reason string) {
+	return runBrokerSelfTest(home, exe, BrokerConnect, connectSteps)
+}
+
+func runFullSelfTest(home, exe string) (passed bool, reason string) {
+	return runBrokerSelfTest(home, exe, BrokerFull, fullSteps)
+}
+
+type brokerSelfTest struct {
+	home, exe, broker string
+	tcp               *net.TCPListener
+	unix              *net.UnixListener
+	to                stepTargets
+}
+
+func runBrokerSelfTest(home, exe, broker string, steps []sliceStep) (passed bool, reason string) {
+	prefix := broker + " self-test: "
 	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
-		return false, "slice self-test: loopback listener: " + err.Error()
+		return false, prefix + "loopback listener: " + err.Error()
 	}
 	defer func() { _ = ln.Close() }()
 	dest, err := netip.ParseAddrPort(ln.Addr().String())
 	if err != nil {
-		return false, "slice self-test: loopback listener: " + err.Error()
+		return false, prefix + "loopback listener: " + err.Error()
 	}
-	for _, step := range sliceSteps {
-		if reason := runSliceAttempt(home, exe, ln, dest, step); reason != "" {
-			return false, "slice self-test: " + step.probe + ": " + reason
+	s := brokerSelfTest{home: home, exe: exe, broker: broker, tcp: ln, to: stepTargets{tcp: dest}}
+	if broker != BrokerSlice {
+		dir, err := os.MkdirTemp("", "codemeld-connect-")
+		if err != nil {
+			return false, prefix + "socket folder: " + err.Error()
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+		s.to.granted, s.to.ungranted = filepath.Join(dir, "granted"), filepath.Join(dir, "ungranted")
+		if s.unix, err = net.ListenUnix("unix", &net.UnixAddr{Name: s.to.granted, Net: "unix"}); err != nil {
+			return false, prefix + "unix listener: " + err.Error()
+		}
+		defer func() { _ = s.unix.Close() }()
+		other, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.to.ungranted, Net: "unix"})
+		if err != nil {
+			return false, prefix + "unix listener: " + err.Error()
+		}
+		defer func() { _ = other.Close() }()
+	}
+	for _, step := range steps {
+		if reason := s.attempt(step); reason != "" {
+			return false, prefix + step.probe + ": " + reason
 		}
 	}
 	return true, ""
 }
 
-func runSliceAttempt(home, exe string, ln *net.TCPListener, dest netip.AddrPort, step sliceStep) string {
-	f, err := newFixture(home, selfTestLeg{})
+func (s brokerSelfTest) attempt(step sliceStep) string {
+	f, err := newFixture(s.home, selfTestLeg{})
 	if err != nil {
 		return "fixture: " + err.Error()
 	}
 	defer f.remove()
 	var frame bytes.Buffer
-	policy := Policy{Mode: ModeAutoEdits, Broker: BrokerSlice, BlockedPaths: []string{filepath.Join(home, ".codemeld")}, TmpDir: f.tmp()}
+	policy := Policy{Mode: ModeAutoEdits, Broker: s.broker, BlockedPaths: []string{filepath.Join(s.home, ".codemeld")}, TmpDir: f.tmp()}
 	if err := WritePolicyFrame(&frame, policy); err != nil {
 		return "policy frame: " + err.Error()
 	}
-	env, err := runner.FixedEnvironment(home, f.root, f.tmp(), runner.FixedPATH, nil)
+	env, err := runner.FixedEnvironment(s.home, f.root, f.tmp(), runner.FixedPATH, nil)
 	if err != nil {
 		return "environment: " + err.Error()
 	}
 	token := rand.Text()
 	argv := []string{HelperCommand, ProbeArg, step.probe}
 	if step.args != nil {
-		argv = append(argv, step.args(dest, token)...)
+		to := s.to
+		to.tmp, to.root = f.tmp(), f.root
+		argv = append(argv, step.args(to, token)...)
 	}
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -92,7 +204,7 @@ func runSliceAttempt(home, exe string, ln *net.TCPListener, dest netip.AddrPort,
 	parent, child := os.NewFile(uintptr(fds[0]), "setup channel"), os.NewFile(uintptr(fds[1]), "helper setup channel")
 	defer func() { _ = parent.Close() }()
 	var stderr bytes.Buffer
-	cmd := exec.Command(exe, argv...)
+	cmd := exec.Command(s.exe, argv...)
 	cmd.Env, cmd.Dir, cmd.Stdin, cmd.Stderr = env, f.root, &frame, &stderr
 	cmd.ExtraFiles = []*os.File{child}
 	cmd.WaitDelay = time.Second
@@ -114,13 +226,21 @@ func runSliceAttempt(home, exe string, ln *net.TCPListener, dest netip.AddrPort,
 		return fail("listener handoff", err)
 	}
 	var brokered atomic.Bool
-	broker, err := sliceStartBroker(listener, func(d netip.AddrPort) bool {
-		if d != dest {
+	decide := func(d netip.AddrPort) bool {
+		if d != s.to.tcp {
 			return false
 		}
 		brokered.Store(true)
 		return true
-	})
+	}
+	var broker *Broker
+	if s.broker != BrokerSlice {
+		deny := NewDenyList()
+		defer deny.Close()
+		broker, err = StartConnectBroker(listener, ConnectRules{Grants: []string{s.to.granted}, Deny: deny, Proxy: decide, TmpDir: f.tmp(), Policy: policy}, nil)
+	} else {
+		broker, err = sliceStartBroker(listener, decide)
+	}
 	if err != nil {
 		return fail("broker start", err)
 	}
@@ -131,6 +251,10 @@ func runSliceAttempt(home, exe string, ln *net.TCPListener, dest netip.AddrPort,
 	_ = parent.Close()
 	deadline := time.Now().Add(selfTestTimeout)
 	paired := make(chan bool, 1)
+	var ln deadlineListener = s.tcp
+	if step.unix {
+		ln = s.unix
+	}
 	if step.payload {
 		_ = ln.SetDeadline(deadline)
 		go func() { paired <- acceptToken(ln, token, deadline) }()
@@ -155,7 +279,12 @@ func runSliceAttempt(home, exe string, ln *net.TCPListener, dest netip.AddrPort,
 	return ""
 }
 
-func acceptToken(ln *net.TCPListener, token string, deadline time.Time) bool {
+type deadlineListener interface {
+	net.Listener
+	SetDeadline(time.Time) error
+}
+
+func acceptToken(ln deadlineListener, token string, deadline time.Time) bool {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -195,7 +324,7 @@ func sliceOutcome(step sliceStep, e helperExit, paired, brokered bool) string {
 		return fmt.Sprintf("helper exit %d, want %d", e.code, step.want)
 	case step.payload && !paired:
 		return "no accepted connection carried the helper's payload"
-	case step.payload && !brokered:
+	case step.payload && !step.unix && !brokered:
 		return "the broker never handled a connect to the expected endpoint"
 	}
 	return ""

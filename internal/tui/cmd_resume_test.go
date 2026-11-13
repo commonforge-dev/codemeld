@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -97,11 +98,18 @@ type fakeLoader struct {
 	older    bool
 	failCat  fserrors.Category
 	err      error
+	firstAt  int
+	reread   func() (*sessions.Store, bool, fserrors.Category, error)
 }
 
 func (l *fakeLoader) Load(entry ResumeEntry) (*sessions.Store, bool, fserrors.Category, error) {
 	l.mark()
 	l.gotEntry = entry
+	if l.calls == 1 {
+		l.firstAt = l.at
+	} else if l.reread != nil {
+		return l.reread()
+	}
 	if l.err != nil {
 		return nil, l.older, l.failCat, l.err
 	}
@@ -469,8 +477,8 @@ func TestResumeHandler_SelectionSwitchesAndOrdersEvents(t *testing.T) {
 	}
 
 	// The chosen entry was loaded and handed to the switch.
-	if fx.loader.calls != 1 || fx.loader.gotEntry.ID != "0190bbbb" {
-		t.Errorf("loader calls=%d gotID=%q, want 1 / 0190bbbb", fx.loader.calls, fx.loader.gotEntry.ID)
+	if fx.loader.calls != 2 || fx.loader.gotEntry.ID != "0190bbbb" {
+		t.Errorf("loader calls=%d gotID=%q, want 2 / 0190bbbb", fx.loader.calls, fx.loader.gotEntry.ID)
 	}
 	if fx.sw.calls != 1 || fx.sw.gotTarget != fx.target() || fx.sw.gotPrior != host.store {
 		t.Errorf("switch calls=%d target=%p prior=%p, want 1 / target / prior", fx.sw.calls, fx.sw.gotTarget, fx.sw.gotPrior)
@@ -490,11 +498,11 @@ func TestResumeHandler_SelectionSwitchesAndOrdersEvents(t *testing.T) {
 	}
 
 	// Call order: load -> switch -> refresh -> model recovery -> agent replay.
-	seq := []int{fx.loader.at, fx.sw.at, fx.refresher.at, fx.model.at, fx.agents.at}
+	seq := []int{fx.loader.firstAt, fx.sw.at, fx.refresher.at, fx.model.at, fx.agents.at}
 	for i := 1; i < len(seq); i++ {
 		if seq[i-1] >= seq[i] {
 			t.Errorf("call order load=%d switch=%d refresh=%d model=%d agents=%d, want strictly increasing",
-				fx.loader.at, fx.sw.at, fx.refresher.at, fx.model.at, fx.agents.at)
+				fx.loader.firstAt, fx.sw.at, fx.refresher.at, fx.model.at, fx.agents.at)
 			break
 		}
 	}
@@ -1351,6 +1359,133 @@ func TestResumeHandler_AbortRollsBackBeforeActivation(t *testing.T) {
 	if fx.refresher.calls != 0 || fx.model.calls != 0 || fx.agents.calls != 0 {
 		t.Errorf("post-switch steps ran on a rolled-back switch: refresh=%d model=%d agents=%d",
 			fx.refresher.calls, fx.model.calls, fx.agents.calls)
+	}
+}
+
+func TestResumeHandler_WritesGoThroughTheReadTakenUnderTheLock(t *testing.T) {
+	host := newWritableHost(t)
+	fx := newResumeFixture(t)
+	fx.lister.entries = twoEntries()
+	fx.picker.result = PickerResult{Selected: true, Index: 1}
+	fx.agents.replays = []events.AgentInstructionsLoaded{{Path: "/g/AGENTS.md", Layer: "global", LoadOrder: 1}}
+	first := fx.target()
+	locked := sessions.New(first.Path(), &sessions.Session{})
+	rereadAt := 0
+	fx.loader.reread = func() (*sessions.Store, bool, fserrors.Category, error) {
+		rereadAt = fx.loader.at
+		return locked, false, "", nil
+	}
+
+	if res := dispatchResume(t, fx, host); res.Err != nil {
+		t.Fatalf("dispatch err: %v", res.Err)
+	}
+
+	if fx.loader.calls != 2 || rereadAt <= fx.sw.at {
+		t.Fatalf("loader calls=%d reread tick=%d switch tick=%d, want a second read after the lock", fx.loader.calls, rereadAt, fx.sw.at)
+	}
+	if fx.sw.gotTarget != first {
+		t.Error("the lock was not taken for the session chosen by the first read")
+	}
+	if fx.sw.activateTarget != locked {
+		t.Error("Activate did not receive the Store read under the lock")
+	}
+	if fx.refresher.target != locked || fx.model.target != locked || fx.agents.target != locked {
+		t.Error("refresh/model/agents did not all receive the Store read under the lock")
+	}
+	if got := eventKinds(locked.Records()); !equalStrings(got, []string{events.KindLaunchBegan, events.KindAgentInstructionsLoaded}) {
+		t.Errorf("locked Store events = %v, want launch_began then agent_instructions_loaded", got)
+	}
+	if !slices.Contains(eventKinds(fx.transcript.replayed), events.KindLaunchBegan) {
+		t.Errorf("transcript replayed %v, want the locked Store's records", eventKinds(fx.transcript.replayed))
+	}
+	if n := len(first.Records()); n != 0 {
+		t.Errorf("the Store from the first read gained %d records after the lock", n)
+	}
+}
+
+func TestResumeHandler_BadReadUnderTheLockAborts(t *testing.T) {
+	cases := []struct {
+		name   string
+		reread func(first *sessions.Store) (*sessions.Store, bool, fserrors.Category, error)
+		want   func(first, second *sessions.Store) string
+	}{
+		{
+			name: "read fails",
+			reread: func(*sessions.Store) (*sessions.Store, bool, fserrors.Category, error) {
+				return nil, false, fserrors.NotFound, errors.New("session file vanished")
+			},
+			want: func(_, _ *sessions.Store) string {
+				return "session 0190aaaa: cannot load chosen session: not found"
+			},
+		},
+		{
+			name: "path changed",
+			reread: func(first *sessions.Store) (*sessions.Store, bool, fserrors.Category, error) {
+				return sessions.New(filepath.Join(filepath.Dir(first.Path()), "moved.json"), &sessions.Session{}), false, "", nil
+			},
+			want: func(first, second *sessions.Store) string {
+				return "session 0190aaaa: cannot load chosen session: it moved from " + first.Path() + " to " + second.Path() + " while taking its lock"
+			},
+		},
+		{
+			name: "older schema",
+			reread: func(first *sessions.Store) (*sessions.Store, bool, fserrors.Category, error) {
+				return sessions.New(first.Path(), &sessions.Session{}), true, "", nil
+			},
+			want: func(_, _ *sessions.Store) string {
+				return "session 0190aaaa: cannot load chosen session: its schema changed while taking its lock"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			host := newWritableHost(t)
+			priorRef := host.store
+			fx := newResumeFixture(t)
+			fx.sw.sealOnSuccess = false
+			sw := withAbortableSwitch(fx)
+			fx.lister.entries = twoEntries()
+			fx.picker.result = PickerResult{Selected: true, Index: 0}
+			first := fx.target()
+			var second *sessions.Store
+			fx.loader.reread = func() (*sessions.Store, bool, fserrors.Category, error) {
+				s, older, cat, err := tc.reread(first)
+				second = s
+				return s, older, cat, err
+			}
+
+			if res := dispatchResume(t, fx, host); res.Err != nil {
+				t.Fatalf("dispatch err: %v", res.Err)
+			}
+
+			want := tc.want(first, second)
+			if len(host.notices) == 0 || host.notices[len(host.notices)-1] != want {
+				t.Errorf("notices = %v, want last %q", host.notices, want)
+			}
+			evs := host.events()
+			if len(evs) != 2 || decodeSlash(t, evs[1]).Outcome != "error" || decodeSlash(t, evs[1]).ErrorDetail != want {
+				t.Errorf("slash_command events = %v, want success then error %q", evs, want)
+			}
+			if host.flushes != 2 {
+				t.Errorf("FlushActive calls = %d, want 2 (picker open, then the error record)", host.flushes)
+			}
+			if sw.aborts != 1 || sw.abortAt <= fx.sw.at {
+				t.Errorf("aborts=%d abort tick=%d switch tick=%d, want one abort after the switch", sw.aborts, sw.abortAt, fx.sw.at)
+			}
+			if fx.sw.activateCalls != 0 || fx.refresher.calls != 0 || fx.model.calls != 0 || fx.agents.calls != 0 || fx.transcript.resets != 0 {
+				t.Errorf("post-lock steps ran: activate=%d refresh=%d model=%d agents=%d transcript=%d",
+					fx.sw.activateCalls, fx.refresher.calls, fx.model.calls, fx.agents.calls, fx.transcript.resets)
+			}
+			if host.Store() != priorRef {
+				t.Error("active store changed after an aborted switch")
+			}
+			if len(first.Records()) != 0 || (second != nil && len(second.Records()) != 0) {
+				t.Error("a target Store gained records after an aborted switch")
+			}
+			if _, err := os.Stat(first.Path()); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("target file stat err = %v, want it never written", err)
+			}
+		})
 	}
 }
 

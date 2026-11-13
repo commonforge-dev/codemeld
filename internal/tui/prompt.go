@@ -1017,6 +1017,7 @@ func (a *App) unmountPrompt() {
 type networkPrompt struct {
 	ctx        context.Context
 	host, port string
+	dest       string
 	project    bool
 	answer     chan PromptOption
 	withdrawn  bool
@@ -1037,16 +1038,30 @@ var networkProjectOptionsInOrder = []promptOptionRow{
 	{OptionDeny, "deny"},
 }
 
+var connectOptionsInOrder = []promptOptionRow{
+	{OptionAllowOnce, "allow this once"},
+	{OptionAllowSession, "allow for this session"},
+	{OptionDeny, "deny"},
+}
+
 var errPromptShutdown = errors.New("tui: the app is shutting down")
 
 func (a *App) PromptNetwork(ctx context.Context, host, port string, projectChoice bool) (PromptOption, error) {
+	return a.promptNetwork(&networkPrompt{ctx: ctx, host: host, port: port, project: projectChoice, answer: make(chan PromptOption, 1)})
+}
+
+func (a *App) PromptConnect(ctx context.Context, dest string) (PromptOption, error) {
+	return a.promptNetwork(&networkPrompt{ctx: ctx, dest: dest, answer: make(chan PromptOption, 1)})
+}
+
+func (a *App) promptNetwork(p *networkPrompt) (PromptOption, error) {
+	ctx := p.ctx
 	if a.shuttingDown() {
 		return OptionDeny, errPromptShutdown
 	}
 	if err := ctx.Err(); err != nil {
 		return OptionDeny, err
 	}
-	p := &networkPrompt{ctx: ctx, host: host, port: port, project: projectChoice, answer: make(chan PromptOption, 1)}
 	// QueueUpdateDraw blocks until the loop runs it, and /exit's turn drain can occupy the loop.
 	go a.app.QueueUpdateDraw(func() { a.showNetworkPrompt(p) })
 	select {
@@ -1131,6 +1146,15 @@ func (a *App) buildNetworkPrompt(p *networkPrompt) (tview.Primitive, *tview.List
 		lines = append(lines, "allow in this project — saves this exact host and port in this project's .codemeld/settings.local.yaml.")
 	}
 	lines = append(lines, "allow everywhere — saves this exact host and port in your global settings for every project.")
+	if p.dest != "" {
+		lines = []string{
+			"Destination: " + permissions.SingleLineControlEscape(p.dest),
+			"",
+			"The command can send data to this destination.",
+			"allow for this session — applies to this exact destination until codemeld exits.",
+		}
+		options = connectOptionsInOrder
+	}
 	facts.SetText(strings.Join(lines, "\n"))
 	list := tview.NewList()
 	list.ShowSecondaryText(false)
@@ -1147,6 +1171,22 @@ func (a *App) buildNetworkPrompt(p *networkPrompt) (tview.Primitive, *tview.List
 		switch ev.Key() {
 		case tcell.KeyEscape:
 			a.answerNetworkPrompt(p, OptionDeny)
+			return nil
+		case tcell.KeyPgDn, tcell.KeyPgUp:
+			if p.dest == "" {
+				return ev
+			}
+			step := promptInfoScrollStep
+			if _, _, _, height := facts.GetInnerRect(); height > 0 && height < step {
+				step = height
+			}
+			row, col := facts.GetScrollOffset()
+			if ev.Key() == tcell.KeyPgDn {
+				row += step
+			} else {
+				row = max(0, row-step)
+			}
+			facts.ScrollTo(row, col)
 			return nil
 		case tcell.KeyRune:
 			if index, ok := promptMnemonicIndex(options, ev.Rune()); ok {

@@ -5,8 +5,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
-	"os"
 	"path/filepath"
 
 	"codemeld.dev/codemeld/internal/tools"
@@ -138,7 +138,12 @@ func (t *ReadTool) read(resolvedTarget string, args map[string]any) tools.Result
 	if !ok {
 		return failResult(reason)
 	}
-	content, rerr := os.ReadFile(real)
+	f, reason := openNoFollowUnder(boundary, real)
+	if f == nil {
+		return failResult(reason)
+	}
+	content, rerr := io.ReadAll(f)
+	_ = f.Close()
 	if rerr != nil {
 		return failResult("cannot read the target file: " + rerr.Error())
 	}

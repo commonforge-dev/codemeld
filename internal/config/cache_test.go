@@ -2555,3 +2555,76 @@ func TestCacheDomainGrants_CopiesIsolateTheCache(t *testing.T) {
 		t.Fatalf("DomainGrants() = %q, want the grant from construction", again)
 	}
 }
+
+func TestCacheConnectGrants_EachUserFileIsReadBack(t *testing.T) {
+	global := "connect_grants:\n  - 127.0.0.1:5436\n"
+	local := "connect_grants:\n  - /run/postgresql/.s.PGSQL.5432\n"
+	for _, tc := range []struct {
+		name          string
+		global, local string
+		want          []string
+	}{
+		{"global only", global, "", []string{"127.0.0.1:5436"}},
+		{"local only", "", local, []string{"/run/postgresql/.s.PGSQL.5432"}},
+		{"both", global, local, []string{"127.0.0.1:5436", "/run/postgresql/.s.PGSQL.5432"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := domainGrantsCache(t, tc.global, "", tc.local).ConnectGrants(); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("ConnectGrants() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCacheConnectGrants_CommittedProjectGrantIsIgnored(t *testing.T) {
+	c := domainGrantsCache(t,
+		"connect_grants:\n  - 127.0.0.1:5436\n",
+		"connect_grants:\n  - /project/socket\nagent:\n  max_concurrency: 9\n",
+		"",
+	)
+	if got := c.ConnectGrants(); !reflect.DeepEqual(got, []string{"127.0.0.1:5436"}) {
+		t.Fatalf("ConnectGrants() = %q, want only the global grant", got)
+	}
+	if got := c.AgentMaxConcurrency(); got != 9 {
+		t.Fatalf("AgentMaxConcurrency() = %d, want 9 from the same project file", got)
+	}
+}
+
+func TestCacheConnectGrants_AcceptedForms(t *testing.T) {
+	for _, g := range []string{"127.0.0.1:1", "127.0.0.1:65535", "[::1]:5436", "/run/postgresql/.s.PGSQL.5432"} {
+		t.Run(g, func(t *testing.T) {
+			c := newCacheOrFatal(t, map[string]any{"connect_grants": []any{g}}, "", nil)
+			if got := c.ConnectGrants(); !reflect.DeepEqual(got, []string{g}) {
+				t.Fatalf("ConnectGrants() = %q, want %q", got, g)
+			}
+		})
+	}
+}
+
+func TestCacheConnectGrants_RejectsBadEntries(t *testing.T) {
+	for name, entry := range map[string]any{
+		"host name":     "localhost:5436",
+		"port 0":        "127.0.0.1:0",
+		"port 65536":    "127.0.0.1:65536",
+		"no port":       "127.0.0.1",
+		"bare IPv6":     "::1:5436",
+		"relative path": "run/socket",
+		"empty":         "",
+		"non-string":    5436,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := NewCache(map[string]any{"connect_grants": []any{entry}}, "", nil)
+			if err == nil {
+				t.Fatalf("NewCache = %q grants, want an error", c.ConnectGrants())
+			}
+		})
+	}
+}
+
+func TestCacheConnectGrants_ReturnedSliceIsACopy(t *testing.T) {
+	c := newCacheOrFatal(t, map[string]any{"connect_grants": []any{"127.0.0.1:5436"}}, "", nil)
+	c.ConnectGrants()[0] = "/mutated"
+	if got := c.ConnectGrants(); !reflect.DeepEqual(got, []string{"127.0.0.1:5436"}) {
+		t.Fatalf("ConnectGrants() = %q, want the grant from construction", got)
+	}
+}

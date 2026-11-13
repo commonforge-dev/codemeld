@@ -2676,7 +2676,7 @@ func TestConfinedShell_BlockedReadOnlyStageRefusesTheReroutedCommand(t *testing.
 }
 
 type refusalHelper struct {
-	records []netproxy.Refusal
+	records []refusal
 	closed  bool
 }
 
@@ -2684,7 +2684,7 @@ func (h *refusalHelper) HelperChannel() *os.File { return nil }
 func (h *refusalHelper) Started() error          { return nil }
 func (h *refusalHelper) Close()                  { h.closed = true }
 
-func (h *refusalHelper) refusals() []netproxy.Refusal {
+func (h *refusalHelper) refusals() []refusal {
 	if !h.closed {
 		return nil
 	}
@@ -2693,7 +2693,7 @@ func (h *refusalHelper) refusals() []netproxy.Refusal {
 
 type refusalReads struct {
 	mu      sync.Mutex
-	pending [][]netproxy.Refusal
+	pending [][]refusal
 	reads   int
 }
 
@@ -2703,11 +2703,11 @@ func (r *refusalReads) count() int {
 	return r.reads
 }
 
-func swapInvocationRefusals(t *testing.T, calls ...[]netproxy.Refusal) *refusalReads {
+func swapInvocationRefusals(t *testing.T, calls ...[]refusal) *refusalReads {
 	t.Helper()
 	r := &refusalReads{pending: calls}
 	real := invocationRefusals
-	invocationRefusals = func(helper cmdrunner.HelperLaunch) []netproxy.Refusal {
+	invocationRefusals = func(helper cmdrunner.HelperLaunch) []refusal {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.reads++
@@ -2716,7 +2716,7 @@ func swapInvocationRefusals(t *testing.T, calls ...[]netproxy.Refusal) *refusalR
 			return nil
 		}
 		helper.Close()
-		var records []netproxy.Refusal
+		var records []refusal
 		if len(r.pending) > 0 {
 			records, r.pending = r.pending[0], r.pending[1:]
 		}
@@ -2757,28 +2757,28 @@ func dispatchedStderr(t *testing.T, content string) string {
 }
 
 func TestConfinedRunner_ProxyRouteDiagnosticsGetTheRouteExplanation(t *testing.T) {
-	malformed := netproxy.Refusal{Reason: "bad request"}
-	notTCP := netproxy.Refusal{Reason: "not a TCP connect"}
-	uninspectable := netproxy.Refusal{Reason: "connect not inspectable"}
-	dest := netproxy.Refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
+	malformed := refusal{Reason: "bad request"}
+	notTCP := refusal{Reason: "not a TCP connect"}
+	uninspectable := refusal{Reason: "connect not inspectable"}
+	dest := refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
 	destLine := refusedLine("a.test:80", "not approved (no one to ask)")
-	long := netproxy.Refusal{Host: strings.Repeat("h", 150) + ".test", Port: "443", Reason: "not approved (denied)"}
+	long := refusal{Host: strings.Repeat("h", 150) + ".test", Port: "443", Reason: "not approved (denied)"}
 	tight := len("\n"+confinedFailureNote) + 1 + 120
 	for _, tc := range []struct {
 		name     string
-		records  []netproxy.Refusal
+		records  []refusal
 		cap      int
 		addition string
 	}{
-		{"malformed proxy request", []netproxy.Refusal{malformed}, 4096, wantProxyRouteNote},
-		{"not a TCP connect", []netproxy.Refusal{notTCP}, 4096, wantProxyRouteNote},
-		{"connect not inspectable", []netproxy.Refusal{uninspectable}, 4096, wantProxyRouteNote},
-		{"mixed diagnostics", []netproxy.Refusal{malformed, notTCP, uninspectable}, 4096, wantProxyRouteNote},
-		{"malformed proxy request and a destination", []netproxy.Refusal{malformed, dest}, 4096, destLine},
-		{"not a TCP connect and a destination", []netproxy.Refusal{dest, notTCP}, 4096, destLine},
-		{"connect not inspectable and a destination", []netproxy.Refusal{uninspectable, dest}, 4096, destLine},
-		{"mixed diagnostics and a destination", []netproxy.Refusal{malformed, dest, notTCP, uninspectable}, 4096, destLine},
-		{"a destination that does not fit", []netproxy.Refusal{malformed, long, notTCP}, tight, omittedLine(1)},
+		{"malformed proxy request", []refusal{malformed}, 4096, wantProxyRouteNote},
+		{"not a TCP connect", []refusal{notTCP}, 4096, wantProxyRouteNote},
+		{"connect not inspectable", []refusal{uninspectable}, 4096, wantProxyRouteNote},
+		{"mixed diagnostics", []refusal{malformed, notTCP, uninspectable}, 4096, wantProxyRouteNote},
+		{"malformed proxy request and a destination", []refusal{malformed, dest}, 4096, destLine},
+		{"not a TCP connect and a destination", []refusal{dest, notTCP}, 4096, destLine},
+		{"connect not inspectable and a destination", []refusal{uninspectable, dest}, 4096, destLine},
+		{"mixed diagnostics and a destination", []refusal{malformed, dest, notTCP, uninspectable}, 4096, destLine},
+		{"a destination that does not fit", []refusal{malformed, long, notTCP}, tight, omittedLine(1)},
 	} {
 		want := "boom\n" + tc.addition + "\n" + confinedFailureNote
 		conf := proxyRouteUnitConfinement(t, t.TempDir(), "ls")
@@ -2814,7 +2814,7 @@ func TestConfinedFailure_RefusalLinesStayWithinTheOutputCap(t *testing.T) {
 	noteRoom := len("\n" + confinedFailureNote)
 	failed := cmdrunner.RunResult{ExitCode: 1}
 	long := strings.Repeat("x", 200) + ".test"
-	records := []netproxy.Refusal{
+	records := []refusal{
 		{Host: "a.test", Port: "443", Reason: "not approved (denied)"},
 		{Reason: "bad request"},
 		{Host: "a.test", Port: "443", Reason: "not approved (denied)"},
@@ -2899,7 +2899,7 @@ func TestConfinedFailure_RefusalLinesStayWithinTheOutputCap(t *testing.T) {
 }
 
 func TestConfinedRunner_ProxyRouteNoteOnlyForFailedRuns(t *testing.T) {
-	record := []netproxy.Refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	record := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
 	for _, tc := range []struct {
 		name    string
 		inner   confineInner
@@ -2931,11 +2931,11 @@ func TestConfinedRunner_ProxyRouteNoteOnlyForFailedRuns(t *testing.T) {
 }
 
 func TestConfinedRunner_ProxyRefusalTotalsCountOnlyRenderedBytes(t *testing.T) {
-	var records []netproxy.Refusal
+	var records []refusal
 	var lines []string
 	for _, host := range []string{"first", "second", "third"} {
 		host = strings.Repeat(host, 8) + ".test"
-		records = append(records, netproxy.Refusal{Host: host, Port: "443", Reason: "not approved (denied)"})
+		records = append(records, refusal{Host: host, Port: "443", Reason: "not approved (denied)"})
 		lines = append(lines, refusedLine(host+":443", "not approved (denied)"))
 	}
 	cap := len("\n"+confinedFailureNote) + 1 + len(lines[0]) + 1 + len(lines[1]) + 1 + len(omittedLine(1)) + 1
@@ -2983,8 +2983,8 @@ func TestConfinedRunner_ProxyRefusalTotalsCountOnlyRenderedBytes(t *testing.T) {
 func TestConfinedShell_ProxyRefusalsSurviveShellAggregation(t *testing.T) {
 	ok := cmdrunner.RunResult{Stdout: []byte("one\n"), Stderr: []byte("fine")}
 	failed := cmdrunner.RunResult{ExitCode: 1, Stdout: []byte("two\n"), Stderr: []byte("boom")}
-	ref := func(host string) netproxy.Refusal {
-		return netproxy.Refusal{Host: host, Port: "80", Reason: "not approved (no one to ask)"}
+	ref := func(host string) refusal {
+		return refusal{Host: host, Port: "80", Reason: "not approved (no one to ask)"}
 	}
 	line := func(host string) string { return refusedLine(host+":80", "not approved (no one to ask)") }
 	noted := func(stderr string, lines ...string) string {
@@ -2996,22 +2996,22 @@ func TestConfinedShell_ProxyRefusalsSurviveShellAggregation(t *testing.T) {
 		command string
 		cap     int
 		results []cmdrunner.RunResult
-		records [][]netproxy.Refusal
+		records [][]refusal
 		ends    []string
 		model   string
 	}{
-		{"ls && false", "ls && false", 4096, []cmdrunner.RunResult{ok, failed}, [][]netproxy.Refusal{{ref("a.test")}},
+		{"ls && false", "ls && false", 4096, []cmdrunner.RunResult{ok, failed}, [][]refusal{{ref("a.test")}},
 			[]string{"fine", noted("boom", line("a.test"))}, noted("fineboom", line("a.test"))},
-		{"false; ls", "false; ls", 4096, []cmdrunner.RunResult{failed, ok}, [][]netproxy.Refusal{{ref("a.test")}},
+		{"false; ls", "false; ls", 4096, []cmdrunner.RunResult{failed, ok}, [][]refusal{{ref("a.test")}},
 			[]string{noted("boom", line("a.test")), "fine"}, noted("boomfine", line("a.test"))},
-		{"ls | false", "ls | false", 4096, []cmdrunner.RunResult{ok, failed}, [][]netproxy.Refusal{{ref("a.test")}},
+		{"ls | false", "ls | false", 4096, []cmdrunner.RunResult{ok, failed}, [][]refusal{{ref("a.test")}},
 			[]string{"fine", noted("boom", line("a.test"))}, noted("fineboom", line("a.test"))},
 		{"two failing stages", "false; false", 4096, []cmdrunner.RunResult{failed, failed},
-			[][]netproxy.Refusal{{ref("a.test"), ref("b.test")}, {ref("b.test"), ref("c.test")}},
+			[][]refusal{{ref("a.test"), ref("b.test")}, {ref("b.test"), ref("c.test")}},
 			[]string{noted("boom", line("a.test"), line("b.test")), noted("boom", line("b.test"), line("c.test"))},
 			noted("boomboom", line("a.test"), line("b.test"), line("c.test"))},
 		{"two failing stages over budget", "false; false", short, []cmdrunner.RunResult{failed, failed},
-			[][]netproxy.Refusal{{ref("a.test"), ref("b.test")}, {ref("b.test"), ref("c.test")}},
+			[][]refusal{{ref("a.test"), ref("b.test")}, {ref("b.test"), ref("c.test")}},
 			nil, noted("b", line("a.test"), line("b.test"), omittedLine(1))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3045,7 +3045,7 @@ func TestConfinedShell_ProxyRefusalsSurviveShellAggregation(t *testing.T) {
 }
 
 func TestConfinedShell_ProxyRefusalNoteIsTheRecordedEndAndKeepsTheTimeoutNote(t *testing.T) {
-	record := []netproxy.Refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	record := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
 	line := refusedLine("a.test:80", "not approved (no one to ask)")
 	want := "boom\n" + line + "\n" + confinedFailureNote
 	for _, withSession := range []bool{true, false} {

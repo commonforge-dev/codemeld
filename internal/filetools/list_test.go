@@ -343,10 +343,15 @@ func TestListTool_ContainmentRejections(t *testing.T) {
 // returns the resolved directory as both target and path scope, and InvokeWithResolvedTarget over that
 // resolved target matches the standalone Invoke.
 func TestListTool_ResolveTargetScopeAndResolvedInvoke(t *testing.T) {
+	assertResolveTargetScopeAndResolvedInvoke(t, func(root string) readNavTool { return newListToolIn(t, root) }, "list", "file\ta.go\n")
+}
+
+func assertResolveTargetScopeAndResolvedInvoke(t *testing.T, newTool func(root string) readNavTool, name, want string) {
+	t.Helper()
 	root := t.TempDir()
 	mkdirAll(t, filepath.Join(root, "sub"))
 	writeFile(t, filepath.Join(root, "sub", "a.go"), "package sub\n")
-	tool := newListToolIn(t, root)
+	tool := newTool(root)
 
 	target, scope, err := tool.ResolveTarget(map[string]any{"path": "sub"})
 	if err != nil {
@@ -364,12 +369,12 @@ func TestListTool_ResolveTargetScopeAndResolvedInvoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InvokeWithResolvedTarget error = %v", err)
 	}
-	directRes, err := invokeList(t, tool, map[string]any{"path": "sub"})
+	directRes, err := tool.Invoke(context.Background(), map[string]any{"path": "sub"})
 	if err != nil {
 		t.Fatalf("Invoke error = %v", err)
 	}
-	if string(resolvedRes.Stdout) != string(directRes.Stdout) || string(resolvedRes.Stdout) != "file\ta.go\n" {
-		t.Fatalf("resolved-target list = %q, direct list = %q, want %q", resolvedRes.Stdout, directRes.Stdout, "file\ta.go\n")
+	if string(resolvedRes.Stdout) != string(directRes.Stdout) || string(resolvedRes.Stdout) != want {
+		t.Fatalf("resolved-target %s = %q, direct %s = %q, want %q", name, resolvedRes.Stdout, name, directRes.Stdout, want)
 	}
 }
 

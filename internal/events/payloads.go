@@ -104,6 +104,7 @@ const (
 
 	KindExecutionCapability = "execution_capability"
 	KindSkillLoaded         = "skill_loaded"
+	KindConnectDecision     = "connect_decision"
 )
 
 // suggest_followup_debug stage labels. Each marks one observable point on
@@ -343,6 +344,54 @@ func (p ExecutionCapability) validate() error {
 		if i > 0 && name <= p.WithheldEnvironment[i-1] {
 			return fmt.Errorf("%s: withheld_environment must be sorted with no duplicates", k)
 		}
+	}
+	return nil
+}
+
+type ConnectDecision struct {
+	Destination string `json:"destination"`
+	Decision    string `json:"decision"`
+	Step        string `json:"step,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Answer      string `json:"answer,omitempty"`
+	Count       int64  `json:"count"`
+}
+
+const UnknownDestination = "(unknown)"
+
+var connectSteps = set("proxy", "own listener", "grant", "session approval", "prompt once", "prompt session")
+
+func (ConnectDecision) Kind() string { return KindConnectDecision }
+func (p ConnectDecision) validate() error {
+	const k = KindConnectDecision
+	if err := required(k, "destination", p.Destination); err != nil {
+		return err
+	}
+	switch p.Decision {
+	case "allowed":
+		if err := enum(k, "step", p.Step, connectSteps); err != nil {
+			return err
+		}
+		if p.Reason != "" {
+			return fmt.Errorf("%s: an allowed decision carries no reason", k)
+		}
+	case "denied":
+		if err := required(k, "reason", p.Reason); err != nil {
+			return err
+		}
+		if p.Step != "" {
+			return fmt.Errorf("%s: a denied decision carries no step", k)
+		}
+	default:
+		return enum(k, "decision", p.Decision, set("allowed", "denied"))
+	}
+	if p.Answer != "" {
+		if err := enum(k, "answer", p.Answer, set("once", "session", "deny")); err != nil {
+			return err
+		}
+	}
+	if p.Count < 1 {
+		return fmt.Errorf("%s.count: must be >= 1, got %d", k, p.Count)
 	}
 	return nil
 }
@@ -2295,6 +2344,8 @@ func unmarshalPayload(kind string, raw json.RawMessage) (EventPayload, error) {
 		return decode[ChildAgentEnd](kind, raw)
 	case KindSkillLoaded:
 		return decode[SkillLoaded](kind, raw)
+	case KindConnectDecision:
+		return decode[ConnectDecision](kind, raw)
 	case KindTurnTerminal:
 		return decodeTurnTerminal(kind, raw)
 	case KindSecurityStateHalted:

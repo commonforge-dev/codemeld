@@ -418,6 +418,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 		terminal.home = result.Home
 		terminal.runCtx = ctx
 		conf.proxyAsker = terminal.askNetwork
+		conf.connectAsker = terminal.askConnect
 	}
 	authorizer := newHeadlessAuthorizer(cache, storeAccessor, modeActive, terminal, stderrNoticeRenderer{w: stderr})
 	authorizer.declaredWrite = declaredWrite

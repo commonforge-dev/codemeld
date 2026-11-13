@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -190,6 +192,9 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					"project), how it was loaded (tool or slash), the file read (empty for SKILL.md),\n" +
 					"and the byte count and SHA-256 digest of the loaded content, never the text\n" +
 					"itself. --kind skill_loaded lists only the skill loads.\n\n" +
+					"Each connection the confinement broker allowed or denied for a command is a\n" +
+					"connect_decision event, printed as one line with how many times it happened; a\n" +
+					"denial adds a 'how to grant' line. --kind connect_decision lists only those.\n\n" +
 					"The filters compose in one invocation, and a record keeps the number of its\n" +
 					"position in the whole session. Whenever a filter is active the header reads\n" +
 					"'records: <selected> of <total>', so a filter that matched nothing is visibly a\n" +
@@ -2331,6 +2336,7 @@ var showKinds = []string{
 	events.KindAgentInstructionsLoaded,
 	events.KindChildAgentEnd,
 	events.KindChildAgentStart,
+	events.KindConnectDecision,
 	events.KindExecutionCapability,
 	events.KindInteractionMode,
 	events.KindLaunchBegan,
@@ -2706,11 +2712,44 @@ func renderMessage(w io.Writer, n int, m sessions.Message) {
 // payload, indented and pretty-printed when it is valid JSON.
 func renderEvent(w io.Writer, n int, e sessions.Event) {
 	fmt.Fprintf(w, "%d. event  kind=%s  %s\n", n, e.Kind, formatTimestamp(e.Timestamp))
+	var d events.ConnectDecision
+	if e.Kind == events.KindConnectDecision && json.Unmarshal(e.Payload, &d) == nil {
+		writeIndented(w, "    ", connectDecisionText(d))
+		return
+	}
 	if pretty, ok := prettyJSON(e.Payload); ok {
 		writeIndented(w, "    ", pretty)
 	} else {
 		writeIndented(w, "    ", strings.TrimSpace(string(e.Payload)))
 	}
+}
+
+func connectDecisionText(d events.ConnectDecision) string {
+	times := ""
+	if d.Count > 1 {
+		times = fmt.Sprintf(" (%d times)", d.Count)
+	}
+	dest := permissions.SingleLineControlEscape(d.Destination)
+	if d.Decision == "allowed" {
+		return fmt.Sprintf("connect %s allowed by %s%s", dest, d.Step, times)
+	}
+	line := fmt.Sprintf("connect %s denied: %s%s\nhow to grant: ", dest, permissions.SingleLineControlEscape(d.Reason), times)
+	if strings.HasPrefix(d.Reason, "always denied: ") {
+		return line + "it is always denied; no grant opens it"
+	}
+	if d.Destination == events.UnknownDestination {
+		return line + "the destination could not be read, so no grant names it"
+	}
+	ap, err := netip.ParseAddrPort(d.Destination)
+	tcp := err == nil && ap.Port() != 0
+	if !tcp && !filepath.IsAbs(d.Destination) {
+		return line + "the recorded destination is not an IP:port endpoint or an absolute socket path, so it cannot be saved as a grant"
+	}
+	line += "add " + dest + " to connect_grants in ~/.codemeld/global/settings.yaml or .codemeld/settings.local.yaml"
+	if tcp {
+		return line
+	}
+	return line + "; a saved grant works only for a socket outside the command's write roots, otherwise allow it when asked (in the TUI or with --prompt-for-approval)"
 }
 
 // toolCallArguments extracts a tool call's function name and a display form of

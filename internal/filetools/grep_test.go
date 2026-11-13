@@ -8,6 +8,7 @@ package filetools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -720,5 +721,36 @@ func TestGrepTool_NamedFIFORejected(t *testing.T) {
 	res, _ := invokeGrep(t, tool, map[string]any{"pattern": "x", "path": "pipe"})
 	if res.ExitCode == 0 || !strings.Contains(string(res.Stderr), "grep target rejected: search path is not a directory") {
 		t.Fatalf("result = exit %d, stderr %q; want the not-a-directory rejection", res.ExitCode, res.Stderr)
+	}
+}
+
+func TestGrepTool_SymlinkSwappedAfterCheckNotSearched(t *testing.T) {
+	for _, tc := range symlinkSwapCases {
+		for _, path := range []string{".", "sub/f"} {
+			for _, filesOnly := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/path=%s/files_only=%v", tc.name, path, filesOnly), func(t *testing.T) {
+					root := t.TempDir()
+					outside := t.TempDir()
+					writeFile(t, filepath.Join(outside, "f"), "OUTSIDE-SECRET\n")
+					if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+						t.Fatalf("Mkdir: %v", err)
+					}
+					writeFile(t, filepath.Join(root, "sub", "f"), "inside\n")
+					swapPath, target := tc.pick(root, outside)
+					calls := swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, swapPath, target) })
+
+					res, _ := invokeGrep(t, newGrepToolIn(t, root), map[string]any{"pattern": "SECRET", "path": path, "files_only": filesOnly})
+					if *calls != 1 {
+						t.Fatalf("swap ran %d times, want 1", *calls)
+					}
+					if got := grepLines(t, res); len(got) != 0 {
+						t.Fatalf("grep after a symlink swap = %q, want no matches", got)
+					}
+					if strings.Contains(string(res.Stdout)+string(res.Stderr), "OUTSIDE-SECRET") {
+						t.Fatalf("grep returned the symlink target's bytes: stdout %q stderr %q", res.Stdout, res.Stderr)
+					}
+				})
+			}
+		}
 	}
 }

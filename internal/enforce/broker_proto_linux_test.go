@@ -1176,7 +1176,28 @@ func TestBrokerProtoPassRights(t *testing.T) {
 	}
 	defer func() { closed(t, "the socket pair", unix.Close(fds[0])) }()
 	defer func() { closed(t, "the socket pair", unix.Close(fds[1])) }()
-	err = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_PASSRIGHTS, 0)
-	claim(t, err == unix.ENOPROTOOPT, "R10 golang.org/x/sys/unix defines SO_PASSRIGHTS=%#x; setsockopt(SO_PASSRIGHTS, 0) on this kernel: %s",
-		unix.SO_PASSRIGHTS, errName(err))
+	if err := unix.SetsockoptInt(fds[1], unix.SOL_SOCKET, unix.SO_PASSRIGHTS, 0); err != nil {
+		t.Skipf("setsockopt(SO_PASSRIGHTS=%#x, 0) refused by this kernel: %s", unix.SO_PASSRIGHTS, errName(err))
+	}
+	sendErr := unix.Sendmsg(fds[0], []byte("L"), unix.UnixRights(fds[0]), nil, 0)
+	b, oob := make([]byte, 1), make([]byte, unix.CmsgSpace(4))
+	n, oobn, flags, _, recvErr := unix.Recvmsg(fds[1], b, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
+	var rights []int
+	if recvErr == nil && oobn > 0 {
+		msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
+			t.Fatalf("parsing control messages: %v", err)
+		}
+		for i := range msgs {
+			got, err := unix.ParseUnixRights(&msgs[i])
+			if err == nil {
+				rights = append(rights, got...)
+			}
+		}
+	}
+	for _, fd := range rights {
+		closed(t, "a received descriptor", unix.Close(fd))
+	}
+	claim(t, len(rights) == 0, "R10 with SO_PASSRIGHTS=0 on the receiver, SCM_RIGHTS is refused: sendmsg=%s recvmsg=%s bytes=%d rights=%d ctrunc=%v",
+		errName(sendErr), errName(recvErr), n, len(rights), flags&unix.MSG_CTRUNC != 0)
 }

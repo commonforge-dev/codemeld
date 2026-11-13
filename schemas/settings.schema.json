@@ -113,6 +113,11 @@
       },
       "description": "Domains the session proxy reaches without asking, each one exact host and port. Read only from the global settings file and the project's settings.local.yaml; a list in the project's committed settings.yaml is ignored. Lists from both files are combined."
     },
+    "connect_grants": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Destinations a confined command may connect to without asking, each one TCP endpoint written IP:port (IPv6 in brackets, no host names) or one absolute Unix socket path. Read only from the global settings file and the project's settings.local.yaml; a list in the project's committed settings.yaml is ignored. Lists from both files are combined."
+    },
     "writable_folders": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },

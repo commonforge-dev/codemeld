@@ -373,7 +373,7 @@ func (b generalAgentBinding) deps(reg *tools.Registry, cache *config.Cache, turn
 			if b.confinement != nil {
 				conf := *b.confinement
 				conf.mode = func() string { return childMode }
-				conf.proxyAsker = nil
+				conf.proxyAsker, conf.connectAsker = nil, nil
 				child.confinement = &conf
 			}
 			return child

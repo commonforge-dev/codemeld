@@ -206,7 +206,7 @@ func TestControlArg(t *testing.T) {
 }
 
 func TestPolicyBrokerVariants(t *testing.T) {
-	for _, broker := range []string{"slice", "full"} {
+	for _, broker := range []string{"slice", "full", "connect"} {
 		p := validAutoEdits()
 		p.Broker = broker
 		if got := roundTrip(t, p); !reflect.DeepEqual(got, p) {

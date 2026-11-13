@@ -290,6 +290,11 @@ func TestStore_FlushDoesNotRewriteMetadataUpdatedAt(t *testing.T) {
 // session's existing value (a rename is not session activity). The `now`
 // seam is wired to a clearly later instant to prove FlushTitle never consults it.
 func TestStore_FlushTitle_PersistsTitleWithoutAdvancingUpdatedAt(t *testing.T) {
+	assertTitleFlushKeepsUpdatedAt(t, "FlushTitle", (*Store).FlushTitle, "my session")
+}
+
+func assertTitleFlushKeepsUpdatedAt(t *testing.T, method string, flush func(*Store, context.Context, string) (fserrors.Category, WriteReason, error), title string) {
+	t.Helper()
 	orig := now
 	t.Cleanup(func() { now = orig })
 	now = func() time.Time { return time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC) }
@@ -300,20 +305,20 @@ func TestStore_FlushTitle_PersistsTitleWithoutAdvancingUpdatedAt(t *testing.T) {
 	s := New(path, base)
 	s.Append(userMessage(testRecID1, "hello"))
 
-	cat, reason, err := s.FlushTitle(context.Background(), "my session")
+	cat, reason, err := flush(s, context.Background(), title)
 	if err != nil {
-		t.Fatalf("FlushTitle error: %v (cat=%q reason=%q)", err, cat, reason)
+		t.Fatalf("%s error: %v (cat=%q reason=%q)", method, err, cat, reason)
 	}
 	if cat != "" || reason != ReasonNone {
 		t.Fatalf("cat=%q reason=%q, want empty cat and ReasonNone on success", cat, reason)
 	}
 
 	got := readBack(t, path)
-	if got.Metadata.Title != "my session" {
-		t.Fatalf("persisted title = %q, want %q", got.Metadata.Title, "my session")
+	if got.Metadata.Title != title {
+		t.Fatalf("persisted title = %q, want %q", got.Metadata.Title, title)
 	}
 	if !got.Metadata.UpdatedAt.Equal(wantUpdatedAt) {
-		t.Fatalf("updated_at = %s after FlushTitle, want it unchanged at %s", got.Metadata.UpdatedAt, wantUpdatedAt)
+		t.Fatalf("updated_at = %s after %s, want it unchanged at %s", got.Metadata.UpdatedAt, method, wantUpdatedAt)
 	}
 	if len(got.Records) != 1 {
 		t.Fatalf("persisted records = %d, want 1 (the appended message persists with the title)", len(got.Records))
@@ -416,34 +421,7 @@ func TestStore_FlushTitle_WriteFailureRestoresPriorMetadata(t *testing.T) {
 // housekeeping, not session activity. The `now` seam is wired to a clearly later
 // instant to prove the helper never consults it.
 func TestStore_FlushGeneratedTitle_PersistsWithoutAdvancingUpdatedAt(t *testing.T) {
-	orig := now
-	t.Cleanup(func() { now = orig })
-	now = func() time.Time { return time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC) }
-
-	path := filepath.Join(t.TempDir(), "session.json")
-	base := baseSession()
-	wantUpdatedAt := base.Metadata.UpdatedAt
-	s := New(path, base)
-	s.Append(userMessage(testRecID1, "hello"))
-
-	cat, reason, err := s.FlushGeneratedTitle(context.Background(), "auto title")
-	if err != nil {
-		t.Fatalf("FlushGeneratedTitle error: %v (cat=%q reason=%q)", err, cat, reason)
-	}
-	if cat != "" || reason != ReasonNone {
-		t.Fatalf("cat=%q reason=%q, want empty cat and ReasonNone on success", cat, reason)
-	}
-
-	got := readBack(t, path)
-	if got.Metadata.Title != "auto title" {
-		t.Fatalf("persisted title = %q, want %q", got.Metadata.Title, "auto title")
-	}
-	if !got.Metadata.UpdatedAt.Equal(wantUpdatedAt) {
-		t.Fatalf("updated_at = %s after FlushGeneratedTitle, want it unchanged at %s", got.Metadata.UpdatedAt, wantUpdatedAt)
-	}
-	if len(got.Records) != 1 {
-		t.Fatalf("persisted records = %d, want 1 (the appended message persists with the title)", len(got.Records))
-	}
+	assertTitleFlushKeepsUpdatedAt(t, "FlushGeneratedTitle", (*Store).FlushGeneratedTitle, "auto title")
 }
 
 func TestStore_FlushGeneratedTitle_RecordsGeneratedProvenance(t *testing.T) {

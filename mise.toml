@@ -1,5 +1,5 @@
 [tools]
-go = "1.26.10"
+go = "1.26.11"
 "go:golang.org/x/vuln/cmd/govulncheck" = "v1.6.0"
 "go:github.com/mibk/dupl" = "v1.1.0"
 
@@ -45,6 +45,10 @@ run = "deadcode -test -filter=codemeld.dev/codemeld codemeld.dev/codemeld/cmd/co
 description = "Formats all Go source in place with gofmt"
 run = "gofmt -w ."
 
+[tasks.fuzz-grants]
+description = "Runs the grant-matching fuzz target for 60 seconds"
+run = "go test ./internal/dispatch -run=^$ -fuzz=FuzzGrantMatchesExecution -fuzztime=60s"
+
 [tasks.fuzz-slash]
 description = "Runs the slash-command parser fuzz target for 30 seconds"
 run = "go test ./internal/tui -run=^$ -fuzz=FuzzSlashParse -fuzztime=30s"
@@ -80,6 +84,10 @@ run = 'f() { [ $# -gt 0 ] || { echo "test-pkg: a package is required, e.g. mise 
 [tasks.vet]
 description = "Runs go vet across all packages"
 run = "go vet ./..."
+
+[tasks.vulncheck]
+description = "Runs govulncheck across all packages with no exceptions applied (needs outbound network)"
+run = "govulncheck ./..."
 
 [tasks.wiring-stub-check]
 description = "Inactive in the public tree: does nothing. The stale-stub check runs only in the development tree, which overrides this task"

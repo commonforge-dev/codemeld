@@ -10,11 +10,13 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -116,7 +118,13 @@ func (s *brkChildState) run(f []string) string {
 		if err != nil {
 			return err.Error()
 		}
-		return errName(rawSockaddrCall(unix.SYS_CONNECT, s.fd(f[1]), addr))
+		nr := uintptr(unix.SYS_CONNECT)
+		if len(f) > 3 {
+			nr = unix.SYS_BIND
+		}
+		return errName(rawSockaddrCall(nr, s.fd(f[1]), addr))
+	case "noport":
+		return errName(unix.SetsockoptInt(s.fd(f[1]), unix.IPPROTO_IP, unix.IP_BIND_ADDRESS_NO_PORT, 1))
 	case "badptr":
 		_, _, e := unix.Syscall(unix.SYS_CONNECT, uintptr(s.fd(f[1])), 1, unix.SizeofSockaddrInet4)
 		return errName(errnoErr(e))
@@ -136,7 +144,11 @@ func (s *brkChildState) run(f []string) string {
 	case "badfd":
 		return errName(rawSockaddrCall(unix.SYS_CONNECT, brkBadFD, brkSockaddr(netip.MustParseAddrPort(f[1]))))
 	case "bind":
-		return errName(unix.Bind(s.fd(f[1]), loopback4(0)))
+		addr := "127.0.0.1:0"
+		if len(f) > 2 {
+			addr = f[2]
+		}
+		return errName(rawSockaddrCall(unix.SYS_BIND, s.fd(f[1]), brkSockaddr(netip.MustParseAddrPort(addr))))
 	case "listen":
 		return errName(unix.Listen(s.fd(f[1]), 1))
 	case "soerror":
@@ -160,8 +172,19 @@ func (s *brkChildState) run(f []string) string {
 			return netip.AddrPortFrom(netip.AddrFrom4(a.Addr), uint16(a.Port)).String()
 		case *unix.SockaddrInet6:
 			return netip.AddrPortFrom(netip.AddrFrom16(a.Addr), uint16(a.Port)).String()
+		case *unix.SockaddrUnix:
+			return strconv.Quote(a.Name)
 		}
 		return errName(err)
+	case "chdir":
+		return errName(unix.Chdir(f[1]))
+	case "umask":
+		mask, err := strconv.ParseUint(f[1], 8, 32)
+		if err != nil {
+			return err.Error()
+		}
+		unix.Umask(int(mask))
+		return "0"
 	case "rewrite":
 		s.mu.Lock()
 		copy(s.bufs[f[1]], brkSockaddr(netip.MustParseAddrPort(f[2])))
@@ -211,6 +234,10 @@ func TestBrokerKernelChild(t *testing.T) {
 	case "":
 		t.Skip("runs only as the disposable child of the broker tests")
 	case "peer":
+		if os.Getenv(brkPeerAddrEnv) == "listen" {
+			_, _ = os.Stdout.WriteString("result=" + errName(unix.Listen(3, 1)) + "\n")
+			return
+		}
 		addr := brkSockaddr(netip.MustParseAddrPort(os.Getenv(brkPeerAddrEnv)))
 		_, _ = os.Stdout.WriteString("result=" + errName(rawSockaddrCall(unix.SYS_CONNECT, 3, addr)) + "\n")
 		return
@@ -235,7 +262,7 @@ func TestBrokerKernelChild(t *testing.T) {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := installSeccompListener(map[string]Policy{"slice": seccompSlice, "full": seccompFull}[mode])
+	listener, err := installSeccompListener(map[string]Policy{"slice": seccompSlice, "full": seccompFull, "connect": seccompConnect}[mode])
 	if err != nil {
 		var e unix.Errno
 		errors.As(err, &e)
@@ -700,18 +727,110 @@ func TestBrokerConnectChecks(t *testing.T) {
 	d.mu.Unlock()
 }
 
-func TestBrokerFullModeDenials(t *testing.T) {
+func TestBrokerFullModeBindListenAndOwnListener(t *testing.T) {
 	c := brkStart(t, "full")
-	_, a := brkListen(t)
-	d := &brkDecisions{allow: map[netip.AddrPort]bool{a: true}}
-	brkStartBroker(t, c, d.decide)
-	c.expect(t, "socket s inet", "0")
-	c.expect(t, "bind s", "EPERM")
-	c.expect(t, "listen s", "EPERM")
+	lnB, other := brkListen(t)
+	d := &brkDecisions{allow: map[netip.AddrPort]bool{}}
+	b := brkStartBroker(t, c, d.decide)
+
 	c.expect(t, "socket u unix", "0")
-	c.expect(t, "connect u "+a.String(), "EPERM")
-	if n := d.count(); n != 0 {
-		t.Errorf("decider called %d times", n)
+	c.expect(t, "connect u "+other.String(), "EPERM")
+	c.expect(t, "socket x inet", "0")
+	for _, addr := range []string{"0.0.0.0:0", "127.0.0.2:0", "192.0.2.1:0"} {
+		c.expect(t, "bind x "+addr, "EPERM")
+	}
+	c.expect(t, "listen x", "EPERM")
+	c.expect(t, "local x", "0.0.0.0:0")
+
+	c.expect(t, "socket s inet", "0")
+	c.expect(t, "bind s 127.0.0.1:0", "0")
+	own := netip.MustParseAddrPort(c.do(t, "local s"))
+	if own.Port() == 0 {
+		t.Fatalf("the port-0 bind left local endpoint %v", own)
+	}
+	b.mu.Lock()
+	recorded := b.own[own]
+	b.mu.Unlock()
+	if !recorded {
+		t.Errorf("the kernel-picked endpoint %v was not recorded", own)
+	}
+	c.expect(t, "listen s", "0")
+	c.expect(t, "socket c inet", "0")
+	c.expect(t, "connect c "+own.String(), "0")
+	c.expect(t, "peer c", own.String())
+	c.expect(t, "socket o inet", "0")
+	c.expect(t, "connect o "+other.String(), "EPERM")
+	if n := brkAccepts(t, lnB, 200*time.Millisecond); n != 0 {
+		t.Errorf("another loopback port accepted %d connections", n)
+	}
+	d.mu.Lock()
+	seen := slices.Clone(d.seen)
+	d.mu.Unlock()
+	if len(seen) != 1 || seen[0] != other {
+		t.Errorf("decider saw %v, want only %v", seen, other)
+	}
+
+	if c.do(t, "socket six inet6") != "0" {
+		t.Log("IPv6 sockets unavailable; IPv6 checks skipped")
+		return
+	}
+	mapped := netip.AddrPortFrom(netip.AddrFrom16([16]byte{10: 0xff, 11: 0xff, 12: 127, 15: 1}), own.Port())
+	c.expect(t, "connect six "+mapped.String(), "0")
+	c.expect(t, "socket v6 inet6", "0")
+	c.expect(t, "connect v6 "+netip.AddrPortFrom(netip.IPv6Loopback(), own.Port()).String(), "EPERM")
+	c.expect(t, "socket any6 inet6", "0")
+	c.expect(t, "bind any6 [::]:0", "EPERM")
+	c.expect(t, "socket m inet6", "0")
+	c.expect(t, "bind m "+netip.AddrPortFrom(mapped.Addr(), 0).String(), "0")
+	c.expect(t, "socket l6 inet6", "0")
+	if got := c.do(t, "bind l6 [::1]:0"); got != "0" && got != "EADDRNOTAVAIL" {
+		t.Errorf("bind to ::1: got %s, want 0 or the kernel's EADDRNOTAVAIL", got)
+	}
+}
+
+func TestBrokerFullModeRecordsTheEndpointListenAllocates(t *testing.T) {
+	c := brkStart(t, "full")
+	lnB, other := brkListen(t)
+	d := &brkDecisions{allow: map[netip.AddrPort]bool{}}
+	brkStartBroker(t, c, d.decide)
+
+	c.expect(t, "socket s inet", "0")
+	c.expect(t, "noport s", "0")
+	c.expect(t, "bind s 127.0.0.1:0", "0")
+	c.expect(t, "local s", "127.0.0.1:0")
+	c.expect(t, "listen s", "0")
+	own := netip.MustParseAddrPort(c.do(t, "local s"))
+	if own.Port() == 0 {
+		t.Fatalf("listen left local endpoint %v", own)
+	}
+	c.expect(t, "socket c inet", "0")
+	c.expect(t, "connect c "+own.String(), "0")
+	c.expect(t, "peer c", own.String())
+	c.expect(t, "socket o inet", "0")
+	c.expect(t, "connect o "+other.String(), "EPERM")
+	if n := brkAccepts(t, lnB, 200*time.Millisecond); n != 0 {
+		t.Errorf("another loopback port accepted %d connections", n)
+	}
+}
+
+func TestBrokerFullModeBindTakesTheShortIPv6Sockaddr(t *testing.T) {
+	c := brkStart(t, "full")
+	brkStartBroker(t, c, (&brkDecisions{allow: map[netip.AddrPort]bool{}}).decide)
+	if c.do(t, "socket six inet6") != "0" {
+		t.Skip("IPv6 sockets unavailable")
+	}
+	short := hex.EncodeToString(brkSockaddr(netip.AddrPortFrom(netip.IPv6Loopback(), 0))[:24])
+	c.expect(t, "socket cut inet6", "0")
+	c.expect(t, "raw cut "+short[:46]+" bind", "EPERM")
+	got := c.do(t, "raw six "+short+" bind")
+	if got == "EADDRNOTAVAIL" {
+		t.Skip("::1 is not configured")
+	}
+	if got != "0" {
+		t.Fatalf("24-byte bind to [::1]:0: got %s, want 0", got)
+	}
+	if local := netip.MustParseAddrPort(c.do(t, "local six")); local.Addr() != netip.IPv6Loopback() || local.Port() == 0 {
+		t.Errorf("24-byte bind left local endpoint %v", local)
 	}
 }
 
@@ -862,14 +981,14 @@ func TestBrokerFailedLookupAndStaleNotification(t *testing.T) {
 	if err != nil {
 		c.fatalf(t, "recvNotification: %v", err)
 	}
-	notConnect := n
-	notConnect.Nr = unix.SYS_BIND
-	if _, why, ok := b.answer(notConnect); !ok || why == nil || *why != (Refusal{Reason: "not a TCP connect"}) {
-		t.Errorf("a non-connect call: refusal %+v sent=%v, want a non-TCP-connect refusal with no destination", why, ok)
+	unbound := n
+	unbound.Nr = unix.SYS_LISTEN
+	if _, why, _, ok := b.answer(unbound); !ok || why == nil || *why != (Refusal{Reason: "listen not allowed (bind to 127.0.0.1 or ::1 first)"}) {
+		t.Errorf("a listen on an unbound socket: refusal %+v sent=%v, want a listen refusal with no destination", why, ok)
 	}
 	forged := n
 	forged.Pid = 1 << 30
-	resp, why, ok := b.answer(forged)
+	resp, why, _, ok := b.answer(forged)
 	if !ok || resp.ID != n.ID || resp.Error != -int32(unix.EPERM) || d.count() != 0 {
 		t.Errorf("failed lookup: answer %+v sent=%v after %d decisions, want EPERM sent without deciding", resp, ok, d.count())
 	}
@@ -882,7 +1001,7 @@ func TestBrokerFailedLookupAndStaleNotification(t *testing.T) {
 	if got := c.await(t, res, "connect"); got != "EPERM" {
 		t.Errorf("connect: got %s, want EPERM", got)
 	}
-	if resp, why, ok := b.answer(n); ok || why != nil {
+	if resp, why, _, ok := b.answer(n); ok || why != nil {
 		t.Errorf("stale notification answered with %+v and refusal %+v, want it dropped", resp, why)
 	}
 }
@@ -1309,5 +1428,903 @@ func TestBrokerStopDuringRegistrationWaitsOnlyForTheCallback(t *testing.T) {
 	}
 	if got := c.await(t, res, "connect"); got != "0" {
 		t.Errorf("connect registered during stop: got %s, want 0", got)
+	}
+}
+
+func brkUnixAddr(path string) string {
+	return hex.EncodeToString(unixDestAddr(unix.AF_UNIX, path))
+}
+
+func brkRealDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func brkHeld(t *testing.T, path string) int {
+	t.Helper()
+	fd, _, err := resolveUnixDest(uint32(os.Getpid()), unixDestAddr(unix.AF_UNIX, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	return fd
+}
+
+func TestBrokerConnectModeDecidesInRuleSixOrder(t *testing.T) {
+	c := brkStart(t, "connect")
+	dir := brkRealDir(t)
+	granted, ungranted, denied := filepath.Join(dir, "granted.sock"), filepath.Join(dir, "other.sock"), filepath.Join(dir, "denied.sock")
+	grantedLn, otherLn, deniedLn := unixDestListen(t, granted), unixDestListen(t, ungranted), unixDestListen(t, denied)
+	grantedTCPLn, grantedTCP := brkListen(t)
+	proxyLn, proxy := brkListen(t)
+	_, otherTCP := brkListen(t)
+	deny := newDenyList([]string{denied}, nil)
+	t.Cleanup(deny.Close)
+	r := &brkRegistry{}
+	b, err := StartConnectBroker(c.take(), ConnectRules{
+		Grants:     []string{granted, denied, grantedTCP.String()},
+		Deny:       deny,
+		Proxy:      (&brkDecisions{allow: map[netip.AddrPort]bool{proxy: true}}).decide,
+		WriteRoots: []string{filepath.Join(dir, "work")},
+		TmpDir:     filepath.Join(dir, "tmp"),
+	}, r.register)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+
+	for _, tc := range []struct{ name, family, addr, cmd, want string }{
+		{"g", "unix", brkUnixAddr(granted), "raw", "0"},
+		{"o", "unix", brkUnixAddr(ungranted), "raw", "EPERM"},
+		{"d", "unix", brkUnixAddr(denied), "raw", "EPERM"},
+		{"a", "unix", brkUnixAddr("\x00codemeld-test"), "raw", "EPERM"},
+		{"t", "inet", grantedTCP.String(), "connect", "0"},
+		{"p", "inet", proxy.String(), "connect", "0"},
+		{"u", "inet", otherTCP.String(), "connect", "EPERM"},
+	} {
+		c.expect(t, "socket "+tc.name+" "+tc.family, "0")
+		c.expect(t, tc.cmd+" "+tc.name+" "+tc.addr, tc.want)
+	}
+	if !unixDestAccepted(t, grantedLn, brkBound) {
+		t.Error("the granted socket accepted no connection")
+	}
+	if unixDestAccepted(t, otherLn, 200*time.Millisecond) || unixDestAccepted(t, deniedLn, 200*time.Millisecond) {
+		t.Error("a refused Unix socket accepted a connection")
+	}
+	if n := brkAccepts(t, grantedTCPLn, 200*time.Millisecond) + brkAccepts(t, proxyLn, 200*time.Millisecond); n != 2 {
+		t.Errorf("the granted and proxy endpoints accepted %d connections, want 2", n)
+	}
+	brkStop(t, b, brkBound)
+	want := []Refusal{
+		{Path: ungranted, Reason: "Unix socket connect not granted"},
+		{Path: denied, Reason: "always denied: " + denied},
+		{Path: "@codemeld-test", Reason: "always denied: abstract Unix address"},
+		{Host: "127.0.0.1", Port: strconv.Itoa(int(otherTCP.Port())), Reason: "direct connection not allowed (use the proxy)"},
+	}
+	if got := b.Refusals(); !slices.Equal(got, want) {
+		t.Errorf("refusals:\n got %+v\nwant %+v", got, want)
+	}
+	if got := r.published(); len(got) != 2 {
+		t.Errorf("published %v, want only the two TCP connections", got)
+	}
+}
+
+func TestStartConnectBrokerRequiresADenyList(t *testing.T) {
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wr.Close() }()
+	if b, err := StartConnectBroker(rd, ConnectRules{}, nil); err == nil {
+		b.Stop()
+		t.Fatal("started with no deny list")
+	}
+}
+
+func TestConnectRulesPathGrantMatchesTheHeldFile(t *testing.T) {
+	dir := brkRealDir(t)
+	a, b := filepath.Join(dir, "a.sock"), filepath.Join(dir, "b.sock")
+	lnA, lnB := unixDestListen(t, a), unixDestListen(t, b)
+	grant := filepath.Join(dir, "grant")
+	if err := os.Symlink(a, grant); err != nil {
+		t.Fatal(err)
+	}
+	deny := newDenyList(nil, nil)
+	rules := &ConnectRules{Grants: []string{grant}, Deny: deny}
+	held := brkHeld(t, a)
+	if ok, why := rules.decideUnix(held); !ok {
+		t.Fatalf("a destination that is the grant's file: refused (%s)", why)
+	}
+	next := filepath.Join(dir, "grant.next")
+	if err := os.Symlink(b, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, grant); err != nil {
+		t.Fatal(err)
+	}
+	unixDestDial(t, &unix.SockaddrUnix{Name: "/proc/self/fd/" + strconv.Itoa(held)})
+	if !unixDestAccepted(t, lnA, brkBound) || unixDestAccepted(t, lnB, 200*time.Millisecond) {
+		t.Error("replacing the grant path after the check redirected the connect")
+	}
+	if ok, _ := rules.decideUnix(held); ok {
+		t.Error("the grant, now leading to another socket, still admits the held destination")
+	}
+	if ok, why := rules.decideUnix(brkHeld(t, b)); !ok {
+		t.Errorf("a replacement present before the check: refused (%s)", why)
+	}
+}
+
+func TestConnectRulesPathGrantPastTheSocketDoesNotAdmit(t *testing.T) {
+	dir := brkRealDir(t)
+	sock := filepath.Join(dir, "s.sock")
+	unixDestListen(t, sock)
+	held := brkHeld(t, sock)
+	deny := newDenyList(nil, nil)
+	if ok, why := (&ConnectRules{Grants: []string{sock}, Deny: deny}).decideUnix(held); !ok {
+		t.Fatalf("the socket's own path: refused (%s)", why)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(sock, link); err != nil {
+		t.Fatal(err)
+	}
+	dotLink := filepath.Join(dir, "dot-link")
+	if err := os.Symlink("s.sock/.", dotLink); err != nil {
+		t.Fatal(err)
+	}
+	for _, grant := range []string{sock + "/", sock + "/.", sock + "/..", link + "/", link + "/..", dotLink} {
+		if ok, _ := (&ConnectRules{Grants: []string{grant}, Deny: deny}).decideUnix(held); ok {
+			t.Errorf("grant %s admitted the socket", grant)
+		}
+	}
+}
+
+func TestConnectRulesPathGrantThroughWriteRootOrTempFolderDoesNotAdmit(t *testing.T) {
+	base := brkRealDir(t)
+	work, tmp, out := filepath.Join(base, "work"), filepath.Join(base, "tmp"), filepath.Join(base, "out")
+	for _, d := range []string{work, tmp, out} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(target, path string) string {
+		t.Helper()
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	outside, inWork, inTmp := filepath.Join(out, "s.sock"), filepath.Join(work, "s.sock"), filepath.Join(tmp, "s.sock")
+	for _, p := range []string{outside, inWork, inTmp} {
+		unixDestListen(t, p)
+	}
+	workLink := link(work, filepath.Join(base, "work-link"))
+	deny := newDenyList(nil, nil)
+	if ok, why := (&ConnectRules{Grants: []string{outside}, Deny: deny, WriteRoots: []string{work}, TmpDir: tmp}).decideUnix(brkHeld(t, outside)); !ok {
+		t.Fatalf("a grant outside every write root: refused (%s)", why)
+	}
+	for _, tc := range []struct {
+		name, grant, dest, folder string
+		roots                     []string
+	}{
+		{"socket in a write root", inWork, inWork, work, nil},
+		{"socket in the temp folder", inTmp, inTmp, tmp, nil},
+		{"symlink in a write root to a socket outside", link(outside, filepath.Join(work, "to-out")), outside, work, nil},
+		{"symlink in the temp folder to a socket outside", link(outside, filepath.Join(tmp, "to-out")), outside, tmp, nil},
+		{"symlink outside into a write root", link(inWork, filepath.Join(out, "to-work")), inWork, work, nil},
+		{"write root named through a symlink", inWork, inWork, work, []string{workLink}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rules := &ConnectRules{Grants: []string{tc.grant}, Deny: deny, WriteRoots: []string{work}, TmpDir: tmp}
+			if tc.roots != nil {
+				rules.WriteRoots, rules.TmpDir = tc.roots, ""
+			}
+			ok, why := rules.decideUnix(brkHeld(t, tc.dest))
+			want := "grant " + tc.grant + " resolves through " + tc.folder + ", inside the write root or temp folder " + tc.folder
+			if ok || why != want {
+				t.Errorf("admitted %v, reason %q, want refused with %q", ok, why, want)
+			}
+		})
+	}
+}
+
+func TestBrokerConnectModeAsksOnlyAfterRuleSixChecksFail(t *testing.T) {
+	c := brkStart(t, "connect")
+	dir := brkRealDir(t)
+	sock := func(name string) (string, *net.UnixListener) {
+		p := filepath.Join(dir, name)
+		return p, unixDestListen(t, p)
+	}
+	granted, _ := sock("granted.sock")
+	once, onceLn := sock("once.sock")
+	refused, refusedLn := sock("refused.sock")
+	silent, _ := sock("silent.sock")
+	denied, _ := sock("denied.sock")
+	_, proxy := brkListen(t)
+	sessionLn, session := brkListen(t)
+	_, refusedTCP := brkListen(t)
+	_, silentTCP := brkListen(t)
+	deny := newDenyList([]string{denied}, nil)
+	t.Cleanup(deny.Close)
+	answers := map[string][2]string{
+		once:                {"prompt once", ""},
+		refused:             {"", "not approved (denied)"},
+		session.String():    {"prompt session", ""},
+		refusedTCP.String(): {"", "not approved (denied)"},
+	}
+	var mu sync.Mutex
+	var asked []string
+	b, err := StartConnectBroker(c.take(), ConnectRules{
+		Grants: []string{granted},
+		Deny:   deny,
+		Proxy:  (&brkDecisions{allow: map[netip.AddrPort]bool{proxy: true}}).decide,
+		Ask: func(_ context.Context, _ func() bool, tcp netip.AddrPort, fd int) (string, string) {
+			dest := tcp.String()
+			if fd >= 0 {
+				dest, _ = os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+			}
+			mu.Lock()
+			asked = append(asked, dest)
+			mu.Unlock()
+			return answers[dest][0], answers[dest][1]
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+
+	for _, tc := range []struct{ name, family, addr, cmd, want string }{
+		{"g", "unix", brkUnixAddr(granted), "raw", "0"},
+		{"o", "unix", brkUnixAddr(once), "raw", "0"},
+		{"r", "unix", brkUnixAddr(refused), "raw", "EPERM"},
+		{"s", "unix", brkUnixAddr(silent), "raw", "EPERM"},
+		{"d", "unix", brkUnixAddr(denied), "raw", "EPERM"},
+		{"p", "inet", proxy.String(), "connect", "0"},
+		{"t", "inet", session.String(), "connect", "0"},
+		{"u", "inet", refusedTCP.String(), "connect", "EPERM"},
+		{"v", "inet", silentTCP.String(), "connect", "EPERM"},
+	} {
+		c.expect(t, "socket "+tc.name+" "+tc.family, "0")
+		c.expect(t, tc.cmd+" "+tc.name+" "+tc.addr, tc.want)
+	}
+	if !unixDestAccepted(t, onceLn, brkBound) || unixDestAccepted(t, refusedLn, 200*time.Millisecond) {
+		t.Error("the admitted Unix socket accepted nothing, or the refused one accepted a connection")
+	}
+	if n := brkAccepts(t, sessionLn, 200*time.Millisecond); n != 1 {
+		t.Errorf("the admitted TCP endpoint accepted %d connections, want 1", n)
+	}
+	brkStop(t, b, brkBound)
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{once, refused, silent, session.String(), refusedTCP.String(), silentTCP.String()}; !slices.Equal(asked, want) {
+		t.Errorf("asked for %q, want only the ungranted destinations %q", asked, want)
+	}
+	port := func(ap netip.AddrPort) string { return strconv.Itoa(int(ap.Port())) }
+	want := []Refusal{
+		{Path: refused, Reason: "not approved (denied)"},
+		{Path: silent, Reason: "Unix socket connect not granted"},
+		{Path: denied, Reason: "always denied: " + denied},
+		{Host: "127.0.0.1", Port: port(refusedTCP), Reason: "not approved (denied)"},
+		{Host: "127.0.0.1", Port: port(silentTCP), Reason: "direct connection not allowed (use the proxy)"},
+	}
+	if got := b.Refusals(); !slices.Equal(got, want) {
+		t.Errorf("refusals:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestBrokerConnectModeRecordsEachDecisionOncePerOutcome(t *testing.T) {
+	c := brkStart(t, "connect")
+	dir := brkRealDir(t)
+	sock := func(name string) string {
+		p := filepath.Join(dir, name)
+		unixDestListen(t, p)
+		return p
+	}
+	granted, once, approved, refused, silent, denied := sock("granted.sock"), sock("once.sock"), sock("approved.sock"), sock("refused.sock"), sock("silent.sock"), sock("denied.sock")
+	link, missing := filepath.Join(dir, "link.sock"), filepath.Join(dir, "missing.sock")
+	if err := os.Symlink(granted, link); err != nil {
+		t.Fatal(err)
+	}
+	_, proxy := brkListen(t)
+	_, grantedTCP := brkListen(t)
+	_, session := brkListen(t)
+	_, refusedTCP := brkListen(t)
+	_, silentTCP := brkListen(t)
+	_, own := brkListen(t)
+	deny := newDenyList([]string{denied}, nil)
+	t.Cleanup(deny.Close)
+	answers := map[string][2]string{
+		once:                {"prompt once", ""},
+		approved:            {"session approval", ""},
+		refused:             {"", "not approved (denied)"},
+		session.String():    {"prompt session", ""},
+		refusedTCP.String(): {"", "not approved (denied)"},
+	}
+	b, err := StartConnectBroker(c.take(), ConnectRules{
+		Grants: []string{granted, grantedTCP.String()},
+		Deny:   deny,
+		Proxy:  (&brkDecisions{allow: map[netip.AddrPort]bool{proxy: true}}).decide,
+		Ask: func(_ context.Context, _ func() bool, tcp netip.AddrPort, fd int) (string, string) {
+			dest := tcp.String()
+			if fd >= 0 {
+				dest, _ = os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+			}
+			return answers[dest][0], answers[dest][1]
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	b.mu.Lock()
+	b.own[own] = true
+	b.mu.Unlock()
+
+	for i, tc := range []struct{ family, addr, cmd, want string }{
+		{"unix", brkUnixAddr(granted), "raw", "0"},
+		{"unix", brkUnixAddr(link), "raw", "0"},
+		{"unix", brkUnixAddr(once), "raw", "0"},
+		{"unix", brkUnixAddr(approved), "raw", "0"},
+		{"unix", brkUnixAddr(refused), "raw", "EPERM"},
+		{"unix", brkUnixAddr(silent), "raw", "EPERM"},
+		{"unix", brkUnixAddr(denied), "raw", "EPERM"},
+		{"unix", brkUnixAddr("\x00codemeld-test"), "raw", "EPERM"},
+		{"unix", brkUnixAddr(missing), "raw", "EPERM"},
+		{"inet", proxy.String(), "connect", "0"},
+		{"inet", proxy.String(), "connect", "0"},
+		{"inet", grantedTCP.String(), "connect", "0"},
+		{"inet", own.String(), "connect", "0"},
+		{"inet", session.String(), "connect", "0"},
+		{"inet", refusedTCP.String(), "connect", "EPERM"},
+		{"inet", silentTCP.String(), "connect", "EPERM"},
+		{"unix", hex.EncodeToString(binary.NativeEndian.AppendUint16(nil, unix.AF_UNIX)), "raw", "EPERM"},
+		{"inet", "01", "raw", "EPERM"},
+		{"inet", "", "badptr", "EPERM"},
+	} {
+		name := "s" + strconv.Itoa(i)
+		c.expect(t, "socket "+name+" "+tc.family, "0")
+		c.expect(t, tc.cmd+" "+name+" "+tc.addr, tc.want)
+	}
+	c.expect(t, "connect udp "+proxy.String(), "EPERM")
+	brkStop(t, b, brkBound)
+	want := []ConnectDecision{
+		{Destination: granted, Allowed: true, Step: "grant", Count: 2},
+		{Destination: once, Allowed: true, Step: "prompt once", Count: 1},
+		{Destination: approved, Allowed: true, Step: "session approval", Count: 1},
+		{Destination: refused, Reason: "not approved (denied)", Count: 1},
+		{Destination: silent, Reason: "Unix socket connect not granted", Count: 1},
+		{Destination: denied, Reason: "always denied: " + denied, Count: 1},
+		{Destination: "@codemeld-test", Reason: "always denied: abstract Unix address", Count: 1},
+		{Destination: missing, Reason: "Unix socket path not checkable", Count: 1},
+		{Destination: proxy.String(), Allowed: true, Step: "proxy", Count: 2},
+		{Destination: grantedTCP.String(), Allowed: true, Step: "grant", Count: 1},
+		{Destination: own.String(), Allowed: true, Step: "own listener", Count: 1},
+		{Destination: session.String(), Allowed: true, Step: "prompt session", Count: 1},
+		{Destination: refusedTCP.String(), Reason: "not approved (denied)", Count: 1},
+		{Destination: silentTCP.String(), Reason: "direct connection not allowed (use the proxy)", Count: 1},
+		{Reason: "Unix socket path not checkable", Count: 1},
+		{Reason: "not a TCP connect", Count: 2},
+		{Reason: "connect not inspectable", Count: 1},
+	}
+	if got := b.Decisions(); !slices.Equal(got, want) {
+		t.Errorf("decisions:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestBrokerStopWithdrawsAPendingAsk(t *testing.T) {
+	c := brkStart(t, "connect")
+	_, dest := brkListen(t)
+	deny := newDenyList(nil, nil)
+	t.Cleanup(deny.Close)
+	entered, withdrawn := make(chan struct{}), make(chan error, 1)
+	b, err := StartConnectBroker(c.take(), ConnectRules{Deny: deny, Ask: func(ctx context.Context, _ func() bool, _ netip.AddrPort, _ int) (string, string) {
+		close(entered)
+		<-ctx.Done()
+		withdrawn <- ctx.Err()
+		return "", "not approved (command ended)"
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.expect(t, "socket s inet", "0")
+	res := c.start(t, "connect s "+dest.String())
+	select {
+	case <-entered:
+	case <-time.After(brkBound):
+		c.fatalf(t, "the broker never asked")
+	}
+	brkStop(t, b, brkBound)
+	if err := <-withdrawn; err == nil {
+		t.Error("the pending ask's context was not cancelled")
+	}
+	if got := c.await(t, res, "connect"); got != "EPERM" {
+		t.Errorf("withdrawn connect: got %s, want EPERM", got)
+	}
+	if got := b.Decisions(); len(got) != 0 {
+		t.Errorf("decisions after a withdrawn ask = %+v, want none recorded while stopping", got)
+	}
+}
+
+func TestBrokerWithdrawsAnAskWhenItsCallerExits(t *testing.T) {
+	c := brkStart(t, "connect")
+	deadLn, dead := brkListen(t)
+	queuedLn, queued := brkListen(t)
+	deny := newDenyList(nil, nil)
+	t.Cleanup(deny.Close)
+	type withdrawal struct {
+		err  error
+		live bool
+	}
+	slot, entered, withdrawn := make(chan struct{}, 1), make(chan struct{}), make(chan withdrawal, 1)
+	var mu sync.Mutex
+	var asked []string
+	b, err := StartConnectBroker(c.take(), ConnectRules{Deny: deny, Ask: func(ctx context.Context, live func() bool, tcp netip.AddrPort, _ int) (string, string) {
+		mu.Lock()
+		asked = append(asked, tcp.String())
+		first := len(asked) == 1
+		mu.Unlock()
+		select {
+		case slot <- struct{}{}:
+		case <-ctx.Done():
+			return "", "not approved (command ended)"
+		}
+		defer func() { <-slot }()
+		switch {
+		case first:
+			close(entered)
+			<-ctx.Done()
+			withdrawn <- withdrawal{ctx.Err(), live()}
+			return "prompt session", ""
+		case tcp == queued:
+			return "prompt once", ""
+		}
+		return "", "not approved (denied)"
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+
+	c.expect(t, "socket p inet", "0")
+	spawned := c.start(t, "spawn p "+dead.String())
+	select {
+	case <-entered:
+	case <-time.After(brkBound):
+		c.fatalf(t, "the broker never asked for the spawned connect")
+	}
+	c.expect(t, "socket q inet", "0")
+	waiting := c.start(t, "connect q "+queued.String())
+	if !c.silent(waiting, 200*time.Millisecond) {
+		t.Fatal("the queued connect finished while the first ask held the slot")
+	}
+	brkKillSpawned(t, c)
+	select {
+	case w := <-withdrawn:
+		if w.err == nil || w.live {
+			t.Errorf("after the caller exited: ask context error %v, live %v; want cancelled and not live", w.err, w.live)
+		}
+	case <-time.After(brkBound):
+		c.fatalf(t, "the ask was not withdrawn after its caller exited")
+	}
+	c.await(t, spawned, "spawn")
+	if got := c.await(t, waiting, "queued connect"); got != "0" {
+		t.Errorf("queued connect: got %s, want 0", got)
+	}
+	if n := brkAccepts(t, queuedLn, 200*time.Millisecond); n != 1 {
+		t.Errorf("the queued endpoint accepted %d connections, want 1", n)
+	}
+	c.expect(t, "socket r inet", "0")
+	c.expect(t, "connect r "+dead.String(), "EPERM")
+	if n := brkAccepts(t, deadLn, 200*time.Millisecond); n != 0 {
+		t.Errorf("the withdrawn destination accepted %d connections, want 0", n)
+	}
+	brkStop(t, b, brkBound)
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{dead.String(), queued.String(), dead.String()}; !slices.Equal(asked, want) {
+		t.Errorf("asked for %q, want %q (the late session answer must not admit the next connect)", asked, want)
+	}
+	want := []ConnectDecision{
+		{Destination: queued.String(), Allowed: true, Step: "prompt once", Count: 1},
+		{Destination: dead.String(), Reason: "not approved (denied)", Count: 1},
+	}
+	if got := b.Decisions(); !slices.Equal(got, want) {
+		t.Errorf("decisions:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func brkKillSpawned(t *testing.T, c *brkChild) {
+	t.Helper()
+	pid := c.cmd.Process.Pid
+	tasks, err := os.ReadDir("/proc/" + strconv.Itoa(pid) + "/task")
+	if err != nil {
+		c.fatalf(t, "list the child's threads: %v", err)
+	}
+	killed := 0
+	for _, task := range tasks {
+		children, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/task/" + task.Name() + "/children")
+		if err != nil {
+			c.fatalf(t, "read the child's processes: %v", err)
+		}
+		for _, f := range strings.Fields(string(children)) {
+			if p, err := strconv.Atoi(f); err == nil && unix.Kill(p, unix.SIGKILL) == nil {
+				killed++
+			}
+		}
+	}
+	if killed == 0 {
+		c.fatalf(t, "no spawned process to kill")
+	}
+}
+
+func brkMkdirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func brkExists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Lstat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	return err == nil
+}
+
+func brkFullPolicy(t *testing.T, base, root string, noWrite ...string) Policy {
+	t.Helper()
+	tmp := filepath.Join(base, "tmp")
+	brkMkdirs(t, tmp)
+	return Policy{Mode: ModeAutoEdits, Broker: BrokerFull, BlockedPaths: []string{filepath.Join(base, "blocked")}, WriteRoots: []string{root}, NoWritePaths: noWrite, TmpDir: tmp}
+}
+
+func TestBrokerFullModeUnixBindWithoutAPolicyIsRefused(t *testing.T) {
+	dir := brkRealDir(t)
+	c := brkStart(t, "full")
+	b := brkStartBroker(t, c, (&brkDecisions{}).decide)
+	c.expect(t, "chdir "+dir, "0")
+	c.expect(t, "socket s unix", "0")
+	c.expect(t, "raw s "+brkUnixAddr("s.sock")+" bind", "EPERM")
+	brkStop(t, b, brkBound)
+	want := []Refusal{{Path: "s.sock", Reason: `Unix bind failed: policy: unknown mode ""`}}
+	if got := b.Refusals(); !slices.Equal(got, want) {
+		t.Errorf("refusals:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestBrokerFullModeUnixBindRunsUnderTheCommandsWriteRules(t *testing.T) {
+	if abi, err := landlockABI(); err != nil || abi < 1 {
+		t.Skipf("unverified: Landlock unavailable (ABI %d, %v)", abi, err)
+	}
+	if statusField(t, "self", "NoNewPrivs") != "0" {
+		t.Skip("inconclusive: the test process already runs with no_new_privs")
+	}
+	base := brkRealDir(t)
+	root, outside := filepath.Join(base, "root"), filepath.Join(base, "out")
+	work, locked := filepath.Join(root, "work"), filepath.Join(root, "locked")
+	brkMkdirs(t, root, outside, work, locked)
+	cwdBefore, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type during struct {
+		otherBind                   error
+		mainNNP, threadNNP, workDir string
+	}
+	seen := make(chan during, 8)
+	var binds atomic.Int32
+	afterConfinedBind = func() {
+		other := filepath.Join(outside, "other-"+strconv.Itoa(int(binds.Add(1)))+".sock")
+		done := make(chan error, 1)
+		go func() {
+			fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+			if err != nil {
+				done <- err
+				return
+			}
+			defer func() { _ = unix.Close(fd) }()
+			done <- unix.Bind(fd, &unix.SockaddrUnix{Name: other})
+		}()
+		field := func(path string) string {
+			data, _ := os.ReadFile(path)
+			for line := range strings.Lines(string(data)) {
+				if v, ok := strings.CutPrefix(line, "NoNewPrivs:"); ok {
+					return strings.TrimSpace(v)
+				}
+			}
+			return "missing"
+		}
+		wd, _ := os.Readlink("/proc/thread-self/cwd")
+		seen <- during{<-done, field("/proc/self/status"), field("/proc/thread-self/status"), wd}
+	}
+	t.Cleanup(func() { afterConfinedBind = func() {} })
+	c := brkStart(t, "full")
+	deny := newDenyList(nil, nil)
+	t.Cleanup(deny.Close)
+	b, err := StartConnectBroker(c.take(), ConnectRules{Deny: deny, Policy: brkFullPolicy(t, base, root, locked)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+
+	var childMask, hostMask uint32 = 0o077, uint32(unix.Umask(0o022))
+	unix.Umask(int(hostMask))
+	if childMask == hostMask {
+		childMask = 0o027
+	}
+	c.expect(t, "umask "+strconv.FormatUint(uint64(childMask), 8), "0")
+	c.expect(t, "chdir "+work, "0")
+	for _, tc := range []struct {
+		name, addr, file, want string
+	}{
+		{"rel", "rel.sock", filepath.Join(work, "rel.sock"), "0"},
+		{"abs", filepath.Join(work, "abs.sock"), filepath.Join(work, "abs.sock"), "0"},
+		{"out", filepath.Join(outside, "out.sock"), filepath.Join(outside, "out.sock"), "EACCES"},
+		{"nowrite", filepath.Join(locked, "x.sock"), filepath.Join(locked, "x.sock"), "EACCES"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c.expect(t, "socket "+tc.name+" unix", "0")
+			c.expect(t, "raw "+tc.name+" "+brkUnixAddr(tc.addr)+" bind", tc.want)
+			if got := brkExists(t, tc.file); got != (tc.want == "0") {
+				t.Errorf("socket file %s exists=%v after bind %s", tc.file, got, tc.want)
+			}
+			if tc.want == "0" {
+				c.expect(t, "local "+tc.name, strconv.Quote(tc.addr))
+				info, err := os.Lstat(tc.file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := uint32(info.Mode().Perm()), 0o777&^childMask; got != want {
+					t.Errorf("socket file mode %o, want %o from the command's umask %o", got, want, childMask)
+				}
+			}
+			select {
+			case d := <-seen:
+				if d.otherBind != nil {
+					t.Errorf("another codemeld thread binding outside the write root while the confined thread was alive: %v", d.otherBind)
+				}
+				if d.mainNNP != "0" || d.threadNNP != "1" {
+					t.Errorf("NoNewPrivs main thread %s, confined thread %s; want 0 and 1", d.mainNNP, d.threadNNP)
+				}
+				if d.workDir != work {
+					t.Errorf("confined thread bound from %s, want the command's folder %s", d.workDir, work)
+				}
+			default:
+				t.Error("the bind did not run on the confined thread")
+			}
+		})
+	}
+	if got := statusField(t, "self", "NoNewPrivs"); got != "0" {
+		t.Errorf("main thread NoNewPrivs %s after the binds, want 0", got)
+	}
+	if cwd, err := os.Getwd(); err != nil || cwd != cwdBefore {
+		t.Errorf("codemeld's working folder %s (%v) after the binds, want %s", cwd, err, cwdBefore)
+	}
+
+	c.expect(t, "socket a unix", "0")
+	c.expect(t, "raw a "+brkUnixAddr("\x00codemeld-test")+" bind", "EPERM")
+	c.expect(t, "raw a "+hex.EncodeToString(binary.NativeEndian.AppendUint16(nil, unix.AF_UNIX))+" bind", "EPERM")
+	c.expect(t, "socket n unix", "0")
+	c.expect(t, "local a", c.do(t, "local n"))
+	brkStop(t, b, brkBound)
+	want := []Refusal{
+		{Path: "@codemeld-test", Reason: "always denied: abstract Unix address"},
+		{Path: "@", Reason: "always denied: abstract Unix address"},
+	}
+	if got := b.Refusals(); !slices.Equal(got, want) {
+		t.Errorf("refusals:\n got %+v\nwant %+v", got, want)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.own) != 0 {
+		t.Errorf("Unix binds published own-endpoint records %v", b.own)
+	}
+}
+
+func TestBrokerFullModeUnixListenAfterAConfinedBind(t *testing.T) {
+	if abi, err := landlockABI(); err != nil || abi < 1 {
+		t.Skipf("unverified: Landlock unavailable (ABI %d, %v)", abi, err)
+	}
+	base := brkRealDir(t)
+	root := filepath.Join(base, "root")
+	brkMkdirs(t, root)
+	c := brkStart(t, "full")
+	deny := newDenyList(nil, nil)
+	t.Cleanup(deny.Close)
+	b, err := StartConnectBroker(c.take(), ConnectRules{Deny: deny, Policy: brkFullPolicy(t, base, root)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	path := filepath.Join(root, "l.sock")
+	c.expect(t, "socket l unix", "0")
+	c.expect(t, "listen l", "EPERM")
+	c.expect(t, "raw l "+brkUnixAddr(path)+" bind", "0")
+	c.expect(t, "listen l", "0")
+	unixDestDial(t, &unix.SockaddrUnix{Name: path})
+}
+
+func brkPauseBoundedCaseOtherInterleavingsAreADocumentedLimit(t *testing.T, nr int32, afterSyscall bool) (<-chan struct{}, func()) {
+	t.Helper()
+	paused, resume := make(chan struct{}), make(chan struct{})
+	ctx := t.Context()
+	var once sync.Once
+	bindOrListenPause = func(got int32, after bool) {
+		if got != nr || after != afterSyscall {
+			return
+		}
+		first := false
+		once.Do(func() { first = true })
+		if !first {
+			return
+		}
+		close(paused)
+		select {
+		case <-resume:
+		case <-ctx.Done():
+		}
+	}
+	t.Cleanup(func() { bindOrListenPause = func(int32, bool) {} })
+	return paused, sync.OnceFunc(func() { close(resume) })
+}
+
+func brkAwaitPause(t *testing.T, c *brkChild, paused <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-paused:
+	case <-time.After(brkBound):
+		c.fatalf(t, "the handler never reached the pause")
+	}
+}
+
+func TestBrokerSameSocketHandlersWaitForAPausedBind(t *testing.T) {
+	paused, release := brkPauseBoundedCaseOtherInterleavingsAreADocumentedLimit(t, unix.SYS_BIND, true)
+	c := brkStart(t, "full")
+	lnA, a := brkListen(t)
+	d := &brkDecisions{allow: map[netip.AddrPort]bool{a: true}}
+	b := brkStartBroker(t, c, d.decide)
+
+	c.expect(t, "socket t inet", "0")
+	c.expect(t, "dup t t2", "0")
+	c.expect(t, "listen t2", "EPERM")
+
+	c.expect(t, "socket s inet", "0")
+	c.expect(t, "dup s s2", "0")
+	bind := c.start(t, "bind s 127.0.0.1:0")
+	brkAwaitPause(t, c, paused)
+	own := netip.MustParseAddrPort(c.do(t, "local s"))
+	if own.Port() == 0 {
+		c.fatalf(t, "the paused bind left local endpoint %v", own)
+	}
+	listen := c.start(t, "listen s2")
+
+	c.expect(t, "socket u inet", "0")
+	c.expect(t, "connect u "+a.String(), "0")
+	if n := brkAccepts(t, lnA, 200*time.Millisecond); n != 1 {
+		t.Errorf("another socket's connect while the bind was paused: %d accepted, want 1", n)
+	}
+	c.expect(t, "socket c inet", "0")
+	c.expect(t, "connect c "+own.String(), "EPERM")
+	if !c.silent(bind, 0) || !c.silent(listen, 300*time.Millisecond) {
+		t.Fatal("the bind or the listen on its duplicate returned while the bind was paused before publishing")
+	}
+	release()
+	if got := c.await(t, bind, "bind"); got != "0" {
+		t.Errorf("paused bind: got %s, want 0", got)
+	}
+	if got := c.await(t, listen, "listen on the duplicate"); got != "0" {
+		t.Errorf("listen on the duplicate after the bind published: got %s, want 0", got)
+	}
+	c.expect(t, "socket c2 inet", "0")
+	c.expect(t, "connect c2 "+own.String(), "0")
+	brkStop(t, b, brkBound)
+	port := strconv.Itoa(int(own.Port()))
+	want := []Refusal{
+		{Reason: "listen not allowed (bind to 127.0.0.1 or ::1 first)"},
+		{Host: "127.0.0.1", Port: port, Reason: "direct connection not allowed (use the proxy)"},
+	}
+	if got := b.Refusals(); !slices.Equal(got, want) {
+		t.Errorf("refusals:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestBrokerListenFromAnotherProcessWaitsForAPausedBind(t *testing.T) {
+	paused, release := brkPauseBoundedCaseOtherInterleavingsAreADocumentedLimit(t, unix.SYS_BIND, true)
+	c := brkStart(t, "full")
+	brkStartBroker(t, c, (&brkDecisions{}).decide)
+	c.expect(t, "socket s inet", "0")
+	bind := c.start(t, "bind s 127.0.0.1:0")
+	brkAwaitPause(t, c, paused)
+	listen := c.start(t, "spawn s listen")
+	if !c.silent(listen, 300*time.Millisecond) {
+		t.Fatal("the other process's listen returned while the bind was paused before publishing")
+	}
+	release()
+	if got := c.await(t, bind, "bind"); got != "0" {
+		t.Errorf("paused bind: got %s, want 0", got)
+	}
+	if got := c.await(t, listen, "listen from the other process"); got != "0" {
+		t.Errorf("listen through the descriptor shared across fork: got %s, want 0", got)
+	}
+}
+
+func TestBrokerStopBeforeAPausedBindsSyscall(t *testing.T) {
+	if abi, err := landlockABI(); err != nil || abi < 1 {
+		t.Skipf("unverified: Landlock unavailable (ABI %d, %v)", abi, err)
+	}
+	paused, release := brkPauseBoundedCaseOtherInterleavingsAreADocumentedLimit(t, unix.SYS_BIND, false)
+	base := brkRealDir(t)
+	root := filepath.Join(base, "root")
+	brkMkdirs(t, root)
+	c := brkStart(t, "full")
+	deny := newDenyList(nil, nil)
+	t.Cleanup(deny.Close)
+	b, err := StartConnectBroker(c.take(), ConnectRules{Deny: deny, Policy: brkFullPolicy(t, base, root)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	path := filepath.Join(root, "s.sock")
+	c.expect(t, "socket s unix", "0")
+	c.expect(t, "socket n unix", "0")
+	unbound := c.do(t, "local n")
+	bind := c.start(t, "raw s "+brkUnixAddr(path)+" bind")
+	brkAwaitPause(t, c, paused)
+	stopped := make(chan struct{})
+	go func() { b.Stop(); close(stopped) }()
+	select {
+	case <-b.stopping:
+	case <-time.After(brkBound):
+		c.fatalf(t, "Stop never began")
+	}
+	release()
+	select {
+	case <-stopped:
+	case <-time.After(brkBound):
+		c.fatalf(t, "Stop did not return")
+	}
+	if got := c.await(t, bind, "bind"); got != "EPERM" {
+		t.Errorf("bind paused across stop: got %s, want EPERM", got)
+	}
+	if brkExists(t, path) {
+		t.Errorf("the bind created %s after stop", path)
+	}
+	c.expect(t, "local s", unbound)
+	if len(b.bound) != 0 || len(b.own) != 0 {
+		t.Errorf("records after stop: bound %v, own %v", b.bound, b.own)
+	}
+}
+
+func TestBrokerStopAfterAPausedBindsSyscall(t *testing.T) {
+	paused, release := brkPauseBoundedCaseOtherInterleavingsAreADocumentedLimit(t, unix.SYS_BIND, true)
+	c := brkStart(t, "full")
+	b := brkStartBroker(t, c, (&brkDecisions{}).decide)
+	c.expect(t, "socket s inet", "0")
+	bind := c.start(t, "bind s 127.0.0.1:0")
+	brkAwaitPause(t, c, paused)
+	stopped := make(chan struct{})
+	go func() { b.Stop(); close(stopped) }()
+	select {
+	case <-b.stopping:
+	case <-time.After(brkBound):
+		c.fatalf(t, "Stop never began")
+	}
+	release()
+	select {
+	case <-stopped:
+	case <-time.After(brkBound):
+		c.fatalf(t, "Stop did not return")
+	}
+	c.await(t, bind, "bind")
+	if len(b.bound) != 0 || len(b.own) != 0 {
+		t.Errorf("records after stop: bound %v, own %v", b.bound, b.own)
 	}
 }

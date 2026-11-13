@@ -1623,3 +1623,30 @@ func TestEditTool_UnchangedAuthorizedScopeStillApplies(t *testing.T) {
 		t.Fatalf("file = %q, want %q", got, want)
 	}
 }
+
+func TestEditTool_PreviewSymlinkSwappedAfterCheckRefused(t *testing.T) {
+	for _, tc := range symlinkSwapCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := eval(t, t.TempDir())
+			outside := eval(t, t.TempDir())
+			writeFile(t, filepath.Join(outside, "f"), "OUTSIDE-SECRET\n")
+			if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			writeFile(t, filepath.Join(root, "sub", "f"), "inside OUTSIDE\n")
+			path, target := tc.pick(root, outside)
+			calls := swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, path, target) })
+
+			patch, refusal := newToolIn(t, root).Preview(filepath.Join(root, "sub", "f"), map[string]any{"path": "sub/f", "old_text": "OUTSIDE", "new_text": "X"})
+			if *calls != 1 {
+				t.Fatalf("swap ran %d times, want 1", *calls)
+			}
+			if refusal == nil {
+				t.Fatalf("Preview after a symlink swap = patch %q, want a refusal", patch)
+			}
+			if strings.Contains(patch+string(refusal.Stdout)+string(refusal.Stderr), "SECRET") {
+				t.Fatalf("Preview returned the symlink target's bytes: patch %q refusal %+v", patch, *refusal)
+			}
+		})
+	}
+}

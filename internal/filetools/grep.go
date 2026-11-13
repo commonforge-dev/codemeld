@@ -3,7 +3,9 @@ package filetools
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -208,17 +210,18 @@ func (t *GrepTool) grep(searchRoot string, args map[string]any) tools.Result {
 	if rootInfo.Mode().IsRegular() {
 		var files []grepCandidate
 		var leftOut []string
+		fileAnchor := readAnchor(filepath.Dir(searchRoot), t.projectRoot)
 		if _, blocked := t.blocked.Blocking(searchRoot); blocked {
 			leftOut = []string{searchRoot}
 		} else {
-			rel, _ := filepath.Rel(readAnchor(filepath.Dir(searchRoot), t.projectRoot), searchRoot)
+			rel, _ := filepath.Rel(fileAnchor, searchRoot)
 			files = []grepCandidate{{rel: filepath.ToSlash(rel), abs: searchRoot}}
 		}
 		var res tools.Result
 		if filesOnly {
-			res = t.searchFilesOnly(files, re, limit)
+			res = t.searchFilesOnly(fileAnchor, files, re, limit)
 		} else {
-			res = t.searchMatches(files, re, limit, contextN)
+			res = t.searchMatches(fileAnchor, files, re, limit, contextN)
 		}
 		return withLeftOut(res, leftOut, t.projectRoot, t.home, t.blocked.FoldCase(), t.outputCap)
 	}
@@ -260,9 +263,9 @@ func (t *GrepTool) grep(searchRoot string, args map[string]any) tools.Result {
 	files := grepCandidates(entries, includeGlob)
 	var res tools.Result
 	if filesOnly {
-		res = t.searchFilesOnly(files, re, limit)
+		res = t.searchFilesOnly(anchor, files, re, limit)
 	} else {
-		res = t.searchMatches(files, re, limit, contextN)
+		res = t.searchMatches(anchor, files, re, limit, contextN)
 	}
 	return withLeftOut(res, leftOut, t.projectRoot, t.home, t.blocked.FoldCase(), t.outputCap)
 }
@@ -316,14 +319,14 @@ type grepFileMatch struct {
 // match lines, never context lines: once the (limit+1)th match is found the search stops and the
 // result is marked truncated. Binary files are skipped without reading their bytes into the
 // output and counted for a trailing notice.
-func (t *GrepTool) searchMatches(files []grepCandidate, re *regexp.Regexp, limit, contextN int) tools.Result {
+func (t *GrepTool) searchMatches(boundary string, files []grepCandidate, re *regexp.Regexp, limit, contextN int) tools.Result {
 	var results []grepFileMatch
 	matchCount := 0
 	truncated := false
 	binarySkipped := 0
 
 	for _, f := range files {
-		content, rerr := os.ReadFile(f.abs)
+		content, rerr := readCandidate(boundary, f.abs)
 		if rerr != nil {
 			continue // an unreadable file is skipped rather than aborting the whole search
 		}
@@ -378,13 +381,13 @@ func (t *GrepTool) searchMatches(files []grepCandidate, re *regexp.Regexp, limit
 // searchFilesOnly returns just the project-relative paths of files that contain at least one match, in
 // ascending order, bounded by `limit` matching files. Searching short-circuits at the first
 // match in a file. Binary files are skipped and counted for the trailing notice.
-func (t *GrepTool) searchFilesOnly(files []grepCandidate, re *regexp.Regexp, limit int) tools.Result {
+func (t *GrepTool) searchFilesOnly(boundary string, files []grepCandidate, re *regexp.Regexp, limit int) tools.Result {
 	var matchedFiles []string
 	truncated := false
 	binarySkipped := 0
 
 	for _, f := range files {
-		content, rerr := os.ReadFile(f.abs)
+		content, rerr := readCandidate(boundary, f.abs)
 		if rerr != nil {
 			continue
 		}
@@ -415,6 +418,15 @@ func (t *GrepTool) searchFilesOnly(files []grepCandidate, re *regexp.Regexp, lim
 		buf.WriteByte('\n')
 	}
 	return t.boundedWithBinaryNotice(buf.String(), truncated, binarySkipped)
+}
+
+func readCandidate(boundary, abs string) ([]byte, error) {
+	f, reason := openNoFollowUnder(boundary, abs)
+	if f == nil {
+		return nil, errors.New(reason)
+	}
+	defer f.Close() //nolint:errcheck // read-only descriptor; the contents are already read
+	return io.ReadAll(f)
 }
 
 // boundedWithBinaryNotice wraps stdout in the BoundedResult (truncation indicator as the first stderr
