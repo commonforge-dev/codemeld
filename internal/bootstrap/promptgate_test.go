@@ -653,7 +653,7 @@ func TestApplyShellContext_CarriesDispatchShellContext(t *testing.T) {
 				t.Errorf("WholeCommand = %v, want %v", got.WholeCommand, tc.wantWhole)
 			}
 			base.Pipeline, base.WholeCommand = tc.wantPipeline, tc.wantWhole
-			if got != base {
+			if !reflect.DeepEqual(got, base) {
 				t.Errorf("applyShellContext altered a field other than the shell context: got %#v, want %#v", got, base)
 			}
 		})
@@ -2537,4 +2537,32 @@ func TestPromptGateConnectAsker_WithdrawnPromptsRefuseWithTheirReason(t *testing
 			t.Errorf("connect after the session ended: step %q reason %q, want not approved (session ended)", step, reason)
 		}
 	})
+}
+
+func TestMarkOutside_OnlyARememberedBuildShellSubject(t *testing.T) {
+	outside := &outsideSubjects{}
+	outside.add("git rebase main", nil)
+	for _, tc := range []struct {
+		name string
+		req  permissions.MatchRequest
+		mode mode.Mode
+		want string
+	}{
+		{"build direct", permissions.MatchRequest{Kind: "direct", Subject: "git rebase main"}, mode.Build, "running outside the sandbox"},
+		{"build literal", permissions.MatchRequest{Kind: "literal", Subject: "git rebase main"}, mode.Build, "running outside the sandbox"},
+		{"build other subject", permissions.MatchRequest{Kind: "direct", Subject: "git rebase dev"}, mode.Build, ""},
+		{"build tool", permissions.MatchRequest{Kind: "tool", Subject: "git rebase main"}, mode.Build, ""},
+		{"auto edits", permissions.MatchRequest{Kind: "direct", Subject: "git rebase main"}, mode.AutoEdits, ""},
+		{"plan", permissions.MatchRequest{Kind: "direct", Subject: "git rebase main"}, mode.Plan, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := markOutside(dispatch.PromptDisplay{Action: dispatch.ActionRunCommand}, tc.req, permissions.ModeContext{Mode: string(tc.mode)}, outside)
+			if got.ExceptionalAuthority != tc.want {
+				t.Fatalf("authority = %q, want %q", got.ExceptionalAuthority, tc.want)
+			}
+		})
+	}
+	if got := markOutside(dispatch.PromptDisplay{}, permissions.MatchRequest{Kind: "direct", Subject: "git rebase main"}, permissions.ModeContext{Mode: string(mode.Build)}, nil); got.ExceptionalAuthority != "" {
+		t.Fatalf("authority without a remembered set = %q, want none", got.ExceptionalAuthority)
+	}
 }

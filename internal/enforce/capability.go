@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"codemeld.dev/codemeld/internal/mode"
 )
@@ -38,6 +39,8 @@ type ResolveInput struct {
 }
 
 var goarch = runtime.GOARCH
+
+const watchCheckFailed = "watch check failed: "
 
 var connectSelfTest = func(string, string) (passed bool, reason string) {
 	return false, "connect self-test: " + ErrBrokerUnsupported.Error()
@@ -88,12 +91,16 @@ func resolveLinux(in ResolveInput) Resolution {
 		return r
 	}
 	r.Capability, r.SelfTestPassed = Constrained, true
-	r.SliceSelfTestPassed, _ = sliceSelfTest(home, exe)
+	var why string
+	r.SliceSelfTestPassed, why = sliceSelfTest(home, exe)
 	if r.SliceSelfTestPassed {
-		r.ConnectSelfTestPassed, _ = connectSelfTest(home, exe)
+		r.ConnectSelfTestPassed, why = connectSelfTest(home, exe)
 	}
 	if r.ConnectSelfTestPassed {
-		r.FullSelfTestPassed, _ = fullSelfTest(home, exe)
+		r.FullSelfTestPassed, why = fullSelfTest(home, exe)
+	}
+	if strings.Contains(why, watchCheckFailed) {
+		r.SliceSelfTestPassed, r.ConnectSelfTestPassed, r.FullSelfTestPassed = false, false, false
 	}
 	return r
 }
@@ -103,10 +110,8 @@ func (r Resolution) SandboxState(modeKey string) string {
 		return "unavailable"
 	}
 	switch mode.Mode(modeKey) {
-	case mode.Plan, mode.AutoEdits:
+	case mode.Plan, mode.AutoEdits, mode.Build:
 		return "on"
-	case mode.Build:
-		return "off"
 	}
 	return "unavailable"
 }

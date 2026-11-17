@@ -99,6 +99,10 @@ func (p *terminalPrompter) notify() {
 // choice creates a grant reads its stored subject scope through the same held permit, so the
 // lifetime, scope, and Program-confirm reads cannot interleave with another request's prompt.
 func (p *terminalPrompter) build(req permissions.MatchRequest, disp dispatch.PromptDisplay) func(context.Context, permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+	return p.buildWithReasons(req, disp, nil)
+}
+
+func (p *terminalPrompter) buildWithReasons(req permissions.MatchRequest, disp dispatch.PromptDisplay, reasons []string) func(context.Context, permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
 	return func(ctx context.Context, esc permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
 		if err := p.gate.acquire(ctx); err != nil {
 			return permissions.PromptOutcome{}, err
@@ -115,7 +119,7 @@ func (p *terminalPrompter) build(req permissions.MatchRequest, disp dispatch.Pro
 		// readDirectScope and the Program confirmation long after the first choice.
 		notifier := tui.StartPromptNotifier(ctx, p.after, p.notify)
 		defer notifier.Stop()
-		p.render(req, disp, esc)
+		p.render(req, disp, esc, reasons)
 		host := req.Kind == matchKindHost
 		outcome, err := p.readChoice(readCtx, host, (host && req.FreshConfirmation) || disp.ExceptionalAuthority != "")
 		if err != nil {
@@ -370,7 +374,7 @@ func (p *terminalPrompter) renderSummary(rows []string) {
 	}
 }
 
-func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.PromptDisplay, esc permissions.ScopeEscalation) {
+func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.PromptDisplay, esc permissions.ScopeEscalation, reasons []string) {
 	p.outMu.Lock()
 	defer p.outMu.Unlock()
 	_, _ = fmt.Fprintln(p.out)
@@ -392,7 +396,7 @@ func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.Pr
 	}
 	p.renderProjectRoot(req)
 	if disp.ExceptionalAuthority != "" {
-		_, _ = fmt.Fprintf(p.out, "  "+tui.ExceptionalSandboxNotice+"\n", disp.ExceptionalAuthority)
+		_, _ = fmt.Fprintf(p.out, "  %s\n", tui.ExceptionalNotice(disp.ExceptionalAuthority))
 	} else if req.Kind == matchKindDirect || req.Kind == matchKindLiteral {
 		_, _ = fmt.Fprintf(p.out, "  %s\n", tui.ShellBlockedPathsNotice)
 	}
@@ -402,7 +406,11 @@ func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.Pr
 	if esc.NarrowerScope != "" {
 		_, _ = fmt.Fprintf(p.out, "  ⚠ broader than a folder you already allowed: this asks for the PARENT of %s\n", fact(esc.NarrowerScope))
 	}
-	p.renderSummary(promptSummaryRows(req, disp))
+	if rows := tui.OutsideReasonRows(reasons); rows != nil {
+		p.renderSummary(rows)
+	} else {
+		p.renderSummary(promptSummaryRows(req, disp))
+	}
 	if line := capabilityCoverageLine(req, disp); line != "" {
 		_, _ = fmt.Fprintf(p.out, "  %s\n", line)
 	}

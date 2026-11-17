@@ -241,6 +241,7 @@ type PromptRequest struct {
 	DirectHTTPFallback bool
 
 	ExceptionalAuthority string
+	OutsideReasons       []string
 }
 
 func (r PromptRequest) isHost() bool { return r.Kind == SubjectHost }
@@ -530,6 +531,30 @@ const ShellBlockedPathsNotice = "⚠ Blocked paths are not enforced for a comman
 
 const ExceptionalSandboxNotice = "⚠ This command still runs inside the sandbox: the fixed floor, blocked paths and every ordinary restriction stay in force; approval adds only %s."
 
+const outsideSandboxNotice = "⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once."
+
+func ExceptionalNotice(authority string) string {
+	if authority == "running outside the sandbox" {
+		return outsideSandboxNotice
+	}
+	return fmt.Sprintf(ExceptionalSandboxNotice, authority)
+}
+
+func OutsideReasonRows(reasons []string) []string {
+	if len(reasons) == 0 {
+		return nil
+	}
+	rows := []string{"Last run: the sandbox probably refused:"}
+	for i, reason := range reasons {
+		if i == 3 {
+			rows = append(rows, fmt.Sprintf("… plus %d more", len(reasons)-3))
+			break
+		}
+		rows = append(rows, permissions.BoundPromptFact(reason))
+	}
+	return rows
+}
+
 const exceptionalAllowOnceExplanation = "allow this once — approves this invocation only; nothing is saved and an identical repeat asks again."
 
 // promptFactLines bounds every variable value it renders. Rows stay logical so the overlay can fit them to a physical-row budget.
@@ -549,7 +574,7 @@ func promptFactLines(req PromptRequest) []string {
 		}
 	}
 	if req.ExceptionalAuthority != "" {
-		lines = append(lines, fmt.Sprintf(ExceptionalSandboxNotice, req.ExceptionalAuthority))
+		lines = append(lines, ExceptionalNotice(req.ExceptionalAuthority))
 	} else if req.isShellSubject() {
 		lines = append(lines, ShellBlockedPathsNotice)
 	}
@@ -608,6 +633,9 @@ func promptFactLines(req PromptRequest) []string {
 }
 
 func promptFixedLines(req PromptRequest) []string {
+	if rows := OutsideReasonRows(req.OutsideReasons); rows != nil {
+		return append(rows, promptFactLines(req)...)
+	}
 	return append(req.Summary.DisplayRows(), promptFactLines(req)...)
 }
 

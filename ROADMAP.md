@@ -12,6 +12,10 @@
 ## Ongoing
 
 ## Completed
+- **0.4.13 Beta — November 2026:**
+  - Sandboxed Auto edits can amend the last commit without asking, until it has been pushed
+  - Build mode runs the commands you approve inside the sandbox; when one fails, codemeld says which folder was refused and can run it once outside the sandbox after asking
+  - Fix for the v0.4.12 known issue with reading files
 - **0.4.12 Beta — November 2026:**
   - Sandboxed commands can connect to local services you approve, such as a database or a test's own server
   - Fix for the v0.4.11 known issue with switching sessions, and a partial fix for the one with reading files

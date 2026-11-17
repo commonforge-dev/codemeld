@@ -3,13 +3,17 @@ package bootstrap
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"codemeld.dev/codemeld/internal/fserrors"
+	"codemeld.dev/codemeld/internal/fsutil"
+	"codemeld.dev/codemeld/internal/vcs"
 	"codemeld.dev/codemeld/internal/vcs/builtin"
 )
 
@@ -202,5 +206,170 @@ func TestRunMaterializeBuiltinTemplates_Failure_EmitsExactOpFailExit1(t *testing
 	}
 	if strings.Count(stderr.String(), "\n") != 1 {
 		t.Errorf("stderr must be exactly one line, got: %q", stderr.String())
+	}
+}
+
+const olderGitTemplate = "# an earlier codemeld git template\ndetect:\n  marker: .git\n"
+
+func swapEarlierGit(t *testing.T, old string) {
+	t.Helper()
+	prev := isEarlierBuiltin
+	isEarlierBuiltin = func(name string, b []byte) bool { return name == "git" && string(b) == old }
+	t.Cleanup(func() { isEarlierBuiltin = prev })
+}
+
+func swapWriteAtomic(t *testing.T, w func(string, []byte, os.FileMode) (fsutil.AtomicWriteStep, fserrors.Category, error)) {
+	t.Helper()
+	prev := writeAtomic
+	writeAtomic = w
+	t.Cleanup(func() { writeAtomic = prev })
+}
+
+func seedFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("seed %q: %v", path, err)
+	}
+}
+
+func readString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %q: %v", path, err)
+	}
+	return string(b)
+}
+
+func TestMaterializeBuiltinTemplates_EarlierVersionReplacedAndLoadsAsReference(t *testing.T) {
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	seedFile(t, gitPath, olderGitTemplate)
+
+	if path, cat, err := MaterializeBuiltinTemplates(home); err != nil {
+		t.Fatalf("MaterializeBuiltinTemplates: %v (path=%q cat=%q)", err, path, cat)
+	}
+
+	want, _ := builtin.BuiltinTemplate("git")
+	if got := readString(t, gitPath); got != string(want) {
+		t.Fatalf("git.yaml = %q, want the current embedded bytes", got)
+	}
+	templates, err := vcs.LoadTemplates(VCSTemplateDir(home))
+	if err != nil {
+		t.Fatalf("LoadTemplates: %v", err)
+	}
+	if tmpl := templates["git"]; tmpl == nil || !tmpl.BuiltinReferenceCopy {
+		t.Fatalf("git template = %#v, want a byte-identical reference copy", tmpl)
+	}
+}
+
+func TestMaterializeBuiltinTemplates_EditedCopyOfEarlierVersionUntouched(t *testing.T) {
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	edited := olderGitTemplate + "# my note\n"
+	seedFile(t, gitPath, edited)
+
+	if path, cat, err := MaterializeBuiltinTemplates(home); err != nil {
+		t.Fatalf("MaterializeBuiltinTemplates: %v (path=%q cat=%q)", err, path, cat)
+	}
+	if got := readString(t, gitPath); got != edited {
+		t.Fatalf("git.yaml = %q, want the edited bytes unchanged", got)
+	}
+}
+
+func TestMaterializeBuiltinTemplates_CurrentCopyNotRewritten(t *testing.T) {
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	current, _ := builtin.BuiltinTemplate("git")
+	seedFile(t, gitPath, string(current))
+	past := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(gitPath, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if path, cat, err := MaterializeBuiltinTemplates(home); err != nil {
+		t.Fatalf("MaterializeBuiltinTemplates: %v (path=%q cat=%q)", err, path, cat)
+	}
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().Equal(past) {
+		t.Fatalf("git.yaml mtime = %v, want %v (not rewritten)", info.ModTime(), past)
+	}
+}
+
+func TestMaterializeBuiltinTemplates_RefreshReadFailureReportsAndPreserves(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses mode bits; permission failure is unobservable")
+	}
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	seedFile(t, gitPath, olderGitTemplate)
+	if err := os.Chmod(gitPath, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitPath, 0o644) })
+
+	path, cat, err := MaterializeBuiltinTemplates(home)
+	if err == nil || path != gitPath || cat != fserrors.PermissionDenied {
+		t.Fatalf("MaterializeBuiltinTemplates = (%q, %q, %v), want (%q, %q, error)", path, cat, err, gitPath, fserrors.PermissionDenied)
+	}
+	if err := os.Chmod(gitPath, 0o644); err != nil {
+		t.Fatalf("chmod back: %v", err)
+	}
+	if got := readString(t, gitPath); got != olderGitTemplate {
+		t.Fatalf("git.yaml = %q, want the existing bytes preserved", got)
+	}
+}
+
+func TestMaterializeBuiltinTemplates_RefreshPrePublicationWriteFailurePreserves(t *testing.T) {
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	seedFile(t, gitPath, olderGitTemplate)
+	swapWriteAtomic(t, func(string, []byte, os.FileMode) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+		return fsutil.WriteStep, fserrors.NoSpace, syscall.ENOSPC
+	})
+
+	path, cat, err := MaterializeBuiltinTemplates(home)
+	if err == nil || path != gitPath || cat != fserrors.NoSpace {
+		t.Fatalf("MaterializeBuiltinTemplates = (%q, %q, %v), want (%q, %q, error)", path, cat, err, gitPath, fserrors.NoSpace)
+	}
+	if got := readString(t, gitPath); got != olderGitTemplate {
+		t.Fatalf("git.yaml = %q, want the existing bytes preserved", got)
+	}
+}
+
+func TestMaterializeBuiltinTemplates_RefreshPostPublicationSyncFailureReports(t *testing.T) {
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	seedFile(t, gitPath, olderGitTemplate)
+	syncErr := errors.New("parent fsync failed")
+	swapWriteAtomic(t, func(p string, d []byte, m os.FileMode) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+		if step, c, err := fsutil.WriteAtomic(p, d, m); err != nil {
+			return step, c, err
+		}
+		return fsutil.ParentSyncStep, fserrors.IOError, syncErr
+	})
+
+	path, cat, err := MaterializeBuiltinTemplates(home)
+	if !errors.Is(err, syncErr) || path != gitPath || cat != fserrors.IOError {
+		t.Fatalf("MaterializeBuiltinTemplates = (%q, %q, %v), want (%q, %q, %v)", path, cat, err, gitPath, fserrors.IOError, syncErr)
+	}
+	want, _ := builtin.BuiltinTemplate("git")
+	if got := readString(t, gitPath); got != string(want) {
+		t.Fatalf("git.yaml = %q, want the current embedded bytes installed", got)
 	}
 }

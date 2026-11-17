@@ -40,6 +40,7 @@ import (
 	"codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/securitystate"
 	"codemeld.dev/codemeld/internal/sessions"
+	"codemeld.dev/codemeld/internal/tools"
 	"codemeld.dev/codemeld/internal/tui"
 	"codemeld.dev/codemeld/internal/vcs"
 )
@@ -51,9 +52,10 @@ func TestConfinedRunner_AutoProjectSymlinkExclusionsThroughTheRealHelper(t *test
 	// The helper's read walk lists every directory above the blocked home, so fixtures avoid the churning shared temp folder.
 	created, err := os.MkdirTemp("/var/tmp", "codemeld-symlinks-")
 	if err != nil {
-		t.Fatal(err)
+		created = t.TempDir()
+	} else {
+		t.Cleanup(func() { _ = os.RemoveAll(created) })
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(created) })
 	base, err := filepath.EvalSymlinks(created)
 	if err != nil {
 		t.Fatal(err)
@@ -1147,6 +1149,84 @@ func TestConfinedRunner_HistoryStoresStayReadOnlyThroughTheRealHelper(t *testing
 	}
 }
 
+func TestConfinedRunner_BuildShellRunsWithTheAutoEditsReachThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	base, err := filepath.EvalSymlinks(filepath.Dir(project))
+	if err != nil {
+		t.Fatal(err)
+	}
+	project = filepath.Join(base, "project")
+	src, outside, tmpDir, userCache := filepath.Join(project, "src"), filepath.Join(base, "outside"), filepath.Join(base, "tmp"), filepath.Join(base, "usercache")
+	hgStore, gitStore := filepath.Join(project, ".hg"), filepath.Join(project, ".git")
+	for _, dir := range []string{src, outside, tmpDir, hgStore, gitStore} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{filepath.Join(hgStore, "requires"): "store", filepath.Join(gitStore, "HEAD"): "head"}
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache, err := config.NewCache(map[string]any{}, project, nil, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	conf := withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.Build, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
+	forward := &helperForwardingRunner{bin: bin}
+	shell := &confinedShellRunner{events: &shellEventRunner{inner: forward, cap: 4096}, conf: conf}
+	env := append(os.Environ(), "GOCACHE="+userCache, "BUILD_PROBE=kept")
+	run := func(t *testing.T, script string, args ...string) runner.RunResult {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := shell.Exec(ctx, runner.RunSpec{InvocationID: ids.NewV7(), Argv: append([]string{"sh", "-c", script, "sh"}, args...), Cwd: project, Env: env})
+		if err != nil || ctx.Err() != nil {
+			t.Fatalf("confined %q %q: %v, %v; result %+v", script, args, err, ctx.Err(), res)
+		}
+		return res
+	}
+
+	if res := run(t, `printf x > "$1/f"`, src); res.ExitCode != 0 {
+		t.Fatalf("write inside the project: exit %d stderr %q, want 0", res.ExitCode, res.Stderr)
+	}
+	if b, err := os.ReadFile(filepath.Join(src, "f")); err != nil || string(b) != "x" {
+		t.Fatalf("%s/f = %q, %v; want the command's write", src, b, err)
+	}
+	if res := run(t, `printf x > "$1/f"`, outside); res.ExitCode == 0 {
+		t.Fatalf("write outside the write roots: exit 0 stderr %q, want a refusal", res.Stderr)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "f")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat %s/f = %v, want it absent", outside, err)
+	}
+	for _, store := range []string{hgStore, gitStore} {
+		if res := run(t, `printf x > "$1/new"`, store); res.ExitCode == 0 {
+			t.Fatalf("write into %s: exit 0 stderr %q, want a refusal", store, res.Stderr)
+		}
+		if _, err := os.Lstat(filepath.Join(store, "new")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("stat %s/new = %v, want it absent", store, err)
+		}
+	}
+	for path, content := range files {
+		if b, err := os.ReadFile(path); err != nil || string(b) != content {
+			t.Fatalf("%s = %q, %v; want %q", path, b, err, content)
+		}
+	}
+	res := run(t, `printf '%s|%s|%s' "$GOCACHE" "$BUILD_PROBE" "$TERM"`)
+	if want := userCache + "|kept|dumb"; res.ExitCode != 0 || string(res.Stdout) != want {
+		t.Fatalf("environment = %q exit %d stderr %q, want %q", res.Stdout, res.ExitCode, res.Stderr, want)
+	}
+	if len(forward.specs) == 0 {
+		t.Fatal("no helper invocation")
+	}
+	if policy, err := enforce.ReadPolicyFrame(bytes.NewReader(forward.specs[0].Stdin)); err != nil || policy.Mode != "auto_edits" {
+		t.Fatalf("policy frame = %+v, %v; want the auto_edits policy", policy, err)
+	}
+}
+
 func TestConfinedRunner_ExternalGitStoresStayReadOnlyThroughTheRealHelper(t *testing.T) {
 	mkdir := func(t *testing.T, dir string) {
 		t.Helper()
@@ -1743,6 +1823,68 @@ func TestBrokerLaunch_OwnerCleanupIsIdempotentAndKeepsTheSessionProxy(t *testing
 	_ = c.Close()
 }
 
+func TestBrokerLaunch_StalledRefusalCollectorSetupIsBoundedAndCapped(t *testing.T) {
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	var started atomic.Int32
+	stalled := func(enforce.Policy) (*enforce.RefusalCollector, error) {
+		started.Add(1)
+		<-release
+		return &enforce.RefusalCollector{}, nil
+	}
+	oldNew, oldWait := newRefusalCollector, refusalInitWait
+	newRefusalCollector, refusalInitWait = stalled, 20*time.Millisecond
+	t.Cleanup(func() { newRefusalCollector, refusalInitWait = oldNew, oldWait })
+	conf := &confinement{broker: enforce.BrokerSlice}
+	startedSessionProxy(t, conf)
+	var launches []*brokerLaunch
+	for i := range cap(refusalInitSlots) + 6 {
+		var spec runner.RunSpec
+		begin := time.Now()
+		if err := conf.attachBroker(&spec, enforce.Policy{Broker: enforce.BrokerSlice}); err != nil {
+			t.Fatal(err)
+		}
+		if took := time.Since(begin); took > 2*time.Second {
+			t.Fatalf("launch %d preparation took %v with a stalled collector setup", i, took)
+		}
+		l := spec.Helper.(*brokerLaunch)
+		if l.files != nil {
+			t.Fatalf("launch %d got a collector from a setup that never finished", i)
+		}
+		launches = append(launches, l)
+	}
+	if n := int(started.Load()); n != cap(refusalInitSlots) {
+		t.Errorf("%d collector setups started, want the cap %d", n, cap(refusalInitSlots))
+	}
+	closed := make(chan struct{})
+	go func() {
+		for _, l := range launches {
+			l.stopBroker()
+			l.Close()
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelling launches waited for stalled collector setups")
+	}
+	releaseOnce()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(refusalInitSlots) > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if n := len(refusalInitSlots); n > 0 {
+		t.Fatalf("%d collector setups still running after release", n)
+	}
+	for i, l := range launches {
+		if l.files != nil {
+			t.Errorf("launch %d got a collector after its setup was abandoned", i)
+		}
+	}
+}
+
 func TestBrokerLaunch_BothSetupEndsAreCloseOnExec(t *testing.T) {
 	conf := &confinement{}
 	startedSessionProxy(t, conf)
@@ -1875,7 +2017,7 @@ func TestLaunchConfinement_SandboxedPlanAndAutoEditsTakeTheProxyRoute(t *testing
 		{"plan", mode.Plan, slicePassed, []string{"mytool"}, "", true},
 		{"plan network command", mode.Plan, slicePassed, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, true},
 		{"plan no-socket fallback", mode.Plan, filtered, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, false},
-		{"build", mode.Build, slicePassed, []string{"mytool"}, "", false},
+		{"build", mode.Build, slicePassed, []string{"mytool"}, "", true},
 		{"network command", mode.AutoEdits, slicePassed, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, true},
 		{"file deletion", mode.AutoEdits, slicePassed, []string{"rm", "x"}, "file deletion", true},
 		{"no-socket fallback", mode.AutoEdits, filtered, []string{"curl", "https://example.com/"}, enforce.NetworkAccessAuthority, false},
@@ -1891,31 +2033,28 @@ func TestLaunchConfinement_SandboxedPlanAndAutoEditsTakeTheProxyRoute(t *testing
 			inner := &confineInner{}
 			spec := confinedSpec(project, tc.argv...)
 			spec.ExceptionalAuthority = authority
+			if tc.m == mode.Build {
+				spec.Env = append([]string{"PATH=" + conf.lookupPath}, conflictingProxyEnv...)
+			}
 			if _, err := (&confinedRunner{inner: inner, conf: conf, cap: 4096}).Exec(context.Background(), spec); err != nil {
 				t.Fatal(err)
 			}
-			if tc.m == mode.Build {
-				if len(inner.execs) != 1 || len(inner.bounded) != 0 || inner.execs[0].Helper != nil || len(inner.execs[0].Env) != 0 {
-					t.Fatalf("build: inner saw %+v, want one unchanged unconfined spec", inner.execs)
+			if len(inner.bounded) != 1 {
+				t.Fatalf("inner saw %d confined specs", len(inner.bounded))
+			}
+			got := inner.bounded[0]
+			policy, _ := decodeFrame(t, got.Stdin)
+			if (policy.Broker == enforce.BrokerSlice) != tc.proxy || (got.Helper != nil) != tc.proxy || policy.ExceptionalAuthority != "" {
+				t.Errorf("broker %q, helper channel %v, authority %q; want the proxy route %v and no authority", policy.Broker, got.Helper != nil, policy.ExceptionalAuthority, tc.proxy)
+			}
+			if tc.proxy {
+				addrs := starts.list()
+				if len(addrs) != 1 || !strings.HasPrefix(addrs[0], "127.0.0.1:") {
+					t.Fatalf("proxy starts = %q, want one loopback proxy", addrs)
 				}
+				requireProxyRouteEnv(t, got.Env, "http://"+addrs[0])
 			} else {
-				if len(inner.bounded) != 1 {
-					t.Fatalf("inner saw %d confined specs", len(inner.bounded))
-				}
-				got := inner.bounded[0]
-				policy, _ := decodeFrame(t, got.Stdin)
-				if (policy.Broker == enforce.BrokerSlice) != tc.proxy || (got.Helper != nil) != tc.proxy || policy.ExceptionalAuthority != "" {
-					t.Errorf("broker %q, helper channel %v, authority %q; want the proxy route %v and no authority", policy.Broker, got.Helper != nil, policy.ExceptionalAuthority, tc.proxy)
-				}
-				if tc.proxy {
-					addrs := starts.list()
-					if len(addrs) != 1 || !strings.HasPrefix(addrs[0], "127.0.0.1:") {
-						t.Fatalf("proxy starts = %q, want one loopback proxy", addrs)
-					}
-					requireProxyRouteEnv(t, got.Env, "http://"+addrs[0])
-				} else {
-					requireInheritedProxyEnv(t, got.Env)
-				}
+				requireInheritedProxyEnv(t, got.Env)
 			}
 			if !tc.proxy && len(starts.list()) != 0 {
 				t.Errorf("proxy starts = %q, want none off the proxy route", starts.list())
@@ -2351,10 +2490,13 @@ func TestConfinedConnectChild(t *testing.T) {
 }
 
 func holdProxyConnection(marker, gate, result, target string) {
-	report := func(msg string) {
-		_ = os.WriteFile(result+".tmp", []byte(msg), 0o600)
-		_ = os.Rename(result+".tmp", result)
+	// Watched file calls fail with ENOSYS once the call's broker stops, so the result file is opened while it runs.
+	out, err := os.OpenFile(result, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return
 	}
+	defer func() { _ = out.Close() }()
+	report := func(msg string) { _, _ = out.WriteString(msg) }
 	c, err := net.Dial("tcp", strings.TrimPrefix(os.Getenv("HTTP_PROXY"), "http://"))
 	if err != nil {
 		report("dial " + err.Error())
@@ -2385,6 +2527,18 @@ func waitForFile(t *testing.T, ctx context.Context, path string) []byte {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("%s never appeared", path)
+	return nil
+}
+
+func waitForReport(t *testing.T, ctx context.Context, path string) []byte {
+	t.Helper()
+	for ctx.Err() == nil {
+		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+			return b
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s never got a report", path)
 	return nil
 }
 
@@ -2436,10 +2590,10 @@ while [ ! -e "$5" ]; do sleep 0.05; done`
 			t.Fatal(err)
 		}
 	}
-	if got := string(waitForFile(t, ctx, file("result1"))); !strings.Contains(got, `read ""`) || strings.Contains(got, "timeout") {
+	if got := string(waitForReport(t, ctx, file("result1"))); !strings.Contains(got, `read ""`) || strings.Contains(got, "timeout") {
 		t.Errorf("background child after its call ended: %s; want its proxy connection closed unanswered", got)
 	}
-	if got := string(waitForFile(t, ctx, file("result2"))); !strings.Contains(got, `read "HTTP/1.1 403 `) {
+	if got := string(waitForReport(t, ctx, file("result2"))); !strings.Contains(got, `read "HTTP/1.1 403 `) {
 		t.Errorf("overlapping call's child: %s; want its connection still served", got)
 	}
 	if r := server.Refusals(); len(r) != 1 {
@@ -2500,7 +2654,7 @@ while [ ! -e "$5" ]; do sleep 0.05; done`
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("call that ends while asked: %v, exit %d stderr %q", err, res.ExitCode, res.Stderr)
 	}
-	if got := string(waitForFile(t, ctx, file("result"))); strings.Contains(got, "timeout") {
+	if got := string(waitForReport(t, ctx, file("result"))); strings.Contains(got, "timeout") {
 		t.Errorf("background child after its call ended: %s; want its proxy connection closed", got)
 	}
 	server := conf.proxy.running()
@@ -2841,7 +2995,7 @@ func TestLaunchConfinement_OnlyTheProxyRouteAddsRefusalLines(t *testing.T) {
 		want       string
 	}{
 		{"plan", mode.Plan, slicePassed, []string{"mytool"}, refused},
-		{"build", mode.Build, slicePassed, []string{"mytool"}, "boom"},
+		{"build", mode.Build, slicePassed, []string{"mytool"}, refused},
 		{"network command", mode.AutoEdits, slicePassed, []string{"curl", "https://example.com/"}, refused},
 		{"no-socket fallback", mode.AutoEdits, filtered, []string{"mytool"}, generic},
 		{"proxy route", mode.AutoEdits, slicePassed, []string{"mytool"}, refused},
@@ -2862,6 +3016,9 @@ func TestLaunchConfinement_OnlyTheProxyRouteAddsRefusalLines(t *testing.T) {
 				conf, project := proxyRouteConfinement(t, tc.resolution, tc.m, "mytool", "curl")
 				spec := confinedSpec(project, tc.argv...)
 				spec.ExceptionalAuthority = authority
+				if tc.m == mode.Build {
+					spec.Env = []string{"PATH=" + conf.lookupPath}
+				}
 				res, err := exec(conf, spec)
 				if err != nil {
 					t.Fatal(err)
@@ -3175,4 +3332,97 @@ type failAfterRun struct{ *helperForwardingRunner }
 func (r failAfterRun) ExecBounded(ctx context.Context, spec runner.RunSpec, maxCapture int) (runner.RunResult, error) {
 	_, _ = r.helperForwardingRunner.ExecBounded(ctx, spec, maxCapture)
 	return runner.RunResult{}, errCaptureFailed
+}
+
+const (
+	wantFileRefusalsClosing = "codemeld: these are predictions and may be wrong; a listed refusal may not be what made the command fail, " +
+		"and more may appear after a folder is allowed. To allow a folder for later runs, add it to writable_folders."
+	wantPlanFileRefusalsClosing = "codemeld: these are predictions and may be wrong; a listed refusal may not be what made the command fail. " +
+		"Plan allows writes only in its temporary folder, and writable_folders does not change Plan."
+)
+
+func TestConfinedShell_FileRefusalsThroughTheRealHelper(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T) (*confinement, string, string){
+		"auto_edits": func(t *testing.T) (*confinement, string, string) {
+			conf, project, _, bin := brokerConfinement(t)
+			return conf, project, bin
+		},
+		"plan": func(t *testing.T) (*confinement, string, string) {
+			home, project, bin := realConfinementHost(t)
+			cache, err := config.NewCache(map[string]any{"confinement": map[string]any{"program_lookup": "strict"}}, project, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			confined, _ := planRealHelperRunner(t, home, project, bin, cache)
+			confined.conf.broker = enforce.BrokerSlice
+			startedSessionProxy(t, confined.conf)
+			return confined.conf, project, bin
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conf, project, bin := setup(t)
+			outside := filepath.Join(filepath.Dir(project), "outside")
+			if err := os.MkdirAll(filepath.Join(outside, "dir"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			outside, err := filepath.EvalSymlinks(outside)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := newProductionToolDispatcher(tools.NewRegistry(), &helperForwardingRunner{bin: bin}, &recordingAuthorizer{decision: allow()},
+				filepath.Join(filepath.Dir(project), "home"), project, nil, 1<<16, securitystate.Policy{})
+			d.confinement = conf
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			stderr := func(command string) string {
+				t.Helper()
+				res, err := d.Dispatch(ctx, bashCall("c1", command))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return dispatchedStderr(t, res.Content)
+			}
+			refused := filepath.Join(outside, "new")
+			line := "codemeld: sandbox probably refused write: " + refused + " (mkdir; grant candidate: " + outside + ")"
+			closing := wantFileRefusalsClosing
+			if name == "plan" {
+				line = "codemeld: sandbox probably refused write: " + refused + " (mkdir)"
+				closing = wantPlanFileRefusalsClosing
+			}
+			if got, want := stderr("mkdir "+refused), "\n"+line+"\n"+closing+"\n"+confinedFailureNote; !strings.HasSuffix(got, want) {
+				t.Errorf("failed mkdir stderr:\n got %q\nwant it to end with %q", got, want)
+			}
+			if got := stderr("sh -c 'mkdir " + filepath.Join(outside, "tolerated") + "; true'"); strings.Contains(got, "codemeld:") {
+				t.Errorf("succeeding command stderr = %q, want no codemeld lines", got)
+			}
+			if got, want := stderr("unlink "+filepath.Join(outside, "dir")), "\ncodemeld: 1 file calls could not be judged\n"+closing+"\n"+confinedFailureNote; !strings.HasSuffix(got, want) {
+				t.Errorf("unlink of a folder stderr:\n got %q\nwant it to end with %q", got, want)
+			}
+		})
+	}
+}
+
+func TestConfinedFailure_FileRefusalLinesAreEscapedAndFitTheRoom(t *testing.T) {
+	f := &confinedFailure{unjudged: 2}
+	for _, r := range []refusal{
+		{File: true, Path: "/a\nb\x1b[2J\xff", Process: "go", Candidate: "/a"},
+		{File: true, Path: "/blocked/x", Process: "sh", Reason: "blocked path"},
+		{File: true, Path: "/" + strings.Repeat("y", 200), Process: "go", Candidate: "/"},
+	} {
+		f.files = appendNew(f.files, fileRefusalLine(r))
+	}
+	lines := []string{
+		"codemeld: sandbox probably refused write: /a\\x0Ab\\x1B[2J� (go; grant candidate: /a)",
+		"codemeld: sandbox probably refused write: /blocked/x (sh; not grantable: blocked path)",
+		"codemeld: 1 more file refusals omitted.",
+		"codemeld: 2 file calls could not be judged",
+		wantFileRefusalsClosing,
+	}
+	want := strings.Join(lines, "\n") + "\n"
+	if got := f.additions(len(want) + 50); got != want {
+		t.Errorf("additions:\n got %q\nwant %q", got, want)
+	}
+	if got := f.additions(len(lines[3]) + len(lines[4]) + 1); got != "" {
+		t.Errorf("additions without room for the closing lines = %q, want none", got)
+	}
 }

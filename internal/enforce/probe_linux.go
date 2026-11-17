@@ -19,7 +19,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const fsNodumpFl = 0x40
+const (
+	fsNodumpFl        = 0x40
+	watchOpenat2Flags = unix.O_WRONLY | unix.O_CREAT | unix.O_EXCL | unix.O_CLOEXEC
+)
 
 type probe struct {
 	n   int
@@ -93,6 +96,9 @@ var probes = map[string]probe{
 	"tcp-bind-listen-connect-thread": {0, onOtherThread(bindListenConnect)},
 	"unix-bind-main":                 {1, onMainThread(unixBind)},
 	"unix-bind-thread":               {1, onOtherThread(unixBind)},
+	"watch-mkdir-main":               {1, onMainThread(watchMkdir)},
+	"watch-mkdir-thread":             {1, onOtherThread(watchMkdir)},
+	"watch-openat2":                  {1, watchOpenat2},
 	"setsockopt-reuseport":           {0, setsockoptProbe(unix.SO_REUSEPORT)},
 	"setsockopt-reuseaddr":           {0, setsockoptProbe(unix.SO_REUSEADDR)},
 	"tcp-fastopen": {1, func(a []string) int {
@@ -242,6 +248,32 @@ func unixBind(a []string) int {
 	}
 	defer func() { _ = unix.Close(fd) }()
 	switch err := unix.Bind(fd, sa); {
+	case err == nil:
+		return probeAllowed
+	case errors.Is(err, unix.EACCES):
+		return probeDenied
+	default:
+		return probeFailed
+	}
+}
+
+func watchMkdir(a []string) int {
+	return landlockExit(unix.Mkdirat(unix.AT_FDCWD, a[0], 0o700))
+}
+
+func watchOpenat2(a []string) int {
+	fd, err := unix.Openat2(unix.AT_FDCWD, a[0], &unix.OpenHow{Flags: watchOpenat2Flags, Mode: 0o600})
+	if err != nil {
+		return landlockExit(err)
+	}
+	if unix.Close(fd) != nil {
+		return probeFailed
+	}
+	return probeAllowed
+}
+
+func landlockExit(err error) int {
+	switch {
 	case err == nil:
 		return probeAllowed
 	case errors.Is(err, unix.EACCES):

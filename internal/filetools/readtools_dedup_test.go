@@ -218,3 +218,31 @@ func assertResolvedRootSwapRejected(t *testing.T, newTool func(root string) read
 		t.Fatalf("Stdout leaked out-of-root content: %q", res.Stdout)
 	}
 }
+
+func TestListTool_ResolvedRootAncestorSwapRejected(t *testing.T) {
+	root := eval(t, t.TempDir())
+	outside := eval(t, t.TempDir())
+	mkdirAll(t, filepath.Join(root, "a", "data"))
+	writeFile(t, filepath.Join(root, "a", "data", "in.go"), "package data\n")
+	mkdirAll(t, filepath.Join(outside, "data"))
+	writeFile(t, filepath.Join(outside, "data", "secret.go"), "package secret\n")
+	tool := newListToolIn(t, root)
+
+	args := map[string]any{"path": "a/data"}
+	target, _, err := tool.ResolveTarget(args)
+	if err != nil {
+		t.Fatalf("ResolveTarget error = %v", err)
+	}
+	replaceWithSymlink(t, filepath.Join(root, "a"), outside)
+
+	res, err := tool.InvokeWithResolvedTarget(context.Background(), args, target)
+	if err != nil {
+		t.Fatalf("InvokeWithResolvedTarget error = %v, want nil (in-band rejection)", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0, want a fail-closed rejection (stdout=%q)", res.Stdout)
+	}
+	if strings.Contains(string(res.Stdout), "secret") {
+		t.Fatalf("Stdout leaked out-of-root content: %q", res.Stdout)
+	}
+}

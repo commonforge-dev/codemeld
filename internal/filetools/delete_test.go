@@ -737,3 +737,46 @@ func TestDeleteTool_AbsentScopeIdentityDeletesNothing(t *testing.T) {
 		t.Fatalf("file = %q, want the entry left in place", got)
 	}
 }
+
+func TestDeleteTool_IntermediateSymlinkSwappedBeforeCaptureRefusesCapture(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	writeFile(t, filepath.Join(root, "a", "b", "f.txt"), "keep\n")
+	tool := newDeleteToolIn(t, root)
+	_, scope, err := tool.ResolveTarget(map[string]any{"path": "a/b/f.txt"})
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+
+	scopeSwapMoveOut(t, root, outside)
+
+	if _, cerr := CaptureScopeIdentity(scope); cerr == nil {
+		t.Fatal("CaptureScopeIdentity = nil error, want a refusal to capture through a symlinked folder")
+	}
+	if _, serr := os.Lstat(filepath.Join(outside, "a", "b", "f.txt")); serr != nil {
+		t.Fatalf("Lstat(outside file) = %v, want it still present", serr)
+	}
+}
+
+func TestDeleteTool_IntermediateSymlinkSwappedAfterConfirmDeletesNothing(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	writeFile(t, filepath.Join(root, "a", "b", "f.txt"), "keep\n")
+	tool := newDeleteToolIn(t, root)
+	args := map[string]any{"path": "a/b/f.txt"}
+	target, scope, err := tool.ResolveTarget(args)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	identity := mustCaptureScope(t, scope)
+	scopeSwapAt(t, &beforeDeleteUnlink, func() { scopeSwapMoveOut(t, root, outside) })
+
+	res, err := tool.InvokeWithAuthorizedScope(context.Background(), args, target, scope, identity)
+	if err != nil {
+		t.Fatalf("error = %v, want nil (the refusal surfaces in-band)", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0 (stdout %q), want a refusal once a folder on the path became a symlink", res.Stdout)
+	}
+	if _, serr := os.Lstat(filepath.Join(outside, "a", "b", "f.txt")); serr != nil {
+		t.Fatalf("Lstat(outside file) = %v, want it still present", serr)
+	}
+}

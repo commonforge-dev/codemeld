@@ -67,6 +67,7 @@ type productionAuthorizer struct {
 	writable             *writableFoldersReader
 	blocked              *permissions.BlockedPaths
 	systemOne            *systemOneCheck
+	outside              *outsideSubjects
 	localNotice          sync.Once
 }
 
@@ -166,13 +167,30 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 	if m, ok := callMode(ctx, a.modeActive); ok {
 		modeCtx.Mode = m
 	}
-	display := a.buildPromptDisplay(markExceptional(disp, req, modeCtx), req.PathScope)
+	display := a.buildPromptDisplay(markOutside(markExceptional(disp, req, modeCtx), req, modeCtx, a.outside), req.PathScope)
+	if display.ExceptionalAuthority == outsideSandboxAuthority {
+		display.OutsideReasons = a.outside.reasons(req.Subject)
+	}
 	texts := systemOneLiteralTexts{}
 	texts.add(req, disp.Subject)
+	prompt := a.prompts.Build(req, display)
+	var grants permissions.GrantTable = a.grants
+	var cache permissions.ApprovalCache = a.grants
+	if display.ExceptionalAuthority == outsideSandboxAuthority {
+		grants, cache = withoutOutsideApprovals(grants, cache, []permissions.MatchRequest{req})
+		ask := prompt
+		prompt = func(ctx context.Context, esc permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+			out, err := ask(ctx, esc)
+			if err == nil {
+				settleOutside(ctx, out.Choice, a.outside, req.Subject)
+			}
+			return out, err
+		}
+	}
 	deps := permissions.AuthorizeDeps{
-		Grants:         a.grants,
-		Cache:          a.grants,
-		Prompt:         a.prompts.Build(req, display),
+		Grants:         grants,
+		Cache:          cache,
+		Prompt:         prompt,
 		PersistGrant:   a.persistGrant(store, req.PathScope),
 		PrePromptCheck: a.systemOne.bind(store, texts),
 		EmitPromptShown: func(subjectKind, subject, pathScope string, directTokens []string, id permissions.DirectIdentity) error {
@@ -236,12 +254,22 @@ func (a *productionAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispat
 		modeCtx.Mode = activeMode
 		batch[i] = permissions.BatchRequest{Req: r.Req, ModeCtx: modeCtx}
 		modeCtxs[i] = modeCtx
-		displays[i] = a.buildPromptDisplay(markExceptional(r.Display, r.Req, modeCtx), r.Req.PathScope)
+		displays[i] = a.buildPromptDisplay(markOutside(markExceptional(r.Display, r.Req, modeCtx), r.Req, modeCtx, a.outside), r.Req.PathScope)
+		if displays[i].ExceptionalAuthority == outsideSandboxAuthority {
+			displays[i].OutsideReasons = a.outside.reasons(r.Req.Subject)
+		}
 	}
 
+	var remembered []permissions.MatchRequest
+	for i, r := range reqs {
+		if displays[i].ExceptionalAuthority == outsideSandboxAuthority {
+			remembered = append(remembered, r.Req)
+		}
+	}
+	grants, cache := withoutOutsideApprovals(a.grants, a.grants, remembered)
 	deps := permissions.AuthorizeDeps{
-		Grants:         a.grants,
-		Cache:          a.grants,
+		Grants:         grants,
+		Cache:          cache,
 		PromptBatch:    a.buildBatchPrompt(displays, modeCtxs),
 		PersistGrant:   a.persistGrant(store, reqs[0].Req.PathScope),
 		PrePromptCheck: a.systemOne.bind(store, texts),
@@ -568,7 +596,16 @@ func (a *productionAuthorizer) buildBatchPrompt(displays []PromptDisplay, modeCt
 		if err := checkExceptionalChoice(promptReq, decision); err != nil {
 			return permissions.PromptOutcome{}, err
 		}
-		return mapOutcome(decision)
+		out, err := mapOutcome(decision)
+		if err != nil {
+			return permissions.PromptOutcome{}, err
+		}
+		for _, p := range prompts {
+			if displayAt(displays, p.Index).ExceptionalAuthority == outsideSandboxAuthority {
+				settleOutside(ctx, out.Choice, a.outside, p.Req.Subject)
+			}
+		}
+		return out, nil
 	}
 }
 
@@ -609,6 +646,18 @@ func buildBatchPromptRequest(prompts []permissions.BatchPromptRequest, displays 
 	if authority := exceptionalAuthority(rep.Req, whole); authority != "" {
 		pr.Action = exceptionalAction(authority)
 		pr.ExceptionalAuthority = authority
+	}
+	if slices.ContainsFunc(prompts, func(p permissions.BatchPromptRequest) bool {
+		return displayAt(displays, p.Index).ExceptionalAuthority == outsideSandboxAuthority
+	}) {
+		pr.Action = exceptionalAction(outsideSandboxAuthority)
+		pr.ExceptionalAuthority = outsideSandboxAuthority
+	}
+	pr.OutsideReasons = nil
+	for _, p := range prompts {
+		for _, reason := range displayAt(displays, p.Index).OutsideReasons {
+			pr.OutsideReasons = appendNew(pr.OutsideReasons, reason)
+		}
 	}
 	pr.BatchedStages = stages
 	pr.BatchedEscalations = escalations

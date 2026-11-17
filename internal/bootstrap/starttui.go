@@ -23,6 +23,7 @@ import (
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
+	"codemeld.dev/codemeld/internal/filetools"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/openaiauth"
@@ -58,7 +59,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.12"
+var codemeldVersion = "Beta 0.4.13"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -140,6 +141,8 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	}
 	stopBlockedDelivery := queueBlockedNotices(app, guard.Blocked, recordTransition)
 	defer stopBlockedDelivery()
+	filetools.SetSwapReporter(app.CommitProviderError)
+	defer filetools.SetSwapReporter(nil)
 	inherited, withheld := runner.InheritedEnvironment(os.Environ())
 	if !execution.SelfTestPassed {
 		withheld = nil
@@ -206,6 +209,8 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	authorizer.systemOne = systemOne
 	conf.proxyAsker = authorizer.prompts.AskNetwork
 	conf.connectAsker = authorizer.prompts.AskConnect
+	conf.outside = &outsideSubjects{}
+	authorizer.outside = conf.outside
 	for _, row := range launchRows {
 		authorizer.grants.addRow(row)
 	}

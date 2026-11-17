@@ -505,3 +505,113 @@ func TestReadTool_SymlinkSwappedAfterCheckRefused(t *testing.T) {
 		})
 	}
 }
+
+const readSwapSecret = "READSWAP-SECRET"
+
+type readSwapCase struct {
+	name               string
+	external, ancestor bool
+	hook               bool
+}
+
+func readSwapCases() []readSwapCase {
+	var cases []readSwapCase
+	for _, external := range []bool{true, false} {
+		for _, ancestor := range []bool{false, true} {
+			for _, hook := range []bool{false, true} {
+				name := "in-project"
+				if external {
+					name = "external"
+				}
+				if ancestor {
+					name += "/ancestor"
+				} else {
+					name += "/parent"
+				}
+				if hook {
+					name += "/from-hook"
+				} else {
+					name += "/before-invoke"
+				}
+				cases = append(cases, readSwapCase{name, external, ancestor, hook})
+			}
+		}
+	}
+	return cases
+}
+
+func readSwapFixture(t *testing.T, c readSwapCase, real, secret []byte) (project string, args map[string]any, swap func()) {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	project = filepath.Join(base, "project")
+	top := project
+	if c.external {
+		top = filepath.Join(base, "ext")
+	}
+	decoy := filepath.Join(top, "decoy")
+	for dir, data := range map[string][]byte{top: real, decoy: secret} {
+		if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "a", "b", "f"), data, 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	rel := filepath.Join("a", "b")
+	if c.ancestor {
+		rel = "a"
+	}
+	path := filepath.Join("a", "b", "f")
+	if c.external {
+		path = filepath.Join(top, path)
+	}
+	return project, map[string]any{"path": path}, func() {
+		replaceWithSymlink(t, filepath.Join(top, rel), filepath.Join(decoy, rel))
+	}
+}
+
+func readSwapApply(t *testing.T, c readSwapCase, swap func(), invoke func()) {
+	t.Helper()
+	if !c.hook {
+		swap()
+		invoke()
+		return
+	}
+	calls := swapBeforeNoFollowOpen(t, swap)
+	invoke()
+	if *calls != 1 {
+		t.Fatalf("swap ran %d times, want 1", *calls)
+	}
+}
+
+func TestReadTool_FolderSwappedAfterResolveTargetRefused(t *testing.T) {
+	for _, c := range readSwapCases() {
+		t.Run(c.name, func(t *testing.T) {
+			project, args, swap := readSwapFixture(t, c, []byte("inside\n"), []byte(readSwapSecret+"\n"))
+			tool := NewReadTool(t.TempDir(), project, project, readTestCap)
+			target, _, err := tool.ResolveTarget(args)
+			if err != nil {
+				t.Fatalf("ResolveTarget(%v) error = %v", args, err)
+			}
+			var res tools.Result
+			readSwapApply(t, c, swap, func() {
+				res, err = tool.InvokeWithResolvedTarget(context.Background(), args, target)
+			})
+			if err != nil {
+				t.Fatalf("InvokeWithResolvedTarget error = %v", err)
+			}
+			if res.ExitCode == 0 {
+				t.Fatalf("read after a folder swap = exit 0 (%q), want a refusal", res.Stdout)
+			}
+			if strings.Contains(string(res.Stdout)+string(res.Stderr), readSwapSecret) {
+				t.Fatalf("read returned the swapped-in file's bytes: stdout %q stderr %q", res.Stdout, res.Stderr)
+			}
+		})
+	}
+}

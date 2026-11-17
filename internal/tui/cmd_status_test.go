@@ -1591,7 +1591,7 @@ func TestRenderStatus_SandboxLineFollowsStarted(t *testing.T) {
 	for _, tc := range []struct{ sandbox, reason, modeKey, want string }{
 		{"on", "", "plan", onLine},
 		{"on", "", "auto_edits", onLine + "; fewer permission prompts"},
-		{"off", "", "build", "Sandbox: off — build mode runs commands outside the sandbox"},
+		{"on", "", "build", onLine},
 		{"unavailable", "linux: not yet supported", "plan", "Sandbox: unavailable (linux: not yet supported)" + unavailableTail},
 		{"unavailable", "settings file is broken", "plan", "Sandbox: unavailable (settings file is broken)" + unavailableTail},
 		{"unavailable", "settings file is broken", "auto_edits", "Sandbox: unavailable (settings file is broken)" + unavailableTail},
@@ -1608,5 +1608,10 @@ func TestRenderStatus_SandboxLineFollowsStarted(t *testing.T) {
 		if tc.sandbox == "unavailable" && strings.Contains(out, "outside the sandbox") {
 			t.Errorf("%s/%s: unavailable overlay claims unconfined execution:\n%s", tc.reason, tc.modeKey, out)
 		}
+	}
+	state := fixtureState()
+	state.sandbox, state.modeKey = "off", "build"
+	if out := visibleStatusText(BuildStatusSnapshot(state)); strings.Contains(out, "Sandbox: off") || strings.Contains(out, "outside the sandbox") {
+		t.Errorf("status still renders a sandbox off state:\n%s", out)
 	}
 }

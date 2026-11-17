@@ -219,13 +219,13 @@ func planEdit(boundary, target string, args map[string]any) (editPlan, *tools.Re
 // planEditAt plans the same edit from the target opened relative to parentDir, the held descriptor the
 // publish also runs through. Binding the read and the write to one directory inode is what keeps a
 // parent replaced mid-edit from having bytes planned off the old file applied to a different one.
-func planEditAt(parentDir *os.File, leaf string, args map[string]any) (editPlan, os.FileInfo, *tools.Result) {
+func planEditAt(parentDir *os.File, target string, args map[string]any) (editPlan, os.FileInfo, *tools.Result) {
 	oldText, newText, refusal := editArgs(args)
 	if refusal != nil {
 		return editPlan{}, nil, refusal
 	}
 
-	data, info, err := readRegularFileAt(parentDir, leaf)
+	data, info, err := readRegularFileAt(parentDir, target)
 	if err != nil {
 		plan, readRefusal := failPlan("cannot read the target file: " + err.Error())
 		return plan, nil, readRefusal
@@ -234,11 +234,13 @@ func planEditAt(parentDir *os.File, leaf string, args map[string]any) (editPlan,
 	return plan, info, planRefusal
 }
 
-// readRegularFileAt reads leaf under the held directory descriptor. O_NONBLOCK is what keeps a FIFO
-// swapped in at the name from blocking the open forever instead of reaching the regular-file refusal.
-func readRegularFileAt(parentDir *os.File, leaf string) ([]byte, os.FileInfo, error) {
+// readRegularFileAt reads target's leaf under the held directory descriptor. O_NONBLOCK is what keeps a
+// FIFO swapped in at the name from blocking the open forever instead of reaching the regular-file refusal.
+func readRegularFileAt(parentDir *os.File, target string) ([]byte, os.FileInfo, error) {
+	leaf := filepath.Base(target)
 	fd, oerr := unix.Openat(int(parentDir.Fd()), leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if oerr != nil {
+		reportIfSymlink(int(parentDir.Fd()), leaf, target)
 		return nil, nil, &os.PathError{Op: "openat", Path: leaf, Err: oerr}
 	}
 	f := os.NewFile(uintptr(fd), leaf)
@@ -368,7 +370,7 @@ func (t *EditTool) apply(ctx context.Context, scope *authorizedScope, target str
 	}
 	defer parentDir.Close() //nolint:errcheck // nothing useful can be done after the edit result is formed
 
-	plan, plannedTarget, refusal := planEditAt(parentDir, leaf, args)
+	plan, plannedTarget, refusal := planEditAt(parentDir, target, args)
 	if refusal != nil {
 		return *refusal
 	}
@@ -393,7 +395,7 @@ func (t *EditTool) apply(ctx context.Context, scope *authorizedScope, target str
 			refusedBeforePublish = moved
 			return errors.New(moved)
 		}
-		if changed := confirmTargetStillPlanned(parentDir, leaf, plannedTarget); changed != "" {
+		if changed := confirmTargetStillPlanned(parentDir, target, plannedTarget); changed != "" {
 			refusedBeforePublish = changed
 			return errors.New(changed)
 		}
@@ -472,12 +474,15 @@ func (t *EditTool) openAuthorizedParent(scope *authorizedScope, authorizedDir st
 	const redirected = "edit target's parent directory changed after authorization; refusing to edit outside the authorized directory"
 	reDir, rerr := permissions.CleanAbsResolve(t.home, t.processCWD, authorizedDir)
 	if rerr != nil || reDir != authorizedDir {
+		if dir, oerr := openDirByComponentsFromRoot(authorizedDir); oerr == nil {
+			_ = dir.Close()
+		}
 		return nil, redirected
 	}
 	if scope != nil {
 		return scope.openWithin(authorizedDir)
 	}
-	dir, oerr := os.OpenFile(authorizedDir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	dir, oerr := openDirByComponentsFromRoot(authorizedDir)
 	if oerr != nil {
 		return nil, redirected
 	}
@@ -490,7 +495,7 @@ func (t *EditTool) openAuthorizedParent(scope *authorizedScope, authorizedDir st
 // to catch a move inside the window the hook cannot cover, where it undoes the write instead.
 func (t *EditTool) confirmParentStillAuthorized(parentDir *os.File, authorizedDir string) string {
 	const moved = "edit target's parent directory moved during the edit; refusing to report an edit at a path the file is not located at"
-	pathDir, oerr := os.OpenFile(authorizedDir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	pathDir, oerr := openDirByComponentsFromRoot(authorizedDir)
 	if oerr != nil {
 		return moved
 	}
@@ -508,12 +513,14 @@ func (t *EditTool) confirmParentStillAuthorized(parentDir *os.File, authorizedDi
 // away and replaced under the same name between the read and the publish would otherwise be overwritten
 // with a change computed from contents it never had. A nil planned identity is refused rather than
 // compared, so the check can never pass by default.
-func confirmTargetStillPlanned(parentDir *os.File, leaf string, planned os.FileInfo) string {
+func confirmTargetStillPlanned(parentDir *os.File, target string, planned os.FileInfo) string {
 	if planned == nil {
 		return editTargetChanged
 	}
+	leaf := filepath.Base(target)
 	fd, oerr := unix.Openat(int(parentDir.Fd()), leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if oerr != nil {
+		reportIfSymlink(int(parentDir.Fd()), leaf, target)
 		return editTargetChanged
 	}
 	current := os.NewFile(uintptr(fd), leaf)

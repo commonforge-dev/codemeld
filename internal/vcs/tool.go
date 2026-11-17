@@ -132,6 +132,7 @@ var actionDescriptions = map[string]string{
 	"diff":           "Show the line-level differences between the working tree and the last commit. Use to review the exact changes you are about to commit.",
 	"add":            "Stage a file's changes so they are included in the next commit. Use to select a specific path to commit.",
 	"commit":         "Record the staged changes as a new commit with the given message. Use once the intended changes are staged.",
+	"amend":          "Replace the last commit with the staged changes and the given message, only while that commit has not been pushed. Use to fix the commit you just made instead of adding another.",
 	"log":            "Show the most recent commits in summary form. Use to review recent project history.",
 	"branch-current": "Report the branch currently checked out. Use to confirm which branch work will land on.",
 	"branch-create":  "Create a new branch with the given name without switching to it. Use to start an isolated line of work.",
@@ -152,6 +153,7 @@ var vcsActionDescriptions = map[string]map[string]string{
 		"status":        "Show the working directory's modified, added, removed, deleted, and unknown files; Mercurial has no staging concept. Use to see what has changed before committing.",
 		"add":           "Begin tracking a file Mercurial does not track yet. Use only for an unknown file: a file that is already tracked needs no add, because its changes are committed automatically.",
 		"commit":        "Record every tracked modified file as a new commit with the given message; Mercurial has no staging step. Use once the working directory holds the changes you intend to commit.",
+		"amend":         "Replace the last commit with every tracked modified file and the given message, only while that commit has not been pushed; Mercurial has no staging step. Use to fix the commit you just made instead of adding another.",
 		"branch-create": "Name the current working-directory branch, rather than creating a branch without switching to it. Use to start an isolated line of work from the current state.",
 	},
 	"jj": {
@@ -205,11 +207,8 @@ func actionParamSchema(actionName string) map[string]any {
 
 // Invoke decodes args into the action's placeholder params and runs the action.
 func (t *ActionTool) Invoke(ctx context.Context, args map[string]any) (tools.Result, error) {
-	params, err := t.decodeOperands(ctx, args)
-	if err != nil {
-		return tools.Result{}, err
-	}
-	return Invoke(ctx, t.actionName, &t.action, params, t.repoRoot, t.runner, t.emit, t.cap)
+	resolvedCwd, cwdErr := t.EffectiveCWD()
+	return t.InvokeWithEffectiveCWD(ctx, args, resolvedCwd, cwdErr)
 }
 
 // InvokeWithEffectiveCWD runs the action using a cwd result that was already resolved by
@@ -218,6 +217,9 @@ func (t *ActionTool) Invoke(ctx context.Context, args map[string]any) (tools.Res
 func (t *ActionTool) InvokeWithEffectiveCWD(ctx context.Context, args map[string]any, resolvedCwd string, cwdErr error) (tools.Result, error) {
 	params, err := t.decodeOperands(ctx, args)
 	if err != nil {
+		return tools.Result{}, err
+	}
+	if err := t.checkAmend(ctx, resolvedCwd, cwdErr); err != nil {
 		return tools.Result{}, err
 	}
 	return invokeResolvedCWD(ctx, t.actionName, &t.action, params, t.runner, t.emit, resolvedCwd, cwdErr, t.cap)
@@ -253,6 +255,27 @@ func decodeParams(actionName string, args map[string]any) (map[string]string, er
 }
 
 var errOperand = errors.New("argument is not a single literal operand")
+
+var errSharedCommit = errors.New("the last commit has left this machine (pushed or public); make a new commit, or ask the user to switch to Build to rewrite it")
+
+func (t *ActionTool) checkAmend(ctx context.Context, cwd string, cwdErr error) error {
+	if t.actionName != "amend" || cwdErr != nil || t.lastCommitLocal(ctx, cwd) {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", toolName(t.actionName), errSharedCommit)
+}
+
+func (t *ActionTool) lastCommitLocal(ctx context.Context, cwd string) bool {
+	switch t.vcsName {
+	case "hg":
+		res, err := t.execQueryIn(ctx, []string{"hg", "log", "-r", ".", "-T", "{phase}"}, cwd)
+		return err == nil && res.ExitCode == 0 && (string(res.Stdout) == "draft" || string(res.Stdout) == "secret")
+	case "git":
+		res, err := t.execQueryIn(ctx, []string{"git", "branch", "-r", "--contains", "HEAD"}, cwd)
+		return err == nil && res.ExitCode == 0 && len(res.Stdout) == 0
+	}
+	return false
+}
 
 func (t *ActionTool) decodeOperands(ctx context.Context, args map[string]any) (map[string]string, error) {
 	params, err := decodeParams(t.actionName, args)
@@ -399,7 +422,7 @@ func registerActions(reg *tools.Registry, tmpl *Template, repoRoot string, runne
 	if tmpl == nil {
 		return nil
 	}
-	for _, actionName := range requiredActions {
+	for _, actionName := range knownActions {
 		if actionName == "detect" {
 			continue
 		}
@@ -621,10 +644,14 @@ func (t *ActionTool) runProtectQuery(ctx context.Context, q protectQuery) (bool,
 }
 
 func (t *ActionTool) execProtectQuery(ctx context.Context, argv []string) (cmdrunner.RunResult, error) {
+	return t.execQueryIn(ctx, argv, t.repoRoot)
+}
+
+func (t *ActionTool) execQueryIn(ctx context.Context, argv []string, cwd string) (cmdrunner.RunResult, error) {
 	res, err := t.runner.Exec(ctx, cmdrunner.RunSpec{
 		InvocationID: t.runner.NewInvocationID(),
 		Argv:         argv,
-		Cwd:          t.repoRoot,
+		Cwd:          cwd,
 	})
 	if err != nil || res.LaunchErrCategory != "" {
 		return cmdrunner.RunResult{}, errProtectQuery

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"codemeld.dev/codemeld/internal/paths"
 	"codemeld.dev/codemeld/internal/permissions"
@@ -393,6 +394,26 @@ func ResolveReadFile(target string, projectRoot string) (real string, ok bool, r
 
 var beforeNoFollowOpen = func() {}
 
+var swapReporter atomic.Pointer[func(string)]
+
+func SetSwapReporter(report func(line string)) {
+	if report == nil {
+		swapReporter.Store(nil)
+		return
+	}
+	swapReporter.Store(&report)
+}
+
+func reportIfSymlink(dirfd int, name, path string) {
+	var st unix.Stat_t
+	if unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFLNK {
+		return
+	}
+	if report := swapReporter.Load(); report != nil {
+		(*report)("Warning: " + oneLine(path) + " was replaced by a symlink after codemeld checked it; codemeld refused to use it. A program left running by an earlier command may be changing your project.")
+	}
+}
+
 func openNoFollowUnder(boundary, real string) (*os.File, string) {
 	const changed = "target file or a folder on its path changed after the read check (now a symlink, missing, or a different type); refusing to read"
 	root := normalizeRoot(boundary)
@@ -401,27 +422,72 @@ func openNoFollowUnder(boundary, real string) (*os.File, string) {
 		return nil, "target is not inside the read boundary; refusing to read"
 	}
 	beforeNoFollowOpen()
-	cur, err := os.OpenFile("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	dirfd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, "cannot open the root folder; refusing to read"
 	}
 	segs := strings.Split(strings.TrimPrefix(filepath.Clean(real), "/"), "/")
-	for i, seg := range segs {
-		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_DIRECTORY
-		if i == len(segs)-1 {
-			flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
-		}
-		fd, oerr := unix.Openat(int(cur.Fd()), seg, flags, 0)
-		_ = cur.Close()
-		if oerr != nil {
-			return nil, changed
-		}
-		cur = os.NewFile(uintptr(fd), seg)
+	fd, err := walkOpenComponents(dirfd, "/", segs, walkDirOpenFlags, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC)
+	if err != nil {
+		return nil, changed
 	}
+	cur := os.NewFile(uintptr(fd), segs[len(segs)-1])
 	info, err := cur.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		_ = cur.Close()
 		return nil, changed
 	}
 	return cur, ""
+}
+
+const walkDirOpenFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+const walkDirSearchFlags = dirSearchOnly | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+func walkOpenComponents(dirfd int, base string, segs []string, midFlags, lastFlags int) (int, error) {
+	fd := dirfd
+	for i, seg := range segs {
+		flags := midFlags
+		if i == len(segs)-1 {
+			flags = lastFlags
+		}
+		next, err := unix.Openat(fd, seg, flags, 0)
+		if err != nil {
+			reportIfSymlink(fd, seg, filepath.Join(base, strings.Join(segs[:i+1], "/")))
+			_ = unix.Close(fd)
+			return -1, err
+		}
+		_ = unix.Close(fd)
+		fd = next
+	}
+	return fd, nil
+}
+
+func walkOpenDirUnder(boundary, target string) (*os.File, error) {
+	clean := filepath.Clean(target)
+	start, segs := clean, []string(nil)
+	if clean != filepath.Clean(boundary) {
+		root := normalizeRoot(boundary)
+		rel, err := filepath.Rel(root, clean)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, &os.PathError{Op: "open", Path: target, Err: errors.New("folder is not inside the read boundary")}
+		}
+		start = root
+		if rel != "." {
+			segs = strings.Split(rel, string(filepath.Separator))
+		}
+	}
+	startFlags := unix.O_RDONLY
+	if len(segs) > 0 {
+		startFlags = dirSearchOnly
+	}
+	dirfd, err := unix.Open(start, startFlags|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: target, Err: err}
+	}
+	fd, err := walkOpenComponents(dirfd, start, segs, walkDirSearchFlags, walkDirOpenFlags)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: target, Err: err}
+	}
+	return os.NewFile(uintptr(fd), clean), nil
 }

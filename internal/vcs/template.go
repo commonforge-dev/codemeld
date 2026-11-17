@@ -25,6 +25,10 @@ var requiredActions = []string{
 	"is-clean", "stash", "stash-pop", "merge-status", "rebase-status",
 }
 
+var optionalActions = []string{"amend"}
+
+var knownActions = slices.Concat(requiredActions, optionalActions)
+
 // forbiddenTopLevelKeys are wrapping keys that must never appear at a template's top level.
 var forbiddenTopLevelKeys = []string{"name", "kind", "version", "actions"}
 
@@ -33,6 +37,7 @@ var placeholderActions = map[string]string{
 	"add":           "{path}",
 	"restore-file":  "{path}",
 	"commit":        "{message}",
+	"amend":         "{message}",
 	"branch-create": "{branch}",
 	"branch-switch": "{branch}",
 }
@@ -250,8 +255,8 @@ func parseTemplateBytes(source, name string, b []byte) (*Template, error) {
 		if slices.Contains(forbiddenTopLevelKeys, key) {
 			return nil, &ValidationError{File: source, Msg: fmt.Sprintf("forbidden top-level wrapping key %q", key)}
 		}
-		if !slices.Contains(requiredActions, key) {
-			return nil, &ValidationError{File: source, Msg: fmt.Sprintf("unknown top-level key %q is not one of the 15 VCS actions", key)}
+		if !slices.Contains(knownActions, key) {
+			return nil, &ValidationError{File: source, Msg: fmt.Sprintf("unknown top-level key %q is not one of the VCS actions", key)}
 		}
 	}
 
@@ -265,7 +270,7 @@ func parseTemplateBytes(source, name string, b []byte) (*Template, error) {
 		tmpl.Detect = detect
 	}
 
-	for _, action := range requiredActions {
+	for _, action := range knownActions {
 		if action == "detect" {
 			continue
 		}

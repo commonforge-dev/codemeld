@@ -1503,7 +1503,7 @@ func TestRunHeadless_ApprovedRootOffersTheProjectChoice(t *testing.T) {
 
 	out := stderr.String()
 	for _, want := range []string{
-		"  [4] allow in this project — remember this permanently in " + projectSettingsPath(dir),
+		"  [4] allow in this project — remember this permanently in " + fact(projectSettingsPath(dir)),
 		"codemeld: choose 1-4 (a machine-wide/global grant is not offered here): ",
 		"codemeld: this grant stores a command subject — choose its scope",
 	} {
@@ -3525,6 +3525,35 @@ func TestRunHeadless_DeclaredOutOfRootPathIsWrittenWithoutAPrompt(t *testing.T) 
 	})
 }
 
+func TestRunHeadless_DeclaredLinkToAnOutsideFileFailsAtStartup(t *testing.T) {
+	dir := declaredScopeDir(t)
+	outside := declaredScopeDir(t)
+	outsideFile := filepath.Join(outside, "f.txt")
+	if err := os.WriteFile(outsideFile, []byte("keep\n"), 0o644); err != nil {
+		t.Fatalf("seed outside: %v", err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(dir, "link.txt")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	client := declaredScopeClient(declaredToolCall{"edit", `{"path":"link.txt","old_text":"keep","new_text":"changed"}`})
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+	driver := NewHeadlessDriver("edit the link", &bytes.Buffer{}, &bytes.Buffer{})
+	driver.SetDeclaredFileScopes([]string{"link.txt"}, nil)
+	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
+	err := driver.Run(context.Background(), result)
+	if err == nil || !strings.Contains(err.Error(), `declared path "link.txt"`) || !strings.Contains(err.Error(), "outside the launch folder") {
+		t.Fatalf("driver.Run = %v, want the startup refusal naming link.txt", err)
+	}
+	if n := client.callCount(); n != 0 {
+		t.Fatalf("provider calls = %d, want none: the run must end before the first turn", n)
+	}
+	if got := mustReadFile(t, outsideFile); got != "keep\n" {
+		t.Fatalf("outside file = %q, want it unchanged", got)
+	}
+}
+
 // TestRunHeadless_DeclaredScopeDeniesInPlanWithPlansOwnEnvelope proves Plan stays the sole
 // authority: a write declared in both lists is still denied there, with Plan's own recoverable
 // mode envelope rather than a declared-scope one.
@@ -4371,77 +4400,97 @@ func TestRunHeadless_PromptApprovalSessionScopeCoversLaterArgumentVariant(t *tes
 }
 
 func TestRunHeadless_PromptApprovalFolderProgramScopePersistsAndDiscloses(t *testing.T) {
-	dir := t.TempDir()
-	for _, name := range []string{"one.txt", "two.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("x\n"), 0o644); err != nil {
-			t.Fatalf("seed %s: %v", name, err)
-		}
-	}
-
-	var round int32
-	client := &stubTurnClient{fn: func(_ context.Context, _ provider.Request) (provider.Response, error) {
-		n := atomic.AddInt32(&round, 1)
-		if n > 2 {
-			return provider.Response{Stream: newStream(contentChunk("done"), finishChunk("stop"))}, nil
-		}
-		file := "one.txt"
-		if n == 2 {
-			file = "two.txt"
-		}
-		frag := toolFrag(0, fmt.Sprintf("call_%d", n), "bash", fmt.Sprintf(`{"command":"rm %s"}`, file))
-		return provider.Response{Stream: newStream(toolCallsChunk(frag))}, nil
-	}}
-	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
-
-	var stderr bytes.Buffer
-	driver := NewHeadlessDriver("clean up", &bytes.Buffer{}, &stderr)
-	// Folder lifetime, then scope choice 3 — the `rm :*` Program row — then its confirmation.
-	driver.EnablePromptForApproval(strings.NewReader("4\n3\n1\n"))
-	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
-	if err := driver.Run(context.Background(), result); err != nil {
-		t.Fatalf("driver.Run: %v", err)
-	}
-
-	if got := driver.DeniedSubjects(); len(got) != 0 {
-		t.Fatalf("DeniedSubjects = %v, want none", got)
-	}
-	for _, name := range []string{"one.txt", "two.txt"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Fatalf("%s still present — the program-scope grant must authorize both calls: stat err = %v", name, err)
-		}
-	}
-	if n := strings.Count(stderr.String(), "approval required"); n != 1 {
-		t.Fatalf("terminal rendered %d prompts, want 1:\n%s", n, stderr.String())
-	}
-
-	settings := config.LocalSettingsPath(dir)
-	entries := readPersistedPermissions(t, settings, dir)
-	if len(entries) != 1 {
-		t.Fatalf("project settings hold %d permission entries, want 1: %+v", len(entries), entries)
-	}
-	if got := entries[0]; got.GrantKind != "folder" || got.Subject != "rm :*" || got.PathScope != dir {
-		t.Fatalf("persisted entry = %+v, want a folder grant for %q scoped to %s", got, "rm :*", dir)
-	}
-	if _, err := os.Stat(filepath.Join(result.Home, ".codemeld", "global", "settings.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("global settings written — a headless run must never grant machine-wide (stat err = %v)", err)
-	}
-
-	out := stderr.String()
-	for _, want := range []string{
-		"project root: " + dir,
-		"saved to: " + projectSettingsPath(dir),
-		"applies to: " + dir + " and its descendants",
-		"canonical command: rm one.txt",
-		"subject kind: direct-command",
-		scopeDestructiveProgramWarning,
-		"effective grant: rm :* (direct command)",
+	for _, tc := range []struct {
+		name    string
+		project func(*testing.T) string
+		bounded bool
+	}{
+		{"temp dir", (*testing.T).TempDir, false},
+		{"long path", func(t *testing.T) string {
+			dir := filepath.Join(t.TempDir(), strings.Repeat("p", 130))
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatalf("mkdir long project: %v", err)
+			}
+			return dir
+		}, true},
 	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("terminal disclosure missing %q:\n%s", want, out)
-		}
-	}
-	if strings.Index(out, scopeDestructiveProgramWarning) > strings.LastIndex(out, scopeProgramWarning) {
-		t.Fatalf("destructive advisory is not above the breadth warning:\n%s", out)
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.project(t)
+			if tc.bounded && fact(dir) == dir {
+				t.Fatalf("project path %q is within the prompt bound, want it over 120 code points", dir)
+			}
+			for _, name := range []string{"one.txt", "two.txt"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("x\n"), 0o644); err != nil {
+					t.Fatalf("seed %s: %v", name, err)
+				}
+			}
+
+			var round int32
+			client := &stubTurnClient{fn: func(_ context.Context, _ provider.Request) (provider.Response, error) {
+				n := atomic.AddInt32(&round, 1)
+				if n > 2 {
+					return provider.Response{Stream: newStream(contentChunk("done"), finishChunk("stop"))}, nil
+				}
+				file := "one.txt"
+				if n == 2 {
+					file = "two.txt"
+				}
+				frag := toolFrag(0, fmt.Sprintf("call_%d", n), "bash", fmt.Sprintf(`{"command":"rm %s"}`, file))
+				return provider.Response{Stream: newStream(toolCallsChunk(frag))}, nil
+			}}
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+			var stderr bytes.Buffer
+			driver := NewHeadlessDriver("clean up", &bytes.Buffer{}, &stderr)
+			// Folder lifetime, then scope choice 3 — the `rm :*` Program row — then its confirmation.
+			driver.EnablePromptForApproval(strings.NewReader("4\n3\n1\n"))
+			result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
+			if err := driver.Run(context.Background(), result); err != nil {
+				t.Fatalf("driver.Run: %v", err)
+			}
+
+			if got := driver.DeniedSubjects(); len(got) != 0 {
+				t.Fatalf("DeniedSubjects = %v, want none", got)
+			}
+			for _, name := range []string{"one.txt", "two.txt"} {
+				if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+					t.Fatalf("%s still present — the program-scope grant must authorize both calls: stat err = %v", name, err)
+				}
+			}
+			if n := strings.Count(stderr.String(), "approval required"); n != 1 {
+				t.Fatalf("terminal rendered %d prompts, want 1:\n%s", n, stderr.String())
+			}
+
+			settings := config.LocalSettingsPath(dir)
+			entries := readPersistedPermissions(t, settings, dir)
+			if len(entries) != 1 {
+				t.Fatalf("project settings hold %d permission entries, want 1: %+v", len(entries), entries)
+			}
+			if got := entries[0]; got.GrantKind != "folder" || got.Subject != "rm :*" || got.PathScope != dir {
+				t.Fatalf("persisted entry = %+v, want a folder grant for %q scoped to %s", got, "rm :*", dir)
+			}
+			if _, err := os.Stat(filepath.Join(result.Home, ".codemeld", "global", "settings.yaml")); !os.IsNotExist(err) {
+				t.Fatalf("global settings written — a headless run must never grant machine-wide (stat err = %v)", err)
+			}
+
+			out := stderr.String()
+			for _, want := range []string{
+				"project root: " + fact(dir),
+				"saved to: " + fact(projectSettingsPath(dir)),
+				"applies to: " + fact(dir) + " and its descendants",
+				"canonical command: rm one.txt",
+				"subject kind: direct-command",
+				scopeDestructiveProgramWarning,
+				"effective grant: rm :* (direct command)",
+			} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("terminal disclosure missing %q:\n%s", want, out)
+				}
+			}
+			if strings.Index(out, scopeDestructiveProgramWarning) > strings.LastIndex(out, scopeProgramWarning) {
+				t.Fatalf("destructive advisory is not above the breadth warning:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -6267,21 +6316,107 @@ func TestRunHeadless_BuildShellUnderConstrainedLaunchKeepsTheGrantPath(t *testin
 	if len(matched) != 1 || matched[0].OutcomeSource != "grant" {
 		t.Fatalf("permission_matched = %+v, want the folder grant", matched)
 	}
-	strip := func(specs []runner.RunSpec) []runner.RunSpec {
-		out := cloneSpecs(specs)
-		for i := range out {
-			out[i].InvocationID = ""
-		}
-		return out
+	if len(unconfined.execs) != 1 || !slices.Equal(unconfined.execs[0].Argv, []string{"touch", "shell-ran.txt"}) || len(unconfined.execs[0].Stdin) != 0 {
+		t.Fatalf("unconstrained launch runs exec %+v bounded %+v, want one unconfined touch", unconfined.execs, unconfined.bounded)
 	}
-	if !reflect.DeepEqual(strip(constrained.execs), strip(unconfined.execs)) || !reflect.DeepEqual(strip(constrained.bounded), strip(unconfined.bounded)) {
-		t.Fatalf("constrained launch runs exec %+v bounded %+v, want the unconfined exec %+v bounded %+v",
-			constrained.execs, constrained.bounded, unconfined.execs, unconfined.bounded)
+	if len(constrained.execs) != 0 || len(constrained.bounded) != 1 {
+		t.Fatalf("constrained launch runs exec %+v bounded %+v, want one confined run", constrained.execs, constrained.bounded)
 	}
-	for _, spec := range append(slices.Clone(constrained.execs), constrained.bounded...) {
-		if spec.Argv[0] == "/proc/self/exe" || len(spec.Stdin) != 0 {
-			t.Fatalf("build spec = %+v, want no helper prefix or policy frame", spec)
+	got := constrained.bounded[0]
+	if len(got.Argv) != 4 || got.Argv[0] != "/proc/self/exe" || got.Argv[1] != enforce.HelperCommand || filepath.Base(got.Argv[2]) != "touch" || got.Argv[3] != "shell-ran.txt" {
+		t.Fatalf("build argv = %q, want touch through the helper", got.Argv)
+	}
+	if policy, _ := decodeFrame(t, got.Stdin); policy.Mode != "auto_edits" {
+		t.Fatalf("build policy mode = %q, want auto_edits", policy.Mode)
+	}
+}
+
+func runHeadlessOutside(t *testing.T, approvals io.Reader, calls int) (*confineInner, []string, string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("the refusal report needs the linux connect broker")
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	resolution := constrainedResolution
+	resolution.SliceSelfTestPassed = true
+	swapResolveExecutionCapability(t, resolution)
+	swapInvocationRefusals(t, []refusal{{File: true, Path: "/srv/data/out.txt", Process: "touch", Candidate: "/srv/data"}})
+	dir := t.TempDir()
+	result := headlessResult(t, dir, mode.NewActiveState(mode.Build, mode.SourceDefault))
+	result.Config["permissions"] = []any{map[string]any{
+		"kind": "direct", "subject": "touch :*", "path_scope": dir, "grant_kind": "folder",
+	}}
+	inner := &confineInner{exitCode: 1, stderr: []byte("boom")}
+	prev := newShellRunner
+	newShellRunner = func() runner.Runner { return inner }
+	defer func() { newShellRunner = prev }()
+	scripted := make([]scriptedToolCall, calls)
+	for i := range scripted {
+		scripted[i] = scriptedToolCall{bashToolName, `{"command":"touch a"}`}
+	}
+	var requests []provider.Request
+	client := refusedCallsClient(scripted, "done", &requests)
+	defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+	var stderr bytes.Buffer
+	driver := NewHeadlessDriver("run it", &bytes.Buffer{}, &stderr)
+	if approvals != nil {
+		driver.EnablePromptForApproval(approvals)
+	}
+	if err := driver.Run(context.Background(), result); err != nil {
+		t.Fatalf("driver.Run: %v", err)
+	}
+	var tool []string
+	for _, m := range messagesByRole(reloadStore(t, result.Session), "tool") {
+		tool = append(tool, m.Content.Text())
+	}
+	return inner, tool, stderr.String()
+}
+
+func TestRunHeadless_BuildOutsideRunWithAnApproverRunsOnlyTheApprovedInvocationUnconfined(t *testing.T) {
+	inner, tool, stderr := runHeadlessOutside(t, strings.NewReader("1\n"), 3)
+	if len(tool) != 3 || !strings.Contains(tool[0], "run it again; you will be asked first") {
+		t.Fatalf("tool messages = %q, want three, the first offering the outside run", tool)
+	}
+	if len(inner.execs) != 1 || len(inner.bounded) != 2 || !slices.Equal(inner.execs[0].Argv, []string{"touch", "a"}) {
+		t.Fatalf("unconfined %+v, confined %d; want only the approved second call unconfined", inner.execs, len(inner.bounded))
+	}
+	if n := strings.Count(stderr, "approval required"); n != 1 {
+		t.Fatalf("prompts = %d, want one despite the folder grant:\n%s", n, stderr)
+	}
+	for _, want := range []string{
+		"Allow running outside the sandbox: touch a",
+		"⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once.",
+		"codemeld: choose 1-2: ",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr)
 		}
+	}
+	if strings.Contains(stderr, "still runs inside the sandbox") {
+		t.Fatalf("stderr claims the command runs inside the sandbox:\n%s", stderr)
+	}
+}
+
+func TestRunHeadless_BuildOutsidePromptShowsWhatTheSandboxRefusedInsteadOfTheSummary(t *testing.T) {
+	_, _, stderr := runHeadlessOutside(t, strings.NewReader("2\n"), 2)
+	want := "  Last run: the sandbox probably refused:\n  sandbox probably refused write: /srv/data/out.txt (touch; grant candidate: /srv/data)\n"
+	if !strings.Contains(stderr, want) {
+		t.Fatalf("stderr missing %q:\n%s", want, stderr)
+	}
+	for _, unwanted := range []string{"Summary:", "effect:"} {
+		if strings.Contains(stderr, unwanted) {
+			t.Fatalf("stderr shows %q with refusal reasons present:\n%s", unwanted, stderr)
+		}
+	}
+}
+
+func TestRunHeadless_BuildOutsideRunWithoutAnApproverIsRefused(t *testing.T) {
+	inner, tool, _ := runHeadlessOutside(t, nil, 2)
+	if len(inner.execs) != 0 || len(inner.bounded) != 1 {
+		t.Fatalf("unconfined/confined runs = %d/%d, want 0/1", len(inner.execs), len(inner.bounded))
+	}
+	if len(tool) != 2 || !strings.Contains(tool[1], "no approval available in non-interactive run mode for an exceptional action that adds running outside the sandbox") {
+		t.Fatalf("tool messages = %q, want the re-issue refused as an exceptional action", tool)
 	}
 }
 
@@ -6586,7 +6721,7 @@ func TestHeadlessAuthorizer_UnattendedExceptionalDenialNamesTheAuthority(t *test
 }
 
 const (
-	constrainedBuildLabel = "sandbox: off"
+	constrainedBuildLabel = "sandbox: on"
 	brokenLaunchLabel     = "sandbox: unavailable (settings file is broken)"
 )
 
@@ -6731,7 +6866,7 @@ func TestRunHeadless_SandboxLabelFollowsTheRunMode(t *testing.T) {
 		resolution enforce.Resolution
 		want       string
 	}{
-		{"build passed", mode.Build, constrainedLaunch, "sandbox: off"},
+		{"build passed", mode.Build, constrainedLaunch, "sandbox: on"},
 		{"plan passed", mode.Plan, constrainedLaunch, "sandbox: on"},
 		{"plan refused", mode.Plan, injectedResolution, "sandbox: unavailable (test: injected refusal)"},
 		{"build refused", mode.Build, injectedResolution, "sandbox: unavailable (test: injected refusal)"},
@@ -8180,6 +8315,10 @@ func TestRunHeadless_UnconfinedWildcardKeepsItsArgv(t *testing.T) {
 			swapResolveExecutionCapability(t, tc.resolution)
 			inner := &confineInner{}
 			runHeadlessShell(t, headlessResult(t, t.TempDir(), mode.NewActiveState(tc.m, mode.SourceDefault)), inner, "grep -n x dir/*.md")
+			if tc.m == mode.Build {
+				requireConfinedLiteralWildcard(t, inner)
+				return
+			}
 			if len(inner.bounded) != 0 || len(inner.execs) != 1 || !slices.Equal(inner.execs[0].Argv, []string{"grep", "-n", "x", "dir/*.md"}) {
 				t.Fatalf("bounded = %+v, execs = %+v; want one unconfined run with the literal wildcard argv", inner.bounded, inner.execs)
 			}
@@ -8227,5 +8366,59 @@ func TestHeadlessAuthorizer_BrokenSettingsReroutedWildcardStillAsksAndStaysConfi
 				requireConfinedShellRun(t, inner, command)
 			})
 		}
+	}
+}
+
+func TestRunHeadless_ListAncestorSwappedToSymlinkWarnsOnStderr(t *testing.T) {
+	for _, name := range []string{"a", "x\ny\x1b[31m"} {
+		t.Run(strconv.Quote(name), func(t *testing.T) {
+			project := declaredScopeDir(t)
+			result := headlessResult(t, project, mode.NewActiveState(mode.Build, mode.SourceConfig))
+			ancestor := filepath.Join(project, name)
+			if err := os.MkdirAll(filepath.Join(ancestor, "b"), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			outside := t.TempDir()
+			if err := os.Mkdir(filepath.Join(outside, "b"), 0o755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			swapped := false
+			defer filetools.SetWalkBeforeRootOpenForTest(func() {
+				if swapped {
+					return
+				}
+				swapped = true
+				if err := os.Rename(ancestor, ancestor+"-orig"); err != nil {
+					t.Errorf("Rename: %v", err)
+				}
+				if err := os.Symlink(outside, ancestor); err != nil {
+					t.Errorf("Symlink: %v", err)
+				}
+			})()
+
+			client, _ := requestRecordingClient(filetools.ListToolName, toolArgs(t, map[string]any{"path": name + "/b"}))
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+			var stdout, stderr bytes.Buffer
+			driver := NewHeadlessDriver("list "+name+"/b", &stdout, &stderr)
+			if err := driver.Run(context.Background(), result); err != nil {
+				t.Fatalf("driver.Run: %v", err)
+			}
+
+			if !swapped {
+				t.Fatal("the walk root-open seam never ran")
+			}
+			shown := ancestor
+			if name != "a" {
+				shown = strconv.QuoteToGraphic(ancestor)
+			}
+			want := "Warning: " + shown + " was replaced by a symlink after codemeld checked it; codemeld refused to use it. A program left running by an earlier command may be changing your project.\n"
+			if n := strings.Count(stderr.String(), want); n != 1 {
+				t.Fatalf("stderr = %q carries the swap warning %d times, want once", stderr.String(), n)
+			}
+			if name != "a" && strings.Contains(stderr.String(), ancestor) {
+				t.Fatalf("stderr = %q carries the raw swapped path", stderr.String())
+			}
+		})
 	}
 }

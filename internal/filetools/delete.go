@@ -288,7 +288,7 @@ func (t *DeleteTool) openAuthorizedParent(scope *authorizedScope, target string)
 	if scope != nil {
 		return scope.openWithin(authorizedParent)
 	}
-	dir, oerr := os.OpenFile(authorizedParent, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	dir, oerr := openDirByComponentsFromRoot(authorizedParent)
 	if oerr != nil {
 		return nil, "delete target's parent directory changed after authorization; refusing to delete outside the authorized directory"
 	}
@@ -308,7 +308,7 @@ func (t *DeleteTool) openAuthorizedParent(scope *authorizedScope, target string)
 func (t *DeleteTool) confirmParentStillAuthorized(parentDir *os.File, target string) string {
 	const moved = "delete target's parent directory moved after authorization; refusing to delete from a directory no longer at the authorized path"
 	authorizedParent := filepath.Dir(target)
-	pathDir, oerr := os.OpenFile(authorizedParent, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	pathDir, oerr := openDirByComponentsFromRoot(authorizedParent)
 	if oerr != nil {
 		return moved
 	}

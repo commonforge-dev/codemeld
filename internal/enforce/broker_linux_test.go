@@ -21,6 +21,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/elastic/go-seccomp-bpf/arch"
 	"golang.org/x/sys/unix"
 )
 
@@ -178,6 +179,14 @@ func (s *brkChildState) run(f []string) string {
 		return errName(err)
 	case "chdir":
 		return errName(unix.Chdir(f[1]))
+	case "mkdir":
+		return errName(unix.Mkdirat(unix.AT_FDCWD, f[1], 0o700))
+	case "openat2":
+		fd, err := unix.Openat2(unix.AT_FDCWD, f[1], &unix.OpenHow{Flags: unix.O_WRONLY | unix.O_CREAT | unix.O_CLOEXEC, Mode: 0o600})
+		if err == nil {
+			_ = unix.Close(fd)
+		}
+		return errName(err)
 	case "umask":
 		mask, err := strconv.ParseUint(f[1], 8, 32)
 		if err != nil {
@@ -2326,5 +2335,290 @@ func TestBrokerStopAfterAPausedBindsSyscall(t *testing.T) {
 	c.await(t, bind, "bind")
 	if len(b.bound) != 0 || len(b.own) != 0 {
 		t.Errorf("records after stop: bound %v, own %v", b.bound, b.own)
+	}
+}
+
+type brkWatch struct {
+	mu    sync.Mutex
+	calls []WatchedCall
+}
+
+func (w *brkWatch) record(c WatchedCall) {
+	c.Record(func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.calls = append(w.calls, c)
+	})
+}
+
+func (w *brkWatch) find(syscall, path string) *WatchedCall {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, c := range w.calls {
+		if c.Syscall == syscall && len(c.Paths) > 0 && c.Paths[0].Path == path {
+			return &c
+		}
+	}
+	return nil
+}
+
+func TestBrokerWatchSeesResolvedPaths(t *testing.T) {
+	c := brkStart(t, "slice")
+	w := &brkWatch{}
+	b, err := StartBroker(c.take(), nil, w.record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	dir := brkRealDir(t)
+	c.expect(t, "chdir "+dir, "0")
+	c.expect(t, "mkdir rel", "0")
+	c.expect(t, "openat2 opened", "0")
+	comm, err := os.ReadFile("/proc/" + strconv.Itoa(c.cmd.Process.Pid) + "/comm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := w.find("mkdirat", filepath.Join(dir, "rel"))
+	if mk == nil || mk.Paths[0].Err != nil || mk.Process != strings.TrimSpace(string(comm)) {
+		t.Errorf("relative mkdir: %+v, want the resolved path %s from %q (calls %+v)", mk, filepath.Join(dir, "rel"), comm, w.calls)
+	}
+	op := w.find("openat2", filepath.Join(dir, "opened"))
+	if op == nil || op.OpenHow == nil {
+		t.Fatalf("openat2: %+v, want the resolved path %s with its open_how (calls %+v)", op, filepath.Join(dir, "opened"), w.calls)
+	}
+	wantHow := WatchedOpenHow{How: unix.OpenHow{Flags: unix.O_WRONLY | unix.O_CREAT | unix.O_CLOEXEC, Mode: 0o600}, Size: 24}
+	if *op.OpenHow != wantHow {
+		t.Errorf("openat2 open_how %+v, want %+v", *op.OpenHow, wantHow)
+	}
+	brkStop(t, b, brkBound)
+	if n := b.Unjudged(); n != 0 {
+		t.Errorf("%d calls not judged, want 0", n)
+	}
+}
+
+func TestBrokerWatchMarksArgumentsItCannotModel(t *testing.T) {
+	dir := brkRealDir(t)
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(file, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	var pinned [][]byte
+	ptr := func(b []byte) uint64 {
+		pinned = append(pinned, b)
+		return uint64(uintptr(unsafe.Pointer(&b[0])))
+	}
+	str := func(s string) uint64 { return ptr(append([]byte(s), 0)) }
+	ext := make([]byte, unix.SizeofOpenHow+8)
+	binary.NativeEndian.PutUint64(ext, unix.O_WRONLY|unix.O_CREAT)
+	ext[unix.SizeofOpenHow] = 1
+	cwd := int64(unix.AT_FDCWD)
+	call := func(name string, args ...uint64) WatchedCall {
+		n := seccompNotification{Pid: uint32(os.Getpid())}
+		copy(n.Args[:], args)
+		return watchCall(n, name)
+	}
+	if c := call("unlink", str(dir+"/")); !errors.Is(c.Paths[0].Err, ErrWatchUnsupported) {
+		t.Errorf("unlink with a trailing slash: %+v, want the path shape marked unmodelled", c.Paths)
+	}
+	if c := call("mkdirat", uint64(fd), str("new")); c.Paths[0].Err == nil {
+		t.Errorf("mkdirat under a descriptor naming a file: %+v, want an error", c.Paths)
+	}
+	if c := call("openat2", uint64(cwd), str(filepath.Join(dir, "w")), 1, unix.SizeofOpenHow); c.OpenHow.Err == nil {
+		t.Errorf("openat2 with an unreadable open_how: %+v, want an error", *c.OpenHow)
+	}
+	c := call("openat2", uint64(cwd), str(filepath.Join(dir, "w")), ptr(ext), uint64(len(ext)))
+	if want := (WatchedOpenHow{How: unix.OpenHow{Flags: unix.O_WRONLY | unix.O_CREAT}, Size: uint64(len(ext)), ExtensionNonzero: true}); *c.OpenHow != want {
+		t.Errorf("openat2 with a set extension byte: %+v, want %+v", *c.OpenHow, want)
+	}
+	if c := call("symlinkat", 1, uint64(cwd), str(filepath.Join(dir, "link"))); c.TargetErr == nil {
+		t.Errorf("symlinkat with an unreadable target: %+v, want a target error", c)
+	}
+	runtime.KeepAlive(pinned)
+}
+
+func TestBrokerContinuesOnlyTheWatchedFileCalls(t *testing.T) {
+	info, err := nativeSeccompArch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	watched := append(seccompWatched(info), "openat")
+	if info.Name == arch.X86_64.Name {
+		watched = append(watched, "open")
+	}
+	b := newBroker(-1, nil)
+	for nr, name := range info.SyscallNumbers {
+		resp, why, _, _ := b.answer(seccompNotification{ID: 7, Nr: int32(nr)})
+		continued := resp.Flags&unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE != 0
+		if want := slices.Contains(watched, name); continued != want {
+			t.Errorf("%s (%d): continued %v, want %v", name, nr, continued, want)
+		}
+		if !continued && resp.Error != -int32(unix.EPERM) {
+			t.Errorf("%s (%d): answer %+v, want EPERM", name, nr, resp)
+		}
+		if continued && (resp.Error != 0 || resp.ID != 7 || why != nil) {
+			t.Errorf("%s (%d): continue %+v with refusal %+v, want a bare continue", name, nr, resp, why)
+		}
+	}
+}
+
+func brkSlowWatch(t *testing.T) (watch func(WatchedCall), entered <-chan string, recorded <-chan bool, release func(), w *brkWatch) {
+	t.Helper()
+	gate := make(chan struct{})
+	release = sync.OnceFunc(func() { close(gate) })
+	in, rec := make(chan string, 4), make(chan bool, 4)
+	w = &brkWatch{}
+	watch = func(c WatchedCall) {
+		if len(c.Paths) == 0 || !strings.HasPrefix(filepath.Base(c.Paths[0].Path), "slow") {
+			w.record(c)
+			return
+		}
+		in <- c.Paths[0].Path
+		<-gate
+		rec <- c.Record(func() {})
+	}
+	return watch, in, rec, release, w
+}
+
+func TestBrokerAbandonedInspectionHoldsUpNothing(t *testing.T) {
+	setVar(t, &watchWait, 2*time.Second)
+	c := brkStart(t, "slice")
+	watch, entered, recorded, release, w := brkSlowWatch(t)
+	b, err := StartBroker(c.take(), nil, watch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	t.Cleanup(release)
+	dir := brkRealDir(t)
+	c.expect(t, "chdir "+dir, "0")
+	slow := c.start(t, "mkdir slow")
+	<-entered
+	c.expect(t, "mkdir fast", "0")
+	select {
+	case got := <-slow:
+		t.Fatalf("the slow mkdir was answered (%s) before the fast one finished", got)
+	default:
+	}
+	if w.find("mkdirat", filepath.Join(dir, "fast")) == nil {
+		t.Errorf("the fast mkdir was not watched while the slow one blocked")
+	}
+	start := time.Now()
+	if got := c.await(t, slow, "slow mkdir"); got != "0" {
+		t.Errorf("slow mkdir: %s, want it continued", got)
+	}
+	if took := time.Since(start); took > watchWait+time.Second {
+		t.Errorf("the slow mkdir was continued after %v, past the %v wait", took, watchWait)
+	}
+	again := c.start(t, "mkdir slow2")
+	<-entered
+	brkStop(t, b, watchWait+time.Second)
+	if got := c.await(t, again, "mkdir during stop"); got != "0" {
+		t.Errorf("mkdir handled during stop: %s, want it continued", got)
+	}
+	for _, d := range []string{"slow", "fast", "slow2"} {
+		if !brkExists(t, filepath.Join(dir, d)) {
+			t.Errorf("%s: not created", d)
+		}
+	}
+	if n := b.Unjudged(); n != 2 {
+		t.Errorf("%d calls not judged, want 2", n)
+	}
+	release()
+	for range 2 {
+		if <-recorded {
+			t.Errorf("an abandoned inspection recorded after its call was answered")
+		}
+	}
+}
+
+func TestBrokerBlockedRecordHoldsUpNothing(t *testing.T) {
+	setVar(t, &watchWait, 500*time.Millisecond)
+	c := brkStart(t, "slice")
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	inside, late := make(chan struct{}, 1), make(chan bool, 1)
+	w := &brkWatch{}
+	b, err := StartBroker(c.take(), nil, func(call WatchedCall) {
+		if len(call.Paths) == 0 || filepath.Base(call.Paths[0].Path) != "slow" {
+			w.record(call)
+			return
+		}
+		call.Record(func() {
+			inside <- struct{}{}
+			<-gate
+		})
+		late <- call.Record(func() {})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	t.Cleanup(release)
+	dir := brkRealDir(t)
+	c.expect(t, "chdir "+dir, "0")
+	start := time.Now()
+	slow := c.start(t, "mkdir slow")
+	<-inside
+	if got := c.await(t, slow, "slow mkdir"); got != "0" {
+		t.Errorf("slow mkdir: %s, want it continued", got)
+	}
+	if took := time.Since(start); took > watchWait+time.Second {
+		t.Errorf("the mkdir blocked inside Record was continued after %v, past the %v wait", took, watchWait)
+	}
+	c.expect(t, "mkdir fast", "0")
+	if w.find("mkdirat", filepath.Join(dir, "fast")) == nil {
+		t.Errorf("the fast mkdir was not watched while a Record blocked")
+	}
+	brkStop(t, b, watchWait+time.Second)
+	release()
+	select {
+	case recorded := <-late:
+		if recorded {
+			t.Errorf("a Record after its call was answered published")
+		}
+	case <-time.After(brkBound):
+		t.Fatal("the released hook never returned")
+	}
+	if n := b.Unjudged(); n != 0 {
+		t.Errorf("%d calls not judged, want 0: the blocked call's Record had started", n)
+	}
+}
+
+func TestBrokerInspectionLimitContinuesWithoutInspecting(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	setVar(t, &watchSlots, slots)
+	setVar(t, &watchWait, 200*time.Millisecond)
+	c := brkStart(t, "slice")
+	watch, entered, _, release, w := brkSlowWatch(t)
+	b, err := StartBroker(c.take(), nil, watch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Stop)
+	t.Cleanup(release)
+	dir := brkRealDir(t)
+	c.expect(t, "chdir "+dir, "0")
+	c.expect(t, "mkdir slow", "0")
+	<-entered
+	c.expect(t, "mkdir second", "0")
+	if w.find("mkdirat", filepath.Join(dir, "second")) != nil {
+		t.Errorf("a call past the inspection limit was inspected")
+	}
+	if n := b.Unjudged(); n != 2 {
+		t.Errorf("%d calls not judged, want 2", n)
+	}
+	release()
+	c.until(t, "the abandoned inspection to end", func() bool { return len(slots) == 0 })
+	c.expect(t, "mkdir third", "0")
+	if w.find("mkdirat", filepath.Join(dir, "third")) == nil {
+		t.Errorf("a call after the inspection ended was not inspected")
+	}
+	if !brkExists(t, filepath.Join(dir, "second")) {
+		t.Errorf("the uninspected mkdir was not continued")
 	}
 }

@@ -253,6 +253,15 @@ type Decision struct {
 // CacheIdentity returns the comparable key under which the turn cache records req's outcome.
 func CacheIdentity(req MatchRequest) any { return turnCacheKeyOf(req) }
 
+func grantsFor(req MatchRequest, deps AuthorizeDeps) []PermissionEntry {
+	if g, ok := deps.Grants.(interface {
+		PermissionsFor(MatchRequest) []PermissionEntry
+	}); ok {
+		return g.PermissionsFor(req)
+	}
+	return deps.Grants.Permissions()
+}
+
 func Authorize(ctx context.Context, req MatchRequest, modeCtx ModeContext, deps AuthorizeDeps) (Decision, error) {
 	if err := ctx.Err(); err != nil {
 		return Decision{}, err
@@ -313,7 +322,7 @@ func resolveWithoutPrompt(ctx context.Context, req MatchRequest, modeCtx ModeCon
 		return Decision{}, false, nil
 	}
 
-	if res := Match(req, deps.Grants.Permissions()); res.Matched {
+	if res := Match(req, grantsFor(req, deps)); res.Matched {
 		grant := res.Grant
 		outcome := grantOutcome(grant.GrantKind)
 		if err := deps.EmitMatched(req.Kind, grantEventSubject(req, grant.Subject), eventScope(req),
@@ -480,7 +489,7 @@ func resolveMember(ctx context.Context, r BatchRequest, idx int, deps AuthorizeD
 	if err != nil || allowed {
 		return Decision{Outcome: outcomeOnce}, nil, err
 	}
-	esc := FindScopeEscalation(r.Req, deps.Grants.Permissions())
+	esc := FindScopeEscalation(r.Req, grantsFor(r.Req, deps))
 	esc.Note = note
 	return Decision{}, &BatchPromptRequest{Req: r.Req, Escalation: esc, Index: idx}, nil
 }
@@ -558,7 +567,7 @@ func promptFlow(ctx context.Context, req MatchRequest, modeCtx ModeContext, deps
 	if err := deps.EmitPromptShown(req.Kind, eventSubject(req), eventScope(req), req.SubjectTokens, directIdentityOf(req)); err != nil {
 		return Decision{}, err
 	}
-	esc := FindScopeEscalation(req, deps.Grants.Permissions())
+	esc := FindScopeEscalation(req, grantsFor(req, deps))
 	esc.Note = note
 	start := time.Now()
 	outcome, err := deps.Prompt(ctx, esc)

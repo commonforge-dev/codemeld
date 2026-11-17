@@ -398,7 +398,7 @@ func TestEmitMatched(t *testing.T) {
 	t.Run("protected-state-deny-round-trips", func(t *testing.T) {
 		for _, tool := range []string{
 			"edit", "create", "delete", "mkdir", "move",
-			"vcs_status", "vcs_diff", "vcs_add", "vcs_commit", "vcs_log",
+			"vcs_status", "vcs_diff", "vcs_add", "vcs_commit", "vcs_amend", "vcs_log",
 			"vcs_branch_current", "vcs_branch_create", "vcs_branch_switch", "vcs_restore_file",
 			"vcs_is_clean", "vcs_stash", "vcs_stash_pop", "vcs_merge_status", "vcs_rebase_status",
 		} {

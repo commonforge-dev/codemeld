@@ -23,8 +23,11 @@ import (
 const helperReceiveWait = 5 * time.Second
 
 var (
-	receiveListener = enforce.ReceiveListener
-	releaseHelper   = enforce.ReleaseHelper
+	receiveListener     = enforce.ReceiveListener
+	releaseHelper       = enforce.ReleaseHelper
+	newRefusalCollector = enforce.NewRefusalCollector
+	refusalInitWait     = time.Second
+	refusalInitSlots    = make(chan struct{}, 64)
 )
 
 type sessionDenyList = enforce.DenyList
@@ -40,6 +43,8 @@ type brokerLaunch struct {
 	own     *os.File
 	helper  *os.File
 	broker  *enforce.Broker
+	files   *enforce.RefusalCollector
+	plan    bool
 	stopped bool
 }
 
@@ -62,7 +67,9 @@ func (c *confinement) attachBroker(spec *runner.RunSpec, policy enforce.Policy) 
 		proxy:  c.proxy,
 		own:    os.NewFile(uintptr(fds[0]), "helper channel"),
 		helper: os.NewFile(uintptr(fds[1]), "helper channel"),
+		plan:   policy.Mode == enforce.ModePlan,
 	}
+	l.files = startRefusalCollector(policy)
 	if policy.Broker == enforce.BrokerConnect || policy.Broker == enforce.BrokerFull {
 		l.rules = &enforce.ConnectRules{Grants: c.connectGrants, Deny: c.deny, Proxy: c.decide, WriteRoots: policy.WriteRoots, TmpDir: policy.TmpDir, Ask: c.askConnect, Policy: policy}
 	}
@@ -78,6 +85,28 @@ func (c *confinement) attachBroker(spec *runner.RunSpec, policy enforce.Policy) 
 	}
 	spec.Helper = l
 	return nil
+}
+
+func startRefusalCollector(policy enforce.Policy) *enforce.RefusalCollector {
+	select {
+	case refusalInitSlots <- struct{}{}:
+	default:
+		return nil
+	}
+	done := make(chan *enforce.RefusalCollector, 1)
+	go func() {
+		defer func() { <-refusalInitSlots }()
+		files, _ := newRefusalCollector(policy)
+		done <- files
+	}()
+	expiry := time.NewTimer(refusalInitWait)
+	defer expiry.Stop()
+	select {
+	case files := <-done:
+		return files
+	case <-expiry.C:
+		return nil
+	}
 }
 
 type fileID struct{ dev, ino uint64 }
@@ -116,13 +145,17 @@ func (l *brokerLaunch) Started() error {
 	if l.stopped {
 		return errSessionProxyStopped
 	}
+	var watch []func(enforce.WatchedCall)
+	if l.files != nil {
+		watch = append(watch, l.files.Watch)
+	}
 	listener, err := receiveListener(l.own, helperReceiveWait)
 	if err == nil && l.rules != nil {
-		l.broker, err = enforce.StartConnectBroker(listener, *l.rules, l.owner.Register)
+		l.broker, err = enforce.StartConnectBroker(listener, *l.rules, l.owner.Register, watch...)
 	} else if err == nil && l.owner != nil {
-		l.broker, err = enforce.StartRegisteringBroker(listener, l.decide, l.owner.Register)
+		l.broker, err = enforce.StartRegisteringBroker(listener, l.decide, l.owner.Register, watch...)
 	} else if err == nil {
-		l.broker, err = enforce.StartBroker(listener, l.decide)
+		l.broker, err = enforce.StartBroker(listener, l.decide, watch...)
 	}
 	if err == nil {
 		err = releaseHelper(l.own)
@@ -177,7 +210,26 @@ func (l *brokerLaunch) refusals() []refusal {
 			out = append(out, refusal{Host: r.Host, Port: r.Port, Path: r.Path, Reason: r.Reason})
 		}
 	}
+	if l.files != nil {
+		files, _ := l.files.Report()
+		for _, r := range files {
+			out = append(out, refusal{File: true, Path: r.Path, Process: r.Process, Candidate: r.Candidate, Reason: r.Reason})
+		}
+	}
 	return out
+}
+
+func (l *brokerLaunch) fileReport() (int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	if l.files != nil {
+		_, n = l.files.Report()
+	}
+	if l.broker != nil {
+		n += l.broker.Unjudged()
+	}
+	return n, l.plan
 }
 
 var connectAnswers = map[string]string{connectPromptOnce: "once", connectPromptSession: "session", connectDenied: "deny"}

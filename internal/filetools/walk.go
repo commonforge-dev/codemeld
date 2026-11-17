@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -16,6 +17,7 @@ import (
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/tools"
+	"golang.org/x/sys/unix"
 )
 
 // IgnoreMatcher is one pluggable ignore filter the walker consults before an entry is emitted or a
@@ -182,6 +184,17 @@ func Walk(opts WalkOptions) (entries []WalkEntry, truncated bool, err error) {
 
 type WalkVisitor func(WalkEntry) error
 
+var (
+	walkBeforeRootOpen  = func() {}
+	walkBeforeChildOpen = func() {}
+)
+
+func SetWalkBeforeRootOpenForTest(fn func()) func() {
+	orig := walkBeforeRootOpen
+	walkBeforeRootOpen = fn
+	return func() { walkBeforeRootOpen = orig }
+}
+
 func WalkContext(ctx context.Context, opts WalkOptions, visit WalkVisitor) error {
 	opts.Blocked = opts.Blocked.Current()
 	skipByIgnore := func(rel string, kind EntryKind) bool {
@@ -196,20 +209,21 @@ func WalkContext(ctx context.Context, opts WalkOptions, visit WalkVisitor) error
 		return false
 	}
 
-	var descend func(dir string, depth int) error
-	descend = func(dir string, depth int) error {
+	var descend func(dir string, f *os.File, depth int) error
+	descend = func(dir string, f *os.File, depth int) error {
+		defer func() { _ = f.Close() }()
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		// os.ReadDir returns entries already sorted ascending by name, which — composed with depth-first
-		// pre-order descent — yields the deterministic "directory before its descendants, siblings
-		// ascending" order. This is a component-wise ordering, not a byte-sort of
-		// the full slash-joined paths (where '/' would sort after '.'), so the hierarchical tree order the
-		// tree tool needs is preserved.
-		dirents, rerr := os.ReadDir(dir)
+		// Sorting each folder's entries by name, composed with depth-first pre-order descent, yields the
+		// deterministic "directory before its descendants, siblings ascending" order. This is a
+		// component-wise ordering, not a byte-sort of the full slash-joined paths (where '/' would sort
+		// after '.'), so the hierarchical tree order the tree tool needs is preserved.
+		dirents, rerr := f.ReadDir(-1)
 		if rerr != nil {
 			return rerr
 		}
+		slices.SortFunc(dirents, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 		for _, de := range dirents {
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
@@ -248,7 +262,13 @@ func WalkContext(ctx context.Context, opts WalkOptions, visit WalkVisitor) error
 			// Descend only into a real directory (never a symlink) and only while under the depth
 			// cap; a directory at the cap is emitted above but its children are not enumerated.
 			if kind == EntryDir && (opts.MaxDepth == 0 || depth < opts.MaxDepth) {
-				if derr := descend(abs, depth+1); derr != nil {
+				walkBeforeChildOpen()
+				fd, oerr := unix.Openat(int(f.Fd()), name, walkDirOpenFlags, 0)
+				if oerr != nil {
+					reportIfSymlink(int(f.Fd()), name, abs)
+					return &os.PathError{Op: "open", Path: abs, Err: oerr}
+				}
+				if derr := descend(abs, os.NewFile(uintptr(fd), abs), depth+1); derr != nil {
 					return derr
 				}
 			}
@@ -287,7 +307,12 @@ func WalkContext(ctx context.Context, opts WalkOptions, visit WalkVisitor) error
 		}
 		return nil
 	}
-	return descend(opts.Root, 1)
+	walkBeforeRootOpen()
+	f, err := walkOpenDirUnder(opts.ProjectRoot, opts.Root)
+	if err != nil {
+		return err
+	}
+	return descend(opts.Root, f, 1)
 }
 
 // classifyDirEntry maps an os.DirEntry to its EntryKind by the entry's own type, never following a symlink

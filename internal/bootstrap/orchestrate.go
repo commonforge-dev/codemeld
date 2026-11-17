@@ -1047,6 +1047,10 @@ func defaultRunFirstRun(home string, stdout, stderr io.Writer) (bool, error) {
 	case err == nil && info.Mode()&os.ModeSymlink != 0:
 		return false, errors.New(config.FormatLoadError(path, config.UnreadableFile, errUnsafeSettingsRead, config.LaunchAborted))
 	case err == nil:
+		// Never create here: a reference copy the user deleted stays deleted.
+		if p, cat, err := syncBuiltinTemplates(home, false); err != nil {
+			_, _ = fmt.Fprintln(stderr, fserrors.FormatOpFail("write-vcs-template", p, cat))
+		}
 		return false, nil // settings present; proceed to step 1
 	case errors.Is(err, fs.ErrNotExist):
 		// absent: fall through to first-run generation

@@ -8825,11 +8825,8 @@ func newChildModeHarness(t *testing.T, published mode.Mode, wiring string) *chil
 	h := &childModeHarness{modeActive: mode.NewActiveState(published, mode.SourceUserCommand), cache: cache, home: home, store: mkStore(t)}
 	turnStore := func() *sessions.Store { return h.store }
 	inner := &confineInner{
-		onBounded: func(spec cmdrunner.RunSpec) {
-			policy, _ := decodeFrame(t, spec.Stdin)
-			h.ran = append(h.ran, policy.Mode)
-		},
-		onExec: func(cmdrunner.RunSpec) { h.ran = append(h.ran, "unconfined") },
+		onBounded: func(spec cmdrunner.RunSpec) { h.ran = append(h.ran, confinedRunLabel(t, spec)) },
+		onExec:    func(cmdrunner.RunSpec) { h.ran = append(h.ran, "unconfined") },
 	}
 	prevVCS := newVCSActionRunner
 	newVCSActionRunner = func() cmdrunner.Runner { return inner }
@@ -8858,7 +8855,7 @@ func newChildModeHarness(t *testing.T, published mode.Mode, wiring string) *chil
 	case "unbound":
 		top = live()
 	case "readerless":
-		top = &confinement{constrained: true, blocked: testBlocked(t)}
+		top = withSessionTemp(t, &confinement{constrained: true, blocked: testBlocked(t), projectRoot: project})
 		bound = top
 	case "none":
 	default:
@@ -9090,8 +9087,9 @@ func TestGeneralAgentBinding_AnUnpinnedCallFallsBackToThePublishedMode(t *testin
 				if h.childStarts(t) != 1 {
 					t.Fatalf("children started = %d, want 1", h.childStarts(t))
 				}
-				if !slices.Equal(h.ran, []string{"unconfined"}) {
-					t.Fatalf("child vcs runs = %v, want the read-only action auto-allowed and run unconfined under build", h.ran)
+				want := map[string]string{"none": "unconfined", "readerless": ranAs(mode.Build)}[wiring]
+				if !slices.Equal(h.ran, []string{want}) {
+					t.Fatalf("child vcs runs = %v, want the read-only action auto-allowed and run as %s under build", h.ran, want)
 				}
 				if got := h.nestedDenialSources(t); !slices.Equal(got, []string{"declared_scope"}) {
 					t.Fatalf("child authorizer denial sources = %v, want the published build mode", got)
@@ -9208,7 +9206,9 @@ func newPinnedVCSHarness(t *testing.T, active *mode.ActiveState) pinnedVCSHarnes
 	conf.projectRoot = project
 	app := tui.New(nil)
 	app.SetActiveStore(store)
-	allowAll := func(tui.PromptRequest) (tui.PromptDecision, error) { return tui.PromptDecision{Option: tui.OptionAllowOnce}, nil }
+	allowAll := func(tui.PromptRequest) (tui.PromptDecision, error) {
+		return tui.PromptDecision{Option: tui.OptionAllowOnce}, nil
+	}
 	auth := newProductionAuthorizer(app, cache, permissions.NewTurnCache(), newPromptGateBuilder(allowAll), home, project, active)
 	auth.executionConstrained = true
 	spy := &pinSpyAuthorizer{productionAuthorizer: auth}
@@ -9216,19 +9216,20 @@ func newPinnedVCSHarness(t *testing.T, active *mode.ActiveState) pinnedVCSHarnes
 	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, spy, home, project, func() *sessions.Store { return store }, cache.MaxToolOutputBytes(), guard)
 	d.confinement = conf
 	ran := &[]string{}
-	inner.onBounded = func(spec cmdrunner.RunSpec) {
-		policy, _ := decodeFrame(t, spec.Stdin)
-		*ran = append(*ran, policy.Mode)
-	}
+	inner.onBounded = func(spec cmdrunner.RunSpec) { *ran = append(*ran, confinedRunLabel(t, spec)) }
 	inner.onExec = func(cmdrunner.RunSpec) { *ran = append(*ran, "unconfined") }
 	return pinnedVCSHarness{d: d, spy: spy, inner: inner, ran: ran}
 }
 
-func ranAs(m mode.Mode) string {
-	if m == mode.Build {
-		return "unconfined"
+func ranAs(m mode.Mode) string { return string(m) }
+
+func confinedRunLabel(t *testing.T, spec cmdrunner.RunSpec) string {
+	t.Helper()
+	policy, _ := decodeFrame(t, spec.Stdin)
+	if policy.Mode == string(mode.AutoEdits) && !slices.Contains(spec.Env, "GOCACHE="+filepath.Join(policy.TmpDir, "go-build")) {
+		return string(mode.Build)
 	}
-	return string(m)
+	return policy.Mode
 }
 
 func authorizedVCSUnit(t *testing.T, d *productionToolDispatcher, id string) turn.PlannedToolCall {
@@ -9410,23 +9411,24 @@ func TestProductionDispatcher_ConcurrentCallsKeepTheirOwnMode(t *testing.T) {
 			if _, err := h.d.Dispatch(context.Background(), bashCall("b", "head")); err != nil {
 				t.Fatalf("call B: %v", err)
 			}
-			if len(h.inner.execs) != 1 || len(h.inner.bounded) != 0 {
-				t.Fatalf("after B bounded/exec = %d/%d, want B's one unconfined Build run", len(h.inner.bounded), len(h.inner.execs))
+			if len(h.inner.bounded) != 1 || len(h.inner.execs) != 0 {
+				t.Fatalf("after B bounded/exec = %d/%d, want B's one confined Build run", len(h.inner.bounded), len(h.inner.execs))
 			}
 			close(release)
 			if err := <-done; err != nil {
 				t.Fatalf("call A: %v", err)
 			}
 
-			if len(h.inner.bounded) != 1 || len(h.inner.execs) != 1 {
-				t.Fatalf("bounded/exec = %d/%d, want A confined and B unconfined", len(h.inner.bounded), len(h.inner.execs))
+			if len(h.inner.bounded) != 2 || len(h.inner.execs) != 0 {
+				t.Fatalf("bounded/exec = %d/%d, want B and A confined", len(h.inner.bounded), len(h.inner.execs))
 			}
-			wantHelperArgv(t, h.inner.bounded[0].Argv, filepath.Join(h.d.confinement.lookupPath, "ls"))
-			if policy, _ := decodeFrame(t, h.inner.bounded[0].Stdin); policy.Mode != string(captured) {
-				t.Fatalf("A policy mode = %q, want its captured %q", policy.Mode, captured)
+			b, a := h.inner.bounded[0], h.inner.bounded[1]
+			if filepath.Base(b.Argv[2]) != "head" || confinedRunLabel(t, b) != string(mode.Build) {
+				t.Fatalf("B run = %q under %q, want head under build", b.Argv, confinedRunLabel(t, b))
 			}
-			if filepath.Base(h.inner.execs[0].Argv[0]) != "head" {
-				t.Fatalf("unconfined run = %q, want B's head", h.inner.execs[0].Argv)
+			wantHelperArgv(t, a.Argv, filepath.Join(h.d.confinement.lookupPath, "ls"))
+			if got := confinedRunLabel(t, a); got != string(captured) {
+				t.Fatalf("A run mode = %q, want its captured %q", got, captured)
 			}
 			if pins := h.spy.recorded(); !slices.Equal(pins, []string{string(captured), string(mode.Build)}) {
 				t.Fatalf("authorization pins = %v, want A under %q and B under build", pins, captured)
@@ -10808,6 +10810,13 @@ func TestProductionDispatcher_OnlyTheVCSRunnerMayWriteTheHistoryStore(t *testing
 	}
 }
 
+func requireConfinedLiteralWildcard(t *testing.T, inner *confineInner) {
+	t.Helper()
+	if len(inner.bounded) != 1 || len(inner.execs) != 0 || filepath.Base(inner.bounded[0].Argv[2]) != "grep" || !slices.Equal(inner.bounded[0].Argv[3:], []string{"-n", "x", "dir/*.md"}) {
+		t.Fatalf("bounded = %+v, execs = %+v; want one confined run with the literal wildcard argv", inner.bounded, inner.execs)
+	}
+}
+
 func TestProductionDispatcher_ConfinedWildcardFollowsTheCallsPinnedMode(t *testing.T) {
 	const command = "grep -n x dir/*.md"
 	for _, tc := range []struct {
@@ -10828,9 +10837,7 @@ func TestProductionDispatcher_ConfinedWildcardFollowsTheCallsPinnedMode(t *testi
 				requireConfinedShellRun(t, h.inner, command)
 				return
 			}
-			if len(h.inner.bounded) != 0 || len(h.inner.execs) != 1 || !slices.Equal(h.inner.execs[0].Argv, []string{"grep", "-n", "x", "dir/*.md"}) {
-				t.Fatalf("bounded = %+v, execs = %+v; want one unconfined run with the literal wildcard argv", h.inner.bounded, h.inner.execs)
-			}
+			requireConfinedLiteralWildcard(t, h.inner)
 		})
 	}
 }
@@ -10869,9 +10876,7 @@ func TestGeneralAgentBinding_ChildConfinedWildcardRunsThroughTheShell(t *testing
 				requireConfinedShellRun(t, inner, command)
 				return
 			}
-			if len(inner.bounded) != 0 || len(inner.execs) != 1 || !slices.Equal(inner.execs[0].Argv, []string{"grep", "-n", "x", "dir/*.md"}) {
-				t.Fatalf("bounded = %+v, execs = %+v; want one unconfined run with the literal wildcard argv", inner.bounded, inner.execs)
-			}
+			requireConfinedLiteralWildcard(t, inner)
 		})
 	}
 }

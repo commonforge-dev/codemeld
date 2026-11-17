@@ -16,8 +16,8 @@ checks. Switch with `/mode <plan|build|auto-edits>` or shift+tab.
 | Mode | Reads | Changes through codemeld's own tools | Shell commands |
 |---|---|---|---|
 | **Plan** | Allowed | Refused without a prompt. Write tools are not offered to the model. | Sandboxed where available (your files are never changed and network goes only through codemeld's [proxy](#sandboxed-network), approved per destination; commands may write a private temp folder; cleanup is attempted, but the folder may remain); elsewhere only read-only commands run: proven read-only by codemeld's rules, or, with the opt-in [System One check](system-one.md), judged read-only by a model for one run |
-| **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Never sandboxed; asked unless read-only or already approved |
-| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking, except while a settings file is broken; network goes through codemeld's [proxy](#sandboxed-network), approved per destination, or through a [direct connection](#connect-grants) a connect grant or the connect prompt allows; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
+| **Build** (default) | Allowed | Asked, unless a saved approval covers the request | Sandboxed where available, with Auto edits' reach for files, [history stores](#history-stores) and network; asked unless read-only or already approved, as without the sandbox |
+| **Auto edits** | Allowed | Create, edit, make-folder and move inside the project run without asking; with the sandbox on, no settings file broken and the project's settings admitted by [project approval](#project-approval-for-cloned-repositories) at launch, so do create, edit and make-folder in a declared writable folder, the folder itself included; with the sandbox on and no settings file broken, so does a delete inside the project or a declared writable folder, and so does a [version-control write action](#vcs-write-actions) from a product-authored template; other calls follow the ordinary rules, including saved grants, declared scopes and open reads | Sandboxed where available, and then run without asking, except while a settings file is broken; network goes through codemeld's [proxy](#sandboxed-network), approved per destination, or through a [direct connection](#connect-grants) a connect grant or the connect prompt allows or to a loopback TCP endpoint the command bound itself; a history rewrite runs but cannot write the [protected history stores](#history-stores); elsewhere as in Build, plus the project's `declared_commands` |
 
 - Auto edits approves only a target that is inside the project after symlinks are resolved, apart
   from the declared folders in [Writing outside the project](#writing-outside-the-project). A move
@@ -245,7 +245,8 @@ word or option value that expands (`bash -$FLAGS`, `xargs -n $N`), a wrapper opt
 list (`xargs --unknown`), `exec`, `eval`, `source`, `.`, `builtin`, control words such as `if`,
 and a `$(...)`, backtick or newline inside a quoted `-c` body. In the command itself, an unquoted
 `$(...)`, a backtick or a newline is refused outright before anything is asked when the command runs
-outside the sandbox (`SplitCommand`, `internal/permissions/pipeline.go`); a sandboxed Plan or Auto
+outside the sandbox or in Build (`SplitCommand`, `internal/permissions/pipeline.go`;
+`confinedShellRunner.Confined`, `internal/bootstrap/confinedrunner.go`); a sandboxed Plan or Auto
 edits command containing one is passed to the shell as written.
 
 Text a shell reads from standard input or a script file, and arguments `xargs` reads while it runs,
@@ -314,7 +315,7 @@ such as `git -C sub rebase main`, runs without asking and can succeed. The versi
 own commands keep write access to the stores (`storesWritable` on the runner
 `internal/bootstrap/tooldispatch.go` builds for them).
 
-Sandboxed commands get the environment codemeld was started with, so a tool that finds its files
+Sandboxed Plan and Auto edits commands get the environment codemeld was started with, so a tool that finds its files
 through a variable, such as mise with `MISE_DATA_DIR`, keeps working. codemeld reads it once, at
 startup (`StartTUI`, `HeadlessDriver.Run`), and withholds three kinds of entries (`runner.InheritedEnvironment` in
 `internal/runner/childenv.go`): the fixed-table names `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`,
@@ -343,17 +344,23 @@ folders grant nothing while settings are degraded (`confinement.policy`). The re
 modes either way. A subfolder, a path list or a value that
 does not resolve keeps its inherited value (`namesFolder` in `internal/bootstrap/confinedrunner.go`).
 Name matching cannot catch every secret: one stored under an unusual name, such as `MYAPP_PW2`,
-reaches sandboxed commands. A sandboxed command cannot open a network
-connection itself, except one a [connect grant or the connect prompt](#connect-grants) allows, but
+reaches sandboxed Plan and Auto edits commands. A sandboxed command cannot open a network
+connection itself, except one a [connect grant or the connect prompt](#connect-grants) allows or one
+to a loopback TCP endpoint it bound itself, but
 such a secret can still leave through the command's output (which reaches
 the transcript and the model provider), through a destination you approve at the proxy, at the
 connect prompt, in `domain_grants` or in `connect_grants`, or through a
 program outside the sandbox that watches a folder the command can write. Build mode runs approved
-commands with codemeld's full environment (`commandEnv` in `internal/runner/descendants_linux.go`).
+commands with codemeld's full environment (`commandEnv` in `internal/runner/descendants_linux.go`),
+in the sandbox too: nothing above is withheld, so secret-looking names, `PATH` and `GOCACHE` keep
+their values, and codemeld only sets `TERM=dumb`, the proxy variables and the
+`GIT_CONFIG_GLOBAL=/dev/null` override as above, points a value naming its temp folder at the session temp
+folder, and sets an unset or empty `TMPDIR` to it (`confinement.prepareBuild`).
 When the launch self-test passed, the `execution_capability` record written when codemeld starts
-lists the names withheld from this inherited environment, never their values. A fixed-table name
+lists the names withheld from this inherited environment, never their values; Build commands
+still receive them. A fixed-table name
 such as `PATH`, `HOME`, `PWD`, `TMPDIR`, `GOCACHE`, `SHELL`, `TERM`, `LANG` or `LC_ALL` can appear
-there although the value a command sees for it comes from the fixed table, which sets `TMPDIR`
+there although the value a Plan or Auto edits command sees for it comes from the fixed table, which sets `TMPDIR`
 and `GOCACHE` only when codemeld created a temp folder for the session. The list does not show
 that any command ran sandboxed. The records written by an in-process `/clear`, `/resume`, fork or
 compact do not repeat it, because those do not take a new snapshot of the process environment;
@@ -370,11 +377,24 @@ deletion, history rewrite or network program is asked with allow once or deny on
 (`exceptionalAuthority`, `internal/bootstrap/promptgate.go`). An approved command still reaches the
 network only as described under [Sandboxed network](#sandboxed-network).
 
-<a id="sandboxed-network"></a>**Sandboxed network.** A sandboxed Plan or Auto edits command reaches
-the network only through codemeld's session proxy, or in Auto edits through a
-[direct connection](#connect-grants) a connect grant or the connect prompt allows, whatever the
-program's name: `curl`, `git fetch` over HTTPS, `go mod download` and an unknown script are treated
-alike. The proxy decides each
+<a id="outside-the-sandbox"></a>**Running a command once outside the sandbox.** In Build, when a sandboxed command fails and the
+sandbox refused it a network destination or a file, codemeld remembers that command
+(`confinedShellRunner.Exec`, `internal/bootstrap/confinedrunner.go`). The next time the model runs
+the same command, unless Build runs it without asking as read-only, the prompt asks to allow running
+outside the sandbox, offers allow once or deny only, and warns that nothing but your user account
+limits what the command can read, write or reach (`markOutside`, `internal/bootstrap/promptgate.go`).
+A saved grant or an earlier approval of that command does not skip this prompt
+(`withoutOutsideApprovals`), and nothing runs outside the sandbox without it: allow once runs that
+one invocation without the sandbox and forgets the command, so an identical run after it is
+sandboxed again; deny refuses it and forgets the command (`settleOutside`). A
+[headless run](#headless-runs-codemeld-run) without `--prompt-for-approval` refuses this prompt.
+
+<a id="sandboxed-network"></a>**Sandboxed network.** A sandboxed command reaches
+the network only through codemeld's session proxy, or in Build and Auto edits through a
+[direct connection](#connect-grants) a connect grant or the connect prompt allows or to a loopback
+TCP endpoint the command bound itself, whatever the program's name: `curl`, `git fetch` over HTTPS, `go mod download` and an unknown script are treated
+alike. In Build the command itself still needs its ordinary approval first; approving a
+destination does not approve the command. The proxy decides each
 destination, a host and port, on its own. It admits one that this session already approved or that a
 saved grant covers, and otherwise asks:
 
@@ -393,16 +413,18 @@ approved or saved destination; loopback and local-network addresses are refused.
 connect-prompt approval for an `IP:port`, such as `127.0.0.1:5432`, is a direct connection that does
 not use the proxy, so it can reach this machine or the local network. When a command
 fails, its output ends with a `codemeld: network refused: <host>:<port> (<reason>)` line for each
-refused destination, as many as fit the output limit, then a count of any left out if that
+refused destination, with the socket path in place of `<host>:<port>` for a Unix socket; an
+identical line is printed once, and a refusal whose destination codemeld does not know prints no
+line. It shows as many as fit the output limit, then a count of any left out if that
 fits too, then codemeld's general note about the sandbox (`confinedFailureOf`,
 `internal/bootstrap/confinedrunner.go`). Only tools that use `HTTPS_PROXY` or `HTTP_PROXY`, or are
 set up to tunnel through an HTTP proxy, get network through it: ordinary SSH does not go through the
 proxy, so a sandboxed `ssh`, `scp` or SSH-URL `git` connection fails unless a connect grant or the
-connect prompt allows the `IP:port` it connects to; otherwise use Build mode for it. An SSH client set up
+connect prompt allows the `IP:port` it connects to. An SSH client set up
 to tunnel through an HTTP proxy, for example with a `ProxyCommand`, can reach an approved host and
 port. When no destination was refused and there is room, the
 failure note says this instead of listing destinations. If the launch self-test's network check does not pass, sandboxed commands get no network at
-all. File deletion and history-rewrite rules are not changed by any of this. Build mode and hosts
+all. File deletion and history-rewrite rules are not changed by any of this. Hosts
 without the sandbox do not use the proxy: an allowed command there has your account's full network
 access.
 
@@ -421,7 +443,7 @@ saved grant, delete its entry from the file. Grants are read once when the sessi
 added or removed by hand takes effect in the next session, and removing one does not undo this
 session's copy or an approval already given for the session.
 
-<a id="connect-grants"></a>**Direct connections.** In Auto edits, when the launch self-test's
+<a id="connect-grants"></a>**Direct connections.** In Build and Auto edits, when the launch self-test's
 connection check also passed (`connectSelfTest` in `internal/enforce/capability.go`,
 `launchConfinement` in `internal/bootstrap/starttui.go`), codemeld checks every connection a
 sandboxed command opens itself (`ConnectRules` in `internal/enforce/broker_linux.go`). Plan commands
@@ -447,8 +469,13 @@ UI and in a headless run with `--prompt-for-approval`:
 No choice saves a grant. A headless run without `--prompt-for-approval` and a command run by a child
 agent are not asked: the connection is refused. A connection that is neither TCP nor to a Unix
 socket path, such as UDP, and one whose destination codemeld cannot inspect or resolve, is refused
-without asking. Every decision for a shell command is written to the session; see
-[Sessions](sessions.md). Connection decisions made during a version-control tool action, such as a
+without asking. For a shell command, each connection decision codemeld answered is written to the
+session, with repeats counted in one entry; see [Sessions](sessions.md). Not written are refusals
+the sandbox filter makes before codemeld sees the call, such as creating a UDP socket
+(`seccompFilterFor` in `internal/enforce/seccomp_linux.go`), a decision whose reply could not reach
+the command, for example because the call was interrupted (`Broker.handle` in
+`internal/enforce/broker_linux.go`), bind and listen decisions, and every decision when no session
+is active (`recordConnectDecisions` in `internal/bootstrap/confinedrunner.go`). Connection decisions made during a version-control tool action, such as a
 hook that connects, are not recorded yet (`confinedRunner.Exec` in
 `internal/bootstrap/confinedrunner.go`).
 
@@ -478,7 +505,7 @@ to the very socket the command connects to and no step of it is, or is inside, o
 write roots or its temp folder, including a read-only exception inside a write root (`pathGrant`);
 otherwise the connection asks as if there were no grant.
 
-**Without the sandbox** (Build mode, or a host where the self-test did not pass) a command runs with
+**Without the sandbox** (a host where the self-test did not pass) a command runs with
 your account's full authority once it is allowed. Plan refuses every command that is not proven
 read-only, unless the opt-in [System One check](system-one.md) allows that one run (`planPosture`,
 `internal/permissions/orchestrate.go`).
@@ -489,12 +516,16 @@ unchanged copy of them, or a global template that runs exactly the built-in read
 repository's own `.codemeld/vcs` templates can never mark an action read-only.
 
 <a id="vcs-write-actions"></a>In Auto edits with the sandbox on and no settings file broken, the
-version-control write actions (add, commit, restore a file, create or switch a branch, stash and
-stash pop) also run without asking when their template is product-authored: codemeld's embedded
-built-in or a byte-identical first-run reference copy, running the built-in command
+version-control write actions (add, commit, amend, restore a file, create or switch a branch,
+stash and stash pop) also run without asking when their template is product-authored: codemeld's
+embedded built-in or a byte-identical first-run reference copy, running the built-in command
 (`ActionTool.routineWrite` in `internal/vcs/tool.go`, `sandboxedVCSWrite` in
 `internal/permissions/orchestrate.go`). A customized global or project template gets no such
-approval: its write actions still ask unless a saved approval covers them.
+approval: its write actions still ask unless a saved approval covers them. The built-in Git and
+Mercurial templates offer amend (`internal/vcs/builtin/git.yaml`, `hg.yaml`). In every mode, amend
+is refused once the last commit has left this machine: in Mercurial when its phase is not draft or
+secret, in Git when a remote-tracking branch contains it, and whenever that check cannot run
+(`ActionTool.checkAmend` in `internal/vcs/tool.go`).
 
 ## Web access
 
@@ -529,7 +560,10 @@ denial stays, and any failure or pause note is added to its reason
   name the only files the run may create or edit, and delete. With either flag set, nothing else
   can approve a file change, not a saved approval, a mode, or a prompt; making a folder or moving a
   file is not allowed at all. Plan still refuses the change. These flags cover codemeld's file tools
-  only, not what a shell command writes.
+  only, not what a shell command writes. A path written inside the launch folder that resolves
+  outside it through a symlink stops the run before it starts; for `--files-authorized-delete` only
+  a symlinked parent folder counts, since declaring a symlink means removing the link
+  (`ResolveDeclaredScopes` in `internal/filetools/resolve.go`).
 
 ## What the model is told
 

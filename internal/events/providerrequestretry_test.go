@@ -16,7 +16,8 @@ import (
 	"codemeld.dev/codemeld/internal/sessions"
 )
 
-func TestEmitProviderRequestRetry_AppendBeforeFlush(t *testing.T) {
+func assertAppendBeforeFlush(t *testing.T, why string, emit func(*sessions.Store) error) {
+	t.Helper()
 	var order []string
 	restoreAppend, restoreFlush := appendEvent, flushStore
 	appendEvent = func(s *sessions.Store, p EventPayload) (sessions.Record, error) {
@@ -29,15 +30,19 @@ func TestEmitProviderRequestRetry_AppendBeforeFlush(t *testing.T) {
 	}
 	t.Cleanup(func() { appendEvent, flushStore = restoreAppend, restoreFlush })
 
-	store := sessions.New("unused", newSession())
-	err := EmitProviderRequestRetry(context.Background(), store, "openai", "gpt-4o",
-		"stream_drop", "stream_eof", 1, 500, 12, failOnWriteFailure(t))
-	if err != nil {
-		t.Fatalf("EmitProviderRequestRetry error = %v", err)
+	if err := emit(sessions.New("unused", newSession())); err != nil {
+		t.Fatalf("emit error = %v", err)
 	}
 	if len(order) != 2 || order[0] != "append" || order[1] != "flush" {
-		t.Fatalf("operation order = %v, want [append flush] (durable before the backoff wait)", order)
+		t.Fatalf("operation order = %v, want [append flush] (%s)", order, why)
 	}
+}
+
+func TestEmitProviderRequestRetry_AppendBeforeFlush(t *testing.T) {
+	assertAppendBeforeFlush(t, "durable before the backoff wait", func(store *sessions.Store) error {
+		return EmitProviderRequestRetry(context.Background(), store, "openai", "gpt-4o",
+			"stream_drop", "stream_eof", 1, 500, 12, failOnWriteFailure(t))
+	})
 }
 
 // An invalid payload (partial_chars_discarded on a non-stream_drop phase) is

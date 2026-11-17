@@ -1650,3 +1650,85 @@ func TestEditTool_PreviewSymlinkSwappedAfterCheckRefused(t *testing.T) {
 		})
 	}
 }
+
+func TestEditTool_IntermediateSymlinkSwappedBeforeCaptureRefusesCapture(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	writeFile(t, filepath.Join(root, "a", "b", "f.txt"), "old\n")
+	tool := newToolIn(t, root)
+	_, scope, err := tool.ResolveTarget(map[string]any{"path": "a/b/f.txt", "old_text": "old", "new_text": "new"})
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+
+	scopeSwapMoveOut(t, root, outside)
+
+	if _, cerr := CaptureScopeIdentity(scope); cerr == nil {
+		t.Fatal("CaptureScopeIdentity = nil error, want a refusal to capture through a symlinked folder")
+	}
+	if got := readFile(t, filepath.Join(outside, "a", "b", "f.txt")); got != "old\n" {
+		t.Fatalf("outside file = %q, want it unchanged", got)
+	}
+}
+
+func TestEditTool_IntermediateSymlinkSwappedAfterConfirmEditsNothing(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	writeFile(t, filepath.Join(root, "a", "b", "f.txt"), "old\n")
+	tool := newToolIn(t, root)
+	args := map[string]any{"path": "a/b/f.txt", "old_text": "old", "new_text": "new"}
+	target, scope, err := tool.ResolveTarget(args)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	identity := mustCaptureScope(t, scope)
+	scopeSwapAt(t, &beforeEditPublish, func() { scopeSwapMoveOut(t, root, outside) })
+
+	res, err := tool.InvokeWithAuthorizedScope(context.Background(), args, target, scope, identity)
+	if err != nil {
+		t.Fatalf("error = %v, want nil (the refusal surfaces in-band)", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0 (stdout %q), want a refusal once a folder on the path became a symlink", res.Stdout)
+	}
+	outsideDir := filepath.Join(outside, "a", "b")
+	if got := readFile(t, filepath.Join(outsideDir, "f.txt")); got != "old\n" {
+		t.Fatalf("outside file = %q, want it unchanged", got)
+	}
+	if names := readDirNames(t, outsideDir); !reflect.DeepEqual(names, []string{"f.txt"}) {
+		t.Fatalf("outside directory = %v, want only the original file", names)
+	}
+}
+
+func TestEditTool_SwapAtApplyOpensWarnsOnlyForSymlink(t *testing.T) {
+	now := func(_ *testing.T, act func()) { act() }
+	beforePublish := func(t *testing.T, act func()) { scopeSwapAt(t, &beforeEditPublish, act) }
+	sites := []struct {
+		name    string
+		swapped func(root string) string
+		at      func(t *testing.T, act func())
+		refusal string
+	}{
+		{"folder while pending", func(root string) string { return filepath.Join(root, "a") }, now, authorizedScopeReplaced},
+		{"folder after confirmation", func(root string) string { return filepath.Join(root, "a") }, afterScopeConfirmedOnce,
+			"edit target's parent directory changed after authorization; refusing to edit outside the authorized directory"},
+		{"file while pending", func(root string) string { return filepath.Join(root, "a", "b", "f.txt") }, now, "cannot read the target file"},
+		{"file before publish", func(root string) string { return filepath.Join(root, "a", "b", "f.txt") }, beforePublish, editTargetChanged},
+	}
+	for _, site := range sites {
+		for _, s := range swapOrRemove {
+			t.Run(site.name+"/"+s.name, func(t *testing.T) {
+				root, _ := scopeSwapLayout(t)
+				file := filepath.Join(root, "a", "b", "f.txt")
+				writeFile(t, file, "inside\n")
+				tool := newToolIn(t, root)
+				invoke := pendingScoped(t, tool.ResolveTarget, tool.InvokeWithAuthorizedScope,
+					map[string]any{"path": "a/b/f.txt", "old_text": "inside", "new_text": "changed"})
+				reports := recordSwapReports(t)
+				swapped := site.swapped(root)
+				site.at(t, func() { s.apply(t, swapped) })
+
+				res, err := invoke()
+				assertSwapRefusal(t, res, err, site.refusal, *reports, swapped, s.warns)
+			})
+		}
+	}
+}

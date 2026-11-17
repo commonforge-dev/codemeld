@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	"codemeld.dev/codemeld/internal/config"
@@ -117,6 +118,7 @@ type PromptDisplay struct {
 	HostRequest          string
 	DirectHTTPFallback   bool
 	ExceptionalAuthority string
+	OutsideReasons       []string
 }
 
 func exceptionalAuthority(req permissions.MatchRequest, mc permissions.ModeContext) string {
@@ -133,6 +135,60 @@ func markExceptional(disp dispatch.PromptDisplay, req permissions.MatchRequest, 
 		disp.ExceptionalAuthority = authority
 	}
 	return disp
+}
+
+const outsideSandboxAuthority = "running outside the sandbox"
+
+func markOutside(disp dispatch.PromptDisplay, req permissions.MatchRequest, mc permissions.ModeContext, outside *outsideSubjects) dispatch.PromptDisplay {
+	if mc.Mode == string(mode.Build) && (req.Kind == matchKindDirect || req.Kind == matchKindLiteral) && outside.has(req.Subject) {
+		disp.Action = exceptionalAction(outsideSandboxAuthority)
+		disp.ExceptionalAuthority = outsideSandboxAuthority
+	}
+	return disp
+}
+
+func withoutOutsideApprovals(grants permissions.GrantTable, cache permissions.ApprovalCache, reqs []permissions.MatchRequest) (permissions.GrantTable, permissions.ApprovalCache) {
+	if len(reqs) == 0 {
+		return grants, cache
+	}
+	return outsideGrants{GrantTable: grants, reqs: reqs}, outsideCache{ApprovalCache: cache, reqs: reqs}
+}
+
+type outsideGrants struct {
+	permissions.GrantTable
+	reqs []permissions.MatchRequest
+}
+
+func (g outsideGrants) PermissionsFor(req permissions.MatchRequest) []permissions.PermissionEntry {
+	entries := g.Permissions()
+	if !slices.ContainsFunc(g.reqs, func(r permissions.MatchRequest) bool { return inflightKeyOf(r) == inflightKeyOf(req) }) {
+		return entries
+	}
+	return slices.DeleteFunc(slices.Clone(entries), func(e permissions.PermissionEntry) bool {
+		return permissions.Match(req, []permissions.PermissionEntry{e}).Matched
+	})
+}
+
+type outsideCache struct {
+	permissions.ApprovalCache
+	reqs []permissions.MatchRequest
+}
+
+func (c outsideCache) Lookup(req permissions.MatchRequest) (string, bool) {
+	outcome, hit := c.ApprovalCache.Lookup(req)
+	if hit && outcome != "deny" && slices.ContainsFunc(c.reqs, func(r permissions.MatchRequest) bool { return inflightKeyOf(r) == inflightKeyOf(req) }) {
+		return "", false
+	}
+	return outcome, hit
+}
+
+func settleOutside(ctx context.Context, choice permissions.PromptChoice, outside *outsideSubjects, subject string) {
+	switch choice {
+	case permissions.PromptAllowOnce:
+		dispatch.MarkRunOutside(ctx, subject)
+	case permissions.PromptDeny:
+		outside.remove(subject)
+	}
 }
 
 func exceptionalAction(authority string) string { return "Allow " + authority }
@@ -464,6 +520,7 @@ func buildPromptRequest(req permissions.MatchRequest, display PromptDisplay, esc
 		ProjectUntrusted:        display.ProjectUntrusted,
 		Summary:                 promptSummaryFor(req, display, nil),
 		ExceptionalAuthority:    display.ExceptionalAuthority,
+		OutsideReasons:          display.OutsideReasons,
 	}
 	// CanonicalProgram/CanonicalArgs drive the direct-command scope
 	// sub-choice; only a direct command carries SubjectTokens, and the prompt leaves

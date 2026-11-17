@@ -2060,61 +2060,67 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 		}
 	}
 
-	t.Run("block model map with an anchored favorites list aliased by a sibling", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "model:\n  favorites:"
-		suffix := "\n  active: *shared\n"
-		source := prefix + " &shared\n    - provider: openai\n      id: gpt-5" + suffix
-		if err := Validate([]byte(source), target); err != nil {
-			t.Fatalf("source failed schema validation: %v\n%s", err, source)
-		}
-		writeAt(t, target, source)
-		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
-		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
-			t.Fatalf("RewriteKey: %v", err)
-		}
-		got := readAt(t, target)
-		assertSpliceBounds(t, got, prefix, suffix)
-		want := prefix + " &shared\n    - provider: openai\n      id: gpt-5\n    - provider: anthropic\n      id: opus" + suffix
-		if got != want {
-			t.Fatalf("anchored block rewrite =\n%q\nwant\n%q", got, want)
-		}
-		if err := Validate([]byte(got), target); err != nil {
-			t.Fatalf("result failed schema validation: %v\n%s", err, got)
-		}
-		if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
-			t.Fatalf("favorites = %v, want %v", favs, want)
-		}
-		assertAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
-	})
-
-	t.Run("flow model map with an anchored favorites list aliased by a sibling", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "model: {favorites:"
-		suffix := ", active: *shared}\n"
-		source := prefix + " &shared [{provider: openai, id: gpt-5}]" + suffix
-		if err := Validate([]byte(source), target); err != nil {
-			t.Fatalf("source failed schema validation: %v\n%s", err, source)
-		}
-		writeAt(t, target, source)
-		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
-		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
-			t.Fatalf("RewriteKey: %v", err)
-		}
-		got := readAt(t, target)
-		assertSpliceBounds(t, got, prefix, suffix)
-		want := prefix + " &shared [{provider: openai, id: gpt-5}, {provider: anthropic, id: opus}]" + suffix
-		if got != want {
-			t.Fatalf("anchored flow rewrite =\n%q\nwant\n%q", got, want)
-		}
-		if err := Validate([]byte(got), target); err != nil {
-			t.Fatalf("result failed schema validation: %v\n%s", err, got)
-		}
-		if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
-			t.Fatalf("favorites = %v, want %v", favs, want)
-		}
-		assertAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
-	})
+	for _, tc := range []struct {
+		name, label, prefix, suffix, tail, wantTail string
+	}{
+		{
+			name:     "block model map with an anchored favorites list aliased by a sibling",
+			label:    "anchored block rewrite",
+			prefix:   "model:\n  favorites:",
+			suffix:   "\n  active: *shared\n",
+			tail:     " &shared\n    - provider: openai\n      id: gpt-5",
+			wantTail: " &shared\n    - provider: openai\n      id: gpt-5\n    - provider: anthropic\n      id: opus",
+		},
+		{
+			name:     "flow model map with an anchored favorites list aliased by a sibling",
+			label:    "anchored flow rewrite",
+			prefix:   "model: {favorites:",
+			suffix:   ", active: *shared}\n",
+			tail:     " &shared [{provider: openai, id: gpt-5}]",
+			wantTail: " &shared [{provider: openai, id: gpt-5}, {provider: anthropic, id: opus}]",
+		},
+		{
+			name:     "block model map with a tagged anchored favorites list aliased by a sibling",
+			label:    "tagged anchored block rewrite",
+			prefix:   "model:\n  favorites:",
+			suffix:   "\n  active: *shared\n",
+			tail:     " &shared !!seq\n    - provider: openai\n      id: gpt-5",
+			wantTail: " &shared !!seq\n    - provider: openai\n      id: gpt-5\n    - provider: anthropic\n      id: opus",
+		},
+		{
+			name:     "flow model map with a tagged anchored favorites list aliased by a sibling",
+			label:    "tagged anchored flow rewrite",
+			prefix:   "model: {favorites:",
+			suffix:   ", active: *shared}\n",
+			tail:     " &shared !!seq [{provider: openai, id: gpt-5}]",
+			wantTail: " &shared !!seq [{provider: openai, id: gpt-5}, {provider: anthropic, id: opus}]",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			source := tc.prefix + tc.tail + tc.suffix
+			if err := Validate([]byte(source), target); err != nil {
+				t.Fatalf("source failed schema validation: %v\n%s", err, source)
+			}
+			writeAt(t, target, source)
+			op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
+			if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
+				t.Fatalf("RewriteKey: %v", err)
+			}
+			got := readAt(t, target)
+			assertSpliceBounds(t, got, tc.prefix, tc.suffix)
+			if want := tc.prefix + tc.wantTail + tc.suffix; got != want {
+				t.Fatalf("%s =\n%q\nwant\n%q", tc.label, got, want)
+			}
+			if err := Validate([]byte(got), target); err != nil {
+				t.Fatalf("result failed schema validation: %v\n%s", err, got)
+			}
+			if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
+				t.Fatalf("favorites = %v, want %v", favs, want)
+			}
+			assertAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
+		})
+	}
 
 	t.Run("block model map with an anchored favorite entry aliased by a sibling", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")
@@ -2251,62 +2257,6 @@ func TestRewriteKey_ModelFavorites_PreservesUnrelatedContent(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("block model map with a tagged anchored favorites list aliased by a sibling", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "model:\n  favorites:"
-		suffix := "\n  active: *shared\n"
-		source := prefix + " &shared !!seq\n    - provider: openai\n      id: gpt-5" + suffix
-		if err := Validate([]byte(source), target); err != nil {
-			t.Fatalf("source failed schema validation: %v\n%s", err, source)
-		}
-		writeAt(t, target, source)
-		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
-		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
-			t.Fatalf("RewriteKey: %v", err)
-		}
-		got := readAt(t, target)
-		assertSpliceBounds(t, got, prefix, suffix)
-		want := prefix + " &shared !!seq\n    - provider: openai\n      id: gpt-5\n    - provider: anthropic\n      id: opus" + suffix
-		if got != want {
-			t.Fatalf("tagged anchored block rewrite =\n%q\nwant\n%q", got, want)
-		}
-		if err := Validate([]byte(got), target); err != nil {
-			t.Fatalf("result failed schema validation: %v\n%s", err, got)
-		}
-		if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
-			t.Fatalf("favorites = %v, want %v", favs, want)
-		}
-		assertAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
-	})
-
-	t.Run("flow model map with a tagged anchored favorites list aliased by a sibling", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), "settings.yaml")
-		prefix := "model: {favorites:"
-		suffix := ", active: *shared}\n"
-		source := prefix + " &shared !!seq [{provider: openai, id: gpt-5}]" + suffix
-		if err := Validate([]byte(source), target); err != nil {
-			t.Fatalf("source failed schema validation: %v\n%s", err, source)
-		}
-		writeAt(t, target, source)
-		op := preparedToggle([]Favorite{openaiGPT5}, anthropicOpus, true)
-		if _, _, err := RewriteKey(target, keyModelFavorites, op); err != nil {
-			t.Fatalf("RewriteKey: %v", err)
-		}
-		got := readAt(t, target)
-		assertSpliceBounds(t, got, prefix, suffix)
-		want := prefix + " &shared !!seq [{provider: openai, id: gpt-5}, {provider: anthropic, id: opus}]" + suffix
-		if got != want {
-			t.Fatalf("tagged anchored flow rewrite =\n%q\nwant\n%q", got, want)
-		}
-		if err := Validate([]byte(got), target); err != nil {
-			t.Fatalf("result failed schema validation: %v\n%s", err, got)
-		}
-		if favs, want := favoritesOnDisk(t, target), []Favorite{openaiGPT5, anthropicOpus}; !slices.Equal(favs, want) {
-			t.Fatalf("favorites = %v, want %v", favs, want)
-		}
-		assertAliasResolves(t, target, []Favorite{openaiGPT5, anthropicOpus})
-	})
 
 	t.Run("empty flow model map stays flow style", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "settings.yaml")

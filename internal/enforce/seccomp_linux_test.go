@@ -369,6 +369,9 @@ func TestSeccompBrokerCallsAndPreservedDenials(t *testing.T) {
 			for _, n := range present(info, wantDenyAll...) {
 				want[n] = retEPERM
 			}
+			for _, n := range seccompWatched(info) {
+				want[n] = retNotify
+			}
 			if got := deniedNames(v); !maps.Equal(got, want) {
 				t.Errorf("%s %s: denied %v, want %v", info.Name, name, got, want)
 			}
@@ -417,6 +420,62 @@ func TestSeccompBrokerCallsAndPreservedDenials(t *testing.T) {
 	}
 }
 
+func seccompWatched(info *arch.Info) []string {
+	names := []string{"mkdirat", "unlinkat", "renameat2", "linkat", "symlinkat", "mknodat", "truncate", "openat2"}
+	if info.Name == arch.X86_64.Name {
+		names = append(names, "mkdir", "rmdir", "unlink", "rename", "renameat", "link", "symlink", "mknod", "creat")
+	}
+	return names
+}
+
+func TestSeccompBrokerPausesWatchedFileCalls(t *testing.T) {
+	writeFlags := []uint64{unix.O_WRONLY, unix.O_RDWR, unix.O_CREAT, unix.O_TRUNC, unix.O_WRONLY | unix.O_APPEND | unix.O_CLOEXEC}
+	readFlags := []uint64{unix.O_RDONLY, unix.O_RDONLY | unix.O_CLOEXEC | unix.O_DIRECTORY, unix.O_PATH, unix.O_RDONLY | unix.O_NOFOLLOW}
+	unbrokered := map[string]Policy{"plan": seccompPlan, "auto_edits": seccompAuto, "auto_edits network": seccompNetwork}
+	for _, info := range seccompArches {
+		opens := map[string]int{"openat": 2}
+		if info == arch.X86_64 {
+			opens["open"] = 1
+		}
+		for name, p := range seccompBrokers {
+			v := newSeccompVM(t, p, info)
+			for _, call := range seccompWatched(info) {
+				if got := v.run(call, 3, 1<<40, 0o700); got != retNotify {
+					t.Errorf("%s %s %s: ret %#x, want notify", info.Name, name, call, got)
+				}
+			}
+			for call, arg := range opens {
+				args := make([]uint64, 4)
+				for _, f := range writeFlags {
+					if args[arg] = f; v.run(call, args...) != retNotify {
+						t.Errorf("%s %s %s flags %#x: not paused", info.Name, name, call, f)
+					}
+				}
+				for _, f := range readFlags {
+					if args[arg] = f; v.run(call, args...) != retAllow {
+						t.Errorf("%s %s %s flags %#x: not allowed unpaused", info.Name, name, call, f)
+					}
+				}
+			}
+		}
+		for name, p := range unbrokered {
+			v := newSeccompVM(t, p, info)
+			for _, call := range seccompWatched(info) {
+				if got := v.run(call, 3, 1<<40, 0o700); got != retAllow {
+					t.Errorf("%s %s %s: ret %#x, want allow", info.Name, name, call, got)
+				}
+			}
+			for call, arg := range opens {
+				args := make([]uint64, 4)
+				args[arg] = unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC
+				if got := v.run(call, args...); got != retAllow {
+					t.Errorf("%s %s %s write: ret %#x, want allow", info.Name, name, call, got)
+				}
+			}
+		}
+	}
+}
+
 func TestSeccompPlanSliceKeepsPlanDenials(t *testing.T) {
 	p := Policy{Mode: ModePlan, BlockedPaths: []string{"/home/u/.codemeld"}, Broker: "slice"}
 	for _, info := range seccompArches {
@@ -424,6 +483,9 @@ func TestSeccompPlanSliceKeepsPlanDenials(t *testing.T) {
 		want := map[string]uint32{"clone3": retENOSYS, "socketpair": retEPERM, "connect": retNotify, "bind": retEPERM, "listen": retEPERM}
 		for _, n := range present(info, append(slices.Clone(wantDenyAll), wantDenyPlan...)...) {
 			want[n] = retEPERM
+		}
+		for _, n := range seccompWatched(info) {
+			want[n] = retNotify
 		}
 		if got := deniedNames(v); !maps.Equal(got, want) {
 			t.Errorf("%s: denied %v, want %v", info.Name, got, want)
@@ -679,6 +741,18 @@ func seccompKernelCases(mode string) []seccompKernelCase {
 			return err
 		})},
 		seccompKernelCase{"sendmmsg plain", "allow", 0, with(unix.AF_UNIX, func(fd int) error { return sendmmsg(fd, nil, 0) })},
+		seccompKernelCase{"mkdirat", "pause", unix.SYS_MKDIRAT, func() error { return unix.Mkdirat(unix.AT_FDCWD, "/nonexistent-codemeld/d", 0o700) }},
+		seccompKernelCase{"openat write", "pause", unix.SYS_OPENAT, func() error {
+			_, err := unix.Openat(unix.AT_FDCWD, "/nonexistent-codemeld/f", unix.O_WRONLY|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
+			return err
+		}},
+		seccompKernelCase{"openat read-only", "allow", 0, func() error {
+			fd, err := unix.Openat(unix.AT_FDCWD, "/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			if err == nil {
+				_ = unix.Close(fd)
+			}
+			return err
+		}},
 	)
 	if mode != "slice" {
 		cases = append(cases, seccompKernelCase{"connect unix socket", "pause", unix.SYS_CONNECT, func() error {

@@ -982,11 +982,16 @@ func TestRun_FilesAuthorized_HelpDocuments(t *testing.T) {
 				"empty directory",
 				"not a sandbox",
 				"sandbox and do not authorize or confine shell writes. A shell command follows the",
-				"mode's OS sandbox when one is active; where none confines it (build mode, or a failed",
-				"or unsupported startup check), a shell command authorized by a grant can still write",
+				"mode's OS sandbox when one is active; where none confines it (after a failed or",
+				"unsupported startup check), a shell command authorized by a grant can still write",
+				"where the mode's OS sandbox does not confine it (after a failed or unsupported startup check) a granted shell command",
 				"A general_agent call may declare only write paths",
 				"an uncovered declaration is refused ahead",
 				"nested general_agent call may declare only paths its own parent already declared",
+				"name it in both lists to do both. A path inside the work folder that\n   resolves outside it through a symlink is refused at startup",
+				"--files-authorized-delete only a symlinked parent folder counts",
+				"can still write elsewhere; a path inside the work folder that resolves outside it through a symlink is refused at startup",
+				"general_agent declaration is uncovered; a path inside the work folder whose parent folder resolves outside it through a symlink is refused at startup",
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("run help (%q) missing %q:\n%s", form, want, out)
@@ -1017,8 +1022,8 @@ func TestRun_Sandbox_HelpDocuments(t *testing.T) {
 			out := stdout.String()
 			for _, want := range []string{
 				"denies mutating tool calls. On Linux (amd64/arm64), when codemeld's startup",
-				"sandbox check passes, 'plan' and 'auto-edits' run shell commands inside an OS sandbox",
-				"with filesystem and process-access restrictions, and 'build' runs them outside it; if",
+				"sandbox check passes, shell commands in every mode run inside an OS sandbox with",
+				"filesystem and process-access restrictions, and 'build' still asks before each one; if",
 				"the check fails or the platform is not supported, commands run outside the sandbox.",
 				"Under 'plan', with intact settings and a passing startup check on a supported host, a",
 				"shell command runs inside the sandbox, where writes and network access fail. Without",
@@ -1215,7 +1220,7 @@ func TestRun_TurnLimitExitsZeroWithOneNoticeAndTheFinalAnswer(t *testing.T) {
 			respelled := strings.Replace(string(args), `":`, `": `, 1)
 
 			var requests atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			provider := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var body struct {
 					Tools []json.RawMessage `json:"tools"`
 				}
@@ -1241,14 +1246,20 @@ func TestRun_TurnLimitExitsZeroWithOneNoticeAndTheFinalAnswer(t *testing.T) {
 					_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
 				}
 				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-			}))
-			defer srv.Close()
+			})
+			prevTransport := http.DefaultTransport
+			http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				rec := httptest.NewRecorder()
+				provider.ServeHTTP(rec, r)
+				return rec.Result(), nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = prevTransport })
 
 			if err := config.UpdateDiscoveredModelsProvider(config.DiscoveredModelsPath(bootstrap.SettingsPath(home)), "openai",
 				config.DiscoveredProvider{Models: []config.DiscoveredModel{{ID: "gpt-5.5"}}}); err != nil {
 				t.Fatal(err)
 			}
-			global := map[string]any{"provider": map[string]any{"openai": map[string]any{"base_url": srv.URL, "api_key": "sk-test"}}}
+			global := map[string]any{"provider": map[string]any{"openai": map[string]any{"base_url": "http://provider.invalid", "api_key": "sk-test"}}}
 			stubHeadlessBootstrap(t, func(ctx context.Context, cwd string, steps bootstrap.FreshSteps, driver *bootstrap.HeadlessDriver) ([]bootstrap.DeniedCall, error) {
 				steps.ResolveHome = func() (string, error) { return home, nil }
 				steps.RunFirstRun = func(string) (bool, error) { return false, nil }

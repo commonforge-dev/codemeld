@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -32,6 +34,7 @@ type sliceStep struct {
 	want    int
 	payload bool
 	unix    bool
+	watch   string
 	args    func(to stepTargets, token string) []string
 }
 
@@ -67,16 +70,35 @@ func socketInRoot(to stepTargets, _ string) []string {
 	return []string{filepath.Join(to.root, "s")}
 }
 
-var sliceSteps = []sliceStep{
+func dirInTmp(to stepTargets, _ string) []string {
+	return []string{filepath.Join(to.tmp, "d")}
+}
+
+func fileInTmp(to stepTargets, _ string) []string {
+	return []string{filepath.Join(to.tmp, "f")}
+}
+
+func dirInRoot(to stepTargets, _ string) []string {
+	return []string{filepath.Join(to.root, "d")}
+}
+
+var watchSteps = []sliceStep{
+	{probe: "watch-mkdir-main", want: probeAllowed, watch: "mkdirat", args: dirInTmp},
+	{probe: "watch-mkdir-thread", want: probeAllowed, watch: "mkdirat", args: dirInTmp},
+	{probe: "watch-openat2", want: probeAllowed, watch: "openat2", args: fileInTmp},
+	{probe: "watch-mkdir-main", want: probeDenied, watch: "mkdirat", args: dirInRoot},
+}
+
+var sliceSteps = append([]sliceStep{
 	{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "tcp-bind", want: probeDenied, args: loopbackAnyPort},
 	{probe: "tcp-listen", want: probeDenied},
 	{probe: "socket-unix", want: probeDenied},
 	{probe: "tcp-fastopen", want: probeDenied, args: endpoint},
-}
+}, watchSteps...)
 
-var connectSteps = []sliceStep{
+var connectSteps = append([]sliceStep{
 	{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "tcp-bind", want: probeDenied, args: loopbackAnyPort},
@@ -89,9 +111,9 @@ var connectSteps = []sliceStep{
 	{probe: "unix-connect-thread", want: probeDenied, args: abstractAndToken},
 	{probe: "unix-connect-main", want: probeDenied, args: ungrantedAndToken},
 	{probe: "unix-connect-thread", want: probeDenied, args: ungrantedAndToken},
-}
+}, watchSteps...)
 
-var fullSteps = []sliceStep{
+var fullSteps = append([]sliceStep{
 	{probe: "tcp-connect-main", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "tcp-connect-thread", want: probeAllowed, payload: true, args: endpointAndToken},
 	{probe: "socket-unix", want: probeAllowed},
@@ -109,7 +131,7 @@ var fullSteps = []sliceStep{
 	{probe: "unix-bind-main", want: probeDenied, args: socketInRoot},
 	{probe: "setsockopt-reuseport", want: probeDenied},
 	{probe: "setsockopt-reuseaddr", want: probeAllowed},
-}
+}, watchSteps...)
 
 var (
 	sliceReceive     = ReceiveListener
@@ -169,6 +191,9 @@ func runBrokerSelfTest(home, exe, broker string, steps []sliceStep) (passed bool
 	}
 	for _, step := range steps {
 		if reason := s.attempt(step); reason != "" {
+			if step.watch != "" {
+				prefix += watchCheckFailed
+			}
 			return false, prefix + step.probe + ": " + reason
 		}
 	}
@@ -196,6 +221,23 @@ func (s brokerSelfTest) attempt(step sliceStep) string {
 		to := s.to
 		to.tmp, to.root = f.tmp(), f.root
 		argv = append(argv, step.args(to, token)...)
+	}
+	var watched string
+	if step.watch != "" {
+		dir, err := filepath.EvalSymlinks(filepath.Dir(argv[3]))
+		if err != nil {
+			return "fixture: " + err.Error()
+		}
+		watched = filepath.Join(dir, filepath.Base(argv[3]))
+	}
+	var seenMu sync.Mutex
+	var seen []WatchedCall
+	watch := func(c WatchedCall) {
+		c.Record(func() {
+			seenMu.Lock()
+			defer seenMu.Unlock()
+			seen = append(seen, c)
+		})
 	}
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -237,9 +279,9 @@ func (s brokerSelfTest) attempt(step sliceStep) string {
 	if s.broker != BrokerSlice {
 		deny := NewDenyList()
 		defer deny.Close()
-		broker, err = StartConnectBroker(listener, ConnectRules{Grants: []string{s.to.granted}, Deny: deny, Proxy: decide, TmpDir: f.tmp(), Policy: policy}, nil)
+		broker, err = StartConnectBroker(listener, ConnectRules{Grants: []string{s.to.granted}, Deny: deny, Proxy: decide, TmpDir: f.tmp(), Policy: policy}, nil, watch)
 	} else {
-		broker, err = sliceStartBroker(listener, decide)
+		broker, err = sliceStartBroker(listener, decide, watch)
 	}
 	if err != nil {
 		return fail("broker start", err)
@@ -273,7 +315,19 @@ func (s brokerSelfTest) attempt(step sliceStep) string {
 	if step.payload && (e.timedOut || e.code != probeAllowed) {
 		_ = ln.SetDeadline(time.Now())
 	}
-	if reason := sliceOutcome(step, e, <-paired, brokered.Load()); reason != "" {
+	seenMu.Lock()
+	saw := slices.ContainsFunc(seen, func(c WatchedCall) bool {
+		if c.Syscall != step.watch || len(c.Paths) != 1 || c.Paths[0].Err != nil || c.Paths[0].Path != watched {
+			return false
+		}
+		if c.Syscall != "openat2" {
+			return true
+		}
+		h := c.OpenHow
+		return h != nil && h.Err == nil && !h.ExtensionNonzero && h.Size == unix.SizeofOpenHow && h.How.Flags == watchOpenat2Flags
+	})
+	seenMu.Unlock()
+	if reason := sliceOutcome(step, e, <-paired, brokered.Load(), saw); reason != "" {
 		return withStderr(reason, &stderr)
 	}
 	return ""
@@ -314,7 +368,7 @@ func exitOf(err error) helperExit {
 	return e
 }
 
-func sliceOutcome(step sliceStep, e helperExit, paired, brokered bool) string {
+func sliceOutcome(step sliceStep, e helperExit, paired, brokered, watched bool) string {
 	switch {
 	case e.timedOut:
 		return "helper timed out"
@@ -326,6 +380,8 @@ func sliceOutcome(step sliceStep, e helperExit, paired, brokered bool) string {
 		return "no accepted connection carried the helper's payload"
 	case step.payload && !step.unix && !brokered:
 		return "the broker never handled a connect to the expected endpoint"
+	case step.watch != "" && !watched:
+		return "the broker's watch never saw the probe's " + step.watch + " path"
 	}
 	return ""
 }

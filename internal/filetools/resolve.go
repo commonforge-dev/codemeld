@@ -190,6 +190,7 @@ func resolveDeclarations(home, launchDir string, decls []string, resolve func(ho
 	if len(decls) == 0 {
 		return nil, nil
 	}
+	resolvedLaunch := normalizeRoot(launchDir)
 	out := make(map[string]bool, len(decls))
 	for _, raw := range decls {
 		if strings.TrimSpace(raw) == "" {
@@ -199,9 +200,17 @@ func resolveDeclarations(home, launchDir string, decls []string, resolve func(ho
 		if reason != "" {
 			return nil, fmt.Errorf("declared path %q: %s", raw, reason)
 		}
+		abs, _ := absDeclaration(home, launchDir, raw)
+		if (strictlyInside(abs, launchDir) || strictlyInside(abs, resolvedLaunch)) && !permissions.IsDescendantOrEqual(target, resolvedLaunch) {
+			return nil, fmt.Errorf("declared path %q: resolves to %q, outside the launch folder %q", raw, target, resolvedLaunch)
+		}
 		out[target] = true
 	}
 	return out, nil
+}
+
+func strictlyInside(path, dir string) bool {
+	return path != filepath.Clean(dir) && permissions.IsDescendantOrEqual(path, dir)
 }
 
 func resolveWriteDeclaration(home, launchDir, raw string) (string, string) {

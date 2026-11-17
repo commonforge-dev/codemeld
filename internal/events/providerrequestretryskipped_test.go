@@ -19,27 +19,10 @@ import (
 )
 
 func TestEmitProviderRequestRetrySkipped_AppendBeforeFlush(t *testing.T) {
-	var order []string
-	restoreAppend, restoreFlush := appendEvent, flushStore
-	appendEvent = func(s *sessions.Store, p EventPayload) (sessions.Record, error) {
-		order = append(order, "append")
-		return sessions.Event{}, nil
-	}
-	flushStore = func(ctx context.Context, s *sessions.Store) (fserrors.Category, sessions.WriteReason, error) {
-		order = append(order, "flush")
-		return "", sessions.ReasonNone, nil
-	}
-	t.Cleanup(func() { appendEvent, flushStore = restoreAppend, restoreFlush })
-
-	store := sessions.New("unused", newSession())
-	err := EmitProviderRequestRetrySkipped(context.Background(), store, "openai", "gpt-4o",
-		"stream_drop", "stream_eof", "max_attempts_reached", 3, 12, failOnWriteFailure(t))
-	if err != nil {
-		t.Fatalf("EmitProviderRequestRetrySkipped error = %v", err)
-	}
-	if len(order) != 2 || order[0] != "append" || order[1] != "flush" {
-		t.Fatalf("operation order = %v, want [append flush] (durable before terminal failure)", order)
-	}
+	assertAppendBeforeFlush(t, "durable before terminal failure", func(store *sessions.Store) error {
+		return EmitProviderRequestRetrySkipped(context.Background(), store, "openai", "gpt-4o",
+			"stream_drop", "stream_eof", "max_attempts_reached", 3, 12, failOnWriteFailure(t))
+	})
 }
 
 // An invalid payload (partial_chars_discarded on a non-stream_drop phase) is rejected

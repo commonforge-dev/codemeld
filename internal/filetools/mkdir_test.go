@@ -951,3 +951,44 @@ func TestMkdirTool_ResolveTargetGivesEquivalentSpellingsOneCanonicalTarget(t *te
 		}
 	}
 }
+
+func TestMkdirTool_IntermediateSymlinkSwappedBeforeCaptureRefusesCapture(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	tool := newMkdirToolIn(t, root)
+	_, scope, err := tool.ResolveTarget(map[string]any{"path": "a/b/c"})
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+
+	scopeSwapMoveOut(t, root, outside)
+
+	if _, cerr := CaptureScopeIdentity(scope); cerr == nil {
+		t.Fatal("CaptureScopeIdentity = nil error, want a refusal to capture through a symlinked folder")
+	}
+	if _, serr := os.Lstat(filepath.Join(outside, "a", "b", "c")); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("Lstat(outside dir) = %v, want nothing created outside", serr)
+	}
+}
+
+func TestMkdirTool_IntermediateSymlinkSwappedAfterConfirmCreatesNothing(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	tool := newMkdirToolIn(t, root)
+	args := map[string]any{"path": "a/b/c"}
+	target, scope, err := tool.ResolveTarget(args)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	identity := mustCaptureScope(t, scope)
+	scopeSwapAt(t, &beforeMkdirCreate, func() { scopeSwapMoveOut(t, root, outside) })
+
+	res, err := tool.InvokeWithAuthorizedScope(context.Background(), args, target, scope, identity)
+	if err != nil {
+		t.Fatalf("error = %v, want nil (the refusal surfaces in-band)", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0 (stdout %q), want a refusal once a folder on the path became a symlink", res.Stdout)
+	}
+	if _, serr := os.Lstat(filepath.Join(outside, "a", "b", "c")); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("Lstat(outside dir) = %v, want nothing created outside", serr)
+	}
+}

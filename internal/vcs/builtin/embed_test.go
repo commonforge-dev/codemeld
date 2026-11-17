@@ -2,6 +2,10 @@
 package builtin
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"maps"
+	"slices"
 	"testing"
 
 	"github.com/goccy/go-yaml"
@@ -20,8 +24,18 @@ var placeholderActions = map[string]string{
 	"add":           "{path}",
 	"restore-file":  "{path}",
 	"commit":        "{message}",
+	"amend":         "{message}",
 	"branch-create": "{branch}",
 	"branch-switch": "{branch}",
+}
+
+var amendTemplates = map[string]bool{"git": true, "hg": true}
+
+func templateActions(name string) []string {
+	if amendTemplates[name] {
+		return append(slices.Clone(requiredActions), "amend")
+	}
+	return requiredActions
 }
 
 var allPlaceholders = []string{"{path}", "{message}", "{branch}"}
@@ -73,6 +87,28 @@ func TestBuiltinTemplate_ReturnsFreshCopy(t *testing.T) {
 	}
 }
 
+func TestIsEarlierVersion_MatchesOnlyListedHashOfSameTemplate(t *testing.T) {
+	old := []byte("detect:\n  marker: .git\n")
+	sum := sha256.Sum256(old)
+	saved := maps.Clone(earlierVersions)
+	t.Cleanup(func() { earlierVersions = saved })
+	earlierVersions = map[string][]string{"git": {hex.EncodeToString(sum[:])}}
+
+	if !IsEarlierVersion("git", old) {
+		t.Error("IsEarlierVersion(git, listed bytes) = false, want true")
+	}
+	if IsEarlierVersion("hg", old) {
+		t.Error("IsEarlierVersion(hg, bytes listed only for git) = true, want false")
+	}
+	if IsEarlierVersion("git", append(old, ' ')) {
+		t.Error("IsEarlierVersion(git, edited bytes) = true, want false")
+	}
+	current, _ := BuiltinTemplate("git")
+	if IsEarlierVersion("git", current) {
+		t.Error("IsEarlierVersion(git, current bytes) = true, want false")
+	}
+}
+
 func TestBuiltinTemplates_ParseAsYAML(t *testing.T) {
 	for _, name := range BuiltinNames() {
 		data, ok := BuiltinTemplate(name)
@@ -89,10 +125,11 @@ func TestBuiltinTemplates_ParseAsYAML(t *testing.T) {
 func TestBuiltinTemplates_AllRequiredActionsPresent(t *testing.T) {
 	for _, name := range BuiltinNames() {
 		doc := mustParse(t, name)
-		if len(doc) != len(requiredActions) {
-			t.Errorf("%s.yaml has %d top-level keys, want exactly %d", name, len(doc), len(requiredActions))
+		want := templateActions(name)
+		if len(doc) != len(want) {
+			t.Errorf("%s.yaml has %d top-level keys, want exactly %d", name, len(doc), len(want))
 		}
-		for _, action := range requiredActions {
+		for _, action := range want {
 			if _, present := doc[action]; !present {
 				t.Errorf("%s.yaml missing required action %q", name, action)
 			}
@@ -125,7 +162,7 @@ func TestBuiltinTemplates_DetectMarkerOnly(t *testing.T) {
 func TestBuiltinTemplates_ActionBodyShapeAndPlaceholders(t *testing.T) {
 	for _, name := range BuiltinNames() {
 		doc := mustParse(t, name)
-		for _, action := range requiredActions {
+		for _, action := range templateActions(name) {
 			if action == "detect" {
 				continue
 			}
@@ -222,6 +259,9 @@ add:
 commit:
   argv: [git, commit, -m, "{message}"]
 
+amend:
+  argv: [git, commit, --amend, -m, "{message}"]
+
 log:
   argv: [git, log, --oneline, -n, "20"]
 
@@ -277,6 +317,9 @@ add:
 
 commit:
   argv: [hg, commit, -m, "{message}"]
+
+amend:
+  argv: [hg, commit, --amend, -m, "{message}"]
 
 log:
   argv: [hg, log, --limit, "20"]

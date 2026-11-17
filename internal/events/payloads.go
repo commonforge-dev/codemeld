@@ -195,7 +195,7 @@ var perCallOutcomeSources = set("mode_auto", outcomeSourceDeclaredScope, outcome
 // registers, both of which internal/securitystate's protected-state guard covers.
 var protectedStateSubjects = set(
 	"edit", "create", "delete", "mkdir", "move",
-	"vcs_status", "vcs_diff", "vcs_add", "vcs_commit", "vcs_log",
+	"vcs_status", "vcs_diff", "vcs_add", "vcs_commit", "vcs_amend", "vcs_log",
 	"vcs_branch_current", "vcs_branch_create", "vcs_branch_switch", "vcs_restore_file",
 	"vcs_is_clean", "vcs_stash", "vcs_stash_pop", "vcs_merge_status", "vcs_rebase_status",
 )

@@ -26,21 +26,46 @@ func VCSTemplatePath(home, name string) string {
 	return filepath.Join(VCSTemplateDir(home), name+".yaml")
 }
 
+var (
+	isEarlierBuiltin = builtin.IsEarlierVersion
+	writeAtomic      = fsutil.WriteAtomic
+)
+
 // MaterializeBuiltinTemplates writes each built-in template that is not already
-// present under ~/.codemeld/global/vcs/, at mode 0644. Existing files are
-// preserved so the operation is idempotent and never overwrites a user-edited
-// template; since WriteAtomic overwrites, existence is checked first. On the
-// first failure it returns the target path, category, and error and stops;
-// templates written before the failure are left in place.
+// present under ~/.codemeld/global/vcs/, at mode 0644, and replaces an existing
+// regular file that is byte-identical to an earlier release of that template.
+// Every other existing file is preserved; since WriteAtomic overwrites,
+// existence is checked first. On the first failure it returns the target path,
+// category, and error and stops; templates written before the failure are left
+// in place.
 func MaterializeBuiltinTemplates(home string) (failedPath string, cat fserrors.Category, err error) {
+	return syncBuiltinTemplates(home, true)
+}
+
+func syncBuiltinTemplates(home string, create bool) (failedPath string, cat fserrors.Category, err error) {
 	for _, name := range builtin.BuiltinNames() {
 		target := VCSTemplatePath(home, name)
 
 		switch _, statErr := os.Stat(target); {
 		case statErr == nil:
-			continue // preserve existing (possibly user-edited) template
+			info, lerr := os.Lstat(target)
+			if lerr != nil {
+				return target, fserrors.CategorizeErrno(lerr), lerr
+			}
+			if !info.Mode().IsRegular() {
+				continue
+			}
+			existing, rerr := os.ReadFile(target)
+			if rerr != nil {
+				return target, fserrors.CategorizeErrno(rerr), rerr
+			}
+			if !isEarlierBuiltin(name, existing) {
+				continue
+			}
 		case errors.Is(statErr, fs.ErrNotExist):
-			// absent: fall through to write
+			if !create {
+				continue
+			}
 		default:
 			return target, fserrors.CategorizeErrno(statErr), statErr
 		}
@@ -50,7 +75,7 @@ func MaterializeBuiltinTemplates(home string) (failedPath string, cat fserrors.C
 			e := fmt.Errorf("builtin template %q not found", name)
 			return target, fserrors.IOError, e
 		}
-		if _, c, e := fsutil.WriteAtomic(target, data, 0o644); e != nil {
+		if _, c, e := writeAtomic(target, data, 0o644); e != nil {
 			return target, c, e
 		}
 	}

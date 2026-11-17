@@ -140,7 +140,8 @@ func TestSliceSelfTestPassesInRealHelper(t *testing.T) {
 	for _, s := range sliceSteps {
 		got = append(got, fmt.Sprintf("%s=%d", s.probe, s.want))
 	}
-	want := []string{"tcp-connect-main=0", "tcp-connect-thread=0", "tcp-bind=10", "tcp-listen=10", "socket-unix=10", "tcp-fastopen=10"}
+	want := []string{"tcp-connect-main=0", "tcp-connect-thread=0", "tcp-bind=10", "tcp-listen=10", "socket-unix=10", "tcp-fastopen=10",
+		"watch-mkdir-main=0", "watch-mkdir-thread=0", "watch-openat2=0", "watch-mkdir-main=10"}
 	if !slices.Equal(got, want) {
 		t.Errorf("steps %v, want %v", got, want)
 	}
@@ -252,9 +253,24 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 	}
 	injected := errors.New("injected")
 	unrecordedBroker := func(t *testing.T) {
-		setVar(t, &sliceStartBroker, func(l *os.File, _ ConnectDecider) (*Broker, error) {
+		setVar(t, &sliceStartBroker, func(l *os.File, _ ConnectDecider, _ ...func(WatchedCall)) (*Broker, error) {
 			return StartBroker(l, func(d netip.AddrPort) bool { return d.Addr().IsLoopback() })
 		})
+	}
+	unwatchedBroker := func(t *testing.T) {
+		setVar(t, &sliceStartBroker, func(l *os.File, d ConnectDecider, _ ...func(WatchedCall)) (*Broker, error) {
+			return StartBroker(l, d)
+		})
+	}
+	alteredWatch := func(alter func(*WatchedCall)) func(*testing.T) {
+		return func(t *testing.T) {
+			setVar(t, &sliceStartBroker, func(l *os.File, d ConnectDecider, watch ...func(WatchedCall)) (*Broker, error) {
+				return StartBroker(l, d, func(c WatchedCall) {
+					alter(&c)
+					watch[0](c)
+				})
+			})
+		}
 	}
 	directPayload := func(to stepTargets, token string) []string {
 		if c, err := net.Dial("tcp4", to.tcp.String()); err == nil {
@@ -282,7 +298,10 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 			})
 		}, reason: "tcp-connect-main: listener handoff: injected"},
 		{name: "broker start", setup: func(t *testing.T) {
-			setVar(t, &sliceStartBroker, func(l *os.File, _ ConnectDecider) (*Broker, error) { _ = l.Close(); return nil, injected })
+			setVar(t, &sliceStartBroker, func(l *os.File, _ ConnectDecider, _ ...func(WatchedCall)) (*Broker, error) {
+				_ = l.Close()
+				return nil, injected
+			})
 		}, reason: "tcp-connect-main: broker start: injected"},
 		{name: "release", setup: func(t *testing.T) {
 			setVar(t, &sliceRelease, func(*os.File) error { return injected })
@@ -317,6 +336,47 @@ func TestSliceSelfTestFailuresAreUnavailable(t *testing.T) {
 		{name: "denial setup failure", steps: append(slices.Clone(connects), exitStep("125")), reason: "s-exit: helper exit 125, want 10"},
 		{name: "denial signal", steps: append(slices.Clone(connects), sliceStep{probe: "s-kill", want: probeDenied}), reason: "s-kill: helper killed by signal 9"},
 		{name: "denial timeout", steps: []sliceStep{{probe: "s-hang", want: probeDenied}}, reason: "s-hang: helper timed out"},
+		{name: "main-thread mkdir the watch never saw", steps: []sliceStep{{probe: "watch-mkdir-main", want: probeAllowed, watch: "mkdirat", args: dirInTmp}},
+			setup: unwatchedBroker, reason: "watch check failed: watch-mkdir-main: the broker's watch never saw the probe's mkdirat path"},
+		{name: "worker-thread mkdir the watch never saw", steps: []sliceStep{{probe: "watch-mkdir-thread", want: probeAllowed, watch: "mkdirat", args: dirInTmp}},
+			setup: unwatchedBroker, reason: "watch check failed: watch-mkdir-thread: the broker's watch never saw the probe's mkdirat path"},
+		{name: "openat2 the watch never saw", steps: []sliceStep{{probe: "watch-openat2", want: probeAllowed, watch: "openat2", args: fileInTmp}},
+			setup: unwatchedBroker, reason: "watch check failed: watch-openat2: the broker's watch never saw the probe's openat2 path"},
+		{name: "openat2 flags read wrong", steps: []sliceStep{{probe: "watch-openat2", want: probeAllowed, watch: "openat2", args: fileInTmp}},
+			setup: func(t *testing.T) {
+				setVar(t, &sliceStartBroker, func(l *os.File, d ConnectDecider, watch ...func(WatchedCall)) (*Broker, error) {
+					return StartBroker(l, d, func(c WatchedCall) {
+						if c.OpenHow != nil {
+							c.OpenHow.How.Flags |= unix.O_TRUNC
+						}
+						watch[0](c)
+					})
+				})
+			}, reason: "watch check failed: watch-openat2: the broker's watch never saw the probe's openat2 path"},
+		{name: "openat2 open_how missing", steps: []sliceStep{{probe: "watch-openat2", want: probeAllowed, watch: "openat2", args: fileInTmp}},
+			setup: alteredWatch(func(c *WatchedCall) { c.OpenHow = nil }),
+			reason: "watch check failed: watch-openat2: the broker's watch never saw the probe's openat2 path"},
+		{name: "openat2 open_how decode error", steps: []sliceStep{{probe: "watch-openat2", want: probeAllowed, watch: "openat2", args: fileInTmp}},
+			setup: alteredWatch(func(c *WatchedCall) {
+				if c.OpenHow != nil {
+					c.OpenHow.Err = injected
+				}
+			}),
+			reason: "watch check failed: watch-openat2: the broker's watch never saw the probe's openat2 path"},
+		{name: "openat2 path resolve error", steps: []sliceStep{{probe: "watch-openat2", want: probeAllowed, watch: "openat2", args: fileInTmp}},
+			setup: alteredWatch(func(c *WatchedCall) {
+				if len(c.Paths) > 0 {
+					c.Paths[0].Err = injected
+				}
+			}),
+			reason: "watch check failed: watch-openat2: the broker's watch never saw the probe's openat2 path"},
+		{name: "mkdir path resolve error", steps: []sliceStep{{probe: "watch-mkdir-main", want: probeAllowed, watch: "mkdirat", args: dirInTmp}},
+			setup: alteredWatch(func(c *WatchedCall) {
+				if len(c.Paths) > 0 {
+					c.Paths[0].Err = injected
+				}
+			}),
+			reason: "watch check failed: watch-mkdir-main: the broker's watch never saw the probe's mkdirat path"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if c.steps != nil {
@@ -397,9 +457,34 @@ func TestConnectSelfTestPassesInRealHelper(t *testing.T) {
 		"unix-connect-thread=10 [@codemeld-connect-self-test tok] payload=false",
 		"unix-connect-main=10 [/u tok] payload=false",
 		"unix-connect-thread=10 [/u tok] payload=false",
+		"watch-mkdir-main=0 [d] payload=false",
+		"watch-mkdir-thread=0 [d] payload=false",
+		"watch-openat2=0 [f] payload=false",
+		"watch-mkdir-main=10 [d] payload=false",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("steps\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestBrokerSelfTestsRunTheWatchProbes(t *testing.T) {
+	to := stepTargets{tmp: "/w/tmp", root: "/w"}
+	want := []string{
+		"watch-mkdir-main=0 mkdirat [/w/tmp/d]",
+		"watch-mkdir-thread=0 mkdirat [/w/tmp/d]",
+		"watch-openat2=0 openat2 [/w/tmp/f]",
+		"watch-mkdir-main=10 mkdirat [/w/d]",
+	}
+	for mode, steps := range map[string][]sliceStep{"slice": sliceSteps, "connect": connectSteps, "full": fullSteps} {
+		var got []string
+		for _, s := range steps {
+			if s.watch != "" {
+				got = append(got, fmt.Sprintf("%s=%d %s %v", s.probe, s.want, s.watch, s.args(to, "tok")))
+			}
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s watch steps\n%s\nwant\n%s", mode, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
 	}
 }
 
@@ -471,6 +556,10 @@ func TestFullSelfTestPassesInRealHelper(t *testing.T) {
 		"unix-bind-main=10 [/w/s] payload=false",
 		"setsockopt-reuseport=10 [] payload=false",
 		"setsockopt-reuseaddr=0 [] payload=false",
+		"watch-mkdir-main=0 [/w/tmp/d] payload=false",
+		"watch-mkdir-thread=0 [/w/tmp/d] payload=false",
+		"watch-openat2=0 [/w/tmp/f] payload=false",
+		"watch-mkdir-main=10 [/w/d] payload=false",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("steps\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

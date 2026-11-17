@@ -820,7 +820,7 @@ func TestProductionDispatcher_ConfinedCommandKeepsItsModeAfterASwitchToBuild(t *
 func TestProductionDispatcher_BuildCommandKeepsBuildAfterASwitchToPlan(t *testing.T) {
 	active := mode.NewActiveState(mode.Build, mode.SourceUserCommand)
 	h := newPinShellHarness(t, active, nil, "ls", "head")
-	h.inner.onExec = func(cmdrunner.RunSpec) { active.ApplyUserCommand(mode.Plan) }
+	h.inner.onBounded = func(cmdrunner.RunSpec) { active.ApplyUserCommand(mode.Plan) }
 
 	if _, err := h.d.Dispatch(context.Background(), bashCall("c1", "ls ; head")); err != nil {
 		t.Fatalf("Dispatch: %v", err)
@@ -828,11 +828,14 @@ func TestProductionDispatcher_BuildCommandKeepsBuildAfterASwitchToPlan(t *testin
 	if live, _ := active.Current(); live != mode.Plan {
 		t.Fatalf("live mode = %q, want the switch to Plan to have happened mid-command", live)
 	}
-	if len(h.inner.execs) != 2 || len(h.inner.bounded) != 0 {
-		t.Fatalf("bounded/exec = %d/%d, want both stages under Build's unconfined resolution", len(h.inner.bounded), len(h.inner.execs))
+	if len(h.inner.bounded) != 2 || len(h.inner.execs) != 0 {
+		t.Fatalf("bounded/exec = %d/%d, want both stages confined", len(h.inner.bounded), len(h.inner.execs))
 	}
-	if filepath.Base(h.inner.execs[1].Argv[0]) != "head" {
-		t.Fatalf("second stage argv = %q, want head run directly", h.inner.execs[1].Argv)
+	if filepath.Base(h.inner.bounded[1].Argv[2]) != "head" {
+		t.Fatalf("second stage argv = %q, want head through the helper", h.inner.bounded[1].Argv)
+	}
+	if policy, _ := decodeFrame(t, h.inner.bounded[1].Stdin); policy.Mode != "auto_edits" {
+		t.Fatalf("second stage policy mode = %q, want Build's auto_edits policy", policy.Mode)
 	}
 	if pins := h.spy.recorded(); !slices.Equal(pins, []string{string(mode.Build)}) {
 		t.Fatalf("authorization pins = %v, want one authorization under build", pins)

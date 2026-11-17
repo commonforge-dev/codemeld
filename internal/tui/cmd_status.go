@@ -295,8 +295,6 @@ func sandboxLine(esc func(string) string, snap StatusSnapshot) string {
 			line += "; fewer permission prompts"
 		}
 		return line
-	case "off":
-		return "Sandbox: off — build mode runs commands outside the sandbox"
 	}
 	if snap.SandboxReason == "" {
 		return "Sandbox: unavailable — automatic command authorization is unavailable"

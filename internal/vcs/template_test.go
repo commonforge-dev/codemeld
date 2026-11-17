@@ -313,6 +313,12 @@ func TestLoadTemplates_ValidationErrors(t *testing.T) {
 			wantPart: "uses placeholder {path} it does not accept",
 		},
 		{
+			name:     "amend missing its message placeholder",
+			basename: "svn.yaml",
+			content:  buildTemplate(nil) + "amend:\n  argv: [svn, commit, --amend]\n",
+			wantPart: `action "amend" must contain its placeholder {message}`,
+		},
+		{
 			name:     "placeholder-accepting action missing placeholder",
 			basename: "svn.yaml",
 			content:  buildTemplate(map[string]string{"add": "add:\n  argv: [svn, add]\n"}),
@@ -510,5 +516,27 @@ func TestLoadTemplates_DuplicateKeyCarriesTheSharedFixAndFileAttribution(t *test
 	}
 	if strings.Contains(msg, "yaml_parse_error") {
 		t.Fatalf("message %q leaks the internal category token", msg)
+	}
+}
+
+func TestLoadTemplates_AmendIsOptional(t *testing.T) {
+	without, err := loadOne(t, "svn.yaml", buildTemplate(nil))
+	if err != nil {
+		t.Fatalf("LoadTemplates without amend: %v", err)
+	}
+	if _, ok := without["svn"].Actions["amend"]; ok {
+		t.Fatal("a template without amend loaded an amend action")
+	}
+
+	with, err := loadOne(t, "svn.yaml", buildTemplate(nil)+"amend:\n  argv: [svn, commit, --amend, -m, \"{message}\"]\n")
+	if err != nil {
+		t.Fatalf("LoadTemplates with amend: %v", err)
+	}
+	amend, ok := with["svn"].Actions["amend"]
+	if !ok {
+		t.Fatal("amend action not loaded")
+	}
+	if want := []string{"svn", "commit", "--amend", "-m", "{message}"}; !slices.Equal(amend.Argv, want) {
+		t.Errorf("amend.Argv = %v, want %v", amend.Argv, want)
 	}
 }

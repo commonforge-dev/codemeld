@@ -101,7 +101,7 @@ func TestSandboxStateAndLabel(t *testing.T) {
 	}{
 		{"constrained plan", constrained, "plan", "on", "sandbox: on"},
 		{"constrained auto_edits", constrained, "auto_edits", "on", "sandbox: on"},
-		{"constrained build", constrained, "build", "off", "sandbox: off"},
+		{"constrained build", constrained, "build", "on", "sandbox: on"},
 		{"refused plan", refused, "plan", "unavailable", "sandbox: unavailable (linux: invalid home: path must be absolute)"},
 		{"refused auto_edits", refused, "auto_edits", "unavailable", "sandbox: unavailable (linux: invalid home: path must be absolute)"},
 		{"refused build", refused, "build", "unavailable", "sandbox: unavailable (linux: invalid home: path must be absolute)"},

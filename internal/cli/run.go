@@ -65,8 +65,8 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"Without --model the run uses the active model from settings (model.active). --mode\n" +
 			"pins the interaction mode for the run, overriding mode.default; under 'plan' the mode\n" +
 			"denies mutating tool calls. On Linux (amd64/arm64), when codemeld's startup\n" +
-			"sandbox check passes, 'plan' and 'auto-edits' run shell commands inside an OS sandbox\n" +
-			"with filesystem and process-access restrictions, and 'build' runs them outside it; if\n" +
+			"sandbox check passes, shell commands in every mode run inside an OS sandbox with\n" +
+			"filesystem and process-access restrictions, and 'build' still asks before each one; if\n" +
 			"the check fails or the platform is not supported, commands run outside the sandbox.\n" +
 			"Under 'plan', with intact settings and a passing startup check on a supported host, a\n" +
 			"shell command runs inside the sandbox, where writes and network access fail. Without\n" +
@@ -133,7 +133,10 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"once per path — the value is never split on a separator, so --files-authorized\n" +
 			"'a,b.txt' authorizes the single file named a,b.txt. The two lists are independent: a\n" +
 			"path you may write is not a path you may delete, and a path you may delete is not a\n" +
-			"path you may write; name it in both lists to do both.\n\n" +
+			"path you may write; name it in both lists to do both. A path inside the work folder that\n" +
+			"resolves outside it through a symlink is refused at startup; for\n" +
+			"--files-authorized-delete only a symlinked parent folder counts, since a declared\n" +
+			"symlink means removing the link itself.\n\n" +
 			"With either flag present the lists become the sole authorization for the write tools\n" +
 			"(create, edit, delete, mkdir, move) for the whole run: an undeclared write is denied\n" +
 			"even if a permission grant, a repeat within the turn, the active mode, or\n" +
@@ -154,8 +157,8 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			"general_agent declaration is uncovered.\n\n" +
 			"Outside the file tools and delegation the lists bound nothing — the lists are not a\n" +
 			"sandbox and do not authorize or confine shell writes. A shell command follows the\n" +
-			"mode's OS sandbox when one is active; where none confines it (build mode, or a failed\n" +
-			"or unsupported startup check), a shell command authorized by a grant can still write\n" +
+			"mode's OS sandbox when one is active; where none confines it (after a failed or\n" +
+			"unsupported startup check), a shell command authorized by a grant can still write\n" +
 			"anywhere the process can write.\n" +
 			"Reads, shell, and network keep their ordinary authorization. An unresolvable\n" +
 			"declaration ends the run before its first turn, naming the path.\n\n" +
@@ -209,11 +212,11 @@ func newRunCommand(stdout, stderr io.Writer) *ucli.Command {
 			},
 			&ucli.StringSliceFlag{
 				Name:  "files-authorized",
-				Usage: "path this run may create and edit; repeat once per path (never split on a separator). With either files-authorized flag the lists are the sole authorization for create/edit/delete/mkdir/move, ahead of grants, the turn cache, the mode, and --prompt-for-approval; mkdir and move are never covered; declaring a path also authorizes creating its missing parent directories; a general_agent call may declare only paths this list covers, and an uncovered one starts no child; outside the file tools and delegation nothing is bound — the lists are not a sandbox, and where the mode's OS sandbox does not confine it (build mode, or a failed or unsupported startup check) a granted shell command can still write elsewhere",
+				Usage: "path this run may create and edit; repeat once per path (never split on a separator). With either files-authorized flag the lists are the sole authorization for create/edit/delete/mkdir/move, ahead of grants, the turn cache, the mode, and --prompt-for-approval; mkdir and move are never covered; declaring a path also authorizes creating its missing parent directories; a general_agent call may declare only paths this list covers, and an uncovered one starts no child; outside the file tools and delegation nothing is bound — the lists are not a sandbox, and where the mode's OS sandbox does not confine it (after a failed or unsupported startup check) a granted shell command can still write elsewhere; a path inside the work folder that resolves outside it through a symlink is refused at startup",
 			},
 			&ucli.StringSliceFlag{
 				Name:  "files-authorized-delete",
-				Usage: "path this run may delete — the exact path, whether a file, a symlink, or an empty directory (a non-empty directory is refused regardless); repeat once per path (never split on a separator). Independent of --files-authorized, and subject to the same sole-authorization rule and the same limits; on its own it leaves the run's write list empty, so every general_agent declaration is uncovered",
+				Usage: "path this run may delete — the exact path, whether a file, a symlink, or an empty directory (a non-empty directory is refused regardless); repeat once per path (never split on a separator). Independent of --files-authorized, and subject to the same sole-authorization rule and the same limits; on its own it leaves the run's write list empty, so every general_agent declaration is uncovered; a path inside the work folder whose parent folder resolves outside it through a symlink is refused at startup",
 			},
 			&ucli.BoolFlag{
 				Name:  "dev-debug",

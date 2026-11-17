@@ -69,7 +69,7 @@ var shortcuts = []shortcut{
 	{"Ctrl+Enter / Ctrl+J", "Insert a newline in the prompt without submitting"},
 	{"Ctrl-Q", "Copy selected input text"},
 	{"@", "Type @ at a word boundary to pick a project file or image to reference"},
-	{"shift+tab", "Cycle the interaction mode (plan/build/auto-edits); plan and auto-edits run shell commands in the sandbox when the startup check passed"},
+	{"shift+tab", "Cycle the interaction mode (plan/build/auto-edits); every mode runs shell commands in the sandbox when the startup check passed"},
 	{"CTRL-L", "Repaint the screen"},
 	{"CTRL-E", "Open the effort picker"},
 	{"CTRL-M", "Open the model picker"},
@@ -83,9 +83,8 @@ var shortcuts = []shortcut{
 }
 
 var sandboxStates = []shortcut{
-	{"on", "Plan or auto-edits mode after the startup sandbox check passed (Linux amd64/arm64): shell commands run with OS-enforced filesystem and process-access restrictions; auto-edits asks fewer permission prompts"},
-	{"off", "Build mode: shell commands run outside the sandbox, with build mode's usual prompts"},
-	{"unavailable", "The startup check failed, the OS or architecture is not supported, or a settings file broke during the session; /status shows the reason. After a passed startup check, a broken settings file keeps plan and auto-edits commands sandboxed but makes every command ask first; after a failed or unsupported check they run outside the sandbox with ordinary prompts, and stay outside it if a settings file later breaks. Build mode runs outside it either way"},
+	{"on", "Plan, build, or auto-edits mode after the startup sandbox check passed (Linux amd64/arm64): shell commands run with OS-enforced filesystem and process-access restrictions; build still asks before each command, and auto-edits asks fewer permission prompts"},
+	{"unavailable", "The startup check failed, the OS or architecture is not supported, or a settings file broke during the session; /status shows the reason. After a passed startup check, a broken settings file keeps commands in every mode sandboxed but makes every command ask first; after a failed or unsupported check commands in every mode run outside the sandbox with ordinary prompts, and stay outside it if a settings file later breaks"},
 }
 
 // RenderHelp returns the deterministic help-panel text for reg: every command
@@ -130,7 +129,7 @@ func RenderHelp(reg *Registry) string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\nSandbox (bottom-bar sandbox: on | off | unavailable)\n")
+	b.WriteString("\nSandbox (bottom-bar sandbox: on | unavailable)\n")
 	for _, s := range sandboxStates {
 		b.WriteString("  ")
 		b.WriteString(s.keys)

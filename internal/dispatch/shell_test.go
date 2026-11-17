@@ -4370,7 +4370,7 @@ func TestJJAutoArgvOverridesRepositoryAndWorkspaceConfiguration(t *testing.T) {
 			writeFile(t, filepath.Join(cwd, "tracked.txt"), "seed\n")
 			sentinel := filepath.Join(home, "formatter.sentinel")
 			writeJJDiffFormatter(t, jjConfigPath(t, cwd, layer), sentinel)
-			env := append(jjAutoEnv(), "XDG_CONFIG_HOME="+xdg)
+			env := append(jjAutoEnv(), "XDG_CONFIG_HOME="+xdg, "TMPDIR="+t.TempDir())
 
 			control := exec.Command("jj", "--no-pager", "diff")
 			control.Dir = cwd
@@ -5883,6 +5883,77 @@ func TestDispatchShell_SandboxedAutoEditsUnclassifiableLoopGetsNoNetwork(t *test
 		}
 		if auth.prompts != 0 || len(run.calls) != 1 || !slices.Equal(run.calls[0].Argv, []string{"sh", "-c", "curl x && nosuchprog y"}) {
 			t.Fatalf("prompts = %d, runner calls = %+v; want no prompt and one sh -c run", auth.prompts, run.calls)
+		}
+	})
+}
+
+type outsideMarkingAuthorizer struct {
+	mark     string
+	deny     string
+	subjects []string
+}
+
+func (a *outsideMarkingAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ PromptDisplay, _ permissions.ModeContext) (permissions.Decision, error) {
+	a.subjects = append(a.subjects, req.Subject)
+	if req.Subject == a.mark {
+		MarkRunOutside(ctx, req.Subject)
+	}
+	if req.Subject == a.deny {
+		return permissions.Decision{Outcome: "deny", DenyEnvelope: "denied"}, nil
+	}
+	return permissions.Decision{Outcome: "once"}, nil
+}
+
+type outsideRun struct {
+	subject string
+	outside bool
+}
+
+type outsideReadingRunner struct {
+	fakeRunner
+	runs []outsideRun
+}
+
+func (r *outsideReadingRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
+	r.runs = append(r.runs, outsideRun{subject: ShellSubject(ctx), outside: TakeRunOutside(ctx)})
+	return r.fakeRunner.Exec(ctx, spec)
+}
+
+func TestDispatchShell_OutsideMarkReachesOnlyItsCallsNextRunOfTheSubject(t *testing.T) {
+	cwd := t.TempDir()
+	t.Run("staged", func(t *testing.T) {
+		auth := &outsideMarkingAuthorizer{mark: "ls"}
+		run := &outsideReadingRunner{}
+		if _, err := DispatchShell(context.Background(), "ls; ls; true", "", cwd, auth, run); err != nil {
+			t.Fatal(err)
+		}
+		want := []outsideRun{{"ls", true}, {"ls", false}, {"true", false}}
+		if !slices.Equal(auth.subjects, []string{"ls", "ls", "true"}) || !slices.Equal(run.runs, want) {
+			t.Fatalf("authorized %q, runs %+v; want %+v", auth.subjects, run.runs, want)
+		}
+	})
+	t.Run("literal", func(t *testing.T) {
+		const command = "ls > /dev/null"
+		auth := &outsideMarkingAuthorizer{mark: command}
+		run := &outsideReadingRunner{}
+		if _, err := DispatchShell(context.Background(), command, "", cwd, auth, run); err != nil {
+			t.Fatal(err)
+		}
+		if want := []outsideRun{{command, true}}; !slices.Equal(auth.subjects, []string{command}) || !slices.Equal(run.runs, want) {
+			t.Fatalf("authorized %q, runs %+v; want %+v", auth.subjects, run.runs, want)
+		}
+	})
+	t.Run("a denied call's mark stays in that call", func(t *testing.T) {
+		if _, err := DispatchShell(context.Background(), "ls; true", "", cwd, &outsideMarkingAuthorizer{mark: "ls", deny: "true"}, &outsideReadingRunner{}); err == nil {
+			t.Fatal("DispatchShell = nil, want the denial")
+		}
+		MarkRunOutside(context.Background(), "ls")
+		run := &outsideReadingRunner{}
+		if _, err := DispatchShell(context.Background(), "ls", "", cwd, &outsideMarkingAuthorizer{}, run); err != nil {
+			t.Fatal(err)
+		}
+		if want := []outsideRun{{"ls", false}}; !slices.Equal(run.runs, want) {
+			t.Fatalf("runs %+v, want %+v", run.runs, want)
 		}
 	})
 }

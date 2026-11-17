@@ -156,7 +156,7 @@ type ScopeIdentity struct {
 // CaptureScopeIdentity requires scope to be already symlink-resolved: the open does not follow a final
 // symlink, so a link standing at that path is a capture failure rather than a capture of its target.
 func CaptureScopeIdentity(scope string) (ScopeIdentity, error) {
-	dir, oerr := os.OpenFile(scope, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	dir, oerr := openDirByComponentsFromRoot(scope)
 	if oerr != nil {
 		return ScopeIdentity{}, fmt.Errorf("cannot record the identity of the authorized directory %s: %w", scope, oerr)
 	}
@@ -195,7 +195,7 @@ func confirmAuthorizedScope(scope string, captured ScopeIdentity) (*authorizedSc
 	if captured == (ScopeIdentity{}) {
 		return nil, authorizedScopeReplaced
 	}
-	dir, oerr := os.OpenFile(scope, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	dir, oerr := openDirByComponentsFromRoot(scope)
 	if oerr != nil {
 		return nil, authorizedScopeReplaced
 	}
@@ -228,7 +228,7 @@ func (s *authorizedScope) openWithin(dir string) (*os.File, string) {
 	if !ok {
 		return nil, authorizedScopeReplaced
 	}
-	opened, reason := openDirRelative(s.dir, segs)
+	opened, reason := openDirRelative(s.dir, s.path, segs)
 	if reason != "" {
 		return nil, authorizedScopeReplaced
 	}
@@ -240,7 +240,7 @@ func (s *authorizedScope) openWithin(dir string) (*os.File, string) {
 }
 
 func (s *authorizedScope) stillAtPath() bool {
-	pathDir, oerr := os.OpenFile(s.path, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	pathDir, oerr := openDirByComponentsFromRoot(s.path)
 	if oerr != nil {
 		return false
 	}
@@ -453,7 +453,7 @@ func (t *CreateTool) create(ctx context.Context, scope *authorizedScope, target 
 		if _, _, _, derr := fsutil.EnsureDirAt(ancestorDir, strings.Join(dirSegs, "/"), lifecycle); derr != nil {
 			return failResult("failed to create the parent directories: " + derr.Error())
 		}
-		finalParent, descendReason := openDirRelative(ancestorDir, dirSegs)
+		finalParent, descendReason := openDirRelative(ancestorDir, ancestor, dirSegs)
 		if descendReason != "" {
 			return failResult(descendReason)
 		}
@@ -487,7 +487,7 @@ func (t *CreateTool) create(ctx context.Context, scope *authorizedScope, target 
 	}
 	moved := t.confirmParentStillAuthorized(ancestorDir, ancestor)
 	if moved == "" {
-		moved = confirmFinalParentUnmoved(ancestorDir, parentDir, dirSegs)
+		moved = confirmFinalParentUnmoved(ancestorDir, ancestor, parentDir, dirSegs)
 	}
 	if moved != "" {
 		if journal != nil {
@@ -514,14 +514,14 @@ func (t *CreateTool) openAuthorizedParent(scope *authorizedScope, authorizedDir 
 	if scope != nil {
 		return scope.openWithin(authorizedDir)
 	}
-	dir, oerr := os.OpenFile(authorizedDir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	dir, oerr := openDirByComponentsFromRoot(authorizedDir)
 	if oerr != nil {
 		return nil, "create target's parent directory changed after authorization; refusing to create outside the authorized directory"
 	}
 	return dir, ""
 }
 
-func openDirRelative(parent *os.File, segs []string) (*os.File, string) {
+func openDirRelative(parent *os.File, base string, segs []string) (*os.File, string) {
 	const redirected = "create target's parent directory changed after authorization; refusing to create outside the authorized directory"
 	if len(segs) == 0 {
 		// A fresh descriptor on the same directory, never parent itself: the caller closes what it is
@@ -533,8 +533,15 @@ func openDirRelative(parent *os.File, segs []string) (*os.File, string) {
 		return os.NewFile(uintptr(fd), parent.Name()), ""
 	}
 	cur := parent
-	for _, seg := range segs {
-		fd, oerr := unix.Openat(int(cur.Fd()), seg, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	for i, seg := range segs {
+		access := unix.O_RDONLY
+		if i < len(segs)-1 {
+			access = dirSearchOnly
+		}
+		fd, oerr := unix.Openat(int(cur.Fd()), seg, access|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if oerr != nil {
+			reportIfSymlink(int(cur.Fd()), seg, filepath.Join(base, strings.Join(segs[:i+1], "/")))
+		}
 		if cur != parent {
 			_ = cur.Close() //nolint:errcheck // read-only intermediate descriptor opened only to descend fd-relative
 		}
@@ -546,9 +553,31 @@ func openDirRelative(parent *os.File, segs []string) (*os.File, string) {
 	return cur, ""
 }
 
+// openDirByComponentsFromRoot walks dir from / because O_NOFOLLOW on a full path guards only its last component.
+func openDirByComponentsFromRoot(dir string) (*os.File, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf("%s is not an absolute path", dir)
+	}
+	rootFD, oerr := unix.Open("/", dirSearchOnly|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if oerr != nil {
+		return nil, &os.PathError{Op: "open", Path: "/", Err: oerr}
+	}
+	root := os.NewFile(uintptr(rootFD), "/")
+	defer root.Close() //nolint:errcheck // read-only descriptor held only to start the walk
+	var segs []string
+	if rel := strings.TrimPrefix(dir, "/"); rel != "" {
+		segs = strings.Split(rel, "/")
+	}
+	opened, reason := openDirRelative(root, "/", segs)
+	if reason != "" {
+		return nil, fmt.Errorf("%s is missing, not a directory, or reached through a symlink", dir)
+	}
+	return opened, nil
+}
+
 func (t *CreateTool) confirmParentStillAuthorized(ancestorDir *os.File, authorizedDir string) string {
 	const moved = "create target's parent directory moved during the create; refusing to report a create at a path the new file is not located at"
-	pathDir, oerr := os.OpenFile(authorizedDir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	pathDir, oerr := openDirByComponentsFromRoot(authorizedDir)
 	if oerr != nil {
 		return moved
 	}
@@ -561,12 +590,12 @@ func (t *CreateTool) confirmParentStillAuthorized(ancestorDir *os.File, authoriz
 	return ""
 }
 
-func confirmFinalParentUnmoved(ancestorDir, parentDir *os.File, dirSegs []string) string {
+func confirmFinalParentUnmoved(ancestorDir *os.File, ancestor string, parentDir *os.File, dirSegs []string) string {
 	const moved = "create target's parent directory moved during the create; refusing to report a create at a path the new file is not located at"
 	if len(dirSegs) == 0 {
 		return ""
 	}
-	reParent, reason := openDirRelative(ancestorDir, dirSegs)
+	reParent, reason := openDirRelative(ancestorDir, ancestor, dirSegs)
 	if reason != "" {
 		return moved
 	}

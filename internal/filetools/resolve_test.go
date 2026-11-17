@@ -350,3 +350,93 @@ func TestResolveDeclaredScopes_EmptyListsProduceNoCeiling(t *testing.T) {
 		t.Fatalf("write = %v, delete = %v, want both empty", write, remove)
 	}
 }
+
+func TestResolveDeclaredScopes_RefusesAnInsidePathThatResolvesOutside(t *testing.T) {
+	home := declRoot(t)
+	root := filepath.Join(home, "proj")
+	outside := declRoot(t)
+	mustMkdirAll(t, filepath.Join(root, "a"))
+	mustWriteFile(t, filepath.Join(outside, "f.txt"), "x\n")
+	mustWriteFile(t, filepath.Join(root, "inner.txt"), "x\n")
+	mustSymlink(t, filepath.Join(outside, "f.txt"), filepath.Join(root, "link.txt"))
+	mustSymlink(t, outside, filepath.Join(root, "sub"))
+	mustSymlink(t, outside, filepath.Join(root, "a", "b"))
+	mustSymlink(t, outside, filepath.Join(root, "link"))
+	mustSymlink(t, filepath.Join(root, "inner.txt"), filepath.Join(root, "alias.txt"))
+	via := filepath.Join(declRoot(t), "via")
+	mustSymlink(t, root, via)
+
+	refused := []struct {
+		name   string
+		delete bool
+		decl   string
+	}{
+		{"write final symlink to an outside file", false, "link.txt"},
+		{"write parent symlink, existing leaf", false, "sub/f.txt"},
+		{"write parent symlink, missing leaf", false, "sub/new.txt"},
+		{"delete parent symlink, existing leaf", true, "sub/f.txt"},
+		{"delete parent symlink, missing leaf", true, "sub/new.txt"},
+		{"write deeper parent symlink", false, "a/b/c.txt"},
+		{"delete deeper parent symlink", true, "a/b/c.txt"},
+		{"write dot-dot re-entering through a link", false, "sub/../link/f.txt"},
+		{"delete dot-dot re-entering through a link", true, "sub/../link/f.txt"},
+		{"write home-relative path under the launch folder", false, "~/proj/link.txt"},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			resolve := writeDecl
+			if tc.delete {
+				resolve = deleteDecl
+			}
+			got, err := resolve(t, home, root, tc.decl)
+			if err == nil {
+				t.Fatalf("declaration %q resolved to %q, want a refusal", tc.decl, got)
+			}
+			if !strings.Contains(err.Error(), strconv.Quote(tc.decl)) || !strings.Contains(err.Error(), "outside the launch folder") {
+				t.Fatalf("refusal %q does not name the declared path %q and the launch folder", err, tc.decl)
+			}
+		})
+	}
+
+	accepted := []struct {
+		name      string
+		delete    bool
+		launchDir string
+		decl      string
+		want      string
+	}{
+		{"delete final symlink to an outside file", true, root, "link.txt", filepath.Join(root, "link.txt")},
+		{"absolute outside path", false, root, filepath.Join(outside, "f.txt"), filepath.Join(outside, "f.txt")},
+		{"inside to inside symlink", false, root, "alias.txt", filepath.Join(root, "inner.txt")},
+		{"launch folder reached through a symlink", false, via, "inner.txt", filepath.Join(root, "inner.txt")},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			resolve := writeDecl
+			if tc.delete {
+				resolve = deleteDecl
+			}
+			got, err := resolve(t, home, tc.launchDir, tc.decl)
+			if err != nil {
+				t.Fatalf("declaration %q error = %v, want it accepted", tc.decl, err)
+			}
+			if got != tc.want {
+				t.Fatalf("declaration %q = %q, want %q", tc.decl, got, tc.want)
+			}
+		})
+	}
+}
+
+func mustMkdirAll(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink %s: %v", link, err)
+	}
+}

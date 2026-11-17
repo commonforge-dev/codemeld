@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"codemeld.dev/codemeld/internal/permissions"
@@ -233,12 +234,50 @@ func (e *DeniedError) Error() string {
 	return "shell command denied by permission prompt"
 }
 
+type shellCall struct {
+	mu      sync.Mutex
+	outside map[string]bool
+}
+
+type shellCallKey struct{}
+
+type shellSubjectKey struct{}
+
+func MarkRunOutside(ctx context.Context, subject string) {
+	call, ok := ctx.Value(shellCallKey{}).(*shellCall)
+	if !ok {
+		return
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	call.outside[subject] = true
+}
+
+func ShellSubject(ctx context.Context) string {
+	subject, _ := ctx.Value(shellSubjectKey{}).(string)
+	return subject
+}
+
+func TakeRunOutside(ctx context.Context) bool {
+	call, ok := ctx.Value(shellCallKey{}).(*shellCall)
+	subject, named := ctx.Value(shellSubjectKey{}).(string)
+	if !ok || !named {
+		return false
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	marked := call.outside[subject]
+	delete(call.outside, subject)
+	return marked
+}
+
 // DispatchShell normalizes, authorizes, and runs one raw shell command from the agent.
 // It performs no pattern-based shell-to-structured-tool rewriting: a raw command always goes
 // through the shell path. input is the verbatim command; home anchors ~ expansion during path-scope
 // resolution; processCWD is codemeld's working directory; authorizer and runner are the bound
 // permission and command-runner seams.
 func DispatchShell(ctx context.Context, input string, home string, processCWD string, authorizer Authorizer, runner Runner, guard ...securitystate.Policy) (tools.Result, error) {
+	ctx = context.WithValue(ctx, shellCallKey{}, &shellCall{outside: map[string]bool{}})
 	policy := guardPolicy(guard)
 	policy.Blocked = policy.Blocked.Current()
 	split, err := permissions.SplitCommand(input)
@@ -499,7 +538,7 @@ func dispatchLiteral(ctx context.Context, literalInput string, scope string, aut
 		Env:                  env,
 		ExceptionalAuthority: authority,
 	}
-	res, err := run.Exec(ctx, spec)
+	res, err := run.Exec(context.WithValue(ctx, shellSubjectKey{}, canonical), spec)
 	if err != nil {
 		return tools.Result{}, err
 	}
@@ -656,6 +695,7 @@ type stagePlan struct {
 	builtin bool
 	result  runner.RunResult
 	spec    runner.RunSpec
+	subject string
 }
 
 // runPipeGroup executes one `|`-joined group for both the direct and the staged route. Only
@@ -730,7 +770,11 @@ func planStages(stages []permissions.StageNormalization, autoAllowed []bool, sco
 		if err := resolveArgv0FromChildPath(&spec, stage); err != nil {
 			return nil, err
 		}
-		plans[i] = stagePlan{spec: spec}
+		req, err := stageRequest(stage, scope, home, permissions.ModeContext{}, "")
+		if err != nil {
+			return nil, err
+		}
+		plans[i] = stagePlan{spec: spec, subject: req.Req.Subject}
 	}
 	return plans, nil
 }
@@ -989,7 +1033,7 @@ func runStagesSequentially(ctx context.Context, plans []stagePlan, run Runner) (
 			spec := plan.spec
 			spec.Stdin = stdin
 			var err error
-			res, err = run.Exec(ctx, spec)
+			res, err = run.Exec(context.WithValue(ctx, shellSubjectKey{}, plan.subject), spec)
 			if err != nil {
 				return pipeGroupResult{}, err
 			}

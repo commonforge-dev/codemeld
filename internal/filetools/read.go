@@ -72,10 +72,8 @@ func (t *ReadTool) Advertise() tools.Metadata {
 // path (placed in the mode-auth context) and the path scope to authorize, mirroring the edit/create
 // target-scoped contract so authorization and the path actually read cannot drift. It rejects unknown
 // arguments, then delegates to ResolveReadTarget in required-path mode (a missing/empty `path` is
-// an in-band rejection) without rejecting directory symlinks (read targets a regular file, which
-// is enforced at invocation by ResolveReadFile, not here). The directory/non-regular/missing rejection
-// is deferred to InvokeWithResolvedTarget, where the read-tool symlink policy is applied to the
-// resolved target immediately before the read.
+// an in-band rejection) without rejecting directory symlinks. The directory/non-regular/missing rejection
+// is deferred to InvokeWithResolvedTarget, which opens the resolved target without following any symlink.
 func (t *ReadTool) ResolveTarget(args map[string]any) (target string, scope string, err error) {
 	if verr := rejectUnknownPhase1ReadArgs(ReadToolName, args); verr != nil {
 		return "", "", &TargetError{Kind: ReadToolName, Reason: verr.Error()}
@@ -134,11 +132,7 @@ func (t *ReadTool) read(resolvedTarget string, args map[string]any) tools.Result
 	if t.ExternalReadScope(resolvedTarget) {
 		boundary = filepath.Dir(resolvedTarget)
 	}
-	real, ok, reason := ResolveReadFile(resolvedTarget, boundary)
-	if !ok {
-		return failResult(reason)
-	}
-	f, reason := openNoFollowUnder(boundary, real)
+	f, reason := openNoFollowUnder(boundary, resolvedTarget)
 	if f == nil {
 		return failResult(reason)
 	}

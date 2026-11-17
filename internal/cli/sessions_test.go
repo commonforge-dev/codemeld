@@ -4394,72 +4394,64 @@ func TestSessionsPermissions_RevocationsKeepRecordOrderAndLiteralIdentity(t *tes
 	}
 }
 
-// TestSessionsPermissions_CountsDeclaredScope proves a caller's declared file scope is reported as
-// its own non-prompted source, in the text tally and the JSON report, and is included in the
-// denominator the prompt count is read against.
-func TestSessionsPermissions_CountsDeclaredScope(t *testing.T) {
-	records := []sessions.Record{
-		eventRecord(events.KindPermissionMatched, events.PermissionMatched{
-			SubjectKind: "tool", Subject: "create", PathScope: auditProj, Outcome: "once", OutcomeSource: "declared_scope",
-		}),
-		eventRecord(events.KindPermissionMatched, events.PermissionMatched{
-			SubjectKind: "tool", Subject: "edit", PathScope: auditProj, Outcome: "deny", OutcomeSource: "declared_scope",
-		}),
-		eventRecord(events.KindPermissionMatched, events.PermissionMatched{
-			SubjectKind: "tool", Subject: "Ripgrep", PathScope: auditProj, Outcome: "once", OutcomeSource: "cache",
-		}),
-	}
-	path := writeSession(t, "declared", records)
+func TestSessionsPermissions_CountsDeclaredSources(t *testing.T) {
+	cache := eventRecord(events.KindPermissionMatched, events.PermissionMatched{
+		SubjectKind: "tool", Subject: "Ripgrep", PathScope: auditProj, Outcome: "once", OutcomeSource: "cache",
+	})
+	for _, tc := range []struct {
+		field   string
+		session string
+		records []sessions.Record
+		tally   string
+	}{
+		{
+			field:   "declared_scope",
+			session: "declared",
+			records: []sessions.Record{
+				eventRecord(events.KindPermissionMatched, events.PermissionMatched{
+					SubjectKind: "tool", Subject: "create", PathScope: auditProj, Outcome: "once", OutcomeSource: "declared_scope",
+				}),
+				eventRecord(events.KindPermissionMatched, events.PermissionMatched{
+					SubjectKind: "tool", Subject: "edit", PathScope: auditProj, Outcome: "deny", OutcomeSource: "declared_scope",
+				}),
+				cache,
+			},
+			tally: "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 2, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)",
+		},
+		{
+			field:   "declared_command",
+			session: "declared-command",
+			records: []sessions.Record{
+				eventRecord(events.KindPermissionMatched, events.PermissionMatched{
+					SubjectKind: "direct", Subject: "prep-open-tasks.sh --only i425", PathScope: auditProj, Outcome: "once", OutcomeSource: "declared_command",
+				}),
+				eventRecord(events.KindPermissionMatched, events.PermissionMatched{
+					SubjectKind: "direct", Subject: "prep-open-tasks.sh --only i425 --force", PathScope: auditProj, Outcome: "once", OutcomeSource: "declared_command",
+				}),
+				cache,
+			},
+			tally: "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 2, open_read: 0, confined: 0, system_one_check: 0)",
+		},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			path := writeSession(t, tc.session, tc.records)
 
-	text := runPermissions(t, path)
-	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 2, declared_command: 0, open_read: 0, confined: 0, system_one_check: 0)"; !strings.Contains(text, want) {
-		t.Fatalf("permissions text missing %q:\n%s", want, text)
-	}
+			text := runPermissions(t, path)
+			if !strings.Contains(text, tc.tally) {
+				t.Fatalf("permissions text missing %q:\n%s", tc.tally, text)
+			}
 
-	var report struct {
-		NonPrompted struct {
-			DeclaredScope int `json:"declared_scope"`
-		} `json:"non_prompted"`
-	}
-	out := runPermissions(t, path, "--json")
-	if err := json.Unmarshal([]byte(out), &report); err != nil {
-		t.Fatalf("--json output is not one valid JSON document: %v\n%s", err, out)
-	}
-	if report.NonPrompted.DeclaredScope != 2 {
-		t.Fatalf("non_prompted.declared_scope = %d, want 2:\n%s", report.NonPrompted.DeclaredScope, out)
-	}
-}
-
-func TestSessionsPermissions_CountsDeclaredCommand(t *testing.T) {
-	records := []sessions.Record{
-		eventRecord(events.KindPermissionMatched, events.PermissionMatched{
-			SubjectKind: "direct", Subject: "prep-open-tasks.sh --only i425", PathScope: auditProj, Outcome: "once", OutcomeSource: "declared_command",
-		}),
-		eventRecord(events.KindPermissionMatched, events.PermissionMatched{
-			SubjectKind: "direct", Subject: "prep-open-tasks.sh --only i425 --force", PathScope: auditProj, Outcome: "once", OutcomeSource: "declared_command",
-		}),
-		eventRecord(events.KindPermissionMatched, events.PermissionMatched{
-			SubjectKind: "tool", Subject: "Ripgrep", PathScope: auditProj, Outcome: "once", OutcomeSource: "cache",
-		}),
-	}
-	path := writeSession(t, "declared-command", records)
-
-	text := runPermissions(t, path)
-	if want := "non-prompted authorizations: 3 (grant: 0, cache: 1, mode_auto: 0, declared_scope: 0, declared_command: 2, open_read: 0, confined: 0, system_one_check: 0)"; !strings.Contains(text, want) {
-		t.Fatalf("permissions text missing %q:\n%s", want, text)
-	}
-
-	var report struct {
-		NonPrompted struct {
-			DeclaredCommand int `json:"declared_command"`
-		} `json:"non_prompted"`
-	}
-	out := runPermissions(t, path, "--json")
-	if err := json.Unmarshal([]byte(out), &report); err != nil {
-		t.Fatalf("--json output is not one valid JSON document: %v\n%s", err, out)
-	}
-	if report.NonPrompted.DeclaredCommand != 2 {
-		t.Fatalf("non_prompted.declared_command = %d, want 2:\n%s", report.NonPrompted.DeclaredCommand, out)
+			var report struct {
+				NonPrompted map[string]any `json:"non_prompted"`
+			}
+			out := runPermissions(t, path, "--json")
+			if err := json.Unmarshal([]byte(out), &report); err != nil {
+				t.Fatalf("--json output is not one valid JSON document: %v\n%s", err, out)
+			}
+			if got := report.NonPrompted[tc.field]; got != float64(2) {
+				t.Fatalf("non_prompted.%s = %v, want 2:\n%s", tc.field, got, out)
+			}
+		})
 	}
 }
 

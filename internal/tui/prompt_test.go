@@ -4537,6 +4537,52 @@ func TestRenderPrompt_ExceptionalPromptNamesTheAuthority(t *testing.T) {
 	}
 }
 
+func TestRenderPrompt_OutsideSandboxPromptWarnsThatNothingLimitsTheCommand(t *testing.T) {
+	req := exceptionalDirectRequest()
+	req.Action = "Allow running outside the sandbox"
+	req.ExceptionalAuthority = "running outside the sandbox"
+	out := renderPrompt(req)
+	if !strings.Contains(out, "⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once.") {
+		t.Errorf("rendered prompt missing the outside-sandbox warning\n--- got ---\n%s", out)
+	}
+	if strings.Contains(out, "still runs inside the sandbox") {
+		t.Errorf("rendered prompt claims the command runs inside the sandbox\n--- got ---\n%s", out)
+	}
+}
+
+func TestRenderPrompt_OutsideReasonsReplaceTheSummaryRows(t *testing.T) {
+	req := exceptionalDirectRequest()
+	req.Action = "Allow running outside the sandbox"
+	req.ExceptionalAuthority = "running outside the sandbox"
+	req.Summary = literalPromptSummary("touch ~/sbtest/a.txt")
+	if out := renderPrompt(req); !strings.Contains(out, "cannot determine the full effect") {
+		t.Fatalf("fixture summary is not the unknown-effect summary\n--- got ---\n%s", out)
+	}
+	reason := "sandbox probably refused write: /home/u/sbtest/a.txt (touch; grant candidate: /home/u/sbtest)"
+	req.OutsideReasons = []string{reason}
+	out := renderPrompt(req)
+	if !strings.Contains(out, "Last run: the sandbox probably refused:\n"+reason+"\n") {
+		t.Errorf("rendered prompt missing the refusal rows\n--- got ---\n%s", out)
+	}
+	if strings.Contains(out, "cannot determine the full effect") || strings.Contains(out, "effect:") {
+		t.Errorf("rendered prompt still shows the summary rows\n--- got ---\n%s", out)
+	}
+	if lines := promptFixedLines(req); lines[0] != "Last run: the sandbox probably refused:" || lines[1] != reason {
+		t.Errorf("first fixed rows = %q, want the refusal header and first reason", lines[:2])
+	}
+}
+
+func TestOutsideReasonRows_ShowsThreeAndEscapesControlCharacters(t *testing.T) {
+	got := OutsideReasonRows([]string{"one\x1b[2J", "two", "three", "four", "five"})
+	want := []string{"Last run: the sandbox probably refused:", "one\\x1B[2J", "two", "three", "… plus 2 more"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("rows = %q, want %q", got, want)
+	}
+	if got := OutsideReasonRows(nil); got != nil {
+		t.Fatalf("rows without reasons = %q, want none", got)
+	}
+}
+
 func TestPromptOverlay_ExceptionalOffersOnlyAllowOnceAndDeny(t *testing.T) {
 	for _, req := range []PromptRequest{exceptionalDirectRequest(), exceptionalLiteralRequest(), exceptionalBatchedRequest()} {
 		if got := promptOptionsFor(req); !equalOptions(got, []PromptOption{OptionAllowOnce, OptionDeny}) {

@@ -1,11 +1,13 @@
 package enforce
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -49,7 +52,65 @@ var (
 	pidfdGetfd        = unix.PidfdGetfd
 	bindOrListenPause = func(nr int32, afterSyscall bool) {}
 	afterConfinedBind = func() {}
+	watchWait         = time.Second
+	watchSlots        = make(chan struct{}, 64)
+
+	ErrWatchNoParent    = errors.New("parent folder missing")
+	ErrWatchUnsupported = errors.New("path shape not modelled")
 )
+
+type WatchedCall struct {
+	Syscall   string
+	Tid       uint32
+	Process   string
+	Paths     []WatchedPath
+	Flags     uint32
+	Mode      uint32
+	Length    int64
+	OpenHow   *WatchedOpenHow
+	Target    string
+	TargetErr error
+	gate      *watchGate
+}
+
+type WatchedPath struct {
+	Path string
+	Err  error
+}
+
+type WatchedOpenHow struct {
+	How              unix.OpenHow
+	Size             uint64
+	ExtensionNonzero bool
+	Err              error
+}
+
+type watchGate struct {
+	mu       sync.Mutex
+	open     bool
+	recorded bool
+}
+
+func (c WatchedCall) Record(f func()) bool {
+	if c.gate == nil {
+		return false
+	}
+	c.gate.mu.Lock()
+	open := c.gate.open
+	c.gate.recorded = c.gate.recorded || open
+	c.gate.mu.Unlock()
+	if open {
+		f()
+	}
+	return open
+}
+
+func (g *watchGate) close() (recorded bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.open = false
+	return g.recorded
+}
 
 type ConnectDecider func(dest netip.AddrPort) bool
 
@@ -86,6 +147,9 @@ type Broker struct {
 	decide   ConnectDecider
 	register ConnectRegistrar
 	rules    *ConnectRules
+	watched  map[int32]string
+	watcher  func(WatchedCall)
+	unjudged atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -110,27 +174,31 @@ type brokerSocket struct {
 	turn  chan struct{}
 }
 
-func StartBroker(listener *os.File, decide ConnectDecider) (*Broker, error) {
-	return StartRegisteringBroker(listener, decide, nil)
+func StartBroker(listener *os.File, decide ConnectDecider, watch ...func(WatchedCall)) (*Broker, error) {
+	return StartRegisteringBroker(listener, decide, nil, watch...)
 }
 
-func StartRegisteringBroker(listener *os.File, decide ConnectDecider, register ConnectRegistrar) (*Broker, error) {
-	return startBroker(listener, decide, register, nil)
+func StartRegisteringBroker(listener *os.File, decide ConnectDecider, register ConnectRegistrar, watch ...func(WatchedCall)) (*Broker, error) {
+	return startBroker(listener, decide, register, nil, watch)
 }
 
-func StartConnectBroker(listener *os.File, rules ConnectRules, register ConnectRegistrar) (*Broker, error) {
+func StartConnectBroker(listener *os.File, rules ConnectRules, register ConnectRegistrar, watch ...func(WatchedCall)) (*Broker, error) {
 	if rules.Deny == nil {
 		if listener != nil {
 			_ = listener.Close()
 		}
 		return nil, errors.New("broker: no deny list")
 	}
-	return startBroker(listener, rules.Proxy, register, &rules)
+	return startBroker(listener, rules.Proxy, register, &rules, watch)
 }
 
-func startBroker(listener *os.File, decide ConnectDecider, register ConnectRegistrar, rules *ConnectRules) (*Broker, error) {
+func startBroker(listener *os.File, decide ConnectDecider, register ConnectRegistrar, rules *ConnectRules, watch []func(WatchedCall)) (*Broker, error) {
 	if listener == nil {
 		return nil, errors.New("broker: no listener")
+	}
+	if len(watch) > 1 {
+		_ = listener.Close()
+		return nil, errors.New("broker: more than one watch hook")
 	}
 	wake, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
 	if err != nil {
@@ -139,13 +207,25 @@ func startBroker(listener *os.File, decide ConnectDecider, register ConnectRegis
 	}
 	b := newBroker(int(listener.Fd()), decide)
 	b.listener, b.wake, b.register, b.rules = listener, wake, register, rules
+	if len(watch) == 1 {
+		b.watcher = watch[0]
+	}
 	go b.receive()
 	return b, nil
 }
 
 func newBroker(fd int, decide ConnectDecider) *Broker {
 	ctx, cancel := context.WithCancel(context.Background())
+	watched := map[int32]string{}
+	if info, err := nativeSeccompArch(); err == nil {
+		for _, name := range watchedSyscalls(info) {
+			if nr, ok := info.SyscallNames[name]; ok {
+				watched[int32(nr)] = name
+			}
+		}
+	}
 	return &Broker{
+		watched:    watched,
 		ctx:        ctx,
 		cancel:     cancel,
 		fd:         fd,
@@ -286,6 +366,219 @@ func (b *Broker) Decisions() []ConnectDecision {
 	return slices.Clone(b.decisions)
 }
 
+func (b *Broker) Unjudged() int {
+	return int(b.unjudged.Load())
+}
+
+func (b *Broker) watch(n seccompNotification, name string) (seccompNotificationResponse, bool) {
+	resp := seccompNotificationResponse{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
+	if b.watcher == nil {
+		return resp, true
+	}
+	slots := watchSlots
+	select {
+	case slots <- struct{}{}:
+	default:
+		b.unjudged.Add(1)
+		return resp, true
+	}
+	gate := &watchGate{open: true}
+	defer gate.close()
+	read, judge, judged := make(chan WatchedCall, 1), make(chan WatchedCall, 1), make(chan struct{})
+	go func() {
+		defer func() { <-slots }()
+		read <- watchCall(n, name)
+		if call, ok := <-judge; ok {
+			b.watcher(call)
+			close(judged)
+		}
+	}()
+	expiry := time.NewTimer(watchWait)
+	defer expiry.Stop()
+	select {
+	case call := <-read:
+		if err := notificationIDValid(b.fd, n.ID); err != nil {
+			close(judge)
+			return resp, err != unix.ENOENT
+		}
+		call.gate = gate
+		judge <- call
+	case <-expiry.C:
+		close(judge)
+		b.unjudged.Add(1)
+		return resp, true
+	}
+	select {
+	case <-judged:
+	case <-expiry.C:
+		if !gate.close() {
+			b.unjudged.Add(1)
+		}
+	}
+	return resp, true
+}
+
+func watchCall(n seccompNotification, name string) WatchedCall {
+	a := n.Args
+	c := WatchedCall{Syscall: name, Tid: n.Pid}
+	if comm, err := os.ReadFile("/proc/" + strconv.FormatUint(uint64(n.Pid), 10) + "/comm"); err == nil {
+		c.Process = strings.TrimSuffix(string(comm), "\n")
+	}
+	path := func(dirfd int32, addr uint64) {
+		p, err := watchString(n.Pid, addr)
+		if err == nil {
+			p, err = watchResolve(n.Pid, dirfd, p)
+		}
+		c.Paths = append(c.Paths, WatchedPath{Path: p, Err: err})
+	}
+	cwd := func(i int) { path(unix.AT_FDCWD, a[i]) }
+	at := func(i int) { path(int32(a[i]), a[i+1]) }
+	switch name {
+	case "open":
+		cwd(0)
+		c.Flags, c.Mode = uint32(a[1]), uint32(uint16(a[2]))
+	case "openat":
+		at(0)
+		c.Flags, c.Mode = uint32(a[2]), uint32(uint16(a[3]))
+	case "creat":
+		cwd(0)
+		c.Mode = uint32(uint16(a[1]))
+	case "openat2":
+		at(0)
+		how := watchOpenHow(n.Pid, a[2], a[3])
+		c.OpenHow = &how
+	case "mkdir", "rmdir", "unlink":
+		cwd(0)
+	case "mkdirat":
+		at(0)
+	case "unlinkat":
+		at(0)
+		c.Flags = uint32(a[2])
+	case "mknod":
+		cwd(0)
+		c.Mode = uint32(uint16(a[1]))
+	case "mknodat":
+		at(0)
+		c.Mode = uint32(uint16(a[2]))
+	case "truncate":
+		cwd(0)
+		c.Length = int64(a[1])
+	case "symlink":
+		c.Target, c.TargetErr = watchString(n.Pid, a[0])
+		cwd(1)
+	case "symlinkat":
+		c.Target, c.TargetErr = watchString(n.Pid, a[0])
+		at(1)
+	case "link", "rename":
+		cwd(0)
+		cwd(1)
+	case "renameat":
+		at(0)
+		at(2)
+	case "linkat", "renameat2":
+		at(0)
+		at(2)
+		c.Flags = uint32(a[4])
+	}
+	return c
+}
+
+func watchRead(pid uint32, addr uint64, buf []byte) error {
+	local := []unix.Iovec{{Base: &buf[0]}}
+	local[0].SetLen(len(buf))
+	n, err := unix.ProcessVMReadv(int(pid), local, []unix.RemoteIovec{{Base: uintptr(addr), Len: len(buf)}}, 0)
+	if err == nil && n != len(buf) {
+		return fmt.Errorf("short read %d of %d", n, len(buf))
+	}
+	return err
+}
+
+func watchString(pid uint32, addr uint64) (string, error) {
+	const page = 4096
+	var out []byte
+	for len(out) < unix.PathMax {
+		chunk := make([]byte, min(page-int(addr%page), unix.PathMax-len(out)))
+		if err := watchRead(pid, addr, chunk); err != nil {
+			return "", err
+		}
+		if i := bytes.IndexByte(chunk, 0); i >= 0 {
+			return string(append(out, chunk[:i]...)), nil
+		}
+		out = append(out, chunk...)
+		addr += uint64(len(chunk))
+	}
+	return "", errors.New("path longer than PATH_MAX")
+}
+
+func watchOpenHow(pid uint32, addr, size uint64) WatchedOpenHow {
+	h := WatchedOpenHow{Size: size}
+	if size < unix.SizeofOpenHow || size > uint64(os.Getpagesize()) {
+		h.Err = fmt.Errorf("open_how size %d", size)
+		return h
+	}
+	buf := make([]byte, size)
+	if h.Err = watchRead(pid, addr, buf); h.Err != nil {
+		return h
+	}
+	h.How = unix.OpenHow{
+		Flags:   binary.NativeEndian.Uint64(buf),
+		Mode:    binary.NativeEndian.Uint64(buf[8:]),
+		Resolve: binary.NativeEndian.Uint64(buf[16:]),
+	}
+	h.ExtensionNonzero = slices.ContainsFunc(buf[unix.SizeofOpenHow:], func(b byte) bool { return b != 0 })
+	return h
+}
+
+func watchResolve(tid uint32, dirfd int32, s string) (string, error) {
+	if s == "" {
+		return "", fmt.Errorf("%w: empty path", ErrWatchUnsupported)
+	}
+	raw := s
+	if !filepath.IsAbs(s) {
+		link := fmt.Sprintf("/proc/%d/cwd", tid)
+		if dirfd != unix.AT_FDCWD {
+			link = fmt.Sprintf("/proc/%d/fd/%d", tid, dirfd)
+		}
+		base, err := os.Readlink(link)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(base) || strings.HasSuffix(base, " (deleted)") {
+			return "", fmt.Errorf("%w: %s names %q, not a folder path", ErrWatchUnsupported, link, base)
+		}
+		raw = base + "/" + s
+	}
+	if raw == "/proc" || strings.HasPrefix(raw, "/proc/") {
+		return "", fmt.Errorf("%w: procfs path", ErrWatchUnsupported)
+	}
+	if strings.HasSuffix(raw, "/") {
+		return "", fmt.Errorf("%w: trailing slash", ErrWatchUnsupported)
+	}
+	i := strings.LastIndexByte(raw, '/')
+	dir, last := raw[:i], raw[i+1:]
+	if last == "." || last == ".." {
+		return "", fmt.Errorf("%w: final component %q", ErrWatchUnsupported, last)
+	}
+	if dir == "" {
+		dir = "/"
+	}
+	parent, err := filepath.EvalSymlinks(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", ErrWatchNoParent
+	}
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(parent)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("lookup parent %s is not a folder", parent)
+	}
+	return filepath.Join(parent, last), nil
+}
+
 func denial(id uint64) seccompNotificationResponse {
 	return seccompNotificationResponse{ID: id, Error: -int32(unix.EPERM)}
 }
@@ -304,6 +597,10 @@ func (b *Broker) answer(n seccompNotification) (seccompNotificationResponse, *Re
 			dec = &ConnectDecision{Reason: reason}
 		}
 		return deny, &Refusal{Reason: reason}, dec, true
+	}
+	if name, ok := b.watched[n.Nr]; ok {
+		resp, ok := b.watch(n, name)
+		return resp, nil, nil, ok
 	}
 	if n.Nr != unix.SYS_CONNECT && n.Nr != unix.SYS_BIND && n.Nr != unix.SYS_LISTEN {
 		return refuse(refusedNotTCP)

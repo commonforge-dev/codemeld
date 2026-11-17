@@ -21,6 +21,9 @@ add:
 commit:
   argv: [hg, commit, -m, "{message}"]
 
+amend:
+  argv: [hg, commit, --amend, -m, "{message}"]
+
 log:
   argv: [hg, log, --limit, "20"]
 

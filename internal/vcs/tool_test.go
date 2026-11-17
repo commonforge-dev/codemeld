@@ -358,7 +358,7 @@ func TestActionTool_BuiltinReadOnlyClassificationExactSets(t *testing.T) {
 		"vcs_merge_status": true, "vcs_rebase_status": true,
 	}
 	wantMutating := map[string]bool{
-		"vcs_add": true, "vcs_commit": true, "vcs_branch_create": true,
+		"vcs_add": true, "vcs_commit": true, "vcs_amend": true, "vcs_branch_create": true,
 		"vcs_branch_switch": true, "vcs_restore_file": true,
 		"vcs_stash": true, "vcs_stash_pop": true,
 	}
@@ -568,7 +568,7 @@ func TestActionTool_GitDescriptionsStayGeneric(t *testing.T) {
 func TestActionTool_NonOverriddenHgActionsStayGeneric(t *testing.T) {
 	reg := registerBuiltinActions(t, "hg")
 
-	expectedOverrides := []string{"add", "branch-create", "commit", "status"}
+	expectedOverrides := []string{"add", "amend", "branch-create", "commit", "status"}
 	if got := slices.Sorted(maps.Keys(vcsActionDescriptions["hg"])); !slices.Equal(got, expectedOverrides) {
 		t.Fatalf("hg override actions = %v, want exactly %v", got, expectedOverrides)
 	}
@@ -1516,11 +1516,14 @@ func routineWrites(reg *tools.Registry) map[string]bool {
 }
 
 func TestActionTool_RoutineVCSWriteMarksOnlyProductWrites(t *testing.T) {
-	want := map[string]bool{
-		"vcs_add": true, "vcs_commit": true, "vcs_branch_create": true, "vcs_branch_switch": true,
-		"vcs_restore_file": true, "vcs_stash": true, "vcs_stash_pop": true,
-	}
 	for _, name := range []string{"git", "hg", "jj"} {
+		want := map[string]bool{
+			"vcs_add": true, "vcs_commit": true, "vcs_branch_create": true, "vcs_branch_switch": true,
+			"vcs_restore_file": true, "vcs_stash": true, "vcs_stash_pop": true,
+		}
+		if name != "jj" {
+			want["vcs_amend"] = true
+		}
 		cases := []struct {
 			label   string
 			tmpl    *Template
@@ -1892,5 +1895,283 @@ func TestActionTool_CustomizedWriteKeepsOperandInterpretation(t *testing.T) {
 	}
 	if want := []string{"hg", "revert", "--all"}; !slices.Equal(run.gotSpec.Argv, want) {
 		t.Fatalf("argv = %q, want %q", run.gotSpec.Argv, want)
+	}
+}
+
+func TestRegisterActions_AmendOnlyWhenDeclared(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"without amend", buildTemplate(nil), false},
+		{"with amend", buildTemplate(nil) + "amend:\n  argv: [svn, commit, --amend, -m, \"{message}\"]\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpls, err := loadOne(t, "svn.yaml", tc.content)
+			if err != nil {
+				t.Fatalf("LoadTemplates: %v", err)
+			}
+			reg := tools.NewRegistry()
+			if err := RegisterActions(reg, tmpls["svn"], t.TempDir(), &scriptRunner{}, newCapture().appendEvent, 64); err != nil {
+				t.Fatalf("RegisterActions: %v", err)
+			}
+			if _, got := reg.Lookup("vcs_amend"); got != tc.want {
+				t.Fatalf("vcs_amend registered = %v, want %v", got, tc.want)
+			}
+			if _, ok := reg.Lookup("vcs_commit"); !ok {
+				t.Fatal("vcs_commit not registered")
+			}
+		})
+	}
+}
+
+func amendTool(vcsName, root string, argv []string, r cmdrunner.Runner) *ActionTool {
+	return &ActionTool{
+		actionName: "amend",
+		action:     ActionSpec{Argv: argv},
+		repoRoot:   root,
+		runner:     r,
+		emit:       newCapture().appendEvent,
+		vcsName:    vcsName,
+	}
+}
+
+func TestActionTool_AmendRefusesUnlessTheLastCommitIsLocal(t *testing.T) {
+	hgQuery := []string{"hg", "log", "-r", ".", "-T", "{phase}"}
+	gitQuery := []string{"git", "branch", "-r", "--contains", "HEAD"}
+	launchFailed := cmdrunner.RunResult{ExitCode: -1, LaunchErrCategory: fserrors.NotFound}
+	cases := []struct {
+		name    string
+		vcsName string
+		query   []string
+		result  cmdrunner.RunResult
+		allowed bool
+	}{
+		{"hg draft", "hg", hgQuery, cmdrunner.RunResult{Stdout: []byte("draft")}, true},
+		{"hg secret", "hg", hgQuery, cmdrunner.RunResult{Stdout: []byte("secret")}, true},
+		{"hg public", "hg", hgQuery, cmdrunner.RunResult{Stdout: []byte("public")}, false},
+		{"hg empty output", "hg", hgQuery, cmdrunner.RunResult{}, false},
+		{"hg draft with newline", "hg", hgQuery, cmdrunner.RunResult{Stdout: []byte("draft\n")}, false},
+		{"hg capitalized Draft", "hg", hgQuery, cmdrunner.RunResult{Stdout: []byte("Draft")}, false},
+		{"hg non-zero exit", "hg", hgQuery, cmdrunner.RunResult{ExitCode: 255, Stdout: []byte("draft")}, false},
+		{"hg launch error", "hg", hgQuery, launchFailed, false},
+		{"hg NUL byte", "hg", hgQuery, cmdrunner.RunResult{Stdout: []byte("draft\x00")}, false},
+		{"git local only", "git", gitQuery, cmdrunner.RunResult{}, true},
+		{"git on a remote-tracking branch", "git", gitQuery, cmdrunner.RunResult{Stdout: []byte("  origin/main\n")}, false},
+		{"git non-zero exit", "git", gitQuery, cmdrunner.RunResult{ExitCode: 129}, false},
+		{"git launch error", "git", gitQuery, launchFailed, false},
+		{"jj", "jj", nil, cmdrunner.RunResult{}, false},
+		{"user-named template", "mine", nil, cmdrunner.RunResult{}, false},
+	}
+	amendArgv := []string{"vcs-bin", "amend", "{message}"}
+	for _, tc := range cases {
+		for _, entry := range []string{"Invoke", "InvokeWithEffectiveCWD"} {
+			t.Run(tc.name+"/"+entry, func(t *testing.T) {
+				results := []cmdrunner.RunResult{tc.result, {}}
+				if tc.query == nil {
+					results = []cmdrunner.RunResult{{}}
+				}
+				run := &scriptRunner{results: results}
+				tool := amendTool(tc.vcsName, t.TempDir(), amendArgv, run)
+				args := map[string]any{"message": "fixed"}
+				var err error
+				if entry == "Invoke" {
+					_, err = tool.Invoke(context.Background(), args)
+				} else {
+					cwd, cwdErr := tool.EffectiveCWD()
+					_, err = tool.InvokeWithEffectiveCWD(context.Background(), args, cwd, cwdErr)
+				}
+				var want [][]string
+				if tc.query != nil {
+					want = append(want, tc.query)
+				}
+				if tc.allowed {
+					if err != nil {
+						t.Fatalf("amend refused: %v", err)
+					}
+					want = append(want, []string{"vcs-bin", "amend", "fixed"})
+				} else if !errors.Is(err, errSharedCommit) {
+					t.Fatalf("err = %v, want the shared-commit refusal", err)
+				}
+				if got := run.argvs(); !slices.EqualFunc(got, want, slices.Equal) {
+					t.Fatalf("ran %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestActionTool_AmendGitRepository(t *testing.T) {
+	requireBinary(t, "git")
+	root := t.TempDir()
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(t.TempDir(), "gitsystem"))
+	t.Setenv("GIT_AUTHOR_NAME", "codemeld")
+	t.Setenv("GIT_AUTHOR_EMAIL", "codemeld@example.test")
+	t.Setenv("GIT_COMMITTER_NAME", "codemeld")
+	t.Setenv("GIT_COMMITTER_EMAIL", "codemeld@example.test")
+	runIn(t, root, "git", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("a\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runIn(t, root, "git", "add", ".")
+	runIn(t, root, "git", "commit", "-m", "base")
+	tool := amendTool("git", root, []string{"git", "commit", "--amend", "-m", "{message}"}, cmdrunner.DirectExecRunner{})
+	subject := func() string {
+		out, err := exec.Command("git", "-C", root, "log", "-1", "--format=%s").Output()
+		if err != nil {
+			t.Fatalf("git log: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	res, err := tool.Invoke(context.Background(), map[string]any{"message": "amended"})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("amend of a local-only commit: err %v, exit %d, stderr %s", err, res.ExitCode, res.Stderr)
+	}
+	if got := subject(); got != "amended" {
+		t.Fatalf("last commit subject = %q, want amended", got)
+	}
+
+	runIn(t, root, "git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	if _, err := tool.Invoke(context.Background(), map[string]any{"message": "rewritten"}); !errors.Is(err, errSharedCommit) {
+		t.Fatalf("err = %v, want the shared-commit refusal", err)
+	}
+	if got := subject(); got != "amended" {
+		t.Fatalf("last commit subject = %q after a refusal, want amended", got)
+	}
+}
+
+type recordingRunner struct {
+	cmdrunner.DirectExecRunner
+	specs []cmdrunner.RunSpec
+}
+
+func (r *recordingRunner) Exec(ctx context.Context, spec cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
+	r.specs = append(r.specs, spec)
+	return r.DirectExecRunner.Exec(ctx, spec)
+}
+
+func TestActionTool_AmendChecksTheRepositoryItRunsIn(t *testing.T) {
+	requireBinary(t, "git")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "gitconfig"))
+	t.Setenv("GIT_CONFIG_SYSTEM", filepath.Join(t.TempDir(), "gitsystem"))
+	t.Setenv("GIT_AUTHOR_NAME", "codemeld")
+	t.Setenv("GIT_AUTHOR_EMAIL", "codemeld@example.test")
+	t.Setenv("GIT_COMMITTER_NAME", "codemeld")
+	t.Setenv("GIT_COMMITTER_EMAIL", "codemeld@example.test")
+	gitQuery := []string{"git", "branch", "-r", "--contains", "HEAD"}
+	for _, sharedRepo := range []string{"nested", "outer"} {
+		for _, entry := range []string{"Invoke", "InvokeWithEffectiveCWD"} {
+			t.Run(sharedRepo+" shared/"+entry, func(t *testing.T) {
+				root := t.TempDir()
+				nested := filepath.Join(root, "nested")
+				for _, dir := range []string{root, nested} {
+					if err := os.MkdirAll(dir, 0o755); err != nil {
+						t.Fatalf("MkdirAll: %v", err)
+					}
+					runIn(t, dir, "git", "init", "-b", "main")
+					if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a\n"), 0o600); err != nil {
+						t.Fatalf("WriteFile: %v", err)
+					}
+					runIn(t, dir, "git", "add", "a.txt")
+					runIn(t, dir, "git", "commit", "-m", "base")
+				}
+				sharedDir := nested
+				if sharedRepo == "outer" {
+					sharedDir = root
+				}
+				runIn(t, sharedDir, "git", "update-ref", "refs/remotes/origin/main", "HEAD")
+				head := func() string {
+					out, err := exec.Command("git", "-C", nested, "log", "-1", "--format=%H %s").Output()
+					if err != nil {
+						t.Fatalf("git log: %v", err)
+					}
+					return strings.TrimSpace(string(out))
+				}
+				before := head()
+
+				run := &recordingRunner{}
+				tool := amendTool("git", root, []string{"git", "commit", "--amend", "-m", "{message}"}, run)
+				tool.action.Cwd = "nested"
+				args := map[string]any{"message": "amended"}
+				var err error
+				if entry == "Invoke" {
+					_, err = tool.Invoke(context.Background(), args)
+				} else {
+					cwd, cwdErr := tool.EffectiveCWD()
+					_, err = tool.InvokeWithEffectiveCWD(context.Background(), args, cwd, cwdErr)
+				}
+
+				wantCwd, cwdErr := tool.EffectiveCWD()
+				if cwdErr != nil {
+					t.Fatalf("EffectiveCWD: %v", cwdErr)
+				}
+				if len(run.specs) == 0 || !slices.Equal(run.specs[0].Argv, gitQuery) {
+					t.Fatalf("first exec = %v, want the shared-commit query", run.specs)
+				}
+				for _, spec := range run.specs {
+					if spec.Cwd != wantCwd {
+						t.Fatalf("%v ran in %q, want %q", spec.Argv, spec.Cwd, wantCwd)
+					}
+				}
+				if sharedRepo == "nested" {
+					if !errors.Is(err, errSharedCommit) {
+						t.Fatalf("err = %v, want the shared-commit refusal", err)
+					}
+					if len(run.specs) != 1 {
+						t.Fatalf("ran %d commands after the refusal, want only the query", len(run.specs))
+					}
+					if got := head(); got != before {
+						t.Fatalf("nested HEAD = %q after a refusal, want %q", got, before)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("amend of a local-only nested commit refused: %v", err)
+				}
+				if got := head(); !strings.HasSuffix(got, " amended") {
+					t.Fatalf("nested HEAD = %q, want subject amended", got)
+				}
+			})
+		}
+	}
+}
+
+func TestActionTool_AmendHgRepository(t *testing.T) {
+	requireBinary(t, "hg")
+	root := t.TempDir()
+	t.Setenv("HGRCPATH", filepath.Join(t.TempDir(), "hgrc"))
+	t.Setenv("HGUSER", "codemeld <codemeld@example.test>")
+	runIn(t, root, "hg", "init")
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("a\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runIn(t, root, "hg", "add", "a.txt")
+	runIn(t, root, "hg", "commit", "-m", "base")
+	tool := amendTool("hg", root, []string{"hg", "commit", "--amend", "-m", "{message}"}, cmdrunner.DirectExecRunner{})
+	description := func() string {
+		out, err := exec.Command("hg", "-R", root, "log", "-r", ".", "-T", "{desc}").Output()
+		if err != nil {
+			t.Fatalf("hg log: %v", err)
+		}
+		return string(out)
+	}
+
+	res, err := tool.Invoke(context.Background(), map[string]any{"message": "amended"})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("amend of a draft commit: err %v, exit %d, stderr %s", err, res.ExitCode, res.Stderr)
+	}
+	if got := description(); got != "amended" {
+		t.Fatalf("last commit description = %q, want amended", got)
+	}
+
+	runIn(t, root, "hg", "phase", "--public", "-r", ".")
+	if _, err := tool.Invoke(context.Background(), map[string]any{"message": "rewritten"}); !errors.Is(err, errSharedCommit) {
+		t.Fatalf("err = %v, want the shared-commit refusal", err)
+	}
+	if got := description(); got != "amended" {
+		t.Fatalf("last commit description = %q after a refusal, want amended", got)
 	}
 }

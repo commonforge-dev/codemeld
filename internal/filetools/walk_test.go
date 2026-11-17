@@ -929,3 +929,187 @@ func TestClassifyDirEntry_UnknownTypeUsesInfo(t *testing.T) {
 		}
 	})
 }
+
+func walkSwapAt(t *testing.T, seam *func(), swap func()) {
+	t.Helper()
+	orig := *seam
+	t.Cleanup(func() { *seam = orig })
+	calls := 0
+	*seam = func() {
+		calls++
+		if calls == 1 {
+			swap()
+		}
+	}
+}
+
+func walkEmitted(opts WalkOptions) ([]string, error) {
+	var got []string
+	err := WalkContext(context.Background(), opts, func(e WalkEntry) error {
+		got = append(got, e.RelPath)
+		return nil
+	})
+	return got, err
+}
+
+func walkAssertRefused(t *testing.T, got []string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("walk error = nil, want a refusal (emitted %v)", got)
+	}
+	for _, rel := range got {
+		if strings.Contains(rel, "SENTINEL") {
+			t.Fatalf("walk emitted %q, which only a read of the swapped-in folder can reach before the refusal", rel)
+		}
+	}
+}
+
+type walkSwapBackMatcher struct{ swapBack func() }
+
+func (m *walkSwapBackMatcher) ShouldSkip(string, EntryKind) bool {
+	if m.swapBack != nil {
+		m.swapBack()
+		m.swapBack = nil
+	}
+	return false
+}
+
+func TestWalk_AncestorSwappedAfterRootCheckRefused(t *testing.T) {
+	proj := eval(t, t.TempDir())
+	outside := eval(t, t.TempDir())
+	root := filepath.Join(proj, "a", "b")
+	mkdir(t, root)
+	writeFile(t, filepath.Join(root, "SENTINEL"), "x")
+	mkdir(t, filepath.Join(outside, "b"))
+	writeFile(t, filepath.Join(outside, "b", "SENTINEL"), "x")
+	walkSwapAt(t, &walkBeforeRootOpen, func() { replaceWithSymlink(t, filepath.Join(proj, "a"), outside) })
+
+	got, err := walkEmitted(WalkOptions{Root: root, ProjectRoot: proj})
+	walkAssertRefused(t, got, err)
+}
+
+func TestWalk_SubfolderSwappedBeforeDescentRefused(t *testing.T) {
+	proj := eval(t, t.TempDir())
+	outside := eval(t, t.TempDir())
+	mkdir(t, filepath.Join(proj, "sub"))
+	writeFile(t, filepath.Join(proj, "sub", "SENTINEL"), "x")
+	writeFile(t, filepath.Join(outside, "SENTINEL"), "x")
+	walkSwapAt(t, &walkBeforeChildOpen, func() { replaceWithSymlink(t, filepath.Join(proj, "sub"), outside) })
+
+	got, err := walkEmitted(WalkOptions{Root: proj, ProjectRoot: proj})
+	walkAssertRefused(t, got, err)
+}
+
+func TestWalk_AncestorSwappedToBlockedFolderAndBackRefused(t *testing.T) {
+	proj := eval(t, t.TempDir())
+	outside := eval(t, t.TempDir())
+	root := filepath.Join(proj, "a", "b")
+	mkdir(t, root)
+	writeFile(t, filepath.Join(root, "SENTINEL"), "x")
+	secret := filepath.Join(outside, "b")
+	mkdir(t, secret)
+	writeFile(t, filepath.Join(secret, "SENTINEL"), "x")
+	blocked := permissions.NewBlockedPaths(eval(t, t.TempDir()), []permissions.BlockedEntry{{Path: secret, Source: "test"}})
+	ancestor := filepath.Join(proj, "a")
+	m := &walkSwapBackMatcher{}
+	walkSwapAt(t, &walkBeforeRootOpen, func() {
+		replaceWithSymlink(t, ancestor, outside)
+		m.swapBack = func() {
+			if err := os.Remove(ancestor); err != nil {
+				t.Fatalf("Remove: %v", err)
+			}
+			if err := os.Rename(ancestor+"-orig", ancestor); err != nil {
+				t.Fatalf("Rename: %v", err)
+			}
+		}
+	})
+
+	got, err := walkEmitted(WalkOptions{Root: root, ProjectRoot: proj, Ignore: []IgnoreMatcher{m}, Blocked: blocked})
+	walkAssertRefused(t, got, err)
+}
+
+func walkSearchOnly(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores folder permissions")
+	}
+	if err := os.Chmod(dir, 0o111); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+}
+
+func TestWalk_TargetBelowSearchOnlyFolderListed(t *testing.T) {
+	proj := eval(t, t.TempDir())
+	root := filepath.Join(proj, "a", "b")
+	mkdir(t, root)
+	writeFile(t, filepath.Join(root, "f.txt"), "x")
+	walkSearchOnly(t, filepath.Join(proj, "a"))
+
+	got, err := walkEmitted(WalkOptions{Root: root, ProjectRoot: proj})
+	if err != nil || len(got) != 1 || got[0] != "a/b/f.txt" {
+		t.Fatalf("walk = %v, %v; want [a/b/f.txt], nil", got, err)
+	}
+}
+
+func TestWalk_TargetBelowSearchOnlyBoundaryListed(t *testing.T) {
+	proj := eval(t, t.TempDir())
+	root := filepath.Join(proj, "b")
+	mkdir(t, root)
+	writeFile(t, filepath.Join(root, "f.txt"), "x")
+	walkSearchOnly(t, proj)
+
+	got, err := walkEmitted(WalkOptions{Root: root, ProjectRoot: proj})
+	if err != nil || len(got) != 1 || got[0] != "b/f.txt" {
+		t.Fatalf("walk = %v, %v; want [b/f.txt], nil", got, err)
+	}
+}
+
+func TestWalk_SymlinkSwapReportsTheSwappedPathOnce(t *testing.T) {
+	for _, at := range []string{"root open", "subfolder open"} {
+		t.Run(at, func(t *testing.T) {
+			proj := eval(t, t.TempDir())
+			outside := eval(t, t.TempDir())
+			swapped := filepath.Join(proj, "a")
+			root, seam := filepath.Join(swapped, "b"), &walkBeforeRootOpen
+			mkdir(t, root)
+			mkdir(t, filepath.Join(outside, "b"))
+			if at == "subfolder open" {
+				root, seam = proj, &walkBeforeChildOpen
+			}
+			walkSwapAt(t, seam, func() { replaceWithSymlink(t, swapped, outside) })
+			reports := recordSwapReports(t)
+
+			got, err := walkEmitted(WalkOptions{Root: root, ProjectRoot: proj})
+			walkAssertRefused(t, got, err)
+			if len(*reports) != 1 || (*reports)[0] != swapWarning(swapped) {
+				t.Fatalf("reports = %q, want exactly [%q]", *reports, swapWarning(swapped))
+			}
+		})
+	}
+}
+
+func TestWalk_DeletedBeforeOpenRefusesWithoutReport(t *testing.T) {
+	for _, at := range []string{"root open", "subfolder open"} {
+		t.Run(at, func(t *testing.T) {
+			proj := eval(t, t.TempDir())
+			root, seam := filepath.Join(proj, "a", "b"), &walkBeforeRootOpen
+			mkdir(t, root)
+			if at == "subfolder open" {
+				root, seam = proj, &walkBeforeChildOpen
+			}
+			walkSwapAt(t, seam, func() {
+				if err := os.RemoveAll(filepath.Join(proj, "a")); err != nil {
+					t.Fatalf("RemoveAll: %v", err)
+				}
+			})
+			reports := recordSwapReports(t)
+
+			got, err := walkEmitted(WalkOptions{Root: root, ProjectRoot: proj})
+			walkAssertRefused(t, got, err)
+			if len(*reports) != 0 {
+				t.Fatalf("reports = %q, want none for a deleted folder", *reports)
+			}
+		})
+	}
+}

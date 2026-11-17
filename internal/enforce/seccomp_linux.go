@@ -19,6 +19,7 @@ const (
 	seccompNrOffset   = 0
 	seccompArchOffset = 4
 	seccompArgsOffset = 16
+	watchWriteFlags   = unix.O_WRONLY | unix.O_RDWR | unix.O_CREAT | unix.O_TRUNC
 )
 
 var seccompDenyAll = []string{
@@ -190,6 +191,18 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 			}
 			names = append(names, "setsockopt")
 		}
+		for _, name := range watchedSyscalls(info) {
+			blocks[name] = []bpf.Instruction{notify}
+		}
+		for name, flagsArg := range map[string]uint32{"openat": 2, "open": 1} {
+			blocks[name] = []bpf.Instruction{
+				loadArg(flagsArg),
+				bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: watchWriteFlags, SkipFalse: 1},
+				notify,
+				loadNr,
+			}
+		}
+		names = append(names, watchedSyscalls(info)...)
 		for name, flagsArg := range map[string]uint32{"sendto": 3, "sendmsg": 2, "sendmmsg": 3} {
 			blocks[name] = []bpf.Instruction{
 				loadArg(flagsArg),
@@ -215,6 +228,14 @@ func seccompFilterFor(p Policy, info *arch.Info) ([]bpf.Instruction, error) {
 		prog = append(append(prog, bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: uint32(nr), SkipTrue: uint8(len(block))}), block...)
 	}
 	return append(prog, bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW}), nil
+}
+
+func watchedSyscalls(info *arch.Info) []string {
+	names := []string{"mkdirat", "unlinkat", "renameat2", "linkat", "symlinkat", "mknodat", "truncate", "openat2", "openat"}
+	if info.Name == arch.X86_64.Name {
+		names = append(names, "mkdir", "rmdir", "unlink", "rename", "renameat", "link", "symlink", "mknod", "creat", "open")
+	}
+	return names
 }
 
 func brokerSocketBlock(withUnix bool, eperm bpf.Instruction) []bpf.Instruction {

@@ -115,25 +115,23 @@ func TestRenderHelp_ListsPhaseOneCommandsAndShortcuts(t *testing.T) {
 func TestRenderHelp_SandboxSection(t *testing.T) {
 	out := RenderHelp(BuildRegistry(nil))
 	shortcutsAt := strings.Index(out, "Keyboard shortcuts")
-	sandboxAt := strings.Index(out, "\nSandbox (bottom-bar sandbox: on | off | unavailable)\n")
+	sandboxAt := strings.Index(out, "\nSandbox (bottom-bar sandbox: on | unavailable)\n")
 	envAt := strings.Index(out, "Environment variables")
 	if shortcutsAt < 0 || sandboxAt < shortcutsAt || envAt < sandboxAt {
 		t.Fatalf("want the Sandbox section between the shortcuts and the environment variables:\n%s", out)
 	}
 	for _, want := range []string{
-		"shift+tab — Cycle the interaction mode (plan/build/auto-edits); plan and auto-edits run shell commands in the sandbox when the startup check passed",
-		"  on — Plan or auto-edits mode after the startup sandbox check passed (Linux amd64/arm64): shell commands run with OS-enforced filesystem and process-access restrictions; auto-edits asks fewer permission prompts",
-		"  off — Build mode: shell commands run outside the sandbox, with build mode's usual prompts",
+		"shift+tab — Cycle the interaction mode (plan/build/auto-edits); every mode runs shell commands in the sandbox when the startup check passed",
+		"  on — Plan, build, or auto-edits mode after the startup sandbox check passed (Linux amd64/arm64): shell commands run with OS-enforced filesystem and process-access restrictions; build still asks before each command, and auto-edits asks fewer permission prompts",
 		"  unavailable — The startup check failed, the OS or architecture is not supported, or a settings file broke during the session; /status shows the reason.",
-		"After a passed startup check, a broken settings file keeps plan and auto-edits commands sandboxed but makes every command ask first",
-		"after a failed or unsupported check they run outside the sandbox with ordinary prompts, and stay outside it if a settings file later breaks",
-		"Build mode runs outside it either way",
+		"After a passed startup check, a broken settings file keeps commands in every mode sandboxed but makes every command ask first",
+		"after a failed or unsupported check commands in every mode run outside the sandbox with ordinary prompts, and stay outside it if a settings file later breaks",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing sandbox text %q", want)
 		}
 	}
-	for _, banned := range []string{"never prompt", "isolat"} {
+	for _, banned := range []string{"never prompt", "isolat", "  off — ", "Build mode runs outside", "build mode's usual prompts"} {
 		if strings.Contains(out, banned) {
 			t.Errorf("help output overclaims the sandbox with %q", banned)
 		}

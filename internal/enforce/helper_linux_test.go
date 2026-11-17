@@ -615,6 +615,11 @@ func TestRunHelperBrokerHandoff(t *testing.T) {
 				t.Fatalf("helper exited before release: %v\n%s", h.err, h.stderr.String())
 			default:
 			}
+			b, err := StartBroker(l, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(b.Stop)
 			if err := ReleaseHelper(h.parent); err != nil {
 				t.Fatal(err)
 			}

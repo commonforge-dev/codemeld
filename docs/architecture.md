@@ -65,7 +65,7 @@ A sandboxed command starts as codemeld's own binary running a hidden helper. The
 policy from its stdin (never the command line, which other processes can read), sets resource
 limits and `no_new_privs`, applies a Landlock ruleset (Landlock ABI 3 or newer) and a seccomp
 filter, then becomes the command. Everything the command starts inherits the restrictions, and
-none can be removed. The command sees codemeld's launch environment minus the fixed-table names,
+none can be removed. In Plan and Auto edits, the command sees codemeld's launch environment minus the fixed-table names,
 secret-looking names and values carrying a URL credential (`runner.InheritedEnvironment`); names
 such as `LD_PRELOAD` or `XDG_CONFIG_HOME` are inherited, and an assignment to them is refused only
 when codemeld parses it from the command (`runner.FixedEnvironment`), not inside shell text run as
@@ -74,7 +74,10 @@ written. Then come the fixed table's `PATH`, `HOME`, `PWD`, `TMPDIR`,
 `GIT_CONFIG_GLOBAL=/dev/null` in place of any inherited one when a global git config is blocked
 (`confinement.prepare`). An inherited value that
 resolves to the same folder as codemeld's own temp folder (`os.TempDir()`) is replaced with the
-session temp folder (`namesFolder`).
+session temp folder (`namesFolder`). A Build command instead keeps codemeld's full environment,
+secret-looking names, `PATH` and `GOCACHE` included: only `TERM=dumb`, the proxy variables, the
+`GIT_CONFIG_GLOBAL=/dev/null` override and the temp folder rewrite apply, and an unset or empty
+`TMPDIR` becomes the session temp folder (`confinement.prepareBuild`).
 
 - **Files.** Reads are allowed everywhere except the blocked paths, which always include
   `~/.codemeld`; the one exception is `~/.codemeld/skills`, readable under the conditions in
@@ -114,13 +117,13 @@ session temp folder (`namesFolder`).
   another process: the one socket it may create is a Unix stream or seqpacket socket pair, whose ends connect only to each
   other; datagram pairs are denied, with the same pair rule in every seccomp filter
   (`seccompFilterFor` in `internal/enforce/seccomp_linux.go`). When the launch self-test's network
-  check passes, Plan and Auto edits commands may also create TCP sockets, and every `connect()`
+  check passes, Plan, Auto edits and Build commands may also create TCP sockets, and every `connect()`
   pauses for codemeld, which makes the connection itself (`internal/enforce/broker_linux.go`). What
   it admits depends on the broker mode: `slice` admits only the session proxy; `connect` also admits
   a TCP endpoint or Unix socket a connect grant or the connect prompt allows (`ConnectRules`);
   `full` also lets the command bind and listen on a loopback TCP port or a Unix socket inside its
   write roots (`bindOrListen`), and admits without a prompt a connection to a TCP endpoint the same
-  command bound. Plan always gets `slice`; Auto edits gets `full`, `connect` or `slice`, the furthest
+  command bound. Plan always gets `slice`; Auto edits and Build get `full`, `connect` or `slice`, the furthest
   of the chained self-tests that passed (`launchConfinement` in `internal/bootstrap/starttui.go`,
   `confinement.policy` in `internal/bootstrap/confinedrunner.go`). The
   proxy asks per destination, admits saved `domain_grants`, and connects only to public addresses
@@ -136,7 +139,10 @@ session temp folder (`namesFolder`).
 On a `constrained` host, the sandbox is the authorization for Plan and Auto edits shell commands:
 they run inside it with no ordinary prompt, and nothing is saved. The same boundary wraps the
 commands of the version-control tools, which alone may write the history stores, and of child
-agents. Build is never sandboxed.
+agents. Build commands run inside it too, with Auto edits' reach (`confinement.policy`), but keep the
+user's environment (`confinement.prepareBuild`) and still ask as without the sandbox
+(`confinedShellRunner.Confined`); after the sandbox refuses one, the user can approve one run of it
+[outside the sandbox](approvals.md#outside-the-sandbox) (`confinedShellRunner.Exec`).
 
 | Startup self-test | Settings file | Recorded capability | Shell commands in Plan and Auto edits |
 |---|---|---|---|
@@ -149,8 +155,8 @@ agents. Build is never sandboxed.
 - If the helper cannot set up the boundary for a command, that command fails with the helper's
   error and is never re-run unsandboxed. A sandboxed command that fails gets a note saying the
   failure may be a boundary denial.
-- The status bar shows `sandbox: on` (Plan or Auto edits after a passed self-test with valid
-  settings), `sandbox: off` (Build after a passed self-test), or `sandbox: unavailable`; `/status`
+- The status bar shows `sandbox: on` (any mode after a passed self-test with valid settings) or
+  `sandbox: unavailable` (`Resolution.SandboxState` in `internal/enforce/capability.go`); `/status`
   and the headless stderr label add the reason. `codemeld sessions summary` reports the recorded
   value.
 
@@ -171,7 +177,11 @@ codemeld itself connects only to:
 - `mcp.exa.ai` for an approved `web_search`, and the page and redirects of an approved `web_fetch`;
 - for a sandboxed shell command, the host and port it asked for through the session proxy, once a
   prompt answer or a saved `domain_grants` entry approved it, and only at a public address that is
-  not this machine's. This limit applies only to the proxy, not to the destinations above.
+  not this machine's. This limit applies only to the proxy, not to the other destinations in this list;
+- for a sandboxed shell command in Auto edits and Build, the direct connections codemeld makes on
+  its behalf: to a TCP endpoint or Unix socket a `connect_grants` entry or the connect prompt
+  allowed, which can be on this machine or the local network, and to a loopback TCP endpoint the
+  same command bound ([Direct connections](approvals.md#connect-grants)).
 
 Any other network call codemeld makes itself is a bug. No telemetry exists: no analytics, crash
 reporting, or update checks, so there is no toggle; adding one is a design change that updates

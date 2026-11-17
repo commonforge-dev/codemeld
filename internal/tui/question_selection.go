@@ -6,6 +6,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"codemeld.dev/codemeld/internal/permissions"
 )
 
 // questionSelection is one physical left-drag over the shown question's options view. It
@@ -158,27 +160,40 @@ func hardRows(text string, _ int) []rowSpan {
 // its "]" on the next, and such a fragment un-escapes to something that is no substring of
 // the source at all, so a search for it finds nothing and the row keeps a stale offset.
 func wrapSource(src string, width int) ([]string, []int) {
-	esc := tview.Escape(src)
+	shown, shownAt := controlEscapedToSource(src)
+	esc := tview.Escape(shown)
 	lines := tview.WordWrap(esc, width)
-	srcAt := escapedToSource(src, esc)
+	escAt := escapedToSource(shown, esc)
 	offsets := make([]int, len(lines))
 	pos := 0
 	for i, line := range lines {
 		if pos > len(esc) {
 			pos = len(esc)
 		}
-		offsets[i] = snapToRune(src, srcAt[pos])
+		offsets[i] = snapToRune(src, shownAt[escAt[pos]])
 		pos += len(line)
-		// WordWrap drops the line break at a hard split; the escaped text still holds it,
-		// and a break is at most one "\r\n" pair because either byte ends the line itself.
-		if pos < len(esc) && esc[pos] == '\r' {
-			pos++
-		}
-		if pos < len(esc) && esc[pos] == '\n' {
-			pos++
-		}
 	}
 	return lines, offsets
+}
+
+func controlEscapedToSource(src string) (string, []int) {
+	var b strings.Builder
+	at := make([]int, 0, len(src)+1)
+	for i := 0; i < len(src); {
+		r, n := utf8.DecodeRuneInString(src[i:])
+		piece := permissions.SingleLineControlEscape(string(r))
+		same := piece == src[i:i+n]
+		for k := range len(piece) {
+			if same {
+				at = append(at, i+k)
+			} else {
+				at = append(at, i)
+			}
+		}
+		b.WriteString(piece)
+		i += n
+	}
+	return b.String(), append(at, len(src))
 }
 
 // escapedToSource maps every byte offset in tview.Escape(src) back onto src. Escape only
@@ -198,6 +213,18 @@ func escapedToSource(src, esc string) []int {
 	return at
 }
 
+func shownRun(at []int, off int) (int, int) {
+	lo := 0
+	for lo < len(at)-1 && at[lo] < off {
+		lo++
+	}
+	hi := lo
+	for hi < len(at)-1 && at[hi] == at[lo] {
+		hi++
+	}
+	return lo, hi
+}
+
 func (o *questionOptions) sourceOf(item int) string {
 	if item < 0 {
 		return o.block.spec.Prompt
@@ -206,6 +233,17 @@ func (o *questionOptions) sourceOf(item int) string {
 		return o.label(item) + "\n" + description
 	}
 	return o.label(item)
+}
+
+func (o *questionOptions) segmentOf(item, off int) (string, int) {
+	if item < 0 {
+		return o.block.spec.Prompt, 0
+	}
+	label := o.label(item)
+	if off > len(label) {
+		return o.description(item), len(label) + 1
+	}
+	return label, 0
 }
 
 type sourceSpan struct {
@@ -232,7 +270,23 @@ func (o *questionOptions) selectedSource() string {
 	}
 
 	var spans []sourceSpan
+	prevItem, prevBase, prevEnd := -2, 0, 0
 	for i, row := range rows {
+		item := o.owner[i]
+		body := row.start
+		if item >= 0 {
+			body += questionRowMarkWidth
+		}
+		seg, base := o.segmentOf(item, o.offsets[i])
+		shown, at := controlEscapedToSource(seg)
+		first, last := shownRun(at, o.offsets[i]-base)
+		// A row offset names only the control a wrap-split escape stands for; the rows above
+		// tell how much of that escape is already drawn.
+		if item == prevItem && base == prevBase && prevEnd > first && prevEnd < last {
+			first = prevEnd
+		}
+		prevItem, prevBase, prevEnd = item, base, first+pastPrefix(row.end, body)
+
 		lo, hi := start, end
 		if lo < row.start {
 			lo = row.start
@@ -243,14 +297,16 @@ func (o *questionOptions) selectedSource() string {
 		if lo > hi {
 			continue
 		}
-		item := o.owner[i]
-		body := row.start
-		if item >= 0 {
-			body += questionRowMarkWidth
-		}
 		src := o.sourceOf(item)
-		s := snapToRune(src, clampLen(o.offsets[i]+pastPrefix(lo, body), len(src)))
-		e := snapToRune(src, clampLen(o.offsets[i]+pastPrefix(hi, body), len(src)))
+		s := snapToRune(src, base+at[min(first+pastPrefix(lo, body), len(shown))])
+		e := s
+		if hi > lo {
+			p := min(first+pastPrefix(hi, body), len(shown))
+			for p > 0 && p < len(shown) && at[p] == at[p-1] {
+				p++
+			}
+			e = snapToRune(src, base+at[p])
+		}
 		if e < s {
 			e = s
 		}
@@ -291,14 +347,4 @@ func pastPrefix(off, body int) int {
 		return 0
 	}
 	return off - body
-}
-
-func clampLen(off, length int) int {
-	if off > length {
-		return length
-	}
-	if off < 0 {
-		return 0
-	}
-	return off
 }

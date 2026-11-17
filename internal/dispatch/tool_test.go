@@ -3902,18 +3902,28 @@ func TestPrepareTool_GeneralAgentIsReadOnlyOnlyWhenItResolvesWithNoPath(t *testi
 }
 
 type sandboxedAutoEditsAuthorizer struct {
-	root     string
-	outcomes []string
+	root        string
+	unsandboxed bool
+	outcomes    []string
+	prompts     int
 }
 
 func (a *sandboxedAutoEditsAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ PromptDisplay, mc permissions.ModeContext) (permissions.Decision, error) {
 	mc.Mode = "auto_edits"
 	mc.ProjectRoot = a.root
-	mc.ExecutionConstrained = true
+	mc.ExecutionConstrained = !a.unsandboxed
 	deps := permissions.AuthorizeDeps{
 		EmitMatched: func(_, _, _, _, _, outcome, source, _, _ string) error {
 			a.outcomes = append(a.outcomes, outcome+"/"+source)
 			return nil
+		},
+		Grants:          &grantList{},
+		Cache:           permissions.NewTurnCache(),
+		EmitPromptShown: func(_, _, _ string, _ []string, _ permissions.DirectIdentity) error { return nil },
+		EmitDecision:    func(_, _, _, _, _, _ string, _ permissions.DirectIdentity) error { return nil },
+		Prompt: func(context.Context, permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+			a.prompts++
+			return permissions.PromptOutcome{Choice: permissions.PromptDeny}, nil
 		},
 	}
 	return permissions.Authorize(ctx, req, mc, deps)
@@ -3971,6 +3981,46 @@ func TestPrepareTool_RoutineVCSWriteReachesModeContext(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDispatchTool_BuiltinAmendRunsWithoutAskingOnlyInSandboxedAutoEdits(t *testing.T) {
+	tmpls, err := vcs.LoadBuiltinTemplates()
+	if err != nil {
+		t.Fatalf("LoadBuiltinTemplates: %v", err)
+	}
+	for name, localCommit := range map[string]string{"git": "", "hg": "draft"} {
+		t.Run(name+" sandboxed", func(t *testing.T) {
+			repo := t.TempDir()
+			run := &fakeCmdRunner{id: "0198f0ab-cdef-7000-8000-000000000012", result: cmdrunner.RunResult{Stdout: []byte(localCommit)}}
+			reg := tools.NewRegistry()
+			if err := vcs.RegisterActions(reg, tmpls[name], repo, run, noopEmit, 65536); err != nil {
+				t.Fatalf("RegisterActions: %v", err)
+			}
+			auth := &sandboxedAutoEditsAuthorizer{root: repo}
+			if _, err := DispatchTool(context.Background(), "vcs_amend", map[string]any{"message": "fix: two  words"}, t.TempDir(), repo, reg, auth); err != nil {
+				t.Fatalf("DispatchTool(vcs_amend) = %v", err)
+			}
+			want := []string{name, "commit", "--amend", "-m", "fix: two  words"}
+			if !slices.Equal(auth.outcomes, []string{"once/mode_auto"}) || auth.prompts != 0 || run.calls != 2 || !slices.Equal(run.gotSpec.Argv, want) {
+				t.Fatalf("outcomes=%v prompts=%d exec=%d argv=%q, want one mode_auto allow, the shared-commit query, then %q", auth.outcomes, auth.prompts, run.calls, run.gotSpec.Argv, want)
+			}
+		})
+		t.Run(name+" without sandbox", func(t *testing.T) {
+			repo := t.TempDir()
+			run := &fakeCmdRunner{id: "0198f0ab-cdef-7000-8000-000000000013", result: cmdrunner.RunResult{Stdout: []byte(localCommit)}}
+			reg := tools.NewRegistry()
+			if err := vcs.RegisterActions(reg, tmpls[name], repo, run, noopEmit, 65536); err != nil {
+				t.Fatalf("RegisterActions: %v", err)
+			}
+			auth := &sandboxedAutoEditsAuthorizer{root: repo, unsandboxed: true}
+			if _, err := DispatchTool(context.Background(), "vcs_amend", map[string]any{"message": "m"}, t.TempDir(), repo, reg, auth); err == nil {
+				t.Fatal("DispatchTool(vcs_amend) ran after a denied prompt, want a refusal")
+			}
+			if auth.prompts != 1 || run.calls != 0 {
+				t.Fatalf("prompts=%d exec=%d, want one prompt and no launch", auth.prompts, run.calls)
+			}
+		})
 	}
 }
 

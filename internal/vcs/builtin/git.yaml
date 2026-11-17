@@ -21,6 +21,9 @@ add:
 commit:
   argv: [git, commit, -m, "{message}"]
 
+amend:
+  argv: [git, commit, --amend, -m, "{message}"]
+
 log:
   argv: [git, log, --oneline, -n, "20"]
 

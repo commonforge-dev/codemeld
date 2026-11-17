@@ -96,6 +96,29 @@ func TestResolveRecordsTheSliceCheckApartFromTheBaseResult(t *testing.T) {
 		}
 	}
 
+	watchFails := func(mode string) func(string, string) (bool, string) {
+		return func(string, string) (bool, string) {
+			return false, mode + " self-test: " + watchCheckFailed + "watch-mkdir-main: the broker's watch never saw the probe's mkdirat path"
+		}
+	}
+	passes := func(string, string) (bool, string) { return true, "" }
+	for _, c := range []struct {
+		name          string
+		connect, full func(string, string) (bool, string)
+	}{
+		{"connect watch fails after slice passes", watchFails("connect"), passes},
+		{"full watch fails after slice and connect pass", passes, watchFails("full")},
+	} {
+		stubStarter(t, expectedExit)
+		setVar(t, &sliceSelfTest, passes)
+		setVar(t, &connectSelfTest, c.connect)
+		setVar(t, &fullSelfTest, c.full)
+		got := resolveFor("linux", ResolveInput{Home: homeWithCodemeld(t)})
+		if got.Capability != Constrained || !got.SelfTestPassed || got.SliceSelfTestPassed || got.ConnectSelfTestPassed || got.FullSelfTestPassed {
+			t.Errorf("%s: Resolve() = %+v, want the base Constrained result with no broker mode", c.name, got)
+		}
+	}
+
 	stubStarter(t, func(mode, leg string) helperExit {
 		if mode == ProbeArg && leg == "socket-inet" {
 			return helperExit{code: probeAllowed}
@@ -612,7 +635,13 @@ func TestResolveThroughRealHelper(t *testing.T) {
 }
 
 func i386ControlUsable(e helperExit) bool {
-	return !e.timedOut && e.signal == 0 && (e.code == probeAllowed || e.code == probeDenied)
+	if e.timedOut {
+		return false
+	}
+	if e.signal != 0 {
+		return e.signal == syscall.SIGSYS
+	}
+	return e.code == probeAllowed || e.code == probeDenied
 }
 
 func realHelperLegMatches(l selfTestLeg, got Leg) bool {
@@ -638,6 +667,7 @@ func TestI386ControlPreflight(t *testing.T) {
 		{helperExit{code: probeDenied}, true},
 		{helperExit{code: SetupFailureExitCode, stderr: "setup"}, false},
 		{helperExit{code: probeFailed}, false},
+		{helperExit{code: -1, signal: syscall.SIGSYS}, true},
 		{helperExit{code: -1, signal: syscall.SIGTERM}, false},
 		{helperExit{code: -1, timedOut: true}, false},
 	} {

@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"codemeld.dev/codemeld/internal/config"
+	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/fserrors"
@@ -330,9 +331,6 @@ func TestConfinedRunner_PassThroughKeepsSpecsIdentical(t *testing.T) {
 	confs := map[string]func(string) *confinement{
 		"nil":             func(string) *confinement { return nil },
 		"not constrained": func(m string) *confinement { return &confinement{mode: fixedMode(m), tmpDir: cwd, inherited: launch} },
-		"constrained build": func(string) *confinement {
-			return &confinement{constrained: true, mode: fixedMode(string(mode.Build)), tmpDir: cwd, inherited: launch}
-		},
 	}
 	for name, mk := range confs {
 		for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits, mode.Build} {
@@ -413,6 +411,7 @@ func TestConfinedRunner_ConfinedPreflightIsUnsupported(t *testing.T) {
 	confs := map[string]*confinement{
 		"plan":                     {constrained: true, mode: fixedMode(string(mode.Plan)), blocked: testBlocked(t)},
 		"auto_edits without a tmp": {constrained: true, mode: fixedMode(string(mode.AutoEdits)), blocked: testBlocked(t)},
+		"build":                    withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Build)), blocked: testBlocked(t)}),
 		"context override to plan": {constrained: true, mode: fixedMode(string(mode.Build)), blocked: testBlocked(t)},
 	}
 	for name, conf := range confs {
@@ -1135,7 +1134,6 @@ func TestConfinedRunner_UnsandboxedRunsGetNoGitOverride(t *testing.T) {
 	blocked := permissions.NewBlockedPaths(home, blockedEntries(t, home, "~/.gitconfig", "~/.config/git/config"))
 	for name, conf := range map[string]*confinement{
 		"self-test failed": {mode: fixedMode(string(mode.AutoEdits)), home: home, blocked: blocked, tmpDir: t.TempDir()},
-		"build mode":       {constrained: true, mode: fixedMode(string(mode.Build)), home: home, blocked: blocked},
 	} {
 		t.Run(name, func(t *testing.T) {
 			spec := confinedSpec(home, "git", "status")
@@ -1171,24 +1169,29 @@ func TestConfinedRunner_ContextModeOverridesTheModeFunction(t *testing.T) {
 	}
 }
 
-func TestConfinedRunner_BuildPinRunsUnconfinedUnderAConfinedLiveMode(t *testing.T) {
+func TestConfinedRunner_BuildPinRunsUnderTheAutoEditsPolicyUnderAConfinedLiveMode(t *testing.T) {
 	lookup := programDir(t, "hg")
 	for _, live := range []mode.Mode{mode.Plan, mode.AutoEdits} {
 		t.Run(string(live), func(t *testing.T) {
-			conf := &confinement{constrained: true, mode: fixedMode(string(live)), lookupPath: lookup,
-				blocked: testBlocked(t), projectRoot: t.TempDir(), tmpDir: t.TempDir()}
+			conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(live)), lookupPath: lookup,
+				blocked: testBlocked(t), projectRoot: t.TempDir()})
 			ctx := vcs.WithConfinementMode(context.Background(), string(mode.Build))
+			spec := confinedSpec(t.TempDir(), "hg", "status")
+			spec.Env = []string{"PATH=" + lookup}
 			inner := &confineInner{}
-			if _, err := (&confinedRunner{inner: inner, conf: conf, cap: 12}).Exec(ctx, confinedSpec(t.TempDir(), "hg", "status")); err != nil {
+			if _, err := (&confinedRunner{inner: inner, conf: conf, cap: 12}).Exec(ctx, spec); err != nil {
 				t.Fatal(err)
 			}
 			shell := &confineInner{}
-			if _, err := shellAdapter(conf, shell).Exec(ctx, confinedSpec(t.TempDir(), "hg", "status")); err != nil {
+			if _, err := shellAdapter(conf, shell).Exec(ctx, spec); err != nil {
 				t.Fatal(err)
 			}
 			for name, got := range map[string]*confineInner{"vcs": inner, "shell": shell} {
-				if len(got.execs) != 1 || len(got.bounded) != 0 || !slices.Equal(got.execs[0].Argv, []string{"hg", "status"}) {
-					t.Fatalf("%s bounded/exec = %d/%d, want the Build pin's one unconfined run", name, len(got.bounded), len(got.execs))
+				if len(got.execs) != 0 || len(got.bounded) != 1 {
+					t.Fatalf("%s bounded/exec = %d/%d, want the Build pin's one confined run", name, len(got.bounded), len(got.execs))
+				}
+				if policy, _ := decodeFrame(t, got.bounded[0].Stdin); policy.Mode != "auto_edits" {
+					t.Fatalf("%s policy mode = %q, want auto_edits for the Build pin", name, policy.Mode)
 				}
 			}
 		})
@@ -1197,21 +1200,106 @@ func TestConfinedRunner_BuildPinRunsUnconfinedUnderAConfinedLiveMode(t *testing.
 
 func TestConfinedRunner_UnpinnedRunFollowsTheLiveMode(t *testing.T) {
 	live := string(mode.Plan)
-	conf := withSessionTemp(t, &confinement{constrained: true, mode: func() string { return live }, lookupPath: programDir(t, "hg"), blocked: testBlocked(t)})
+	lookup := programDir(t, "hg")
+	conf := withSessionTemp(t, &confinement{constrained: true, mode: func() string { return live }, lookupPath: lookup, blocked: testBlocked(t), projectRoot: t.TempDir()})
 	inner := &confineInner{}
 	r := &confinedRunner{inner: inner, conf: conf, cap: 12}
 	if _, err := r.Exec(context.Background(), confinedSpec(t.TempDir(), "hg", "status")); err != nil {
 		t.Fatal(err)
 	}
 	live = string(mode.Build)
-	if _, err := r.Exec(context.Background(), confinedSpec(t.TempDir(), "hg", "status")); err != nil {
+	spec := confinedSpec(t.TempDir(), "hg", "status")
+	spec.Env = []string{"PATH=" + lookup}
+	if _, err := r.Exec(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
-	if len(inner.bounded) != 1 || len(inner.execs) != 1 {
-		t.Fatalf("bounded/exec = %d/%d, want one confined Plan run then one unconfined Build run", len(inner.bounded), len(inner.execs))
+	if len(inner.bounded) != 2 || len(inner.execs) != 0 {
+		t.Fatalf("bounded/exec = %d/%d, want one confined Plan run then one confined Build run", len(inner.bounded), len(inner.execs))
 	}
-	if policy, _ := decodeFrame(t, inner.bounded[0].Stdin); policy.Mode != string(mode.Plan) {
-		t.Fatalf("policy mode = %q, want plan", policy.Mode)
+	for i, want := range []string{"plan", "auto_edits"} {
+		if policy, _ := decodeFrame(t, inner.bounded[i].Stdin); policy.Mode != want {
+			t.Fatalf("run %d policy mode = %q, want %s", i, policy.Mode, want)
+		}
+	}
+}
+
+func TestConfinedShell_BuildKeepsTheCommandEnvironment(t *testing.T) {
+	launch := canonicalTempDir(t)
+	elsewhere := canonicalTempDir(t)
+	for name, tmpEntry := range map[string]string{"launch TMPDIR": "TMPDIR=" + launch, "no TMPDIR": "", "other TMPDIR": "TMPDIR=" + elsewhere} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TMPDIR", launch)
+			home := t.TempDir()
+			project := canonicalTempDir(t)
+			if err := os.Mkdir(filepath.Join(project, ".hg"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			tools := programDir(t, "tool")
+			conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Build)), home: home, projectRoot: project,
+				blocked: permissions.NewBlockedPaths(home, blockedEntries(t, home, "~/.gitconfig")), lookupPath: programDir(t),
+				inherited: launchSnapshot("GOPATH=/launch/go")})
+			spec := confinedSpec(project, "tool", "arg")
+			spec.Env = []string{"PATH=" + tools, "GOCACHE=/user/go-build", "HOME=/user/home", "MY_VAR=kept", "TERM=xterm-256color",
+				"GIT_CONFIG_GLOBAL=/user/gitconfig", "BUILD_TMP=" + launch}
+			if tmpEntry != "" {
+				spec.Env = append(spec.Env, tmpEntry)
+			}
+			inner := &confineInner{}
+			if _, err := shellAdapter(conf, inner).Exec(context.Background(), spec); err != nil {
+				t.Fatal(err)
+			}
+			if len(inner.bounded) != 1 || len(inner.execs) != 0 {
+				t.Fatalf("bounded/exec = %d/%d, want one confined run", len(inner.bounded), len(inner.execs))
+			}
+			got := inner.bounded[0]
+			wantHelperArgv(t, got.Argv, filepath.Join(tools, "tool"), "arg")
+			wantTmp := conf.tmpDir
+			if tmpEntry == "TMPDIR="+elsewhere {
+				wantTmp = elsewhere
+			}
+			want := []string{"PATH=" + tools, "GOCACHE=/user/go-build", "HOME=/user/home", "MY_VAR=kept", "TERM=",
+				"GIT_CONFIG_GLOBAL=/dev/null", "BUILD_TMP=" + conf.tmpDir, "TMPDIR=" + wantTmp}
+			if env := slices.Sorted(slices.Values(got.Env)); !slices.Equal(env, slices.Sorted(slices.Values(want))) {
+				t.Fatalf("env = %q, want exactly %q", env, want)
+			}
+			policy, _ := decodeFrame(t, got.Stdin)
+			if policy.Mode != "auto_edits" || policy.TmpDir != conf.tmpDir || !slices.Contains(policy.NoWritePaths, filepath.Join(project, ".hg")) {
+				t.Fatalf("policy = %+v, want auto_edits with %s read-only and temp folder %s", policy, filepath.Join(project, ".hg"), conf.tmpDir)
+			}
+		})
+	}
+}
+
+func TestConfinedShell_BuildWithoutCommandEnvironmentStartsFromTheProcessEnvironment(t *testing.T) {
+	tools := programDir(t, "tool")
+	t.Setenv("PATH", tools)
+	t.Setenv("GOCACHE", "/user/go-build")
+	conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Build)), home: t.TempDir(), projectRoot: canonicalTempDir(t),
+		blocked: testBlocked(t), lookupPath: programDir(t)})
+	inner := &confineInner{}
+	if _, err := shellAdapter(conf, inner).Exec(context.Background(), confinedSpec(t.TempDir(), "tool")); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.bounded) != 1 {
+		t.Fatalf("bounded = %d, want one confined run", len(inner.bounded))
+	}
+	env := inner.bounded[0].Env
+	for _, want := range []string{"PATH=" + tools, "GOCACHE=/user/go-build"} {
+		name, _, _ := strings.Cut(want, "=")
+		if got := envNamed(env, name); !slices.Equal(got, []string{want}) {
+			t.Fatalf("%s entries = %q, want exactly %s", name, got, want)
+		}
+	}
+}
+
+func TestConfinedShell_BuildKeepsTodaysRoutingSeam(t *testing.T) {
+	for m, want := range map[mode.Mode]bool{mode.Build: false, mode.AutoEdits: true} {
+		t.Run(string(m), func(t *testing.T) {
+			conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(m)), blocked: testBlocked(t)})
+			if got, err := shellAdapter(conf, &confineInner{}).Confined(context.Background()); err != nil || got != want {
+				t.Fatalf("Confined = %v, %v; want %v", got, err, want)
+			}
+		})
 	}
 }
 
@@ -1226,9 +1314,8 @@ func TestConfinedRunner_ConfinedExecNeedsBoundedCapability(t *testing.T) {
 func TestConfinedRunner_PipelineRunsThePreflightSnapshot(t *testing.T) {
 	cwd := t.TempDir()
 	confs := map[string]*confinement{
-		"nil":               nil,
-		"not constrained":   {mode: fixedMode(string(mode.Plan))},
-		"constrained build": {constrained: true, mode: fixedMode(string(mode.Build))},
+		"nil":             nil,
+		"not constrained": {mode: fixedMode(string(mode.Plan))},
 	}
 	mutate := func(pipe []cmdrunner.RunSpec) {
 		pipe[0].Argv[1] = "-R"
@@ -2055,9 +2142,8 @@ func TestConfinedShellRunner_FailureNoteSurvivesShellAggregation(t *testing.T) {
 func TestConfinedRunner_UnconfinedFailureGetsNoNote(t *testing.T) {
 	cwd := t.TempDir()
 	for name, conf := range map[string]*confinement{
-		"nil":               nil,
-		"not constrained":   {mode: fixedMode(string(mode.AutoEdits)), tmpDir: cwd},
-		"constrained build": {constrained: true, mode: fixedMode(string(mode.Build))},
+		"nil":             nil,
+		"not constrained": {mode: fixedMode(string(mode.AutoEdits)), tmpDir: cwd},
 	} {
 		for adapter, exec := range confinedAdapters(t, conf, 4096) {
 			t.Run(name+"/"+adapter, func(t *testing.T) {
@@ -2539,9 +2625,13 @@ func TestConfinedRunner_BrokenGitPointerStopsOnlyAutoEdits(t *testing.T) {
 	}{
 		{"missing gitdir", func(t *testing.T, project string) string { return filepath.Join(project, ".git") }, false},
 		{"dangling commondir symlink", func(t *testing.T, project string) string { return filepath.Join(gitdir(t, project), "commondir") }, false},
-		{"dangling sharedpath symlink", func(t *testing.T, project string) string { return filepath.Join(mkdir(t, filepath.Join(project, ".hg")), "sharedpath") }, false},
+		{"dangling sharedpath symlink", func(t *testing.T, project string) string {
+			return filepath.Join(mkdir(t, filepath.Join(project, ".hg")), "sharedpath")
+		}, false},
 		{"commondir fifo", func(t *testing.T, project string) string { return filepath.Join(gitdir(t, project), "commondir") }, true},
-		{"sharedpath fifo", func(t *testing.T, project string) string { return filepath.Join(mkdir(t, filepath.Join(project, ".hg")), "sharedpath") }, true},
+		{"sharedpath fifo", func(t *testing.T, project string) string {
+			return filepath.Join(mkdir(t, filepath.Join(project, ".hg")), "sharedpath")
+		}, true},
 		{"gitdir selector through a regular file then dot-dot", func(t *testing.T, project string) string {
 			mkdir(t, filepath.Join(project, "store"))
 			if err := os.WriteFile(filepath.Join(project, "plainfile"), nil, 0o600); err != nil {
@@ -2556,7 +2646,7 @@ func TestConfinedRunner_BrokenGitPointerStopsOnlyAutoEdits(t *testing.T) {
 		for _, tc := range []struct {
 			mode    mode.Mode
 			wantErr bool
-		}{{mode.AutoEdits, true}, {mode.Plan, false}, {mode.Build, false}} {
+		}{{mode.AutoEdits, true}, {mode.Plan, false}, {mode.Build, true}} {
 			t.Run(broken.name+"/"+string(tc.mode), func(t *testing.T) {
 				project := canonicalTempDir(t)
 				marker := broken.marker(t, project)
@@ -2737,7 +2827,7 @@ func proxyRouteUnitConfinement(t *testing.T, projectRoot string, programs ...str
 	return conf
 }
 
-const wantProxyRouteNote = "codemeld: this command ran on the proxy route; tools that do not use HTTPS_PROXY/HTTP_PROXY, including ssh, scp and SSH URLs, get no network; use Build mode for those."
+const wantProxyRouteNote = "codemeld: this command ran on the proxy route; tools that do not use HTTPS_PROXY/HTTP_PROXY, including ssh, scp and SSH URLs, get no network; ask the user to run those."
 
 func refusedLine(hostPort, reason string) string {
 	return "codemeld: network refused: " + hostPort + " (" + reason + ")"
@@ -3096,4 +3186,136 @@ func TestConfinedShell_ProxyRefusalNoteIsTheRecordedEndAndKeepsTheTimeoutNote(t 
 			t.Fatalf("tool_exec_end = %+v, want the bounded execution stderr without the timeout note", ends)
 		}
 	})
+}
+
+const wantOutsideRunLine = "codemeld: to run this command once outside the sandbox, run it again; you will be asked first."
+
+func outsideConfinement(t *testing.T, projectRoot string, m mode.Mode) *confinement {
+	t.Helper()
+	conf := proxyRouteUnitConfinement(t, projectRoot, "ls")
+	conf.mode = fixedMode(string(m))
+	conf.outside = &outsideSubjects{}
+	return conf
+}
+
+func TestConfinedShell_BuildRefusalRemembersTheSubjectAndOffersTheOutsideRun(t *testing.T) {
+	network := refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
+	file := refusal{File: true, Path: "/x/y", Process: "ls"}
+	for _, tc := range []struct {
+		name       string
+		mode       mode.Mode
+		command    string
+		exit       int
+		records    [][]refusal
+		remembered bool
+	}{
+		{"build network refusal", mode.Build, "ls", 1, [][]refusal{{network}}, true},
+		{"build file refusal", mode.Build, "ls", 1, [][]refusal{{file}}, true},
+		{"build refusals in two stages", mode.Build, "ls; ls", 1, [][]refusal{{network}, {file}}, true},
+		{"build failure without a refusal", mode.Build, "ls", 1, nil, false},
+		{"build success", mode.Build, "ls", 0, [][]refusal{{network}}, false},
+		{"auto edits refusal", mode.AutoEdits, "ls", 1, [][]refusal{{network}}, false},
+		{"plan refusal", mode.Plan, "ls", 1, [][]refusal{{network}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			swapInvocationRefusals(t, tc.records...)
+			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: tc.exit, stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
+			d.confinement = outsideConfinement(t, d.processCWD, tc.mode)
+			got, err := d.Dispatch(context.Background(), bashCall("c1", tc.command))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stderr := dispatchedStderr(t, got.Content)
+			lines := 0
+			if tc.remembered {
+				lines = 1
+			}
+			if strings.Count(stderr, wantOutsideRunLine) != lines || d.confinement.outside.has("ls") != tc.remembered {
+				t.Fatalf("stderr = %q, remembered = %v; want %d outside-run lines and remembered %v", stderr, d.confinement.outside.has("ls"), lines, tc.remembered)
+			}
+			if tc.name == "build network refusal" {
+				if want := "boom\n" + refusedLine("a.test:80", network.Reason) + "\n" + wantOutsideRunLine + "\n" + confinedFailureNote; stderr != want {
+					t.Fatalf("stderr = %q, want %q", stderr, want)
+				}
+			}
+		})
+	}
+}
+
+func TestConfinement_OutsideMarkRunsOneInvocationUnconfinedAndForgetsTheSubject(t *testing.T) {
+	conf := outsideConfinement(t, t.TempDir(), mode.Build)
+	conf.outside.add("ls", nil)
+	inner := &confineInner{}
+	r := shellAdapter(conf, inner)
+	auth := &outsideAuthorizer{}
+	if _, err := dispatch.DispatchShell(context.Background(), "ls; ls", "", t.TempDir(), auth, r); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.execs) != 1 || len(inner.bounded) != 1 || conf.outside.has("ls") {
+		t.Fatalf("unconfined/confined = %d/%d, remembered = %v; want the marked run unconfined, the next sandboxed, the subject forgotten",
+			len(inner.execs), len(inner.bounded), conf.outside.has("ls"))
+	}
+}
+
+func TestOutsideSubjects_ReasonsAreReplacedOnRememberAndDroppedWithTheSubject(t *testing.T) {
+	var none *outsideSubjects
+	if got := none.reasons("ls"); got != nil {
+		t.Fatalf("nil reasons = %q, want none", got)
+	}
+	o := &outsideSubjects{}
+	o.add("ls", []string{"first"})
+	o.add("ls", []string{"second"})
+	if got := o.reasons("ls"); !slices.Equal(got, []string{"second"}) {
+		t.Fatalf("reasons = %q, want the later remember's", got)
+	}
+	o.remove("ls")
+	if got := o.reasons("ls"); got != nil {
+		t.Fatalf("reasons after remove = %q, want none", got)
+	}
+}
+
+type outsideAuthorizer struct{ marked bool }
+
+func (a *outsideAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ dispatch.PromptDisplay, _ permissions.ModeContext) (permissions.Decision, error) {
+	if !a.marked {
+		a.marked = true
+		dispatch.MarkRunOutside(ctx, req.Subject)
+	}
+	return allow(), nil
+}
+
+func TestConfinedShell_BuildOutsideRunLineSurvivesTheMinimumOutputLimit(t *testing.T) {
+	const cap = 256
+	network := refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
+	file := refusal{File: true, Path: "/x/y", Process: "ls"}
+	oversized := refusal{Host: strings.Repeat("h", 300) + ".test", Port: "80", Reason: "not approved (no one to ask)"}
+	for _, tc := range []struct {
+		name    string
+		refusal refusal
+		line    string
+		offered bool
+	}{
+		{"short network refusal", network, refusedLine("a.test:80", network.Reason), true},
+		{"file refusal whose closing does not fit", file, fileRefusalLine(file), false},
+		{"oversized network refusal", oversized, refusedLine(oversized.Host+":80", oversized.Reason), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			swapInvocationRefusals(t, []refusal{tc.refusal})
+			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: 1, stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
+			d.outputCap = cap
+			d.confinement = outsideConfinement(t, d.processCWD, mode.Build)
+			got, err := d.Dispatch(context.Background(), bashCall("c1", "ls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stderr := dispatchedStderr(t, got.Content)
+			remembered := d.confinement.outside.has("ls")
+			offers := strings.Count(stderr, wantOutsideRunLine)
+			if len(stderr) > cap || remembered != tc.offered || offers > 1 || (offers == 1) != tc.offered ||
+				(tc.offered && strings.Count(stderr, tc.line+"\n") != 1) {
+				t.Fatalf("stderr = %q (%d bytes), remembered = %v; want within %d, offered and remembered = %v with the refusal listed when offered",
+					stderr, len(stderr), remembered, cap, tc.offered)
+			}
+		})
+	}
 }

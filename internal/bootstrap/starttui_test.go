@@ -6304,7 +6304,6 @@ var (
 
 const (
 	sandboxOnLine       = "Sandbox: on — commands run with OS-enforced filesystem and process-access restrictions"
-	sandboxOffLine      = "Sandbox: off — build mode runs commands outside the sandbox"
 	brokenSandboxLine   = "Sandbox: unavailable (settings file is broken) — automatic command authorization is unavailable"
 	injectedSandboxLine = "Sandbox: unavailable (test: injected refusal) — automatic command authorization is unavailable"
 )
@@ -6320,7 +6319,7 @@ func TestStatusState_SandboxPillAndOverlayFollowCapabilityAndMode(t *testing.T) 
 	}{
 		{"passed plan", constrainedLaunch, "plan", "sandbox: on", sandboxOnLine},
 		{"passed auto_edits", constrainedLaunch, "auto_edits", "sandbox: on", sandboxOnLine + "; fewer permission prompts"},
-		{"passed build", constrainedLaunch, "build", "sandbox: off", sandboxOffLine},
+		{"passed build", constrainedLaunch, "build", "sandbox: on", sandboxOnLine},
 		{"refused plan", injectedResolution, "plan", "sandbox: unavailable", injectedSandboxLine},
 		{"refused auto_edits", injectedResolution, "auto_edits", "sandbox: unavailable", injectedSandboxLine},
 		{"refused build", injectedResolution, "build", "sandbox: unavailable", injectedSandboxLine},
@@ -6356,8 +6355,8 @@ func TestStartTUI_SandboxPillFollowsModeSwitch(t *testing.T) {
 	if err := StartTUI(context.Background(), result, io.Discard); err != nil {
 		t.Fatalf("StartTUI error: %v", err)
 	}
-	if got := strings.TrimSpace(ran.StatusLineText()); !strings.HasSuffix(got, "sandbox: off") {
-		t.Fatalf("launch status line = %q, want the sandbox: off pill in build mode", got)
+	if got := strings.TrimSpace(ran.StatusLineText()); !strings.HasSuffix(got, "sandbox: on") {
+		t.Fatalf("launch status line = %q, want the sandbox: on pill in build mode", got)
 	}
 	ran.RefreshModeHint(string(mode.AutoEdits))
 	if got := strings.TrimSpace(ran.StatusLineText()); !strings.HasSuffix(got, "sandbox: on") {
@@ -6434,7 +6433,7 @@ func TestStartTUI_BrokenSettingsFileRefusesAndRecordsUntilFixed(t *testing.T) {
 
 	defer runLiveApp(t, tcell.NewSimulationScreen("UTF-8"), func(app *tui.App) {
 		requireRecordedCapability(t, recorded, enforce.Constrained)
-		waitForStatusLine(t, app, "sandbox: off")
+		waitForStatusLine(t, app, "sandbox: on")
 
 		rewriteSettings(t, f.global, "blocked_paths: [\n")
 		var overlay string
@@ -6452,7 +6451,7 @@ func TestStartTUI_BrokenSettingsFileRefusesAndRecordsUntilFixed(t *testing.T) {
 		f.editGlobal(t, "a")
 		onEventLoop(t, app, func() { app.SubmitInput("/blocked") })
 		requireRecordedCapability(t, recorded, enforce.Constrained)
-		waitForStatusLine(t, app, "sandbox: off")
+		waitForStatusLine(t, app, "sandbox: on")
 	})()
 
 	if err := StartTUI(context.Background(), result, io.Discard); err != nil {

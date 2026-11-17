@@ -450,15 +450,18 @@ func TestQuestionPrompt_HostileControlsInEveryDisplayedField(t *testing.T) {
 		t.Run(hv.name, func(t *testing.T) {
 			v := hv.value
 			hostileContext := marked("CT", v)
-			// The pad rows absorb the extra rows a raw VT draws beyond the options view's counted height, which would otherwise clip the hostile tail.
 			spec := QuestionSpec{
 				ID:                 "q",
 				Prompt:             marked("QP", v),
 				Context:            "CTok\n" + hostileContext,
-				Options:            []string{marked("O1", v), marked("O2", v), "pad 1", "pad 2", "pad 3", "pad 4", "pad 5", "pad 6"},
+				Options:            []string{marked("O1", v), marked("O2", v)},
 				OptionDescriptions: []string{marked("D1", v), marked("D2", v)},
+				AllowCustom:        true,
 			}
-			drawn := append(markers("QP", "O1", "O2", "D1", "D2"), "CTok")
+			drawn := []string{"CTok", customAnswerRowLabel}
+			for _, tag := range []string{"QP", "O1", "O2", "D1", "D2"} {
+				drawn = append(drawn, escapedControls(marked(tag, v)))
+			}
 			var absent []string
 			for _, piece := range strings.Split(hostileContext, "\n") {
 				for _, m := range markers("CT") {

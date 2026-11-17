@@ -23,7 +23,7 @@
 
 - **Single static binary per platform**. Linux is the tested target: `mise run check` builds codemeld and runs the test suite there, and there is no hosted CI. macOS and FreeBSD build but are untested. Windows is not supported: codemeld does not compile for it. Confined shell execution works only on Linux amd64 and arm64.
 - **No CGO in the shipped binary today** — this excludes tree-sitter bindings, embedded sqlite, and anything else that requires a C toolchain on the build host. Revisit when the constraint becomes limiting.
-- **No outbound network traffic** other than to configured LLM providers, the fixed OpenAI ChatGPT login and model origins when that provider is used, web research hosts a human approved (`mcp.exa.ai` for search; the fetched page and its redirect hops for `web_fetch`), and the session proxy's connections for sandboxed shell commands to destinations a human approved or saved in `domain_grants`, limited to public addresses that are not this machine's (a limit for the proxy only, not for provider traffic). No analytics, telemetry, crash reporting, or update checks. See [Privacy & Telemetry](architecture.md#privacy--telemetry).
+- **No outbound network traffic** other than to configured LLM providers, the fixed OpenAI ChatGPT login and model origins when that provider is used, web research hosts a human approved (`mcp.exa.ai` for search; the fetched page and its redirect hops for `web_fetch`), the session proxy's connections for sandboxed shell commands to destinations a human approved or saved in `domain_grants`, limited to public addresses that are not this machine's (a limit for the proxy only, not for provider traffic), and the direct connections codemeld makes for sandboxed shell commands in Auto edits and Build: to a TCP endpoint or Unix socket a `connect_grants` entry or the connect prompt allowed, which can be on this machine or the local network, and to a loopback TCP endpoint the same command bound. No analytics, telemetry, crash reporting, or update checks. See [Privacy & Telemetry](architecture.md#privacy--telemetry).
 
 ## Optional runtime dependencies
 
@@ -49,8 +49,8 @@ strictly optional: the feature degrades to a friendly notice when none is instal
 ### Build & test commands
 
 Use the mise tasks, not raw `go`/`golangci-lint` invocations: they encode the correct flags. Run
-`mise tasks` to list them with a one-line description each. This section covers only what that
-listing does not show.
+`mise tasks` to list them with a one-line description each. This section explains when to run each
+gate and adds what those descriptions leave out.
 
 Which gate to run when, each fail-fast:
 
@@ -65,7 +65,7 @@ Which gate to run when, each fail-fast:
 `mise run test-pkg` takes package paths before any `go test` flags and fails without arguments; it is
 for testing one package while other work is in progress, not a gate.
 
-Race coverage therefore sits at the integration boundary, not every dev iteration: a data race surfaces when work is integrated rather than on each local gate, but still before it leaves `main/`. Static reachability and the shipping-set reference check run in `check` and `check-race`; all three gates call `wiring-stub-check`, but the real stale-stub check runs only in the development tree, where a development-only mise overlay that does not ship replaces it. In the public tree `wiring-stub-check` is an intentionally inactive step that does nothing.
+Race-enabled tests therefore run at the integration gate, which is run before pushing, not on every dev iteration; they find only the races the tests exercise. Static reachability and the shipping-set reference check run in `check` and `check-race`; all three gates call `wiring-stub-check`, but the real stale-stub check runs only in the development tree, where a development-only mise overlay that does not ship replaces it. In the public tree `wiring-stub-check` is an intentionally inactive step that does nothing.
 
 The two open-source scans are split by what they cost to run. `oss-reference-check` is a local scan over the shipping-file list (grep, plus a small awk lexer that pulls the comment text out of Go files), so it runs in `check` and `check-race` as well as `release-check`: it fails if a shipping file reintroduces an internal requirement-number tag, a pointer to internal-only files, or a task or ADR id (in Go files, only in comments), and keeping it in the everyday gates stops that drift at the edit that caused it rather than at release. `oss-secret-scan` stays release-only — it fails on credential-shaped values, session-dump paths, or private developer-machine paths inside a shipping file, and those only have to be absent when the project ships. Both read one shared shipping-file list (`scripts/oss-shipping-files.sh`) so they cannot drift. That list is built with `find` over the shipping roots rather than from the VCS manifest, so an untracked scratch file under one of them is scanned like a committed one. See `docs/gated-changes.md` for the fix steps.
 

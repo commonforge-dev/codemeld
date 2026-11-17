@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"unicode/utf8"
 
+	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/mode"
@@ -49,6 +51,53 @@ type confinement struct {
 	connectGrants []string
 	deny          *sessionDenyList
 	approvals     *connectApprovals
+	outside       *outsideSubjects
+}
+
+type outsideSubjects struct {
+	mu       sync.Mutex
+	subjects map[string][]string
+}
+
+func (o *outsideSubjects) add(subject string, reasons []string) bool {
+	if o == nil || subject == "" {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.subjects == nil {
+		o.subjects = map[string][]string{}
+	}
+	o.subjects[subject] = slices.Clone(reasons)
+	return true
+}
+
+func (o *outsideSubjects) has(subject string) bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, ok := o.subjects[subject]
+	return ok
+}
+
+func (o *outsideSubjects) reasons(subject string) []string {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.subjects[subject])
+}
+
+func (o *outsideSubjects) remove(subject string) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.subjects, subject)
 }
 
 type connectAsker func(ctx context.Context, dest string, covered func() bool, accept func(netproxy.Decision) bool) (netproxy.Decision, error)
@@ -404,9 +453,11 @@ func (c *confinement) resolve(ctx context.Context) (current, tmpDir string, conf
 		current = c.mode()
 	}
 	switch mode.Mode(current) {
-	case mode.Build:
-		return current, "", false, nil
-	case mode.Plan, mode.AutoEdits:
+	case mode.Plan, mode.AutoEdits, mode.Build:
+		if mode.Mode(current) == mode.Build && dispatch.TakeRunOutside(ctx) {
+			c.outside.remove(dispatch.ShellSubject(ctx))
+			return current, "", false, nil
+		}
 		if c.tmpDir == "" {
 			return current, "", true, fmt.Errorf("bootstrap: confined %s run has no private temporary folder", current)
 		}
@@ -471,6 +522,68 @@ func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permi
 	prepared.Env = env
 	if len(prepared.Argv) > 0 {
 		if prepared.Argv[0], err = runner.ResolveOnPath(prepared.Argv[0], lookup); err != nil {
+			return runner.RunSpec{}, err
+		}
+	}
+	return prepared, nil
+}
+
+func (c *confinement) prepareBuild(spec runner.RunSpec, tmpDir string, blocked *permissions.BlockedPaths, proxyURL string) (runner.RunSpec, error) {
+	base := spec.Env
+	if base == nil {
+		base = os.Environ()
+	}
+	home := c.home
+	if home == "" {
+		home = blocked.Home()
+	}
+	overrides := []string{"TERM=dumb"}
+	if proxyURL != "" {
+		overrides = append(overrides, "HTTPS_PROXY="+proxyURL, "HTTP_PROXY="+proxyURL, "https_proxy="+proxyURL, "http_proxy="+proxyURL,
+			"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1")
+	}
+	if gitGlobalConfigBlocked(home, blocked) {
+		overrides = append(overrides, "GIT_CONFIG_GLOBAL=/dev/null")
+	}
+	drop := make(map[string]bool, len(overrides)+2)
+	for _, e := range overrides {
+		name, _, _ := strings.Cut(e, "=")
+		drop[name] = true
+	}
+	if proxyURL != "" {
+		drop["ALL_PROXY"], drop["all_proxy"] = true, true
+	}
+	var launchTemp string
+	if abs, err := unresolvedAbs(os.TempDir()); err == nil {
+		launchTemp, _ = reachableDir(abs)
+	}
+	env := make([]string, 0, len(base)+len(overrides)+1)
+	var tmpVar, path string
+	for _, e := range base {
+		name, value, _ := strings.Cut(e, "=")
+		if drop[name] {
+			continue
+		}
+		if launchTemp != "" && namesFolder(value, spec.Cwd, launchTemp) {
+			value = tmpDir
+			e = name + "=" + value
+		}
+		switch name {
+		case "TMPDIR":
+			tmpVar = value
+		case "PATH":
+			path = value
+		}
+		env = append(env, e)
+	}
+	if tmpVar == "" {
+		env = append(env, "TMPDIR="+tmpDir)
+	}
+	prepared := cloneSpec(spec)
+	prepared.Env = append(env, overrides...)
+	if len(prepared.Argv) > 0 {
+		var err error
+		if prepared.Argv[0], err = runner.ResolveOnPath(prepared.Argv[0], path); err != nil {
 			return runner.RunSpec{}, err
 		}
 	}
@@ -553,7 +666,11 @@ func (c *confinement) confine(ctx context.Context, spec runner.RunSpec, current,
 		}
 		proxyURL = "http://" + endpoint.String()
 	}
-	prepared, err := c.prepare(spec, tmpDir, blocked, proxyURL)
+	prepare := c.prepare
+	if mode.Mode(current) == mode.Build {
+		prepare = c.prepareBuild
+	}
+	prepared, err := prepare(spec, tmpDir, blocked, proxyURL)
 	if err != nil {
 		return runner.RunSpec{}, false, err
 	}
@@ -576,6 +693,9 @@ func (c *confinement) confine(ctx context.Context, spec runner.RunSpec, current,
 }
 
 func (c *confinement) policy(current, tmpDir string, blocked *permissions.BlockedPaths, storesWritable bool) (enforce.Policy, error) {
+	if mode.Mode(current) == mode.Build {
+		current = enforce.ModeAutoEdits
+	}
 	p := enforce.Policy{Mode: current, BlockedPaths: blocked.Forms()}
 	skills, err := c.skillsReadRoots(blocked)
 	if err != nil {
@@ -800,15 +920,32 @@ func confinedRunFailed(res runner.RunResult) bool {
 	return res.ExitCode != 0 && res.LaunchErrCategory == ""
 }
 
-const proxyRouteNote = "codemeld: this command ran on the proxy route; tools that do not use HTTPS_PROXY/HTTP_PROXY, including ssh, scp and SSH URLs, get no network; use Build mode for those."
+const proxyRouteNote = "codemeld: this command ran on the proxy route; tools that do not use HTTPS_PROXY/HTTP_PROXY, including ssh, scp and SSH URLs, get no network; ask the user to run those."
+
+const (
+	fileRefusalsClosing = "codemeld: these are predictions and may be wrong; a listed refusal may not be what made the command fail, " +
+		"and more may appear after a folder is allowed. To allow a folder for later runs, add it to writable_folders."
+	planFileRefusalsClosing = "codemeld: these are predictions and may be wrong; a listed refusal may not be what made the command fail. " +
+		"Plan allows writes only in its temporary folder, and writable_folders does not change Plan."
+)
 
 type confinedFailure struct {
 	proxyRoute bool
 	lines      []string
+	files      []string
+	unjudged   int
+	plan       bool
+	outside    bool
+	remembered *outsideSubjects
+	subjects   []string
 }
+
+const outsideRunLine = "codemeld: to run this command once outside the sandbox, run it again; you will be asked first."
 
 type refusal struct {
 	Host, Port, Path, Reason string
+	File                     bool
+	Process, Candidate       string
 }
 
 var invocationRefusals = func(helper runner.HelperLaunch) []refusal {
@@ -829,48 +966,102 @@ func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.Help
 		return f
 	}
 	for _, r := range invocationRefusals(helper) {
+		if r.File {
+			f.files = appendNew(f.files, fileRefusalLine(r))
+			continue
+		}
 		dest := r.Path
 		if r.Host != "" && r.Port != "" {
 			dest = net.JoinHostPort(r.Host, r.Port)
 		}
 		if dest != "" {
-			f.addLine(strings.ToValidUTF8(fmt.Sprintf("codemeld: network refused: %s (%s)", dest, r.Reason), "\uFFFD"))
+			f.lines = appendNew(f.lines, strings.ToValidUTF8(fmt.Sprintf("codemeld: network refused: %s (%s)", dest, r.Reason), "\uFFFD"))
 		}
+	}
+	if h, ok := helper.(interface{ fileReport() (int, bool) }); ok {
+		f.unjudged, f.plan = h.fileReport()
 	}
 	return f
 }
 
-func (f *confinedFailure) addLine(line string) {
-	if !slices.Contains(f.lines, line) {
-		f.lines = append(f.lines, line)
+func fileRefusalLine(r refusal) string {
+	detail := cmp.Or(r.Process, "unknown process")
+	if r.Candidate != "" {
+		detail += "; grant candidate: " + r.Candidate
+	} else if r.Reason != "" {
+		detail += "; not grantable: " + r.Reason
 	}
+	return permissions.SingleLineControlEscape(fmt.Sprintf("codemeld: sandbox probably refused write: %s (%s)", r.Path, detail))
+}
+
+func appendNew(lines []string, line string) []string {
+	if slices.Contains(lines, line) {
+		return lines
+	}
+	return append(lines, line)
 }
 
 func (f *confinedFailure) merge(g *confinedFailure) {
 	f.proxyRoute = f.proxyRoute || g.proxyRoute
+	f.plan = f.plan || g.plan
+	f.outside = f.outside || g.outside
+	f.remembered = cmp.Or(f.remembered, g.remembered)
+	for _, s := range g.subjects {
+		f.subjects = appendNew(f.subjects, s)
+	}
+	f.unjudged += g.unjudged
 	for _, line := range g.lines {
-		f.addLine(line)
+		f.lines = appendNew(f.lines, line)
+	}
+	for _, line := range g.files {
+		f.files = appendNew(f.files, line)
 	}
 }
 
 func (f *confinedFailure) additions(room int) string {
+	if !f.outside || len(outsideRunLine)+1 > room {
+		return f.refusalAdditions(room)
+	}
+	return f.refusalAdditions(room-len(outsideRunLine)-1) + outsideRunLine + "\n"
+}
+
+func (f *confinedFailure) refusalAdditions(room int) string {
+	var out string
 	if len(f.lines) == 0 {
 		if f.proxyRoute && len(proxyRouteNote)+1 <= room {
-			return proxyRouteNote + "\n"
+			out = proxyRouteNote + "\n"
 		}
-		return ""
+	} else {
+		out = linesWithin(f.lines, room, "network refusals")
 	}
+	if len(f.files) == 0 && f.unjudged == 0 {
+		return out
+	}
+	tail := fileRefusalsClosing + "\n"
+	if f.plan {
+		tail = planFileRefusalsClosing + "\n"
+	}
+	if f.unjudged > 0 {
+		tail = fmt.Sprintf("codemeld: %d file calls could not be judged\n", f.unjudged) + tail
+	}
+	if rest := room - len(out) - len(tail); rest >= 0 {
+		out += linesWithin(f.files, rest, "file refusals") + tail
+	}
+	return out
+}
+
+func linesWithin(lines []string, room int, what string) string {
 	var b strings.Builder
 	shown := 0
-	for _, line := range f.lines {
+	for _, line := range lines {
 		if b.Len()+len(line)+1 > room {
 			break
 		}
 		b.WriteString(line + "\n")
 		shown++
 	}
-	if omitted := len(f.lines) - shown; omitted > 0 {
-		if marker := fmt.Sprintf("codemeld: %d more network refusals omitted.\n", omitted); b.Len()+len(marker) <= room {
+	if omitted := len(lines) - shown; omitted > 0 {
+		if marker := fmt.Sprintf("codemeld: %d more %s omitted.\n", omitted, what); b.Len()+len(marker) <= room {
 			b.WriteString(marker)
 		}
 	}
@@ -889,7 +1080,29 @@ func noteConfinedFailure(res runner.RunResult, cap int, f *confinedFailure) runn
 }
 
 func withConfinedFailure(stderr []byte, cap int, f *confinedFailure) ([]byte, int) {
-	avail := cap - len("\n"+confinedFailureNote)
+	out, kept, add := renderConfinedFailure(stderr, cap, f)
+	if f.outside && !f.listsRefusal(add) {
+		for _, s := range f.subjects {
+			f.remembered.remove(s)
+		}
+		f.outside, f.subjects = false, nil
+		out, kept, _ = renderConfinedFailure(stderr, cap, f)
+	}
+	return out, kept
+}
+
+func (f *confinedFailure) listsRefusal(add string) bool {
+	return slices.ContainsFunc(strings.Split(add, "\n"), func(line string) bool {
+		return slices.Contains(f.lines, line) || slices.Contains(f.files, line)
+	})
+}
+
+func renderConfinedFailure(stderr []byte, cap int, f *confinedFailure) ([]byte, int, string) {
+	note := confinedFailureNote
+	if f.outside && len(f.additions(cap-len("\n"+note))) < len(f.additions(cap-1)) {
+		note = ""
+	}
+	avail := cap - len("\n"+note)
 	minKeep := 0
 	if len(rawPrefixWithin(stderr, avail)) > 0 {
 		for len(rawPrefixWithin(stderr, minKeep)) == 0 {
@@ -902,7 +1115,7 @@ func withConfinedFailure(stderr []byte, cap int, f *confinedFailure) ([]byte, in
 	if len(out) > 0 && out[len(out)-1] != '\n' {
 		out = append(out, '\n')
 	}
-	return append(append(out, add...), confinedFailureNote...), len(kept)
+	return append(append(out, add...), note...), len(kept), add
 }
 
 // rawPrefixWithin keeps raw bytes rather than their model-input form so that a dropped tail still
@@ -972,7 +1185,10 @@ type confinedPipeline struct {
 func (r *confinedShellRunner) NewInvocationID() string { return r.events.NewInvocationID() }
 
 func (r *confinedShellRunner) Confined(ctx context.Context) (bool, error) {
-	_, _, confined, err := r.conf.resolve(ctx)
+	current, _, confined, err := r.conf.resolve(ctx)
+	if mode.Mode(current) == mode.Build {
+		return false, nil
+	}
 	return confined, err
 }
 
@@ -992,7 +1208,18 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 		defer prepared.Helper.Close()
 	}
 	res, failure, err := r.events.execBoundedPrepared(ctx, spec, prepared, r.events.cap, func(res runner.RunResult) *confinedFailure {
-		return confinedFailureOf(res, proxyRoute, prepared.Helper)
+		f := confinedFailureOf(res, proxyRoute, prepared.Helper)
+		if f != nil && mode.Mode(current) == mode.Build && len(f.lines)+len(f.files) > 0 {
+			subject := dispatch.ShellSubject(ctx)
+			var reasons []string
+			for _, line := range slices.Concat(f.files, f.lines) {
+				reasons = append(reasons, strings.TrimPrefix(line, "codemeld: "))
+			}
+			if f.outside = r.conf.outside.add(subject, reasons); f.outside {
+				f.remembered, f.subjects = r.conf.outside, []string{subject}
+			}
+		}
+		return f
 	})
 	if err == nil && failure != nil {
 		if r.failure == nil {

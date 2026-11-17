@@ -4,7 +4,11 @@ package bootstrap
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io/fs"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -187,6 +191,142 @@ func TestFirstRun_WritesBlockedPathsOnlyOnFirstRun(t *testing.T) {
 		}
 	})
 }
+
+func TestFreshStartup_ExistingSettingsRefreshesEarlierReferenceCopy(t *testing.T) {
+	home := realPath(t, t.TempDir())
+	project := realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, "provider:\n  openai:\n    base_url: https://api.openai.com/v1\n    api_key: sk-test\n", 0o600)
+	seedFirstRunDirs(t, home)
+	swapEarlierGit(t, olderGitTemplate)
+	gitPath := VCSTemplatePath(home, "git")
+	seedFile(t, gitPath, olderGitTemplate)
+
+	var stderr bytes.Buffer
+	steps := DefaultFreshSteps(&bytes.Buffer{}, &stderr)
+	steps.ResolveHome = func() (string, error) { return home, nil }
+	var atLoad string
+	load := steps.LoadVCSTemplates
+	steps.LoadVCSTemplates = func(h, root string, layer map[string]any, approved bool) (any, error) {
+		atLoad = readString(t, gitPath)
+		return load(h, root, layer, approved)
+	}
+
+	res, firstRun, err := runFreshCore(context.Background(), project, steps)
+	if err != nil || firstRun || res == nil {
+		t.Fatalf("runFreshCore = (%v, %v, %v), want a completed non-first-run startup; stderr=%q", res, firstRun, err, stderr.String())
+	}
+	t.Cleanup(res.ResumeLockRelease)
+
+	want, _ := builtin.BuiltinTemplate("git")
+	if atLoad != string(want) {
+		t.Fatalf("git.yaml at template load = %q, want the current embedded bytes", atLoad)
+	}
+	if got := readString(t, gitPath); got != string(want) {
+		t.Fatalf("git.yaml after startup = %q, want the current embedded bytes", got)
+	}
+	for _, name := range []string{"hg", "jj"} {
+		if _, err := os.Lstat(VCSTemplatePath(home, name)); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("%s.yaml stat err = %v, want a missing reference copy left missing", name, err)
+		}
+	}
+	if strings.Contains(stderr.String(), "write-vcs-template") {
+		t.Fatalf("stderr = %q, want no refresh failure", stderr.String())
+	}
+}
+
+func TestFreshStartup_RefreshesPreviousEmbeddedHgTemplateWithAmend(t *testing.T) {
+	home := realPath(t, t.TempDir())
+	project := realPath(t, t.TempDir())
+	writeGlobalSettings(t, home, "provider:\n  openai:\n    base_url: https://api.openai.com/v1\n    api_key: sk-test\n", 0o600)
+	seedFirstRunDirs(t, home)
+	hgPath := VCSTemplatePath(home, "hg")
+	seedFile(t, hgPath, previousEmbeddedHg)
+
+	var stderr bytes.Buffer
+	steps := DefaultFreshSteps(&bytes.Buffer{}, &stderr)
+	steps.ResolveHome = func() (string, error) { return home, nil }
+	var loaded any
+	load := steps.LoadVCSTemplates
+	steps.LoadVCSTemplates = func(h, root string, layer map[string]any, approved bool) (any, error) {
+		got, err := load(h, root, layer, approved)
+		loaded = got
+		return got, err
+	}
+
+	res, firstRun, err := runFreshCore(context.Background(), project, steps)
+	if err != nil || firstRun || res == nil {
+		t.Fatalf("runFreshCore = (%v, %v, %v), want a completed non-first-run startup; stderr=%q", res, firstRun, err, stderr.String())
+	}
+	t.Cleanup(res.ResumeLockRelease)
+
+	const amend = "amend:\n  argv: [hg, commit, --amend, -m, \"{message}\"]\n"
+	if got := readString(t, hgPath); !strings.Contains(got, amend) {
+		t.Fatalf("hg.yaml after startup = %q, want it to declare %q", got, amend)
+	}
+	hg := loaded.(*vcsLoaded).templates["hg"]
+	if !hg.BuiltinReferenceCopy || hg.Source != hgPath {
+		t.Fatalf("loaded hg template source %q reference copy %v, want the refreshed %q as a reference copy", hg.Source, hg.BuiltinReferenceCopy, hgPath)
+	}
+	if got := hg.Actions["amend"].Argv; !slices.Equal(got, []string{"hg", "commit", "--amend", "-m", "{message}"}) {
+		t.Fatalf("loaded hg amend argv = %q, want hg commit --amend -m {message}", got)
+	}
+}
+
+const previousEmbeddedHg = `# codemeld built-in VCS template: hg (Mercurial).
+#
+# Materialized to ~/.codemeld/global/vcs/hg.yaml on first run as a complete,
+# copy-and-modify reference. Each top-level key is one VCS action. 'detect' uses
+# a single 'marker' key; every other action uses 'argv' (run directly, with no
+# shell) and an optional 'cwd'. The placeholders {path}, {message}, and {branch}
+# are substituted before the command runs.
+
+detect:
+  marker: .hg
+
+status:
+  argv: [hg, status]
+
+diff:
+  argv: [hg, diff]
+
+add:
+  argv: [hg, add, "{path}"]
+
+commit:
+  argv: [hg, commit, -m, "{message}"]
+
+log:
+  argv: [hg, log, --limit, "20"]
+
+branch-current:
+  argv: [hg, branch]
+
+branch-create:
+  argv: [hg, branch, "{branch}"]
+
+branch-switch:
+  argv: [hg, update, "{branch}"]
+
+restore-file:
+  argv: [hg, revert, "{path}"]
+
+is-clean:
+  argv: [hg, status]
+
+stash:
+  argv: [hg, shelve]
+
+stash-pop:
+  argv: [hg, unshelve]
+
+# Probe-only: list unresolved merge files; never start/continue/abort a merge.
+merge-status:
+  argv: [hg, resolve, --list]
+
+# Probe-only: report interrupted operations such as an in-progress rebase.
+rebase-status:
+  argv: [hg, summary]
+`
 
 // readSnapshot loads a snapshot fixture relative to the package's testdata dir,
 // failing the test loudly if it is missing (a deleted fixture must not silently

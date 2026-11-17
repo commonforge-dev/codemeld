@@ -55,15 +55,16 @@ safely.
     the network through codemeld's session proxy, which asks per
     destination (host and port) whatever the program's name, admits saved
     `domain_grants`, and connects only to public addresses that are not
-    this machine's. In Plan that is the only route. In Auto edits, when the
+    this machine's. In Plan that is the only route. In Auto edits and Build, when the
     self-test's connection check also passes, a command can also connect
     directly to a TCP endpoint or Unix socket that a `connect_grants` entry
     names or that you allow at the connect prompt; when its listening check
     passes too, the command can also listen on a loopback TCP port or a Unix
     socket inside its write roots, and connects without a prompt to a
     loopback TCP endpoint it bound itself. Ordinary SSH does not
-    use the proxy: it fails in Plan, and in Auto edits unless a connect grant or
-    the connect prompt allows the `IP:port` it connects to, though an SSH client set up to tunnel
+    use the proxy: it fails in Plan, and in Auto edits and Build unless a connect grant or
+    the connect prompt allows the `IP:port` it connects to or the same command bound that
+    endpoint itself, though an SSH client set up to tunnel
     through an HTTP proxy (for example with a `ProxyCommand`) can reach an approved host and port. Shell commands cannot write the Git or Mercurial history
     store of a repository at the project root or at a declared
     `writable_folders` root, including a worktree's `.git` pointer file, so a
@@ -75,21 +76,29 @@ safely.
     customized templates get no routine-write auto-approval; a matching saved
     grant or turn approval can still cover them. The status bar shows `sandbox: on`.
   - <a id="broken-settings"></a>**Self-test passed, then a settings file's blocked-path list breaks.** Plan and
-    Auto edits commands stay confined, but every shell command asks until the
-    file is fixed, except one you already denied this turn, and a recognized
+    Auto edits commands stay confined, but every Plan and Auto edits shell
+    command asks until the file is fixed, except one you already denied this turn, and a recognized
     file deletion asks with allow once or deny only. codemeld's version-control
     tool calls keep their usual rules. In Auto edits, codemeld's own delete tool
     asks unless a declared file limit resolves it first (Plan refuses it), and
     declared writable folders stop approving its edit, create and make-folder
     tools outside the project. The status bar shows `sandbox: unavailable`;
-    `/status` and headless output add the reason.
+    `/status` and headless output add the reason. Build commands stay confined
+    too and keep their ordinary rules, so a read-only or already-approved
+    command still runs without asking; after the sandbox refuses a command, you
+    can approve one run of it
+    [outside the sandbox](docs/approvals.md#outside-the-sandbox).
   - **Self-test failed, or an unsupported OS, architecture, or kernel.** Commands
     run unconfined with ordinary permission prompts, and Plan still refuses
     mutating commands. The status bar shows `sandbox: unavailable`; `/status`
     and headless output add the reason as `sandbox: unavailable (reason)`, for
     example a Landlock ABI below 3, which Linux kernels before 6.2 have.
-  - **Build mode** always runs commands unconfined with ordinary prompts
-    (`sandbox: off` on a confined host).
+  - **Build mode** runs commands inside the Auto edits boundary when the
+    self-test passed, with the same proxy, direct-connection and listening
+    reach, still with ordinary prompts: a command needs its own approval
+    before any destination is asked. After the sandbox refuses a command, you
+    can approve one run of it
+    [outside the sandbox](docs/approvals.md#outside-the-sandbox).
 
 - **It stores provider credentials locally.** Provider API keys and login
   session state are kept as plaintext in your per-user settings file
@@ -167,7 +176,7 @@ further than described here are still welcome.
   send data to a host and port approved at the proxy or saved in
   `domain_grants`, for as long as the approval lasts. The proxy refuses
   loopback, local-network and this machine's own addresses.
-- **A command's own endpoint stays open to it.** Once an Auto edits command
+- **A command's own endpoint stays open to it.** Once an Auto edits or Build command
   binds a loopback TCP endpoint, whether or not it then listens, connecting to
   that endpoint is allowed without a prompt for the rest of the command, even
   after the command closes the socket and another program takes the same
@@ -179,8 +188,10 @@ further than described here are still welcome.
   leaves a timing race that a program still running from an earlier command
   could use to gain write access through a symlink.
 
-Outside the boundary — Build mode, or any host where the self-test did not pass
-— a shell command has your account's full authority once it is allowed to run.
+Outside the boundary — any host where the self-test did not pass, or a Build
+command you approved to run once
+[outside the sandbox](docs/approvals.md#outside-the-sandbox) — a shell
+command has your account's full authority once it is allowed to run.
 
 ### Network destinations
 
@@ -193,7 +204,7 @@ codemeld itself connects only to:
   ChatGPT subscription login;
 - Exa at `mcp.exa.ai` for `web_search`, and the page and redirect hops of a
   `web_fetch`;
-- in Auto edits, for a sandboxed shell command, a TCP endpoint or Unix socket
+- in Auto edits and Build, for a sandboxed shell command, a TCP endpoint or Unix socket
   that a `connect_grants` entry names or that the connect prompt allowed, and a
   loopback TCP endpoint the same command bound; these direct connections can
   reach this machine and the local network;

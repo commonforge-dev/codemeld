@@ -426,6 +426,8 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	authorizer.executionConstrained = execution.SelfTestPassed
 	authorizer.blocked = guard.Blocked
 	authorizer.systemOne = systemOne
+	conf.outside = &outsideSubjects{}
+	authorizer.outside = conf.outside
 	d.authorizer = authorizer
 
 	dispatcher := newProductionToolDispatcher(registry, newShellRunner(), authorizer, result.Home, result.LaunchDir, storeAccessor, cache.MaxToolOutputBytes(), guard)
@@ -446,6 +448,8 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	// possibly-nil shipped surface and accept a name that collides.
 	assembleTools = newCapabilityGatedToolAdvertiser(assembleTools, cache, active)
 	surface := newHeadlessSurface(d.stdout, stderr)
+	filetools.SetSwapReporter(surface.CommitProviderError)
+	defer filetools.SetSwapReporter(nil)
 	var timeLimit time.Duration
 	surface.deadline, timeLimit = d.TimeLimit()
 
@@ -848,6 +852,7 @@ type headlessAuthorizer struct {
 	writable             *writableFoldersReader
 	blocked              *permissions.BlockedPaths
 	systemOne            *systemOneCheck
+	outside              *outsideSubjects
 	localNotice          sync.Once
 
 	mu       sync.Mutex
@@ -930,7 +935,7 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 	}
 	texts := systemOneLiteralTexts{}
 	texts.add(req, disp.Subject)
-	disp = markExceptional(disp, req, modeCtx)
+	disp = markOutside(markExceptional(disp, req, modeCtx), req, modeCtx, a.outside)
 	noApprover := headlessDenyReason
 	if disp.ExceptionalAuthority != "" {
 		noApprover = "no approval available in non-interactive run mode for an exceptional action that adds " + disp.ExceptionalAuthority
@@ -945,9 +950,22 @@ func (a *headlessAuthorizer) Authorize(ctx context.Context, req permissions.Matc
 			return a.denyPrompt(ctx, esc)
 		}
 	}
+	var grants permissions.GrantTable = a.grants
+	var cache permissions.ApprovalCache = a.grants
+	if disp.ExceptionalAuthority == outsideSandboxAuthority {
+		grants, cache = withoutOutsideApprovals(grants, cache, []permissions.MatchRequest{req})
+		ask := prompt
+		prompt = func(ctx context.Context, esc permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
+			out, err := ask(ctx, esc)
+			if err == nil {
+				settleOutside(ctx, out.Choice, a.outside, req.Subject)
+			}
+			return out, err
+		}
+	}
 	deps := permissions.AuthorizeDeps{
-		Grants:         a.grants,
-		Cache:          a.grants,
+		Grants:         grants,
+		Cache:          cache,
 		Prompt:         prompt,
 		PersistGrant:   a.persistGrant(store, req.PathScope),
 		PrePromptCheck: a.systemOne.bind(store, texts),
@@ -1043,6 +1061,9 @@ func (a *headlessAuthorizer) denialReason(dec permissions.Decision, noApprover s
 // fail-closed) is honored uniformly for every tool/shell check.
 func (a *headlessAuthorizer) promptFor(req permissions.MatchRequest, disp dispatch.PromptDisplay) func(context.Context, permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
 	if a.terminal != nil {
+		if disp.ExceptionalAuthority == outsideSandboxAuthority {
+			return a.terminal.buildWithReasons(req, disp, a.outside.reasons(req.Subject))
+		}
 		return a.terminal.build(req, disp)
 	}
 	return a.denyPrompt

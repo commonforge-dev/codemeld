@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codemeld.dev/codemeld/internal/tools"
 )
 
 func imageBytes(format string) []byte {
@@ -368,6 +370,33 @@ func TestReadImageTool_SymlinkSwappedAfterCheckRefused(t *testing.T) {
 			}
 			if strings.Contains(stdout+stderr, "OUTSIDE-SECRET") {
 				t.Fatalf("read_image returned the symlink target's bytes: stdout %q stderr %q", stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestReadImageTool_FolderSwappedAfterResolveTargetRefused(t *testing.T) {
+	secret := append(imageBytes("png"), []byte(readSwapSecret)...)
+	for _, c := range readSwapCases() {
+		t.Run(c.name, func(t *testing.T) {
+			project, args, swap := readSwapFixture(t, c, imageBytes("gif"), secret)
+			tool := NewReadImageTool(t.TempDir(), project, project, 65536)
+			target, _, err := tool.ResolveTarget(args)
+			if err != nil {
+				t.Fatalf("ResolveTarget(%v) error = %v", args, err)
+			}
+			var res tools.Result
+			readSwapApply(t, c, swap, func() {
+				res, err = tool.InvokeWithResolvedTarget(context.Background(), args, target)
+			})
+			if err != nil {
+				t.Fatalf("InvokeWithResolvedTarget error = %v", err)
+			}
+			if res.ExitCode == 0 || res.ModelContextImage != "" {
+				t.Fatalf("read_image after a folder swap = (exit %d, image %q), want a refusal with no image", res.ExitCode, res.ModelContextImage)
+			}
+			if strings.Contains(string(res.Stdout)+string(res.Stderr), readSwapSecret) {
+				t.Fatalf("read_image returned the swapped-in file's bytes: stdout %q stderr %q", res.Stdout, res.Stderr)
 			}
 		})
 	}

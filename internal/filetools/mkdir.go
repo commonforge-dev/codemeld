@@ -341,7 +341,7 @@ func (t *MkdirTool) openAuthorizedAncestor(scope *authorizedScope, ancestor stri
 	if scope != nil {
 		return scope.openWithin(ancestor)
 	}
-	dir, oerr := os.OpenFile(ancestor, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	dir, oerr := openDirByComponentsFromRoot(ancestor)
 	if oerr != nil {
 		return nil, "mkdir target's existing parent directory changed after authorization; refusing to create outside the authorized directory"
 	}
@@ -357,7 +357,7 @@ func (t *MkdirTool) openAuthorizedAncestor(scope *authorizedScope, ancestor stri
 // where it was authorized; a non-empty reason means the caller must roll the create back.
 func confirmAncestorStillAuthorized(parentDir *os.File, ancestor string) string {
 	const moved = "mkdir target's authorized parent directory moved during the create; refusing to report a directory create at a path it is not located at"
-	pathDir, oerr := os.OpenFile(ancestor, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	pathDir, oerr := openDirByComponentsFromRoot(ancestor)
 	if oerr != nil {
 		return moved
 	}

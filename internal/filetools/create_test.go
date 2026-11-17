@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"codemeld.dev/codemeld/internal/fsutil"
+	"codemeld.dev/codemeld/internal/tools"
 )
 
 // newCreateToolIn builds a create tool whose project root and relative-path base are root, with a
@@ -1554,5 +1556,217 @@ func TestCreateTool_IntermediateDirectoryAppearingWhilePendingStillCreates(t *te
 	}
 	if got := readFile(t, target); got != "package b\n" {
 		t.Fatalf("file = %q, want the created content", got)
+	}
+}
+
+func scopeSwapLayout(t *testing.T) (root, outside string) {
+	t.Helper()
+	root = eval(t, t.TempDir())
+	outside = eval(t, t.TempDir())
+	if err := os.MkdirAll(filepath.Join(root, "a", "b"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	return root, outside
+}
+
+// scopeSwapMoveOut leaves a symlink to the moved-out directory so a path reopen that follows it finds the
+// very inode the tool already holds and every identity comparison agrees.
+func scopeSwapMoveOut(t *testing.T, root, outside string) {
+	t.Helper()
+	moved := filepath.Join(outside, "a")
+	if err := os.Rename(filepath.Join(root, "a"), moved); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if err := os.Symlink(moved, filepath.Join(root, "a")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+}
+
+func scopeSwapAt(t *testing.T, seam *func(), fn func()) {
+	t.Helper()
+	orig := *seam
+	t.Cleanup(func() { *seam = orig })
+	*seam = fn
+}
+
+func TestCreateTool_IntermediateSymlinkSwappedBeforeCaptureRefusesCapture(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	tool := newCreateToolIn(t, root)
+	_, scope, err := tool.ResolveTarget(map[string]any{"path": "a/b/new.txt", "content": "x"})
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+
+	scopeSwapMoveOut(t, root, outside)
+
+	if _, cerr := CaptureScopeIdentity(scope); cerr == nil {
+		t.Fatal("CaptureScopeIdentity = nil error, want a refusal to capture through a symlinked folder")
+	}
+	if _, serr := os.Lstat(filepath.Join(outside, "a", "b", "new.txt")); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("Lstat(outside file) = %v, want nothing created outside", serr)
+	}
+}
+
+func TestCreateTool_IntermediateSymlinkSwappedAfterConfirmCreatesNothing(t *testing.T) {
+	root, outside := scopeSwapLayout(t)
+	tool := newCreateToolIn(t, root)
+	args := map[string]any{"path": "a/b/new.txt", "content": "x"}
+	target, scope, err := tool.ResolveTarget(args)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	identity := mustCaptureScope(t, scope)
+	scopeSwapAt(t, &beforeCreatePublish, func() { scopeSwapMoveOut(t, root, outside) })
+
+	res, err := tool.InvokeWithAuthorizedScope(context.Background(), args, target, scope, identity)
+	if err != nil {
+		t.Fatalf("error = %v, want nil (the refusal surfaces in-band)", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0 (stdout %q), want a refusal once a folder on the path became a symlink", res.Stdout)
+	}
+	outsideDir := filepath.Join(outside, "a", "b")
+	if _, serr := os.Lstat(filepath.Join(outsideDir, "new.txt")); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("Lstat(outside file) = %v, want nothing created outside", serr)
+	}
+	assertNoTemp(t, outsideDir)
+}
+
+func TestAuthorizedWrites_ProjectBelowSearchOnlyFolderSucceed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores folder permissions")
+	}
+	gate := filepath.Join(eval(t, t.TempDir()), "gate")
+	project := filepath.Join(gate, "proj")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeFile(t, filepath.Join(project, "a.txt"), "PAYLOAD\n")
+	if err := os.Chmod(gate, 0o111); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gate, 0o755) })
+
+	target := filepath.Join(project, "new.go")
+	res, err := newCreateToolIn(t, project).InvokeWithAuthorizedScope(context.Background(),
+		map[string]any{"path": "new.go", "content": "package main\n"}, target, project, mustCaptureScope(t, project))
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("create: err=%v exit=%d stderr=%q, want success below a search-only folder", err, res.ExitCode, res.Stderr)
+	}
+
+	mover := newMoveToolIn(t, project)
+	src, dst := filepath.Join(project, "a.txt"), filepath.Join(project, "b.txt")
+	resolved, err := mover.ResolveEndpoints(map[string]any{"source": src, "destination": dst})
+	if err != nil {
+		t.Fatalf("ResolveEndpoints: %v", err)
+	}
+	res, err = mover.InvokeWithAuthorizedMove(WithWriteJournal(context.Background(), newFakeJournal(src, dst)), resolved,
+		mustCaptureScope(t, resolved.SourceScope), mustCaptureScope(t, resolved.DestinationScope))
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("move: err=%v exit=%d stderr=%q, want success below a search-only folder", err, res.ExitCode, res.Stderr)
+	}
+	if _, serr := os.Lstat(dst); serr != nil {
+		t.Fatalf("Lstat(destination) = %v, want the moved file", serr)
+	}
+}
+
+var swapOrRemove = []struct {
+	name  string
+	apply func(t *testing.T, path string)
+	warns bool
+}{
+	{"symlink", func(t *testing.T, path string) { replaceWithSymlink(t, path, path+"-orig") }, true},
+	{"deleted", func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
+		}
+	}, false},
+	{"unreadable file", func(t *testing.T, path string) {
+		t.Helper()
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && os.Geteuid() == 0 {
+			t.Skip("root can open a mode 0 file")
+		}
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
+		}
+		if err := os.WriteFile(path, nil, 0); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}, false},
+}
+
+func pendingScoped(t *testing.T, resolve func(map[string]any) (string, string, error),
+	invoke func(context.Context, map[string]any, string, string, ScopeIdentity) (tools.Result, error),
+	args map[string]any) func() (tools.Result, error) {
+	t.Helper()
+	target, scope, err := resolve(args)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	identity := mustCaptureScope(t, scope)
+	return func() (tools.Result, error) { return invoke(context.Background(), args, target, scope, identity) }
+}
+
+func assertSwapRefusal(t *testing.T, res tools.Result, err error, refusal string, reports []string, swapped string, warns bool) {
+	t.Helper()
+	if err != nil || res.ExitCode == 0 {
+		t.Fatalf("err=%v exit=%d stdout=%q, want an in-band refusal", err, res.ExitCode, res.Stdout)
+	}
+	if got := string(res.Stderr); !strings.Contains(got, refusal) {
+		t.Fatalf("stderr = %q, want the refusal %q", got, refusal)
+	}
+	var want []string
+	if warns {
+		want = []string{swapWarning(swapped)}
+	}
+	if !slices.Equal(reports, want) {
+		t.Fatalf("reports = %q, want %q", reports, want)
+	}
+}
+
+func TestScopedWrites_FolderSwappedWhilePendingWarnsOnlyForSymlink(t *testing.T) {
+	writes := []struct {
+		name    string
+		prepare func(t *testing.T, root string) func() (tools.Result, error)
+	}{
+		{"create", func(t *testing.T, root string) func() (tools.Result, error) {
+			tool := newCreateToolIn(t, root)
+			return pendingScoped(t, tool.ResolveTarget, tool.InvokeWithAuthorizedScope, map[string]any{"path": "a/b/new.txt", "content": "x"})
+		}},
+		{"delete", func(t *testing.T, root string) func() (tools.Result, error) {
+			tool := newDeleteToolIn(t, root)
+			return pendingScoped(t, tool.ResolveTarget, tool.InvokeWithAuthorizedScope, map[string]any{"path": "a/b/f.txt"})
+		}},
+		{"mkdir", func(t *testing.T, root string) func() (tools.Result, error) {
+			tool := newMkdirToolIn(t, root)
+			return pendingScoped(t, tool.ResolveTarget, tool.InvokeWithAuthorizedScope, map[string]any{"path": "a/b/sub"})
+		}},
+		{"move", func(t *testing.T, root string) func() (tools.Result, error) {
+			tool := newMoveToolIn(t, root)
+			resolved, err := tool.ResolveEndpoints(map[string]any{"source": "a/b/f.txt", "destination": "a/b/g.txt"})
+			if err != nil {
+				t.Fatalf("ResolveEndpoints: %v", err)
+			}
+			src, dst := mustCaptureScope(t, resolved.SourceScope), mustCaptureScope(t, resolved.DestinationScope)
+			return func() (tools.Result, error) {
+				return tool.InvokeWithAuthorizedMove(context.Background(), resolved, src, dst)
+			}
+		}},
+	}
+	for _, w := range writes {
+		for _, s := range swapOrRemove {
+			t.Run(w.name+"/"+s.name, func(t *testing.T) {
+				root, _ := scopeSwapLayout(t)
+				writeFile(t, filepath.Join(root, "a", "b", "f.txt"), "inside\n")
+				invoke := w.prepare(t, root)
+				reports := recordSwapReports(t)
+				folder := filepath.Join(root, "a")
+				s.apply(t, folder)
+
+				res, err := invoke()
+				assertSwapRefusal(t, res, err, authorizedScopeReplaced, *reports, folder, s.warns)
+			})
+		}
 	}
 }

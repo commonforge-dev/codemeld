@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -840,5 +841,102 @@ func TestOpenNoFollowUnder_BoundaryOrParentSwappedAfterCheckRefused(t *testing.T
 				t.Fatal("reason empty, want a refusal reason")
 			}
 		})
+	}
+}
+
+func recordSwapReports(t *testing.T) *[]string {
+	t.Helper()
+	var got []string
+	SetSwapReporter(func(line string) { got = append(got, line) })
+	t.Cleanup(func() { SetSwapReporter(nil) })
+	return &got
+}
+
+func swapWarning(path string) string {
+	return "Warning: " + path + " was replaced by a symlink after codemeld checked it; codemeld refused to use it. A program left running by an earlier command may be changing your project."
+}
+
+func swapFixture(t *testing.T) (root, outside string) {
+	t.Helper()
+	root = eval(t, t.TempDir())
+	outside = eval(t, t.TempDir())
+	writeFile(t, filepath.Join(outside, "f"), "OUTSIDE-SECRET\n")
+	mkdir(t, filepath.Join(root, "sub"))
+	writeFile(t, filepath.Join(root, "sub", "f"), "inside\n")
+	return root, outside
+}
+
+func TestOpenNoFollowUnder_SymlinkSwapReportsTheSwappedPathOnce(t *testing.T) {
+	for _, tc := range symlinkSwapCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root, outside := swapFixture(t)
+			path, target := tc.pick(root, outside)
+			swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, path, target) })
+			reports := recordSwapReports(t)
+
+			f, reason := openNoFollowUnder(root, filepath.Join(root, "sub", "f"))
+			if f != nil {
+				_ = f.Close()
+				t.Fatal("openNoFollowUnder opened a file after a symlink swap, want a refusal")
+			}
+			if reason == "" {
+				t.Fatal("reason empty, want a refusal reason")
+			}
+			if len(*reports) != 1 || (*reports)[0] != swapWarning(path) {
+				t.Fatalf("reports = %q, want exactly [%q]", *reports, swapWarning(path))
+			}
+		})
+	}
+}
+
+func TestOpenNoFollowUnder_DeletedBeforeOpenRefusesWithoutReport(t *testing.T) {
+	for _, removed := range []string{"file", "folder"} {
+		t.Run(removed, func(t *testing.T) {
+			root, _ := swapFixture(t)
+			path := filepath.Join(root, "sub")
+			if removed == "file" {
+				path = filepath.Join(path, "f")
+			}
+			swapBeforeNoFollowOpen(t, func() {
+				if err := os.RemoveAll(path); err != nil {
+					t.Fatalf("RemoveAll: %v", err)
+				}
+			})
+			reports := recordSwapReports(t)
+
+			f, reason := openNoFollowUnder(root, filepath.Join(root, "sub", "f"))
+			if f != nil {
+				_ = f.Close()
+				t.Fatal("openNoFollowUnder opened a deleted file, want a refusal")
+			}
+			if reason == "" {
+				t.Fatal("reason empty, want a refusal reason")
+			}
+			if len(*reports) != 0 {
+				t.Fatalf("reports = %q, want none for a deleted %s", *reports, removed)
+			}
+		})
+	}
+}
+
+func TestOpenNoFollowUnder_SymlinkSwapReportEscapesControlCharacters(t *testing.T) {
+	root, outside := swapFixture(t)
+	path := filepath.Join(root, "x\ny\x1b[31m")
+	mkdir(t, path)
+	writeFile(t, filepath.Join(path, "f"), "inside\n")
+	swapBeforeNoFollowOpen(t, func() { replaceWithSymlink(t, path, outside) })
+	reports := recordSwapReports(t)
+
+	f, _ := openNoFollowUnder(root, filepath.Join(path, "f"))
+	if f != nil {
+		_ = f.Close()
+		t.Fatal("openNoFollowUnder opened a file after a symlink swap, want a refusal")
+	}
+	want := swapWarning(strconv.QuoteToGraphic(path))
+	if len(*reports) != 1 || (*reports)[0] != want {
+		t.Fatalf("reports = %q, want exactly [%q]", *reports, want)
+	}
+	if strings.ContainsAny((*reports)[0], "\n\x1b") {
+		t.Fatalf("report %q carries raw control characters", (*reports)[0])
 	}
 }

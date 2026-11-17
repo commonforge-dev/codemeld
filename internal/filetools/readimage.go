@@ -122,18 +122,14 @@ func (t *ReadImageTool) resolveAndReadImage(resolvedTarget string) (mime string,
 	if t.ExternalReadScope(resolvedTarget) {
 		boundary = filepath.Dir(resolvedTarget)
 	}
-	real, ok, reason := ResolveReadFile(resolvedTarget, boundary)
-	if !ok {
-		return "", nil, fmt.Errorf("%s", reason)
-	}
-	ignored, ierr := imagePathIgnored(t.projectRoot, t.home, real)
+	ignored, ierr := imagePathIgnored(t.projectRoot, t.home, resolvedTarget)
 	if ierr != nil {
 		return "", nil, ierr
 	}
 	if ignored {
 		return "", nil, fmt.Errorf("path is excluded by codemeldignore")
 	}
-	data, err = readCappedImageBytes(boundary, real)
+	data, err = readCappedImageBytes(boundary, resolvedTarget)
 	if err != nil {
 		return "", nil, err
 	}

@@ -328,8 +328,9 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					"commands could run sandboxed with fewer prompts; refused carries the reason they\n" +
 					"could not. A refusal for a broken settings file after a passed check still kept plan\n" +
 					"and auto-edits commands sandboxed but made every command ask; a failed or unsupported\n" +
-					"check ran them outside the sandbox with ordinary prompts. Neither value describes\n" +
-					"build mode, which always runs commands outside the sandbox.\n\n" +
+					"check ran them outside the sandbox with ordinary prompts. Sessions recorded before\n" +
+					"v0.4.13 ran build-mode commands outside the sandbox either way; from v0.4.13 build\n" +
+					"commands are sandboxed too when the check passed, still asking before each one.\n\n" +
 					"Execution is reported as two separately labelled classes, because the file keeps\n" +
 					"two distinct durable lifecycles. tool_exec_end covers shell and vcs execution and\n" +
 					"ends in an exit code, so its rows count invocations, non-zero-exit failures, and\n" +

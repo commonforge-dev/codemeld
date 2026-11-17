@@ -17,6 +17,7 @@ internal/fsutil/atomic.go SetRecoveryNameForTest
 internal/fsutil/atomic.go SetBeforeCleanupForTest
 internal/fsutil/move.go SetRenameNoReplaceAtForTest
 internal/fsutil/move.go SetBeforeMoveRenameForTest
+internal/filetools/walk.go SetWalkBeforeRootOpenForTest
 
 # --prompt-for-approval wiring observability: the run test asserts the flag bound
 # interactive terminal escalation onto the real HeadlessDriver. Production reads the field
@@ -90,3 +91,7 @@ internal/events/payloads.go checkSecurityHaltRecords
 # Pathname entrypoint kept for the rewrite tests: config.Persist publishes through the
 # held-parent route (rewriteKeyAt), so RewriteKey has no production caller by design.
 internal/config/rewrite.go RewriteKey
+
+# Test entrypoint for the vcs invocation tests: ActionTool resolves the action cwd itself so
+# the amend shared-commit query runs in the same folder, so Invoke has no production caller.
+internal/vcs/invoke.go Invoke

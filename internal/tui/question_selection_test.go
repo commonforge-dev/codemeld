@@ -6,6 +6,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -249,36 +250,43 @@ func TestQuestionSelection_DescriptionRowsCopyTheirSource(t *testing.T) {
 	})
 }
 
-// A newline the provider wrote is source text, so a drag that meets it at a row edge has
-// to copy it. The break the renderer inserts to wrap a long line is not in the source and
-// still must not appear, which is why the two edges are asserted separately.
-func TestQuestionSelection_SourceNewlineAtARowEdgeIsCopied(t *testing.T) {
+// A newline the provider wrote is source text drawn as its escape, so a drag that meets
+// the escape has to copy the newline. The break the renderer inserts to wrap a long line is
+// not in the source and still must not appear.
+func TestQuestionSelection_SourceNewlineEscapeIsCopiedAsTheNewline(t *testing.T) {
 	const prompt = "First line\nSecond line"
+	const head = "First line"
 
-	t.Run("a drag from the row end into the next row keeps it", func(t *testing.T) {
-		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 120, 30)
-		if o.starts[0] != 2 {
-			t.Fatalf("prompt rendered on %d row(s); the hard-break case is not covered", o.starts[0])
+	t.Run("the escape is drawn in place of a row break", func(t *testing.T) {
+		_, o, _ := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 120, 30)
+		if o.starts[0] != 1 {
+			t.Fatalf("prompt rendered on %d row(s), want 1", o.starts[0])
 		}
-		x1, y1 := qsRowEnd(o, 0)
-		x1--
-		x2, y2 := qsRowEnd(o, 1)
+		if row := strings.Split(o.GetText(true), "\n")[0]; row != `First line\x0ASecond line` {
+			t.Fatalf("prompt row = %q, want the newline drawn as its escape", row)
+		}
+	})
+
+	t.Run("a drag from the escape to the row end keeps the newline", func(t *testing.T) {
+		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 120, 30)
+		x1, y1 := qsAt(o, 0, len(head))
+		x2, y2 := qsRowEnd(o, 0)
 		qsDrag(a, x1, y1, x2, y2)
 		qsCopied(t, a, captured, "\nSecond line")
 	})
 
-	t.Run("a drag ending at the next row's start keeps it", func(t *testing.T) {
+	t.Run("a drag ending just past the escape keeps the newline", func(t *testing.T) {
 		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 120, 30)
 		x1, y1 := qsAt(o, 0, 0)
-		x2, y2 := qsAt(o, 1, 0)
+		x2, y2 := qsAt(o, 0, len(head)+4)
 		qsDrag(a, x1, y1, x2, y2)
 		qsCopied(t, a, captured, "First line\n")
 	})
 
-	t.Run("a whole prompt with a hard break copies both lines", func(t *testing.T) {
+	t.Run("a whole prompt with a newline copies both lines", func(t *testing.T) {
 		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 120, 30)
 		x1, y1 := qsAt(o, 0, 0)
-		x2, y2 := qsRowEnd(o, 1)
+		x2, y2 := qsRowEnd(o, 0)
 		qsDrag(a, x1, y1, x2, y2)
 		qsCopied(t, a, captured, prompt)
 	})
@@ -286,13 +294,12 @@ func TestQuestionSelection_SourceNewlineAtARowEdgeIsCopied(t *testing.T) {
 	t.Run("an option label keeps its own newline", func(t *testing.T) {
 		const label = "Local disk\nunder the cache dir"
 		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: "Pick one", Options: []string{label}}, 120, 30)
-		first, last := o.starts[0], o.lastLineOf(0)
-		if last != first+1 {
-			t.Fatalf("label rendered on %d row(s); the hard-break case is not covered", last-first+1)
+		row := o.starts[0]
+		if o.lastLineOf(0) != row {
+			t.Fatalf("label rendered on %d row(s), want 1", o.lastLineOf(0)-row+1)
 		}
-		x1, y1 := qsRowEnd(o, first)
-		x1--
-		x2, y2 := qsRowEnd(o, last)
+		x1, y1 := qsAt(o, row, questionRowMarkWidth+len("Local disk"))
+		x2, y2 := qsRowEnd(o, row)
 		qsDrag(a, x1, y1, x2, y2)
 		qsCopied(t, a, captured, "\nunder the cache dir")
 	})
@@ -318,6 +325,105 @@ func TestQuestionSelection_SourceNewlineAtARowEdgeIsCopied(t *testing.T) {
 			t.Fatalf("copied %q, want a suffix of %q", a.input.lastCopied, label)
 		}
 	})
+}
+
+func TestQuestionSelection_ControlEscapeCopiesTheRawControl(t *testing.T) {
+	const prompt = "Pick\vone of these stores before the session starts writing"
+
+	t.Run("a wrapped row with an escape copies its source", func(t *testing.T) {
+		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 34, 30)
+		if o.starts[0] < 2 {
+			t.Fatalf("prompt rendered on %d row(s); the wrapped case is not covered", o.starts[0])
+		}
+		row := strings.Split(o.GetText(true), "\n")[0]
+		if !strings.HasPrefix(row, `Pick\x0Bone`) {
+			t.Fatalf("prompt row = %q, want the VT drawn as its escape", row)
+		}
+		x1, y1 := qsAt(o, 0, 0)
+		x2, y2 := qsRowEnd(o, 0)
+		qsDrag(a, x1, y1, x2, y2)
+		qsCopied(t, a, captured, strings.Replace(row, `\x0B`, "\v", 1))
+	})
+
+	t.Run("a drag ending just past the escape copies through the control", func(t *testing.T) {
+		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 34, 30)
+		x1, y1 := qsAt(o, 0, 0)
+		x2, y2 := qsAt(o, 0, len("Pick")+4)
+		qsDrag(a, x1, y1, x2, y2)
+		qsCopied(t, a, captured, "Pick\v")
+	})
+
+	t.Run("a drag ending inside the escape copies through the control", func(t *testing.T) {
+		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 34, 30)
+		x1, y1 := qsAt(o, 0, 0)
+		x2, y2 := qsAt(o, 0, len("Pick")+2)
+		qsDrag(a, x1, y1, x2, y2)
+		qsCopied(t, a, captured, "Pick\v")
+	})
+
+	t.Run("a drag starting inside the escape copies from the control", func(t *testing.T) {
+		a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 34, 30)
+		x1, y1 := qsAt(o, 0, len("Pick")+2)
+		x2, y2 := qsAt(o, 0, len("Pick")+7)
+		qsDrag(a, x1, y1, x2, y2)
+		qsCopied(t, a, captured, "\vone")
+	})
+}
+
+// A wrap can split a control's escape across two rows, so a row's source offset alone does
+// not say how much of the escape the row above already drew.
+func TestQuestionSelection_SplitControlEscapeCopiesTheRawControl(t *testing.T) {
+	for _, tc := range []struct {
+		name, control, escape string
+	}{
+		{"C0", "\v", `\x0B`},
+		{"C1", "\u0085", `\u0085`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			open := func(t *testing.T, split int) (*App, *questionOptions, *[]string, string) {
+				t.Helper()
+				_, probe, _ := qsOpen(t, QuestionSpec{ID: "q", Prompt: "p", Options: []string{"Local disk"}}, 30, 30)
+				head := strings.Repeat("a", probe.width-split)
+				prompt := head + tc.control + "b"
+				a, o, captured := qsOpen(t, QuestionSpec{ID: "q", Prompt: prompt, Options: []string{"Local disk"}}, 30, 30)
+				rows := strings.Split(o.GetText(true), "\n")
+				if o.starts[0] != 2 || rows[0] != head+tc.escape[:split] || rows[1] != tc.escape[split:]+"b" {
+					t.Fatalf("prompt rows = %q, want the escape split after %d bytes", rows[:o.starts[0]], split)
+				}
+				return a, o, captured, prompt
+			}
+			for split := 1; split < len(tc.escape); split++ {
+				t.Run("whole source", func(t *testing.T) {
+					a, o, captured, prompt := open(t, split)
+					x1, y1 := qsAt(o, 0, 0)
+					x2, y2 := qsRowEnd(o, 1)
+					qsDrag(a, x1, y1, x2, y2)
+					qsCopied(t, a, captured, prompt)
+				})
+				t.Run("first row only", func(t *testing.T) {
+					a, o, captured, prompt := open(t, split)
+					x1, y1 := qsAt(o, 0, 0)
+					x2, y2 := qsRowEnd(o, 0)
+					qsDrag(a, x1, y1, x2, y2)
+					qsCopied(t, a, captured, strings.TrimSuffix(prompt, "b"))
+				})
+				t.Run("continuation row", func(t *testing.T) {
+					a, o, captured, _ := open(t, split)
+					x1, y1 := qsAt(o, 1, 0)
+					x2, y2 := qsRowEnd(o, 1)
+					qsDrag(a, x1, y1, x2, y2)
+					qsCopied(t, a, captured, tc.control+"b")
+				})
+				t.Run("text after the escape on the continuation row", func(t *testing.T) {
+					a, o, captured, _ := open(t, split)
+					x1, y1 := qsAt(o, 1, len(tc.escape)-split)
+					x2, y2 := qsRowEnd(o, 1)
+					qsDrag(a, x1, y1, x2, y2)
+					qsCopied(t, a, captured, "b")
+				})
+			}
+		})
+	}
 }
 
 // An ordinary soft wrap breaks at the offset past the breaking space, so the separator is
@@ -828,14 +934,43 @@ func TestWrapSource_LandsOnSourceByteBoundaries(t *testing.T) {
 		}
 	})
 
-	t.Run("a dropped hard-break newline still advances the offset", func(t *testing.T) {
+	t.Run("a newline is drawn as its escape on the same line", func(t *testing.T) {
 		const src = "one\ntwo"
 		lines, offsets := wrapSource(src, 40)
-		if len(lines) != 2 {
-			t.Fatalf("wrapped %q into %d lines, want 2", src, len(lines))
+		if want := `one\x0Atwo`; len(lines) != 1 || lines[0] != want || offsets[0] != 0 {
+			t.Fatalf("wrapped %q into %q at %v, want [%q] at [0]", src, lines, offsets, want)
 		}
-		if offsets[0] != 0 || offsets[1] != 4 {
-			t.Fatalf("offsets = %v, want [0 4] (the newline WordWrap dropped still occupies a byte)", offsets)
+	})
+
+	t.Run("every control is drawn as its escape", func(t *testing.T) {
+		for _, hv := range hostileControls() {
+			if utf8.RuneCountInString(hv.value) != 1 {
+				continue
+			}
+			src := "a " + hv.value + " b"
+			lines, offsets := wrapSource(src, 40)
+			if want := escapedControls(src); len(lines) != 1 || lines[0] != want || offsets[0] != 0 {
+				t.Fatalf("%s: wrapped into %q at %v, want [%q] at [0]", hv.name, lines, offsets, want)
+			}
+		}
+	})
+
+	t.Run("an escape split by the wrap maps to its control", func(t *testing.T) {
+		for _, tc := range []struct {
+			src   string
+			width int
+			lines []string
+			offs  []int
+		}{
+			{"\vb", 4, []string{`\x0B`, "b"}, []int{0, 1}},
+			{"a\vb", 3, []string{`a\x`, "0Bb"}, []int{0, 1}},
+			{"\u0085b", 6, []string{`\u0085`, "b"}, []int{0, 2}},
+			{"\u0085b", 3, []string{`\u0`, "085", "b"}, []int{0, 0, 2}},
+		} {
+			lines, offsets := wrapSource(tc.src, tc.width)
+			if !slices.Equal(lines, tc.lines) || !slices.Equal(offsets, tc.offs) {
+				t.Fatalf("%q at width %d: %q at %v, want %q at %v", tc.src, tc.width, lines, offsets, tc.lines, tc.offs)
+			}
 		}
 	})
 
