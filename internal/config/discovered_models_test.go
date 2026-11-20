@@ -59,8 +59,9 @@ func TestDiscoveredModelsWriteOwnerOnlyAndMergesProviders(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "models.yaml")
 
 	if err := UpdateDiscoveredModelsProvider(path, "openai-chatgpt", DiscoveredProvider{
-		Source: "chatgpt-discovery",
-		Models: []DiscoveredModel{{ID: "gpt-x", DisplayName: "GPT X", ContextWindow: 128000}},
+		Source:        "chatgpt-discovery",
+		ClientVersion: "0.169.0",
+		Models:        []DiscoveredModel{{ID: "gpt-x", DisplayName: "GPT X", ContextWindow: 128000}},
 	}); err != nil {
 		t.Fatalf("write provider A: %v", err)
 	}
@@ -86,8 +87,10 @@ func TestDiscoveredModelsWriteOwnerOnlyAndMergesProviders(t *testing.T) {
 	if store.Version != DiscoveredModelsVersion {
 		t.Errorf("version = %d, want %d", store.Version, DiscoveredModelsVersion)
 	}
-	if _, ok := store.Providers["openai-chatgpt"]; !ok {
+	if a, ok := store.Providers["openai-chatgpt"]; !ok {
 		t.Errorf("first provider dropped after second update: %+v", store.Providers)
+	} else if a.ClientVersion != "0.169.0" {
+		t.Errorf("client_version = %q, want 0.169.0", a.ClientVersion)
 	}
 	v, ok := store.Providers["venice"]
 	if !ok || len(v.Models) != 1 || v.Models[0].ID != "venice-1" {
@@ -265,8 +268,9 @@ func TestDiscoveredModelsNoSecrets(t *testing.T) {
 	// A caller that mistakenly stuffs secret-shaped data into every free-form field must
 	// still not leak it to disk: the write path redacts it.
 	if err := UpdateDiscoveredModelsProvider(path, "venice", DiscoveredProvider{
-		RefreshedAt: "Authorization: Bearer sk-live-refreshed",
-		Source:      "sk-live-shouldnotpersist",
+		RefreshedAt:   "Authorization: Bearer sk-live-refreshed",
+		Source:        "sk-live-shouldnotpersist",
+		ClientVersion: "sk-live-clientversion",
 		Models: []DiscoveredModel{{
 			ID:              "venice-1",
 			DisplayName:     "Authorization: Bearer sk-live-abc",
@@ -307,7 +311,7 @@ func TestDiscoveredModelsNoSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"api_key", "apikey", "api-key", "x-api-key", "authorization", "bearer", "sk-", "api-key-live-value", "live-hyphenated-secret", "sk-live-refreshed", "sk-live-concretemap", "sk-live-slice", "sk-live-deep", "sk-live-struct", "sk-live-structptr"} {
+	for _, secret := range []string{"api_key", "apikey", "api-key", "x-api-key", "authorization", "bearer", "sk-", "api-key-live-value", "live-hyphenated-secret", "sk-live-refreshed", "sk-live-clientversion", "sk-live-concretemap", "sk-live-slice", "sk-live-deep", "sk-live-struct", "sk-live-structptr"} {
 		if strings.Contains(strings.ToLower(string(data)), secret) {
 			t.Errorf("persisted store contains secret-shaped token %q:\n%s", secret, data)
 		}

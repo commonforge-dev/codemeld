@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"math/big"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,7 +52,15 @@ type openRouterEndpointsResponse struct {
 	} `json:"data"`
 }
 
-func fetchOpenRouterEndpoints(ctx context.Context, hc *http.Client, entry ProviderEntry, authName, authValue, model string) ([]openRouterEndpoint, map[string]int, error) {
+type OpenRouterHostOffer struct {
+	Quantization               string
+	PromptPerM, CompletionPerM float64
+	Priced                     bool
+	P50Throughput              float64
+	HasThroughput              bool
+}
+
+func fetchOpenRouterEndpoints(ctx context.Context, hc *http.Client, entry ProviderEntry, authName, authValue, model string) ([]openRouterEndpoint, []OpenRouterHostOffer, error) {
 	redact := func(s string) string { return redactCredentials(s, entry.APIKey, authValue) }
 
 	segments := strings.Split(model, "/")
@@ -93,27 +101,31 @@ func fetchOpenRouterEndpoints(ctx context.Context, hc *http.Client, entry Provid
 	}
 
 	out := make([]openRouterEndpoint, 0, len(body.Data.Endpoints))
-	quantizations := map[string]int{}
+	offers := make([]OpenRouterHostOffer, 0, len(body.Data.Endpoints))
 	for _, e := range body.Data.Endpoints {
-		quantizations[e.Quantization]++
+		offer := OpenRouterHostOffer{Quantization: e.Quantization}
+		if e.Throughput != nil && e.Throughput.P50 != nil {
+			offer.P50Throughput, offer.HasThroughput = *e.Throughput.P50, true
+		}
 		prompt, okPrompt := pricePerMillion(e.Pricing.Prompt)
 		completion, okCompletion := pricePerMillion(e.Pricing.Completion)
 		if !okPrompt || !okCompletion {
+			offers = append(offers, offer)
 			continue
 		}
-		ep := openRouterEndpoint{
+		offer.PromptPerM, offer.CompletionPerM, offer.Priced = prompt, completion, true
+		offers = append(offers, offer)
+		out = append(out, openRouterEndpoint{
 			ProviderName:   e.ProviderName,
 			Tag:            e.Tag,
 			PromptPerM:     prompt,
 			CompletionPerM: completion,
+			P50Throughput:  offer.P50Throughput,
+			HasThroughput:  offer.HasThroughput,
 			Quantization:   e.Quantization,
-		}
-		if e.Throughput != nil && e.Throughput.P50 != nil {
-			ep.P50Throughput, ep.HasThroughput = *e.Throughput.P50, true
-		}
-		out = append(out, ep)
+		})
 	}
-	return out, quantizations, nil
+	return out, offers, nil
 }
 
 // Appending the exponent to the decimal string avoids the rounding error of multiplying the parsed per-token float.
@@ -208,13 +220,13 @@ type openRouterEndpointKey struct {
 }
 
 type openRouterEndpointEntry struct {
-	fetched       time.Time
-	failed        bool
-	retained      bool
-	endpoints     []openRouterEndpoint
-	quantizations map[string]int
-	pending       chan struct{}
-	notify        []func()
+	fetched   time.Time
+	failed    bool
+	retained  bool
+	endpoints []openRouterEndpoint
+	offers    []OpenRouterHostOffer
+	pending   chan struct{}
+	notify    []func()
 }
 
 func (s *OpenRouterEndpointStore) now() time.Time {
@@ -242,8 +254,8 @@ func (s *OpenRouterEndpointStore) claim(key openRouterEndpointKey) *openRouterEn
 }
 
 func (s *OpenRouterEndpointStore) fill(ctx context.Context, owned *openRouterEndpointEntry, entry ProviderEntry, authName, authValue, model string) (openRouterEndpointEntry, []func()) {
-	endpoints, quantizations, err := fetchOpenRouterEndpoints(ctx, s.HTTPClient, entry, authName, authValue, model)
-	filled := openRouterEndpointEntry{fetched: s.now(), failed: err != nil, retained: err == nil, endpoints: endpoints, quantizations: quantizations}
+	endpoints, offers, err := fetchOpenRouterEndpoints(ctx, s.HTTPClient, entry, authName, authValue, model)
+	filled := openRouterEndpointEntry{fetched: s.now(), failed: err != nil, retained: err == nil, endpoints: endpoints, offers: offers}
 	s.mu.Lock()
 	pending, notify := owned.pending, owned.notify
 	*owned = filled
@@ -308,7 +320,7 @@ func openRouterBestValueTag(endpoints []openRouterEndpoint, level string, ignore
 	if level != "" {
 		var matching []openRouterEndpoint
 		for _, e := range endpoints {
-			if openRouterQuantizationMatches(level, e.Quantization) {
+			if OpenRouterQuantizationMatches(level, e.Quantization) {
 				matching = append(matching, e)
 			}
 		}
@@ -318,7 +330,7 @@ func openRouterBestValueTag(endpoints []openRouterEndpoint, level string, ignore
 	return pick.Tag
 }
 
-func openRouterQuantizationMatches(level, quantization string) bool {
+func OpenRouterQuantizationMatches(level, quantization string) bool {
 	switch level {
 	case "fp8":
 		return quantization == "fp8" || quantization == "mxfp8"
@@ -336,7 +348,7 @@ const (
 	OpenRouterHostsFailed
 )
 
-func (s *OpenRouterEndpointStore) QuantizationCounts(entry ProviderEntry, authName, authValue, model string, fetched func()) (map[string]int, OpenRouterHostsState) {
+func (s *OpenRouterEndpointStore) HostOffers(entry ProviderEntry, authName, authValue, model string, fetched func()) ([]OpenRouterHostOffer, OpenRouterHostsState) {
 	key := openRouterKey(entry, model)
 	s.mu.Lock()
 	e := s.entries[key]
@@ -348,12 +360,12 @@ func (s *OpenRouterEndpointStore) QuantizationCounts(entry ProviderEntry, authNa
 		return nil, OpenRouterHostsPending
 	}
 	if e != nil && (e.retained || e.failed) && s.fresh(e) {
-		counts, failed := maps.Clone(e.quantizations), e.failed
+		offers, failed := slices.Clone(e.offers), e.failed
 		s.mu.Unlock()
 		if failed {
 			return nil, OpenRouterHostsFailed
 		}
-		return counts, OpenRouterHostsReady
+		return offers, OpenRouterHostsReady
 	}
 	owned := s.claim(key)
 	if fetched != nil {

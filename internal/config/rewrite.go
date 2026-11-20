@@ -36,9 +36,10 @@ const (
 	KeyAuthOpenAIChatGPT = "auth.openai-chatgpt"
 	KeyAttribution       = "attribution"
 	KeySystemOne         = "system_one"
-	KeyRetentionDays    = "sessions.retention_days"
+	KeyRetentionDays     = "sessions.retention_days"
 	KeyVCSUserConfig     = "confinement.vcs_user_config"
 	KeyDomainGrants      = domainGrantsKey
+	KeyWritableFolders   = writableFoldersKey
 	keyModelFavorites    = "model.favorites"
 )
 
@@ -271,6 +272,8 @@ func rewriteKey(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWrit
 			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires a DomainGrant with a host and a port from 1 to 65535, got %T", key, newValue)
 		}
 		return addDomainGrant(r, g)
+	case KeyWritableFolders:
+		return rewriteWritableFolders(r, key, newValue)
 	case KeyOpenRouterRoutingDataCollection, KeyOpenRouterRoutingSort:
 		v, ok := newValue.(string)
 		if !ok {
@@ -817,8 +820,20 @@ func rootMapping(doc *ast.File) yamlMapping {
 }
 
 func insertTopLevelEntry(data []byte, doc *ast.File, block, flowEntry string) ([]byte, error) {
-	if root := rootMapping(doc); root.flow != nil {
+	root := rootMapping(doc)
+	if root.flow != nil {
 		return insertMappingEntry(data, root, nil, flowEntry)
+	}
+	if len(root.values) > 0 {
+		if col := root.values[0].Key.GetToken().Position.Column - 1; col > 0 {
+			lines := strings.SplitAfter(block, "\n")
+			for i, ln := range lines {
+				if strings.TrimSpace(ln) != "" {
+					lines[i] = strings.Repeat(" ", col) + ln
+				}
+			}
+			block = strings.Join(lines, "")
+		}
 	}
 	at := documentEnd(data)
 	return append(appendBlockAtEnd(data[:at:at], block), data[at:]...), nil
@@ -1846,6 +1861,165 @@ func setSystemOne(r *settingsRewrite, name string) (fsutil.AtomicWriteStep, fser
 		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %s failed schema validation: %w", KeySystemOne, err)
 	}
 	return r.publish(body)
+}
+
+type writableFolderAddValue struct{ entry string }
+
+type writableFolderRemoveValue struct{ entry string }
+
+func WritableFolderAdd(entry string) any { return writableFolderAddValue{entry: entry} }
+
+func WritableFolderRemove(entry string) any { return writableFolderRemoveValue{entry: entry} }
+
+func rewriteWritableFolders(r *settingsRewrite, key string, newValue any) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	switch newValue.(type) {
+	case writableFolderAddValue, writableFolderRemoveValue:
+	default:
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %q requires a WritableFolderAdd or WritableFolderRemove payload, got %T", key, newValue)
+	}
+	data, _, step, cat, err := r.read()
+	if err != nil {
+		return step, cat, err
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: re-decode for %s: %w", key, err)
+	}
+	folders := []string{}
+	if v := raw[writableFoldersKey]; v != nil {
+		list, ok := v.([]any)
+		if !ok {
+			return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %s is not a list (got %T)", key, v)
+		}
+		for _, item := range list {
+			s, ok := item.(string)
+			if !ok {
+				return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %s item is not a string (got %T)", key, item)
+			}
+			folders = append(folders, s)
+		}
+	}
+	var next []string
+	switch v := newValue.(type) {
+	case writableFolderAddValue:
+		if slices.Contains(folders, v.entry) {
+			return "", "", nil
+		}
+		next = append(folders, v.entry)
+	case writableFolderRemoveValue:
+		next = slices.DeleteFunc(slices.Clone(folders), func(s string) bool { return s == v.entry })
+		if len(next) == len(folders) {
+			return "", "", nil
+		}
+	}
+	return setWritableFolders(r, data, folders, next)
+}
+
+func setWritableFolders(r *settingsRewrite, data []byte, source, folders []string) (fsutil.AtomicWriteStep, fserrors.Category, error) {
+	var doc *ast.File
+	var root yamlMapping
+	var mv *ast.MappingValueNode
+	anchors := make([]string, len(folders))
+	if len(bytes.TrimSpace(data)) != 0 {
+		var perr error
+		doc, perr = parser.ParseBytes(data, parser.ParseComments)
+		if perr != nil {
+			return fsutil.LoadStep, fserrors.IOError, perr
+		}
+		root = rootMapping(doc)
+		mv = findMV(root.values, writableFoldersKey)
+		if mv != nil {
+			var aerr error
+			if anchors, aerr = writableFolderAnchors(data, mv, root.values, source, folders); aerr != nil {
+				return fsutil.LoadStep, "", aerr
+			}
+		}
+	}
+	marshaled, err := yaml.Marshal(yaml.MapSlice{{Key: writableFoldersKey, Value: folders}})
+	if err != nil {
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: marshal %s value: %w", writableFoldersKey, err)
+	}
+	lines := strings.Split(strings.TrimRight(string(marshaled), "\n"), "\n")
+	item := 0
+	for k, ln := range lines {
+		if !strings.HasPrefix(ln, "- ") {
+			continue
+		}
+		if anchors[item] != "" {
+			lines[k] = "- " + anchors[item] + " " + ln[2:]
+		}
+		item++
+	}
+	block := []byte(strings.Join(lines, "\n") + "\n")
+	flowItems := make([]string, len(folders))
+	for i, f := range folders {
+		v, ferr := flowYAML(f, writableFoldersKey)
+		if ferr != nil {
+			return fsutil.LoadStep, "", ferr
+		}
+		if anchors[i] != "" {
+			v = anchors[i] + " " + v
+		}
+		flowItems[i] = v
+	}
+	flow := "[" + strings.Join(flowItems, ", ") + "]"
+	var body []byte
+	if doc == nil {
+		body = block
+	} else {
+		switch {
+		case mv == nil:
+			body, err = insertTopLevelEntry(data, doc, string(block), writableFoldersKey+": "+flow)
+		case root.flow != nil:
+			body, err = setMappingScalar(data, root, writableFoldersKey, flow)
+		default:
+			start := startOfLine(data, tokenOffset(data, mv.Key.GetToken()))
+			end := lineEndAfter(data, subtreeEnd(data, mv))
+			indent := strings.Repeat(" ", mv.Key.GetToken().Position.Column-1)
+			var b strings.Builder
+			for _, ln := range strings.Split(strings.TrimRight(string(block), "\n"), "\n") {
+				b.WriteString(indent)
+				b.WriteString(ln)
+				b.WriteByte('\n')
+			}
+			rep := b.String()
+			if data[end-1] != '\n' {
+				rep = strings.TrimSuffix(rep, "\n")
+			}
+			body = spliceBytes(data, start, end, rep)
+		}
+		if err != nil {
+			return fsutil.LoadStep, "", err
+		}
+	}
+	if err := Validate(body, r.path); err != nil {
+		return fsutil.LoadStep, "", fmt.Errorf("config.RewriteKey: %s failed schema validation: %w", writableFoldersKey, err)
+	}
+	return r.publish(body)
+}
+
+func writableFolderAnchors(data []byte, mv *ast.MappingValueNode, siblings []*ast.MappingValueNode, source, next []string) ([]string, error) {
+	anchors := make([]string, len(next))
+	inner, _, _ := nodeProperties(data, mv.Value)
+	seq, ok := inner.(*ast.SequenceNode)
+	if !ok || len(seq.Values) != len(source) {
+		return anchors, nil
+	}
+	referenced := aliasNamesOutside(siblings, mv.Value)
+	j := 0
+	for i, s := range source {
+		if j < len(next) && next[j] == s {
+			_, anchors[j], _ = nodeProperties(data, seq.Values[i])
+			j++
+			continue
+		}
+		for _, name := range anchorNamesInSubtree(seq.Values[i]) {
+			if referenced[name] {
+				return nil, fmt.Errorf("config.RewriteKey: removing a %s entry drops anchor &%s referenced by an unchanged alias; refusing to publish an undefined YAML alias", writableFoldersKey, name)
+			}
+		}
+	}
+	return anchors, nil
 }
 
 func setNestedScalar(r *settingsRewrite, container, field, value string) (fsutil.AtomicWriteStep, fserrors.Category, error) {
@@ -2948,7 +3122,14 @@ func subtreeEnd(data []byte, n ast.Node) int {
 		}
 		return subtreeEnd(data, last)
 	default:
-		return tokenOffset(data, n.GetToken())
+		tok := n.GetToken()
+		offset := tokenOffset(data, tok)
+		if tok != nil {
+			for range strings.Count(strings.TrimSpace(tok.Origin), "\n") {
+				offset = lineEndAfter(data, offset)
+			}
+		}
+		return offset
 	}
 }
 

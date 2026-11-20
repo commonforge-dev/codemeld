@@ -2564,22 +2564,24 @@ func emptyChunk() []byte {
 }
 
 type noOutputTimers struct {
-	mu      sync.Mutex
-	chans   []chan time.Time
-	created []time.Time
-	stops   []int
+	mu        sync.Mutex
+	chans     []chan time.Time
+	created   []time.Time
+	durations []time.Duration
+	stops     []int
 }
 
 func fakeNoOutputTimers(t *testing.T) *noOutputTimers {
 	t.Helper()
 	f := &noOutputTimers{}
 	restore := noOutputTimer
-	noOutputTimer = func() (<-chan time.Time, func()) {
+	noOutputTimer = func(d time.Duration) (<-chan time.Time, func()) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		i := len(f.chans)
 		f.chans = append(f.chans, make(chan time.Time, 1))
 		f.created = append(f.created, now())
+		f.durations = append(f.durations, d)
 		f.stops = append(f.stops, 0)
 		return f.chans[i], func() {
 			f.mu.Lock()
@@ -2603,7 +2605,8 @@ func (f *noOutputTimers) fire() {
 
 func (f *noOutputTimers) fireIfDue() {
 	f.mu.Lock()
-	due := !now().Before(f.created[len(f.created)-1].Add(noOutputLimit))
+	last := len(f.created) - 1
+	due := !now().Before(f.created[last].Add(f.durations[last]))
 	f.mu.Unlock()
 	if due {
 		f.fire()
@@ -2668,9 +2671,29 @@ func hasNoOutputRecord(recs []sessions.Record) bool {
 	return false
 }
 
-func TestNoOutputLimitDefaultIsThirtyMinutes(t *testing.T) {
-	if noOutputLimit != 30*time.Minute {
-		t.Fatalf("noOutputLimit = %v, want 30m", noOutputLimit)
+func TestRun_NoOutputTimerUsesPolicyLimit(t *testing.T) {
+	cases := []struct {
+		name  string
+		retry RetryPolicy
+		want  time.Duration
+	}{
+		{"zero policy", RetryPolicy{}, 20 * time.Minute},
+		{"retry on", retryOn(), 20 * time.Minute},
+		{"negative limit", RetryPolicy{NoOutputLimit: -time.Minute}, 20 * time.Minute},
+		{"configured limit", RetryPolicy{NoOutputLimit: 7 * time.Minute}, 7 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			timers := fakeNoOutputTimers(t)
+			store := storeAt(filepath.Join(t.TempDir(), "session.json"))
+			client := streamClient(contentChunk("ok"), finishChunk("stop"))
+			if err := New(noOutputDeps(store, client, tc.retry)).Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(timers.durations) != 1 || timers.durations[0] != tc.want {
+				t.Fatalf("no-output timer durations = %v, want [%v]", timers.durations, tc.want)
+			}
+		})
 	}
 }
 
@@ -3030,8 +3053,8 @@ func TestRun_NoOutputTimerOnePerAttemptNotReset(t *testing.T) {
 		t.Fatalf("timers created at %v, want one per attempt with a fresh one for the retry", timers.created)
 	}
 	rounds := providerRoundTripEvents(t, diskRecords(t, store))
-	if len(rounds) != 2 || rounds[0].DurationMs != (30*time.Minute).Milliseconds() || rounds[0].Chunks != 30 {
-		t.Fatalf("provider_round_trip = %+v, want the first cut at 30m after 30 chunks", rounds)
+	if len(rounds) != 2 || rounds[0].DurationMs != (20*time.Minute).Milliseconds() || rounds[0].Chunks != 20 {
+		t.Fatalf("provider_round_trip = %+v, want the first cut at 20m after 20 chunks", rounds)
 	}
 }
 
@@ -3044,18 +3067,18 @@ func TestRun_NoOutputTimerStartsAfterSlowStreamOpen(t *testing.T) {
 	client.fn = func(context.Context, provider.Request) (provider.Response, error) {
 		clock.advance(10 * time.Minute)
 		dec := &stepDecoder{step: func(i int) ([]byte, error) {
-			if i < 25 {
+			if i < 15 {
 				clock.advance(time.Minute)
 				timers.fireIfDue()
 				return reasoningChunk("r"), nil
 			}
-			return chunkAt(i-25, contentChunk("answer"), finishChunk("stop"))
+			return chunkAt(i-15, contentChunk("answer"), finishChunk("stop"))
 		}}
 		return provider.Response{Stream: ssestream.NewStream[openai.ChatCompletionChunk](dec, nil)}, nil
 	}
 
 	if err := New(noOutputDeps(store, client, RetryPolicy{})).Run(context.Background()); err != nil {
-		t.Fatalf("Run() error = %v, want nil: 25m of streaming after a 10m open is within the allowance", err)
+		t.Fatalf("Run() error = %v, want nil: 15m of streaming after a 10m open is within the allowance", err)
 	}
 	if want := opened.Add(10 * time.Minute); !timers.created[0].Equal(want) {
 		t.Fatalf("timer anchored at %v, want %v (after the stream opened)", timers.created[0], want)
@@ -3080,7 +3103,7 @@ func TestRun_TwentyEightMinuteOutputlessStreamIsNotCut(t *testing.T) {
 		return nil, nil
 	})
 
-	_ = New(noOutputDeps(store, client, RetryPolicy{})).Run(context.Background())
+	_ = New(noOutputDeps(store, client, RetryPolicy{NoOutputLimit: 30 * time.Minute})).Run(context.Background())
 	recs := diskRecords(t, store)
 	failed := findProviderRequestFailed(t, recs)
 	if failed.Phase != "empty_response" || failed.Reason != "zero_delta_stream" {

@@ -140,6 +140,26 @@ declared folder run without asking, and so does a delete inside it, though not o
 folder itself (`sandboxedDelete`, `internal/permissions/orchestrate.go`). A declared folder never
 approves a move.
 
+The `/settings` folders tab lists, adds and removes `writable_folders` entries in the project's
+`.codemeld/settings.yaml` (`writableFolders` in `internal/bootstrap/writabledeps.go`) and marks each
+one active in Auto edits, active for sandboxed Build commands (command approval still required), or
+why it does not apply. The folder grants on that tab cover the file tools only and do not widen what
+sandboxed commands may write. An entry takes effect only when the project settings file was admitted
+at launch (`newWritableFoldersReader` in `internal/bootstrap/blockedpaths.go`): a project settings
+file created or first approved after launch needs a restart and project approval.
+
+In Auto edits and Build, when a sandboxed command fails and codemeld saw it try to write outside the
+folders the sandbox allows, it shows a notice naming the folder, once per folder per session: "sandbox likely blocked
+writes to `<folder>`", with how to allow it (`/settings`, folders tab, press `a`). If an
+environment variable such as `GOCACHE` names a folder that holds the refused write, the notice
+suggests that whole folder rather than one subfolder. codemeld never suggests the filesystem root,
+your home folder, or a folder that holds the project or a blocked path; a refusal in such a folder,
+or one no folder grant can allow, gets one notice per folder and reason, naming why it cannot be
+allowed. The watcher predicts the refusal and may
+be wrong, and nothing is allowed until you add the folder. `codemeld sessions doctor` lists the
+same refusals as `sandbox_write_refused` findings. In Plan, codemeld records no such refusal and
+shows no such notice.
+
 A file tool creates, writes or deletes through the folder it checked and never follows a symlink
 in the last step, so a folder or symlink swapped in after the check cannot redirect it.
 
@@ -166,8 +186,17 @@ Read-only is not the only way to run without a prompt: the sandbox in Auto edits
 a declared command and the System One check can also let a command run, as this page explains.
 Options from configuration codemeld did not check are kept out: when a read-only command runs
 automatically outside the sandbox, a Mercurial command ignores your hgrc files and `jj` its
-configuration, and approving the same command at a prompt runs it with your configuration. `rg`
-never receives `RIPGREP_CONFIG_PATH`.
+configuration, and approving the same command at a prompt runs it with your configuration. In Plan
+and Auto edits, a sandboxed command inherits `RIPGREP_CONFIG_PATH` like any other variable (see the
+environment paragraph below), and whatever its configuration makes `rg` run stays inside the
+sandbox. Outside the sandbox (Build, a command approved to run outside the sandbox, or a host
+without the sandbox), codemeld removes an inherited `RIPGREP_CONFIG_PATH` from a command the shell
+runs as written, from a command whose program is `rg` and from a command with leading `VAR=value`
+assignments, but keeps a `RIPGREP_CONFIG_PATH=...` assignment the command writes itself; other
+commands, such as `xargs rg` or a script, keep the inherited value, and so does an automatically
+allowed `ps` run directly, even with leading assignments (`ripgrepConfigEnv` in
+`internal/dispatch/shell.go`). A command that clears its environment with `env -i`, or an
+automatically allowed `hg` or `jj` command, which gets its own environment, is outside these rules.
 
 These commands are proven read-only by codemeld's own rules. In Plan and Auto edits only, never
 Build, the opt-in [System One check](system-one.md) can also allow a `direct` or `literal` shell
@@ -283,7 +312,11 @@ mismatch or a failed removal leaves the folder behind. Auto edits commands may w
 project (except its `.codemeld` folder), a private temp folder for the session, and the folders
 listed in `writable_folders`. Each command reads that list when it starts, so a folder added or
 removed mid-session applies from the next command without a restart; a command already running
-keeps the folders it started with. While the project settings file cannot be read or is invalid,
+keeps the folders it started with. That holds only when the project settings file was admitted at
+launch (`newWritableFoldersReader` in `internal/bootstrap/blockedpaths.go`); a newly created or
+not yet approved project settings file needs a restart and project approval. The list can be
+managed from the `/settings` folders tab, whose folder grants do not widen what sandboxed commands
+may write. While the project settings file cannot be read or is invalid,
 or any settings file is broken, commands get none of the declared folders, and the next command
 after the settings are fixed gets them back. git stops on a global config file it cannot read, so
 while `blocked_paths` covers `~/.gitconfig` or `~/.config/git/config`, sandboxed commands get
@@ -352,7 +385,9 @@ the transcript and the model provider), through a destination you approve at the
 connect prompt, in `domain_grants` or in `connect_grants`, or through a
 program outside the sandbox that watches a folder the command can write. Build mode runs approved
 commands with codemeld's full environment (`commandEnv` in `internal/runner/descendants_linux.go`),
-in the sandbox too: nothing above is withheld, so secret-looking names, `PATH` and `GOCACHE` keep
+in the sandbox too: nothing above is withheld, though dispatch still removes `RIPGREP_CONFIG_PATH`
+as described earlier in this section and gives automatically allowed `hg`, `jj` and `ps` their own
+environments (`internal/dispatch/shell.go`), so secret-looking names, `PATH` and `GOCACHE` keep
 their values, and codemeld only sets `TERM=dumb`, the proxy variables and the
 `GIT_CONFIG_GLOBAL=/dev/null` override as above, points a value naming its temp folder at the session temp
 folder, and sets an unset or empty `TMPDIR` to it (`confinement.prepareBuild`).
@@ -415,7 +450,8 @@ not use the proxy, so it can reach this machine or the local network. When a com
 fails, its output ends with a `codemeld: network refused: <host>:<port> (<reason>)` line for each
 refused destination, with the socket path in place of `<host>:<port>` for a Unix socket; an
 identical line is printed once, and a refusal whose destination codemeld does not know prints no
-line. It shows as many as fit the output limit, then a count of any left out if that
+line, nor does a connection refused while codemeld is stopping its connection check at the end of the
+command's run (`Broker.handle` in `internal/enforce/broker_linux.go`). It shows as many as fit the output limit, then a count of any left out if that
 fits too, then codemeld's general note about the sandbox (`confinedFailureOf`,
 `internal/bootstrap/confinedrunner.go`). Only tools that use `HTTPS_PROXY` or `HTTP_PROXY`, or are
 set up to tunnel through an HTTP proxy, get network through it: ordinary SSH does not go through the
@@ -469,8 +505,14 @@ UI and in a headless run with `--prompt-for-approval`:
 No choice saves a grant. A headless run without `--prompt-for-approval` and a command run by a child
 agent are not asked: the connection is refused. A connection that is neither TCP nor to a Unix
 socket path, such as UDP, and one whose destination codemeld cannot inspect or resolve, is refused
-without asking. For a shell command, each connection decision codemeld answered is written to the
-session, with repeats counted in one entry; see [Sessions](sessions.md). Not written are refusals
+without asking. For a shell command, each connection decision codemeld answered with this check on
+the command's own connections is written to the session, with repeats counted in one entry; see
+[Sessions](sessions.md). Not written are every decision in Plan, where codemeld only lets
+connections reach the session proxy and keeps no decision records (`policy` sets
+`enforce.BrokerSlice` in `internal/bootstrap/confinedrunner.go`, and `attachBroker` in
+`internal/bootstrap/confinedrunner_broker_linux.go` gives `ConnectRules` only to
+`enforce.BrokerConnect` and `enforce.BrokerFull`), a reply sent after codemeld began stopping the check at the end of the command's run
+(`Broker.handle` in `internal/enforce/broker_linux.go`), refusals
 the sandbox filter makes before codemeld sees the call, such as creating a UDP socket
 (`seccompFilterFor` in `internal/enforce/seccomp_linux.go`), a decision whose reply could not reach
 the command, for example because the call was interrupted (`Broker.handle` in

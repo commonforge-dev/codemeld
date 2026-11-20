@@ -26,7 +26,7 @@ func TestChatGPTModelDiscoveryCacheSanitizesPromptFields(t *testing.T) {
 	srv := modelsServer(t, nil, 200, body)
 	c := testClient(srv, "tok", "acct")
 
-	cache, err := c.discoverModels(context.Background())
+	cache, err := c.discoverModels(context.Background(), chatGPTCodexClientVersion)
 	if err != nil {
 		t.Fatalf("discoverModels() error = %v", err)
 	}

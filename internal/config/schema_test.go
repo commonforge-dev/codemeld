@@ -272,6 +272,7 @@ func TestValidate_Accepts(t *testing.T) {
     max_attempts: 4
     base_delay_ms: 500
     max_delay_ms: 8000
+    no_output_timeout_minutes: 20
   openai:
     base_url: https://api.openai.com/v1
     api_key: x
@@ -885,6 +886,22 @@ func TestValidate_Rejects(t *testing.T) {
     max_attempts: 0
 `,
 			"provider.retry.max_attempts",
+		},
+		{
+			"provider.retry no_output_timeout_minutes below minimum",
+			`provider:
+  retry:
+    no_output_timeout_minutes: 0
+`,
+			"provider.retry.no_output_timeout_minutes",
+		},
+		{
+			"provider.retry no_output_timeout_minutes as a string",
+			`provider:
+  retry:
+    no_output_timeout_minutes: "20"
+`,
+			"provider.retry.no_output_timeout_minutes",
 		},
 		{
 			"reserved provider.openai-chatgpt rejected by name",

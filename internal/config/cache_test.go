@@ -39,10 +39,11 @@ func fullComposed() map[string]any {
 			// Reserved config under `provider`: must resolve as retry settings,
 			// not as a selectable provider (Providers() stays length 1 below).
 			"retry": map[string]any{
-				"enabled":       false,
-				"max_attempts":  int64(6),
-				"base_delay_ms": int64(250),
-				"max_delay_ms":  int64(4000),
+				"enabled":                   false,
+				"max_attempts":              int64(6),
+				"base_delay_ms":             int64(250),
+				"max_delay_ms":              int64(4000),
+				"no_output_timeout_minutes": int64(9),
 			},
 		},
 		"permissions": []any{
@@ -130,7 +131,7 @@ func TestCacheAccessors(t *testing.T) {
 	if _, ok := c.Provider("retry"); ok {
 		t.Error("Provider(retry) reported present; provider.retry must not be a selectable provider")
 	}
-	if got := c.ProviderRetry(); got != (RetrySettings{Enabled: false, MaxAttempts: 6, BaseDelayMs: 250, MaxDelayMs: 4000}) {
+	if got := c.ProviderRetry(); got != (RetrySettings{Enabled: false, MaxAttempts: 6, BaseDelayMs: 250, MaxDelayMs: 4000, NoOutputTimeoutMinutes: 9}) {
 		t.Errorf("ProviderRetry() = %+v, want the configured override", got)
 	}
 	if got := c.WebResearch(); got != (WebResearchSettings{Enabled: true, MaxResults: 12, TimeoutSeconds: 45}) {
@@ -195,7 +196,7 @@ func TestCacheDefaults(t *testing.T) {
 	if got := c.Providers(); len(got) != 0 {
 		t.Errorf("Providers() default len = %d, want 0", len(got))
 	}
-	if got := c.ProviderRetry(); got != (RetrySettings{Enabled: true, MaxAttempts: 4, BaseDelayMs: 500, MaxDelayMs: 8000}) {
+	if got := c.ProviderRetry(); got != (RetrySettings{Enabled: true, MaxAttempts: 4, BaseDelayMs: 500, MaxDelayMs: 8000, NoOutputTimeoutMinutes: 20}) {
 		t.Errorf("ProviderRetry() defaults = %+v, want adr-021 on/4/500/8000", got)
 	}
 	if got := c.WebResearch(); got != (WebResearchSettings{Enabled: true, MaxResults: 6, TimeoutSeconds: 20}) {

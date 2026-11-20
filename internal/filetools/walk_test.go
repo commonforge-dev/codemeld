@@ -1113,3 +1113,75 @@ func TestWalk_DeletedBeforeOpenRefusesWithoutReport(t *testing.T) {
 		})
 	}
 }
+
+func TestWalk_ExternalRootSwappedAfterBlockedCheckRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		parent, swapBack bool
+	}{
+		{"root", false, false},
+		{"parent", true, false},
+		{"root swapped back on first entry", false, true},
+		{"parent swapped back on first entry", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ext := filepath.Join(eval(t, t.TempDir()), "p", "ext")
+			mkdir(t, ext)
+			outside := eval(t, t.TempDir())
+			secret := filepath.Join(outside, "ext")
+			mkdir(t, secret)
+			writeFile(t, filepath.Join(secret, "SENTINEL"), "x")
+			blocked := permissions.NewBlockedPaths(eval(t, t.TempDir()), []permissions.BlockedEntry{{Path: secret, Source: "test"}})
+			swapped, link := ext, secret
+			if tc.parent {
+				swapped, link = filepath.Dir(ext), outside
+			}
+			m := &walkSwapBackMatcher{}
+			walkSwapAt(t, &walkBeforeRootOpen, func() {
+				replaceWithSymlink(t, swapped, link)
+				restored := false
+				restore := func() {
+					if restored {
+						return
+					}
+					restored = true
+					if err := os.Remove(swapped); err != nil {
+						t.Errorf("Remove: %v", err)
+					}
+					if err := os.Rename(swapped+"-orig", swapped); err != nil {
+						t.Errorf("Rename: %v", err)
+					}
+				}
+				t.Cleanup(restore)
+				if tc.swapBack {
+					m.swapBack = restore
+				}
+			})
+
+			got, err := walkEmitted(WalkOptions{Root: ext, ProjectRoot: ext, Ignore: []IgnoreMatcher{m}, Blocked: blocked})
+			walkAssertRefused(t, got, err)
+		})
+	}
+}
+
+func TestWalk_ExternalRootListed(t *testing.T) {
+	ext := filepath.Join(eval(t, t.TempDir()), "p", "ext")
+	mkdir(t, filepath.Join(ext, "sub"))
+	writeFile(t, filepath.Join(ext, "sub", "f.txt"), "x")
+
+	got, err := walkEmitted(WalkOptions{Root: ext, ProjectRoot: ext})
+	if err != nil || !reflect.DeepEqual(got, []string{"sub", "sub/f.txt"}) {
+		t.Fatalf("walk = %v, %v; want [sub sub/f.txt], nil", got, err)
+	}
+}
+
+func TestWalkOpenDirUnder_FilesystemRootIsReadable(t *testing.T) {
+	f, err := walkOpenDirUnder("/", "/")
+	if err != nil {
+		t.Fatalf("walkOpenDirUnder(/) error = %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.ReadDir(1); err != nil {
+		t.Fatalf("ReadDir(/) error = %v", err)
+	}
+}

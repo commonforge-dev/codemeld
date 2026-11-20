@@ -1071,9 +1071,9 @@ func TestSystemOneCheck_TUILaunchSharesTheCheckWithTheStatusLine(t *testing.T) {
 	f.server.status(http.StatusPaymentRequired)
 	var auth *productionAuthorizer
 	prev := newSettingsDeps
-	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, a *productionAuthorizer) tui.SettingsDeps {
+	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, a *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 		auth = a
-		return prev(app, cache, active, a)
+		return prev(app, cache, active, a, writable)
 	}
 	t.Cleanup(func() { newSettingsDeps = prev })
 

@@ -495,10 +495,20 @@ const quantizationBody = `{"data":{"endpoints":[
 	{"provider_name":"c","tag":"c/nvfp4","quantization":"nvfp4","pricing":{"prompt":"0.000001","completion":"0.000001"},"throughput_last_30m":{"p50":5}},
 	{"provider_name":"d","tag":"d","quantization":"unknown","pricing":{"prompt":"0.000002","completion":"0.000002"},"throughput_last_30m":{"p50":5}},
 	{"provider_name":"e","tag":"e","quantization":"","pricing":{"prompt":"0.000002","completion":"0.000002"},"throughput_last_30m":{"p50":5}},
-	{"provider_name":"f","tag":"f","pricing":{"prompt":"bad","completion":"0.000002"},"throughput_last_30m":{"p50":5}}
+	{"provider_name":"f","tag":"f","pricing":{"prompt":"bad","completion":"0.000002"}}
 ]}}`
 
 const quantizationBestTag = "b/fp8"
+
+var quantizationOffers = []OpenRouterHostOffer{
+	{Quantization: "fp8", PromptPerM: 0.3, CompletionPerM: 0.4, Priced: true, P50Throughput: 10, HasThroughput: true},
+	{Quantization: "fp8", PromptPerM: 0.1, CompletionPerM: 0.2, Priced: true, P50Throughput: 90, HasThroughput: true},
+	{Quantization: "fp8", P50Throughput: 900, HasThroughput: true},
+	{Quantization: "nvfp4", PromptPerM: 1, CompletionPerM: 1, Priced: true, P50Throughput: 5, HasThroughput: true},
+	{Quantization: "unknown", PromptPerM: 2, CompletionPerM: 2, Priced: true, P50Throughput: 5, HasThroughput: true},
+	{Quantization: "", PromptPerM: 2, CompletionPerM: 2, Priced: true, P50Throughput: 5, HasThroughput: true},
+	{Quantization: ""},
+}
 
 func awaitFetched(t *testing.T, fetched chan struct{}) {
 	t.Helper()
@@ -509,33 +519,33 @@ func awaitFetched(t *testing.T, fetched chan struct{}) {
 	}
 }
 
-func countsNow(store *OpenRouterEndpointStore, baseURL string) (map[string]int, OpenRouterHostsState, chan struct{}) {
+func offersNow(store *OpenRouterEndpointStore, baseURL string) ([]OpenRouterHostOffer, OpenRouterHostsState, chan struct{}) {
 	fetched := make(chan struct{})
-	counts, state := store.QuantizationCounts(endpointsEntry(baseURL), "Authorization", "Bearer "+endpointsKey, "m", func() { close(fetched) })
-	return counts, state, fetched
+	offers, state := store.HostOffers(endpointsEntry(baseURL), "Authorization", "Bearer "+endpointsKey, "m", func() { close(fetched) })
+	return offers, state, fetched
 }
 
-func expectCounts(t *testing.T, store *OpenRouterEndpointStore, s *endpointsServer, want map[string]int, wantState OpenRouterHostsState, wantHits int32) {
+func expectOffers(t *testing.T, store *OpenRouterEndpointStore, s *endpointsServer, want []OpenRouterHostOffer, wantState OpenRouterHostsState, wantHits int32) {
 	t.Helper()
-	counts, state, _ := countsNow(store, s.srv.URL)
-	if state != wantState || !reflect.DeepEqual(counts, want) {
-		t.Fatalf("QuantizationCounts = %v, %v; want %v, %v", counts, state, want, wantState)
+	offers, state, _ := offersNow(store, s.srv.URL)
+	if state != wantState || !reflect.DeepEqual(offers, want) {
+		t.Fatalf("HostOffers = %v, %v; want %v, %v", offers, state, want, wantState)
 	}
 	if got := s.hits.Load(); got != wantHits {
 		t.Fatalf("endpoint requests = %d, want %d", got, wantHits)
 	}
 }
 
-func TestOpenRouterEndpointStore_QuantizationCountsTallyEveryHostButKeepPricedEligibility(t *testing.T) {
+func TestOpenRouterEndpointStore_HostOffersTallyEveryHostButKeepPricedEligibility(t *testing.T) {
 	s := newEndpointsServer(t, quantizationBody)
 	store, _ := newTestStore(s)
 
-	counts, state, fetched := countsNow(store, s.srv.URL)
-	if state != OpenRouterHostsPending || counts != nil {
-		t.Fatalf("QuantizationCounts before any fetch = %v, %v; want pending", counts, state)
+	offers, state, fetched := offersNow(store, s.srv.URL)
+	if state != OpenRouterHostsPending || offers != nil {
+		t.Fatalf("HostOffers before any fetch = %v, %v; want pending", offers, state)
 	}
 	awaitFetched(t, fetched)
-	expectCounts(t, store, s, map[string]int{"fp8": 3, "nvfp4": 1, "unknown": 1, "": 2}, OpenRouterHostsReady, 1)
+	expectOffers(t, store, s, quantizationOffers, OpenRouterHostsReady, 1)
 
 	var tags []string
 	for _, e := range store.entries[openRouterKey(endpointsEntry(s.srv.URL), "m")].endpoints {
@@ -547,19 +557,19 @@ func TestOpenRouterEndpointStore_QuantizationCountsTallyEveryHostButKeepPricedEl
 	expectLookup(t, store, s, s.srv.URL, quantizationBestTag, 1)
 }
 
-func TestOpenRouterEndpointStore_BestValueTagFetchFeedsQuantizationCounts(t *testing.T) {
+func TestOpenRouterEndpointStore_BestValueTagFetchFeedsHostOffers(t *testing.T) {
 	s := newEndpointsServer(t, quantizationBody)
 	store, _ := newTestStore(s)
 	expectLookup(t, store, s, s.srv.URL, quantizationBestTag, 1)
-	expectCounts(t, store, s, map[string]int{"fp8": 3, "nvfp4": 1, "unknown": 1, "": 2}, OpenRouterHostsReady, 1)
+	expectOffers(t, store, s, quantizationOffers, OpenRouterHostsReady, 1)
 }
 
-func TestOpenRouterEndpointStore_BestValueTagJoinsQuantizationCountsFetch(t *testing.T) {
+func TestOpenRouterEndpointStore_BestValueTagJoinsHostOffersFetch(t *testing.T) {
 	s := newEndpointsServer(t, quantizationBody)
 	s.block()
 	store, _ := newTestStore(s)
 
-	_, _, fetched := countsNow(store, s.srv.URL)
+	_, _, fetched := offersNow(store, s.srv.URL)
 	<-s.entered
 	tag := make(chan string, 1)
 	go func() {
@@ -576,16 +586,16 @@ func TestOpenRouterEndpointStore_BestValueTagJoinsQuantizationCountsFetch(t *tes
 	}
 }
 
-func TestOpenRouterEndpointStore_QuantizationCountsKeepCacheWindows(t *testing.T) {
+func TestOpenRouterEndpointStore_HostOffersKeepCacheWindows(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		status    int
 		body      string
-		want      map[string]int
+		want      []OpenRouterHostOffer
 		wantState OpenRouterHostsState
 		window    time.Duration
 	}{
-		{"empty list is ready", http.StatusOK, `{"data":{"endpoints":[]}}`, map[string]int{}, OpenRouterHostsReady, 12 * time.Hour},
+		{"empty list is ready", http.StatusOK, `{"data":{"endpoints":[]}}`, []OpenRouterHostOffer{}, OpenRouterHostsReady, 12 * time.Hour},
 		{"failure", http.StatusServiceUnavailable, "down", nil, OpenRouterHostsFailed, 15 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -593,65 +603,65 @@ func TestOpenRouterEndpointStore_QuantizationCountsKeepCacheWindows(t *testing.T
 			s.set(tc.status, tc.body)
 			store, clock := newTestStore(s)
 
-			_, _, fetched := countsNow(store, s.srv.URL)
+			_, _, fetched := offersNow(store, s.srv.URL)
 			awaitFetched(t, fetched)
-			expectCounts(t, store, s, tc.want, tc.wantState, 1)
+			expectOffers(t, store, s, tc.want, tc.wantState, 1)
 			clock.advance(tc.window - time.Second)
-			expectCounts(t, store, s, tc.want, tc.wantState, 1)
+			expectOffers(t, store, s, tc.want, tc.wantState, 1)
 
 			s.set(http.StatusOK, quantizationBody)
 			clock.advance(time.Second)
-			_, state, fetched := countsNow(store, s.srv.URL)
+			_, state, fetched := offersNow(store, s.srv.URL)
 			if state != OpenRouterHostsPending {
 				t.Fatalf("expired entry state = %v, want pending", state)
 			}
 			awaitFetched(t, fetched)
-			expectCounts(t, store, s, map[string]int{"fp8": 3, "nvfp4": 1, "unknown": 1, "": 2}, OpenRouterHostsReady, 2)
+			expectOffers(t, store, s, quantizationOffers, OpenRouterHostsReady, 2)
 		})
 	}
 }
 
-func TestOpenRouterEndpointStore_QuantizationCountsRefetchAnUnretainedEntry(t *testing.T) {
+func TestOpenRouterEndpointStore_HostOffersRefetchAnUnretainedEntry(t *testing.T) {
 	s := newEndpointsServer(t, quantizationBody)
 	store, clock := newTestStore(s)
 	store.entries = map[openRouterEndpointKey]*openRouterEndpointEntry{
 		{baseURL: s.srv.URL, model: "m"}: {fetched: clock.Now()},
 	}
 
-	_, state, fetched := countsNow(store, s.srv.URL)
+	_, state, fetched := offersNow(store, s.srv.URL)
 	if state != OpenRouterHostsPending {
 		t.Fatalf("unretained entry state = %v, want pending", state)
 	}
 	awaitFetched(t, fetched)
-	expectCounts(t, store, s, map[string]int{"fp8": 3, "nvfp4": 1, "unknown": 1, "": 2}, OpenRouterHostsReady, 1)
+	expectOffers(t, store, s, quantizationOffers, OpenRouterHostsReady, 1)
 }
 
-func TestOpenRouterEndpointStore_QuantizationCountsJoinTheirOwnFetch(t *testing.T) {
+func TestOpenRouterEndpointStore_HostOffersJoinTheirOwnFetch(t *testing.T) {
 	s := newEndpointsServer(t, quantizationBody)
 	s.block()
 	store, _ := newTestStore(s)
 
-	_, _, first := countsNow(store, s.srv.URL)
+	_, _, first := offersNow(store, s.srv.URL)
 	<-s.entered
-	_, state, joined := countsNow(store, s.srv.URL)
+	_, state, joined := offersNow(store, s.srv.URL)
 	if state != OpenRouterHostsPending {
 		t.Fatalf("joined state = %v, want pending", state)
 	}
 	close(s.release)
 	awaitFetched(t, first)
 	awaitFetched(t, joined)
-	expectCounts(t, store, s, map[string]int{"fp8": 3, "nvfp4": 1, "unknown": 1, "": 2}, OpenRouterHostsReady, 1)
+	expectOffers(t, store, s, quantizationOffers, OpenRouterHostsReady, 1)
 }
 
-func TestOpenRouterEndpointStore_QuantizationCountsJoinABestValueTagFetch(t *testing.T) {
+func TestOpenRouterEndpointStore_HostOffersJoinABestValueTagFetch(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		status    int
 		wantTag   string
-		want      map[string]int
+		want      []OpenRouterHostOffer
 		wantState OpenRouterHostsState
 	}{
-		{"success", http.StatusOK, quantizationBestTag, map[string]int{"fp8": 3, "nvfp4": 1, "unknown": 1, "": 2}, OpenRouterHostsReady},
+		{"success", http.StatusOK, quantizationBestTag, quantizationOffers, OpenRouterHostsReady},
 		{"failure", http.StatusServiceUnavailable, "", nil, OpenRouterHostsFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -665,7 +675,7 @@ func TestOpenRouterEndpointStore_QuantizationCountsJoinABestValueTagFetch(t *tes
 				tag <- lookupTag(context.Background(), store, s.srv.URL, "m")
 			}()
 			<-s.entered
-			_, state, fetched := countsNow(store, s.srv.URL)
+			_, state, fetched := offersNow(store, s.srv.URL)
 			if state != OpenRouterHostsPending {
 				t.Fatalf("state while BestValueTag fetches = %v, want pending", state)
 			}
@@ -674,7 +684,7 @@ func TestOpenRouterEndpointStore_QuantizationCountsJoinABestValueTagFetch(t *tes
 			if got := <-tag; got != tc.wantTag {
 				t.Fatalf("BestValueTag = %q, want %q", got, tc.wantTag)
 			}
-			expectCounts(t, store, s, tc.want, tc.wantState, 1)
+			expectOffers(t, store, s, tc.want, tc.wantState, 1)
 		})
 	}
 }

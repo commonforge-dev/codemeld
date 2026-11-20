@@ -12,6 +12,15 @@
 ## Ongoing
 
 ## Completed
+- **0.4.14 Beta — November 2026:**
+  - When a sandboxed command fails because it wrote outside the allowed folders, codemeld tells you which folder and how to allow it
+  - Folders that sandboxed commands may write to can be added and removed in settings
+  - OpenRouter model settings show how many providers fit your price caps, and their speed range
+  - How long codemeld waits for a model that sends nothing is configurable
+  - ChatGPT models keep working when OpenAI updates its client version
+  - Headless runs can use a model from a provider whose models codemeld hasn't loaded yet
+  - Security fix: directory tools that walk the project folder itself or a folder outside the project can no longer be led into a blocked folder by a link swapped in after the blocked check
+  - Model prompts and documentation corrected for sandboxed network access and inherited variables
 - **0.4.13 Beta — November 2026:**
   - Sandboxed Auto edits can amend the last commit without asking, until it has been pushed
   - Build mode runs the commands you approve inside the sandbox; when one fails, codemeld says which folder was refused and can run it once outside the sandbox after asking

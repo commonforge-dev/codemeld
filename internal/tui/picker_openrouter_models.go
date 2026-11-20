@@ -28,6 +28,21 @@ var (
 	openRouterModelsHeader     = []string{"model", "input $/M", "output $/M", quantizationsLabel}
 )
 
+type swallowMouse struct {
+	tview.Primitive
+}
+
+func (s swallowMouse) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+	return func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(tview.Primitive)) (bool, tview.Primitive) {
+		if consumed, capture := s.Primitive.MouseHandler()(action, event, setFocus); consumed {
+			return true, capture
+		}
+		x, y, w, h := s.GetRect()
+		px, py := event.Position()
+		return px >= x && px < x+w && py >= y && py < y+h, nil
+	}
+}
+
 type openRouterModelRow struct {
 	model string
 	price provider.MaxPrice
@@ -242,7 +257,7 @@ func (a *App) showOpenRouterModelAdd() {
 		AddItem(footer, 1, 0, false)
 	body.SetBorder(true)
 	body.SetTitle(" add openrouter model ")
-	a.pages.AddPage(openRouterModelsAddPage, centeredModal(body), true, true)
+	a.pages.AddPage(openRouterModelsAddPage, swallowMouse{centeredModal(body)}, true, true)
 	a.app.SetFocus(field)
 }
 

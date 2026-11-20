@@ -32,14 +32,15 @@ const (
 	defaultMode = "build"
 	// provider.retry defaults: auto-retry is on out of the box with 4 total
 	// attempts (3 retries), a ~500ms exponential base, and an ~8s cap.
-	defaultRetryEnabled              = true
-	defaultRetryMaxAttempts          = 4
-	defaultRetryBaseDelayMs          = 500
-	defaultRetryMaxDelayMs           = 8000
-	defaultAttribution               = true
-	defaultWebResearchEnabled        = true
-	defaultWebResearchMaxResults     = 6
-	defaultWebResearchTimeoutSeconds = 20
+	defaultRetryEnabled                = true
+	defaultRetryMaxAttempts            = 4
+	defaultRetryBaseDelayMs            = 500
+	defaultRetryMaxDelayMs             = 8000
+	defaultRetryNoOutputTimeoutMinutes = 20
+	defaultAttribution                 = true
+	defaultWebResearchEnabled          = true
+	defaultWebResearchMaxResults       = 6
+	defaultWebResearchTimeoutSeconds   = 20
 )
 
 // RetrySettings is the resolved provider.retry auto-retry configuration:
@@ -48,10 +49,11 @@ const (
 // wall-clock budget is not a settings knob — it has a fixed default applied at the
 // turn layer.
 type RetrySettings struct {
-	Enabled     bool
-	MaxAttempts int
-	BaseDelayMs int
-	MaxDelayMs  int
+	Enabled                bool
+	MaxAttempts            int
+	BaseDelayMs            int
+	MaxDelayMs             int
+	NoOutputTimeoutMinutes int
 }
 
 // WebResearchSettings excludes the API key so formatted settings cannot disclose it.
@@ -915,10 +917,11 @@ func resolveModeDefault(m map[string]any) (mode string, configured bool) {
 // (provider.RetryConfigKey); ParseProviders skips it so it is never selectable.
 func resolveRetry(m map[string]any) RetrySettings {
 	r := RetrySettings{
-		Enabled:     defaultRetryEnabled,
-		MaxAttempts: defaultRetryMaxAttempts,
-		BaseDelayMs: defaultRetryBaseDelayMs,
-		MaxDelayMs:  defaultRetryMaxDelayMs,
+		Enabled:                defaultRetryEnabled,
+		MaxAttempts:            defaultRetryMaxAttempts,
+		BaseDelayMs:            defaultRetryBaseDelayMs,
+		MaxDelayMs:             defaultRetryMaxDelayMs,
+		NoOutputTimeoutMinutes: defaultRetryNoOutputTimeoutMinutes,
 	}
 	prov, ok := m["provider"].(map[string]any)
 	if !ok {
@@ -939,6 +942,9 @@ func resolveRetry(m map[string]any) RetrySettings {
 	}
 	if n, ok := asInt(retry["max_delay_ms"]); ok {
 		r.MaxDelayMs = n
+	}
+	if n, ok := asInt(retry["no_output_timeout_minutes"]); ok {
+		r.NoOutputTimeoutMinutes = n
 	}
 	return r
 }

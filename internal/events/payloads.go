@@ -105,6 +105,7 @@ const (
 	KindExecutionCapability = "execution_capability"
 	KindSkillLoaded         = "skill_loaded"
 	KindConnectDecision     = "connect_decision"
+	KindSandboxWriteRefused = "sandbox_write_refused"
 )
 
 // suggest_followup_debug stage labels. Each marks one observable point on
@@ -392,6 +393,26 @@ func (p ConnectDecision) validate() error {
 	}
 	if p.Count < 1 {
 		return fmt.Errorf("%s.count: must be >= 1, got %d", k, p.Count)
+	}
+	return nil
+}
+
+type SandboxWriteRefused struct {
+	Path     string `json:"path"`
+	Process  string `json:"process,omitempty"`
+	Folder   string `json:"folder,omitempty"`
+	Variable string `json:"variable,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+func (SandboxWriteRefused) Kind() string { return KindSandboxWriteRefused }
+func (p SandboxWriteRefused) validate() error {
+	const k = KindSandboxWriteRefused
+	if err := required(k, "path", p.Path); err != nil {
+		return err
+	}
+	if p.Folder == "" && p.Variable != "" {
+		return fmt.Errorf("%s: a variable needs a folder", k)
 	}
 	return nil
 }
@@ -2346,6 +2367,8 @@ func unmarshalPayload(kind string, raw json.RawMessage) (EventPayload, error) {
 		return decode[SkillLoaded](kind, raw)
 	case KindConnectDecision:
 		return decode[ConnectDecision](kind, raw)
+	case KindSandboxWriteRefused:
+		return decode[SandboxWriteRefused](kind, raw)
 	case KindTurnTerminal:
 		return decodeTurnTerminal(kind, raw)
 	case KindSecurityStateHalted:

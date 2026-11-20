@@ -48,10 +48,10 @@ var idleTimer = func() (<-chan time.Time, func()) {
 	return t.C, func() { t.Stop() }
 }
 
-var noOutputLimit = 30 * time.Minute
+const defaultNoOutputLimit = 20 * time.Minute
 
-var noOutputTimer = func() (<-chan time.Time, func()) {
-	t := time.NewTimer(noOutputLimit)
+var noOutputTimer = func(d time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTimer(d)
 	return t.C, func() { t.Stop() }
 }
 
@@ -441,6 +441,9 @@ func New(deps Deps) *Runner {
 			deps.Retry.MaxAttempts = 1
 		}
 	}
+	if deps.Retry.NoOutputLimit <= 0 {
+		deps.Retry.NoOutputLimit = defaultNoOutputLimit
+	}
 	return &Runner{deps: deps}
 }
 
@@ -811,7 +814,7 @@ func (r *Runner) runAttempt(ctx context.Context, req provider.Request, sel model
 	lastActivity := now()
 	idleEmitted := false
 	idlePending := false
-	noOutputC, stopNoOutput := noOutputTimer()
+	noOutputC, stopNoOutput := noOutputTimer(r.deps.Retry.NoOutputLimit)
 	defer stopNoOutput()
 	noOutputExpired, noOutputTripped := false, false
 	tripNoOutput := func(read <-chan bool) bool {

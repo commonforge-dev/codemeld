@@ -202,6 +202,9 @@ codemeld itself connects only to:
 - `https://auth.openai.com` (login, token refresh, logout) and
   `https://chatgpt.com/backend-api/codex` (model requests), only if you use the
   ChatGPT subscription login;
+- `https://registry.npmjs.org/@openai/codex/latest`, fetched without credentials
+  during ChatGPT model discovery to read the current Codex client version, only
+  if you use the ChatGPT subscription login;
 - Exa at `mcp.exa.ai` for `web_search`, and the page and redirect hops of a
   `web_fetch`;
 - in Auto edits and Build, for a sandboxed shell command, a TCP endpoint or Unix socket

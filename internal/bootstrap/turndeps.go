@@ -895,10 +895,11 @@ func turnOutcome(err error, denied bool) string {
 // when Budget is left zero here.
 func retryPolicy(s config.RetrySettings) turn.RetryPolicy {
 	return turn.RetryPolicy{
-		Enabled:     s.Enabled,
-		MaxAttempts: s.MaxAttempts,
-		BaseDelay:   time.Duration(s.BaseDelayMs) * time.Millisecond,
-		MaxDelay:    time.Duration(s.MaxDelayMs) * time.Millisecond,
+		Enabled:       s.Enabled,
+		MaxAttempts:   s.MaxAttempts,
+		BaseDelay:     time.Duration(s.BaseDelayMs) * time.Millisecond,
+		MaxDelay:      time.Duration(s.MaxDelayMs) * time.Millisecond,
+		NoOutputLimit: time.Duration(s.NoOutputTimeoutMinutes) * time.Minute,
 	}
 }
 

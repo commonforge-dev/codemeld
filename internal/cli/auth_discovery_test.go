@@ -107,7 +107,7 @@ func TestChatGPTDiscoveredProviderWritesSanitizedStore(t *testing.T) {
 			// A stray secret-shaped field must be redacted by the store write backstop.
 			"api_key": "sk-should-not-persist",
 		},
-	}})
+	}}, "0.169.0")
 	if err := config.UpdateDiscoveredModelsProvider(modelsPath, chatGPTProviderID, entry); err != nil {
 		t.Fatalf("UpdateDiscoveredModelsProvider() error = %v", err)
 	}
@@ -206,6 +206,106 @@ func TestLiveRefreshChatGPTModelsWritesStore(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "xhigh") {
 		t.Fatalf("store dropped whitelisted reasoning levels:\n%s", raw)
+	}
+}
+
+func TestLiveRefreshChatGPTModelsSavesAndReusesClientVersion(t *testing.T) {
+	npmVersion := "0.900.0"
+	var discoveryQueries []string
+	stub := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		status, body := http.StatusOK, `{"models":[{"slug":"gpt-5.6"}]}`
+		switch {
+		case r.URL.Host == "registry.npmjs.org" && npmVersion == "":
+			status, body = http.StatusNotFound, ""
+		case r.URL.Host == "registry.npmjs.org":
+			body = `{"version":"` + npmVersion + `"}`
+		default:
+			discoveryQueries = append(discoveryQueries, r.URL.Query().Get("client_version"))
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	modelsPath := config.DiscoveredModelsPath(bootstrap.SettingsPath(t.TempDir()))
+	cfg := provider.ChatGPTClientConfig{AccessToken: "a", AccountID: "b", HTTPClient: stub}
+
+	if err := liveRefreshChatGPTModels(context.Background(), cfg, modelsPath); err != nil {
+		t.Fatalf("first liveRefreshChatGPTModels() error = %v", err)
+	}
+	store, err := config.ReadDiscoveredModels(modelsPath)
+	if err != nil {
+		t.Fatalf("ReadDiscoveredModels() error = %v", err)
+	}
+	if got := store.Providers[chatGPTProviderID].ClientVersion; got != "0.900.0" {
+		t.Fatalf("stored client_version = %q, want 0.900.0", got)
+	}
+
+	npmVersion = ""
+	if err := liveRefreshChatGPTModels(context.Background(), cfg, modelsPath); err != nil {
+		t.Fatalf("second liveRefreshChatGPTModels() error = %v", err)
+	}
+	if len(discoveryQueries) != 2 || discoveryQueries[1] != "0.900.0" {
+		t.Fatalf("discovery client_version values = %v, want the saved 0.900.0 on the second run", discoveryQueries)
+	}
+}
+
+func TestLiveRefreshChatGPTModelsOverlapKeepsHighestClientVersion(t *testing.T) {
+	stub := func(npmVersion string, onDiscovery func(clientVersion string)) *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			status, body := http.StatusOK, `{"models":[{"slug":"gpt-5.6"}]}`
+			switch {
+			case r.URL.Host == "registry.npmjs.org" && npmVersion == "":
+				status, body = http.StatusNotFound, ""
+			case r.URL.Host == "registry.npmjs.org":
+				body = `{"version":"` + npmVersion + `"}`
+			default:
+				onDiscovery(r.URL.Query().Get("client_version"))
+			}
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})}
+	}
+	modelsPath := config.DiscoveredModelsPath(bootstrap.SettingsPath(t.TempDir()))
+	if err := config.UpdateDiscoveredModelsProvider(modelsPath, chatGPTProviderID, config.DiscoveredProvider{ClientVersion: "0.200.0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	lowReady, release := make(chan struct{}), make(chan struct{})
+	var lowSent string
+	lowCfg := provider.ChatGPTClientConfig{AccessToken: "a", AccountID: "b", HTTPClient: stub("", func(v string) {
+		lowSent = v
+		close(lowReady)
+		<-release
+	})}
+	lowDone := make(chan error, 1)
+	go func() { lowDone <- liveRefreshChatGPTModels(context.Background(), lowCfg, modelsPath) }()
+	<-lowReady
+
+	var highSent string
+	highCfg := provider.ChatGPTClientConfig{AccessToken: "a", AccountID: "b", HTTPClient: stub("0.900.0", func(v string) { highSent = v })}
+	if err := liveRefreshChatGPTModels(context.Background(), highCfg, modelsPath); err != nil {
+		t.Fatalf("higher-version liveRefreshChatGPTModels() error = %v", err)
+	}
+	close(release)
+	if err := <-lowDone; err != nil {
+		t.Fatalf("failed-lookup liveRefreshChatGPTModels() error = %v", err)
+	}
+	if lowSent != "0.200.0" || highSent != "0.900.0" {
+		t.Fatalf("sent versions = %q (failed lookup), %q (higher), want 0.200.0 and 0.900.0", lowSent, highSent)
+	}
+
+	store, err := config.ReadDiscoveredModels(modelsPath)
+	if err != nil {
+		t.Fatalf("ReadDiscoveredModels() error = %v", err)
+	}
+	if got := store.Providers[chatGPTProviderID].ClientVersion; got != "0.900.0" {
+		t.Fatalf("stored client_version after overlap = %q, want 0.900.0", got)
+	}
+
+	var nextSent string
+	nextCfg := provider.ChatGPTClientConfig{AccessToken: "a", AccountID: "b", HTTPClient: stub("", func(v string) { nextSent = v })}
+	if err := liveRefreshChatGPTModels(context.Background(), nextCfg, modelsPath); err != nil {
+		t.Fatalf("next liveRefreshChatGPTModels() error = %v", err)
+	}
+	if nextSent != "0.900.0" {
+		t.Fatalf("next failed-lookup discovery sent %q, want the retained 0.900.0", nextSent)
 	}
 }
 

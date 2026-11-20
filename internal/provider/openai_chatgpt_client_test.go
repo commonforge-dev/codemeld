@@ -11,10 +11,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/ssestream"
@@ -994,7 +996,7 @@ func TestChatGPTModelDiscoveryRequest(t *testing.T) {
 	srv := modelsServer(t, &cap, http.StatusOK, body)
 	c := testClient(srv, "sk-access-XYZ", "acct-777")
 
-	cache, err := c.discoverModels(context.Background())
+	cache, err := c.discoverModels(context.Background(), chatGPTCodexClientVersion)
 	if err != nil {
 		t.Fatalf("discoverModels() error = %v, want nil", err)
 	}
@@ -1044,6 +1046,9 @@ func TestRefreshChatGPTModelCache_WritesSanitizedCache(t *testing.T) {
 	var cap capturedRequest
 	var gotHost string
 	stub := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "registry.npmjs.org" {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
 		cap.method = r.Method
 		cap.path = r.URL.Path
 		cap.query = r.URL.RawQuery
@@ -1060,8 +1065,9 @@ func TestRefreshChatGPTModelCache_WritesSanitizedCache(t *testing.T) {
 	// artifact back from disk, standing in for the CLI's real models.yaml store write.
 	storePath := filepath.Join(t.TempDir(), "models.yaml")
 	var gotModels []ChatGPTStoreModel
-	write := func(models []ChatGPTStoreModel) error {
-		gotModels = models
+	var gotVersion string
+	write := func(models []ChatGPTStoreModel, sentVersion string) error {
+		gotModels, gotVersion = models, sentVersion
 		data, err := json.Marshal(models)
 		if err != nil {
 			return err
@@ -1070,8 +1076,11 @@ func TestRefreshChatGPTModelCache_WritesSanitizedCache(t *testing.T) {
 	}
 
 	cfg := ChatGPTClientConfig{AccessToken: "sk-access-XYZ", AccountID: "acct-777", HTTPClient: stub}
-	if err := RefreshChatGPTModelCache(context.Background(), cfg, write); err != nil {
+	if err := RefreshChatGPTModelCache(context.Background(), cfg, "", write); err != nil {
 		t.Fatalf("RefreshChatGPTModelCache() error = %v, want nil", err)
+	}
+	if gotVersion != chatGPTCodexClientVersion {
+		t.Fatalf("written client version = %q, want %s", gotVersion, chatGPTCodexClientVersion)
 	}
 
 	// The real entrypoint must hit the pinned origin's discovery endpoint with the pinned
@@ -1135,7 +1144,7 @@ func TestChatGPTModelDiscovery_DoesNotFollowRedirect(t *testing.T) {
 	t.Cleanup(redirector.Close)
 
 	c := testClient(redirector, "sk-secret-XYZ", "acct-777")
-	_, err := c.discoverModels(context.Background())
+	_, err := c.discoverModels(context.Background(), chatGPTCodexClientVersion)
 
 	if leakedHeader != "" {
 		t.Fatalf("credential header %q reached the redirect target", leakedHeader)
@@ -1163,7 +1172,7 @@ func TestChatGPTModelDiscovery_NonOKDropsBody(t *testing.T) {
 	srv := modelsServer(t, nil, http.StatusUnauthorized, body)
 	c := testClient(srv, token, account)
 
-	_, err := c.discoverModels(context.Background())
+	_, err := c.discoverModels(context.Background(), chatGPTCodexClientVersion)
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) {
 		t.Fatalf("error = %v, want *HTTPError", err)
@@ -1198,7 +1207,7 @@ func TestChatGPTModelDiscovery_MalformedJSON(t *testing.T) {
 	srv := modelsServer(t, nil, http.StatusOK, body)
 	c := testClient(srv, token, account)
 
-	cache, err := c.discoverModels(context.Background())
+	cache, err := c.discoverModels(context.Background(), chatGPTCodexClientVersion)
 	if err == nil {
 		t.Fatal("discoverModels() error = nil, want a decode error for malformed JSON")
 	}
@@ -1218,7 +1227,7 @@ func TestChatGPTModelDiscovery_ContextCancel(t *testing.T) {
 	c := testClient(srv, "t", "a")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := c.discoverModels(ctx); err == nil {
+	if _, err := c.discoverModels(ctx, chatGPTCodexClientVersion); err == nil {
 		t.Fatal("discoverModels() error = nil, want a context-cancel error")
 	}
 }
@@ -1230,5 +1239,153 @@ func TestRedactCredentials_SkipsEmptySecrets(t *testing.T) {
 	}
 	if got := redactCredentials("token=abc and abc again", "abc"); got != "token=[REDACTED] and [REDACTED] again" {
 		t.Fatalf("redactCredentials = %q, want both occurrences replaced", got)
+	}
+}
+
+func TestChatGPTCodexClientVersionPinned(t *testing.T) {
+	if chatGPTCodexClientVersion != "0.169.0" {
+		t.Fatalf("chatGPTCodexClientVersion = %q, want 0.169.0", chatGPTCodexClientVersion)
+	}
+}
+
+func useCodexVersionServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	prev := chatGPTCodexVersionURL
+	chatGPTCodexVersionURL = srv.URL + "/@openai/codex/latest"
+	t.Cleanup(func() { chatGPTCodexVersionURL = prev })
+	return srv
+}
+
+func chatGPTToServer(t *testing.T, discovery *httptest.Server) *http.Client {
+	t.Helper()
+	target, err := url.Parse(discovery.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "chatgpt.com" {
+			r = r.Clone(r.Context())
+			r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+}
+
+func TestRefreshChatGPTModelCache_SendsHighestClientVersion(t *testing.T) {
+	const pinned = "0.169.0"
+	jsonVersion := func(v string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"name":"@openai/codex","version":"`+v+`"}`)
+		}
+	}
+	paddedToBound := func(doc, tail string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, doc+strings.Repeat(" ", chatGPTCodexVersionMaxBody-len(doc))+tail)
+		}
+	}
+	cases := []struct {
+		name  string
+		npm   http.HandlerFunc
+		saved string
+		want  string
+	}{
+		{"lookup_padded_past_bound_garbage", paddedToBound(`{"version":"9.0.0"}`, "garbage"), "0.300.0", "0.300.0"},
+		{"lookup_padded_past_bound_json_value", paddedToBound(`{"version":"9.0.0"}`, `{"version":"8.0.0"}`), "", pinned},
+		{"lookup_complete_at_bound", paddedToBound(`{"version":"0.900.0"}`, ""), "0.200.0", "0.900.0"},
+		{"lookup_highest", jsonVersion("0.900.0"), "0.170.0", "0.900.0"},
+		{"saved_highest", jsonVersion("0.170.0"), "0.800.0", "0.800.0"},
+		{"constant_highest", jsonVersion("0.1.0"), "0.2.0", pinned},
+		{"lookup_404", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"version":"9.0.0"}`)
+		}, "0.200.0", "0.200.0"},
+		{"lookup_404_no_saved", func(w http.ResponseWriter, _ *http.Request) { http.NotFound(w, nil) }, "", pinned},
+		{"lookup_malformed_json", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"version":`) }, "0.300.0", "0.300.0"},
+		{"lookup_trailing_garbage", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"version":"9.0.0"}garbage`) }, "0.300.0", "0.300.0"},
+		{"lookup_trailing_json_value", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"version":"9.0.0"}{"version":"8.0.0"}`)
+		}, "", pinned},
+		{"lookup_trailing_whitespace", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "{\"version\":\"0.900.0\"}\n \t\n")
+		}, "0.200.0", "0.900.0"},
+		{"lookup_not_xyz", jsonVersion("9.0.0.1"), "", pinned},
+		{"lookup_stalls", func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }, "0.400.0", "0.400.0"},
+		{"saved_invalid", jsonVersion("0.1.0"), "+9.0.0", pinned},
+		{"numeric_order", jsonVersion("1.99.0"), "1.100.0", "1.100.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prevTimeout := chatGPTCodexVersionLookupTimeout
+			chatGPTCodexVersionLookupTimeout = 100 * time.Millisecond
+			t.Cleanup(func() { chatGPTCodexVersionLookupTimeout = prevTimeout })
+			useCodexVersionServer(t, tc.npm)
+			var cap capturedRequest
+			discovery := modelsServer(t, &cap, http.StatusOK, `{"models":[{"slug":"gpt-5.6"}]}`)
+
+			var written string
+			cfg := ChatGPTClientConfig{AccessToken: "tok", AccountID: "acct", HTTPClient: chatGPTToServer(t, discovery)}
+			err := RefreshChatGPTModelCache(context.Background(), cfg, tc.saved, func(_ []ChatGPTStoreModel, v string) error {
+				written = v
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("RefreshChatGPTModelCache() error = %v, want nil", err)
+			}
+			if cap.query != "client_version="+tc.want {
+				t.Errorf("query = %q, want client_version=%s", cap.query, tc.want)
+			}
+			if got := cap.header.Get("version"); got != tc.want {
+				t.Errorf("version header = %q, want %s", got, tc.want)
+			}
+			if got := cap.header.Get("User-Agent"); got != "codex_cli_rs/"+tc.want {
+				t.Errorf("User-Agent = %q, want codex_cli_rs/%s", got, tc.want)
+			}
+			if written != tc.want {
+				t.Errorf("written client version = %q, want %s", written, tc.want)
+			}
+		})
+	}
+	if got := HighestCodexVersion("0.99.0", "0.100.0"); got != "0.100.0" {
+		t.Errorf("HighestCodexVersion(0.99.0, 0.100.0) = %q, want 0.100.0", got)
+	}
+}
+
+func TestCodexVersionLookup_NoCredentialsNoRedirect(t *testing.T) {
+	var npmHeader http.Header
+	useCodexVersionServer(t, func(w http.ResponseWriter, r *http.Request) {
+		npmHeader = r.Header.Clone()
+		_, _ = io.WriteString(w, `{"version":"0.900.0"}`)
+	})
+	discovery := modelsServer(t, nil, http.StatusOK, `{"models":[]}`)
+	cfg := ChatGPTClientConfig{AccessToken: "tok-secret", AccountID: "acct-secret", HTTPClient: chatGPTToServer(t, discovery)}
+	if err := RefreshChatGPTModelCache(context.Background(), cfg, "", func([]ChatGPTStoreModel, string) error { return nil }); err != nil {
+		t.Fatalf("RefreshChatGPTModelCache() error = %v", err)
+	}
+	if npmHeader == nil {
+		t.Fatal("npm registry was never asked")
+	}
+	for _, h := range []string{"Authorization", chatGPTAccountHeader, "originator", "version"} {
+		if v := npmHeader.Get(h); v != "" {
+			t.Errorf("npm request carried %s = %q, want none", h, v)
+		}
+	}
+
+	targetHit := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHit = true
+		_, _ = io.WriteString(w, `{"version":"0.900.0"}`)
+	}))
+	t.Cleanup(target.Close)
+	useCodexVersionServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/latest", http.StatusFound)
+	})
+	if got := lookupCodexVersion(context.Background(), cfg.HTTPClient); got != "" {
+		t.Errorf("lookup through a redirect = %q, want no result", got)
+	}
+	if targetHit {
+		t.Error("lookup followed a redirect to another origin")
 	}
 }

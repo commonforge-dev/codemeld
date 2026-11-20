@@ -4256,7 +4256,8 @@ func TestQueueBlockedNotices_ReturnsAtOnceFromTheEventLoop(t *testing.T) {
 	blocked := permissions.NewLiveBlockedPaths(t.TempDir(), "", nil, func() permissions.BlockedReload {
 		return permissions.BlockedReload{Problems: problems}
 	})
-	t.Cleanup(queueBlockedNotices(app, blocked, nil))
+	_, stopQueue := queueBlockedNotices(app, blocked, nil, nil)
+	t.Cleanup(stopQueue)
 
 	returned := make(chan struct{})
 	go func() {
@@ -4302,7 +4303,7 @@ func TestQueueBlockedNotices_StopEndsTheDrainAfterTheAppStops(t *testing.T) {
 	blocked := permissions.NewLiveBlockedPaths(t.TempDir(), "", nil, func() permissions.BlockedReload {
 		return permissions.BlockedReload{Problems: problems}
 	})
-	stop := queueBlockedNotices(app, blocked, nil)
+	_, stop := queueBlockedNotices(app, blocked, nil, nil)
 	problems = map[string]string{"/g/settings.yaml": "is not valid YAML"}
 	blocked.Entries()
 	line := problemNotice("/g/settings.yaml", "is not valid YAML")
@@ -4360,7 +4361,7 @@ func TestQueueBlockedNotices_DeliversThroughTheHookReadWhenTheQueueStarts(t *tes
 	blocked := permissions.NewLiveBlockedPaths(t.TempDir(), "", nil, func() permissions.BlockedReload {
 		return permissions.BlockedReload{Problems: problems}
 	})
-	stop := queueBlockedNotices(tui.New(nil), blocked, nil)
+	_, stop := queueBlockedNotices(tui.New(nil), blocked, nil, nil)
 	hookEntered := false
 	var releaseOnce sync.Once
 	releaseHook := func() { releaseOnce.Do(func() { close(release) }) }
@@ -4436,7 +4437,7 @@ func TestQueueBlockedNotices_DeliveryThatSeesTheStopSkipsTheHook(t *testing.T) {
 	blocked := permissions.NewLiveBlockedPaths(t.TempDir(), "", nil, func() permissions.BlockedReload {
 		return permissions.BlockedReload{Problems: problems}
 	})
-	stop := queueBlockedNotices(tui.New(nil), blocked, nil)
+	_, stop := queueBlockedNotices(tui.New(nil), blocked, nil, nil)
 	wasSpawned := false
 	var releaseOnce sync.Once
 	releaseDelivery := func() { releaseOnce.Do(func() { close(release) }) }
@@ -5514,8 +5515,8 @@ func captureSettingsDeps(t *testing.T) *tui.SettingsDeps {
 	t.Helper()
 	var captured tui.SettingsDeps
 	production := newSettingsDeps
-	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
-		captured = production(app, cache, active, authorizer)
+	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
+		captured = production(app, cache, active, authorizer, writable)
 		return captured
 	}
 	t.Cleanup(func() { newSettingsDeps = production })
@@ -6687,9 +6688,9 @@ func runLiveDelivery(t *testing.T, app *tui.App, recorder *capabilityRecorder) {
 	t.Helper()
 	orig := deliverBlockedNotice
 	deliverBlockedNotice = func(*tui.App, string) {}
-	stop := queueBlockedNotices(app, recorder.blocked, func(degraded bool, notices tui.NoticeRenderer) {
+	_, stop := queueBlockedNotices(app, recorder.blocked, func(degraded bool, notices tui.NoticeRenderer) {
 		recorder.deliver(context.Background(), app, degraded, notices)
-	})
+	}, nil)
 	t.Cleanup(func() {
 		stop()
 		deliverBlockedNotice = orig
@@ -6712,9 +6713,9 @@ func captureLiveBlocked(t *testing.T) func() *permissions.BlockedPaths {
 	t.Helper()
 	var blocked atomic.Pointer[permissions.BlockedPaths]
 	production := newSettingsDeps
-	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, a *productionAuthorizer) tui.SettingsDeps {
+	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, a *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 		blocked.Store(a.blocked)
-		return production(app, cache, active, a)
+		return production(app, cache, active, a, writable)
 	}
 	t.Cleanup(func() { newSettingsDeps = production })
 	return blocked.Load

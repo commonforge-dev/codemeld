@@ -74,7 +74,7 @@ func HeadlessFreshSteps(stderr io.Writer, modelOverride *model.Selection, modeKe
 		recoverChildJournals(home, projectRoot, global, decision, nil, stderr, false)
 	}
 	if modelOverride != nil {
-		steps.DetermineModel = overrideDetermineModelStep(*modelOverride)
+		steps.DetermineModel = overrideDetermineModelStep(*modelOverride, stderr)
 	}
 	if modeKey != "" {
 		steps.InitMode = overrideInitModeStep(modeKey, stderrNoticeRenderer{w: stderr})
@@ -88,7 +88,7 @@ func HeadlessFreshSteps(stderr io.Writer, modelOverride *model.Selection, modeKe
 // the on-disk model.active path does; an uncatalogued provider/model surfaces
 // ErrModelNotInCatalog (CLI exit 2) rather than a launch failure. The recorded source
 // is SourceProject — an explicit, validated selection, like a per-project model.active.
-func overrideDetermineModelStep(sel model.Selection) func(composed, global map[string]any, projectRoot string, layerPaths []string) (any, bool, error) {
+func overrideDetermineModelStep(sel model.Selection, stderr io.Writer) func(composed, global map[string]any, projectRoot string, layerPaths []string) (any, bool, error) {
 	return func(composed, global map[string]any, projectRoot string, layerPaths []string) (any, bool, error) {
 		if composed == nil {
 			composed = map[string]any{}
@@ -98,11 +98,32 @@ func overrideDetermineModelStep(sel model.Selection) func(composed, global map[s
 			return nil, false, fmt.Errorf("bootstrap: headless model config cache: %w", err)
 		}
 		s := sel
-		if verr := model.Validate(&s, cache); verr != nil {
+		verr := model.Validate(&s, cache)
+		if verr != nil && neverDiscovered(verr, sel.Provider, layerPaths) {
+			_, _ = fmt.Fprintf(stderr, "codemeld: fetching the model list for %s...\n", sel.Provider)
+			done := make(chan RefreshResult, 1)
+			NewProviderCatalogRefresher(cache).Refresh(sel.Provider, false, func(res RefreshResult) { done <- res })
+			if res := <-done; res.Outcome == RefreshUpdated {
+				verr = model.Validate(&s, cache)
+			}
+		}
+		if verr != nil {
 			return nil, false, fmt.Errorf("%w: %s", ErrModelNotInCatalog, verr.Error())
 		}
 		return model.NewActiveState(&s, model.SourceProject), false, nil
 	}
+}
+
+func neverDiscovered(verr *model.ShapeError, providerID string, layerPaths []string) bool {
+	if verr.Category != model.CategoryModelNotAllowed || providerID == provider.ChatGPTProviderID || len(layerPaths) == 0 {
+		return false
+	}
+	store, err := config.ReadDiscoveredModels(config.DiscoveredModelsPath(layerPaths[0]))
+	if err != nil {
+		return false
+	}
+	_, ok := store.Providers[providerID]
+	return !ok
 }
 
 // overrideInitModeStep returns an InitMode step that pins the run's interaction mode

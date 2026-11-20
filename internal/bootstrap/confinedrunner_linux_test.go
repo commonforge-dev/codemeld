@@ -3383,7 +3383,7 @@ func TestConfinedShell_FileRefusalsThroughTheRealHelper(t *testing.T) {
 				return dispatchedStderr(t, res.Content)
 			}
 			refused := filepath.Join(outside, "new")
-			line := "codemeld: sandbox probably refused write: " + refused + " (mkdir; grant candidate: " + outside + ")"
+			line := "codemeld: sandbox likely refused write: " + refused + " (mkdir; to allow, add the writable folder " + outside + " in /settings, folders tab, key a)"
 			closing := wantFileRefusalsClosing
 			if name == "plan" {
 				line = "codemeld: sandbox probably refused write: " + refused + " (mkdir)"
@@ -3402,6 +3402,126 @@ func TestConfinedShell_FileRefusalsThroughTheRealHelper(t *testing.T) {
 	}
 }
 
+func TestConfinedShellAndVCS_WriteRefusalsNotifyOncePerFolderPerSessionThroughTheLaunchQueue(t *testing.T) {
+	conf, project, _, bin := brokerConfinement(t)
+	base := filepath.Dir(project)
+	for _, dir := range []string{"cache/a", "cache/b", "other", "quiet", "vcs"} {
+		if err := os.MkdirAll(filepath.Join(base, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, other, vcsDir := filepath.Join(base, "cache"), filepath.Join(base, "other"), filepath.Join(base, "vcs")
+	conf.inherited = append(conf.inherited, "TOOL_CACHE="+cache)
+	lookup, target := t.TempDir(), filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(filepath.Join(lookup, "git"), []byte("#!/bin/sh\nread -r dir < "+target+"\nexec mkdir \"$dir\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf.lookupPath = lookup + ":" + conf.lookupPath
+	prevVCS := newVCSActionRunner
+	newVCSActionRunner = func() runner.Runner { return &helperForwardingRunner{bin: bin} }
+	t.Cleanup(func() { newVCSActionRunner = prevVCS })
+
+	app, first := tui.New(nil), mkStore(t)
+	app.SetActiveStore(first)
+	_, stop := queueBlockedNotices(app, permissions.NewBlockedPaths(t.TempDir(), nil), nil, conf.writes)
+	t.Cleanup(stop)
+	shell := &confinedShellRunner{events: &shellEventRunner{inner: &helperForwardingRunner{bin: bin}, active: app.ActiveStore, cap: 1 << 16}, conf: conf}
+	run := func(argv ...string) {
+		t.Helper()
+		if _, err := shell.Exec(context.Background(), runner.RunSpec{InvocationID: ids.NewV7(), Argv: argv, Cwd: project}); err != nil {
+			t.Fatalf("%q: %v", argv, err)
+		}
+	}
+	var seen uint64
+	requireNotice := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for app.NoticeSeq() == seen && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		seen++
+		if got := app.NoticeSeq(); got != seen {
+			t.Fatalf("notice count = %d, want %d (expecting %q)", got, seen, want)
+		}
+		if got := app.NoticeText(); got != want {
+			t.Fatalf("notice = %q, want %q", got, want)
+		}
+	}
+	cacheNotice := "sandbox likely blocked writes to " + cache + " (TOOL_CACHE); commands that write there fail. To allow it: /settings, folders tab, press a"
+	otherNotice := "sandbox likely blocked writes to " + other + "; commands that write there fail. To allow it: /settings, folders tab, press a"
+	swapper := &clearSessionSwapper{app: app, ctx: context.Background(), home: t.TempDir(), recorder: fixedRecorder(injectedResolution), conf: conf}
+	factory := &toolRegistryFactory{active: &ActiveVCS{Template: productVettedGitTemplate(t), RepoRoot: project}}
+	reg, err := realizeToolRegistry(factory, emptyCache(t, project), app.ActiveStore, t.TempDir(), project, securitystate.Policy{}, generalAgentBinding{notices: &recordingNotices{}, confinement: conf})
+	if err != nil {
+		t.Fatalf("realizeToolRegistry: %v", err)
+	}
+	vcsStatus, ok := reg.Lookup("vcs_status")
+	if !ok {
+		t.Fatal("vcs_status not registered")
+	}
+	runVCS := func(dir string) {
+		t.Helper()
+		if err := os.WriteFile(target, []byte(dir+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := vcsStatus.Invoke(context.Background(), map[string]any{}); err != nil {
+			t.Fatalf("vcs_status writing %s: %v", dir, err)
+		}
+	}
+	vcsNotice := "sandbox likely blocked writes to " + vcsDir + "; commands that write there fail. To allow it: /settings, folders tab, press a"
+
+	run("mkdir", filepath.Join(cache, "a", "x"))
+	requireNotice(cacheNotice)
+	run("mkdir", filepath.Join(cache, "b", "y"))
+	run("sh", "-c", "mkdir "+filepath.Join(base, "quiet", "q")+"; true")
+	run("mkdir", filepath.Join(other, "z"))
+	requireNotice(otherNotice)
+	runVCS(filepath.Join(cache, "a", "g"))
+	runVCS(filepath.Join(vcsDir, "g"))
+	requireNotice(vcsNotice)
+
+	tmp := os.Getenv("TMPDIR")
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	if _, err := swapper.Fresh(); err == nil || app.ActiveStore() != first {
+		t.Fatalf("Fresh = %v with active %p, want a failed switch that keeps %p", err, app.ActiveStore(), first)
+	}
+	t.Setenv("TMPDIR", tmp)
+	run("mkdir", filepath.Join(cache, "a", "x2"))
+
+	second, err := swapper.Fresh()
+	if err != nil || app.ActiveStore() != second {
+		t.Fatalf("Fresh = (%p, %v), want the switch to stand", second, err)
+	}
+	run("mkdir", filepath.Join(cache, "a", "x3"))
+	requireNotice(cacheNotice)
+	run("mkdir", filepath.Join(cache, "b", "w"))
+	run("mkdir", filepath.Join(other, "v"))
+	requireNotice(otherNotice)
+
+	for _, tc := range []struct {
+		store *sessions.Store
+		want  []events.SandboxWriteRefused
+	}{
+		{first, []events.SandboxWriteRefused{
+			{Path: filepath.Join(cache, "a", "x"), Process: "mkdir", Folder: cache, Variable: "TOOL_CACHE"},
+			{Path: filepath.Join(other, "z"), Process: "mkdir", Folder: other},
+			{Path: filepath.Join(vcsDir, "g"), Process: "mkdir", Folder: vcsDir},
+		}},
+		{second, []events.SandboxWriteRefused{
+			{Path: filepath.Join(cache, "a", "x3"), Process: "mkdir", Folder: cache, Variable: "TOOL_CACHE"},
+			{Path: filepath.Join(other, "v"), Process: "mkdir", Folder: other},
+		}},
+	} {
+		if got := decodeStoreEvents[events.SandboxWriteRefused](t, reloadStore(t, tc.store), "sandbox_write_refused"); !slices.Equal(got, tc.want) {
+			t.Errorf("sandbox_write_refused events in %s:\n got %+v\nwant %+v", tc.store.Path(), got, tc.want)
+		}
+	}
+}
+
 func TestConfinedFailure_FileRefusalLinesAreEscapedAndFitTheRoom(t *testing.T) {
 	f := &confinedFailure{unjudged: 2}
 	for _, r := range []refusal{
@@ -3412,7 +3532,7 @@ func TestConfinedFailure_FileRefusalLinesAreEscapedAndFitTheRoom(t *testing.T) {
 		f.files = appendNew(f.files, fileRefusalLine(r))
 	}
 	lines := []string{
-		"codemeld: sandbox probably refused write: /a\\x0Ab\\x1B[2J� (go; grant candidate: /a)",
+		"codemeld: sandbox likely refused write: /a\\x0Ab\\x1B[2J� (go; to allow, add the writable folder /a in /settings, folders tab, key a)",
 		"codemeld: sandbox probably refused write: /blocked/x (sh; not grantable: blocked path)",
 		"codemeld: 1 more file refusals omitted.",
 		"codemeld: 2 file calls could not be judged",

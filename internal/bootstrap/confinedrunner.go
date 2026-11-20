@@ -26,6 +26,7 @@ import (
 	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/runner"
+	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/vcs"
 )
 
@@ -52,6 +53,141 @@ type confinement struct {
 	deny          *sessionDenyList
 	approvals     *connectApprovals
 	outside       *outsideSubjects
+	writes        *writeRefusalReports
+}
+
+type writeRefusalReports struct {
+	mu     sync.Mutex
+	seen   map[string]bool
+	notice func(string)
+}
+
+func (w *writeRefusalReports) fresh(refused []refusal) []refusal {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.seen == nil {
+		w.seen = map[string]bool{}
+	}
+	var out []refusal
+	for _, r := range refused {
+		key := cmp.Or(r.Candidate, filepath.Dir(r.Path)+"\x00"+r.Reason)
+		if w.seen[key] {
+			continue
+		}
+		w.seen[key] = true
+		out = append(out, r)
+		if w.notice != nil {
+			w.notice(writeRefusalNotice(r))
+		}
+	}
+	return out
+}
+
+func (w *writeRefusalReports) setNotice(notice func(string)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.notice = notice
+}
+
+func (w *writeRefusalReports) reset() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.seen = nil
+}
+
+func writeRefusalNotice(r refusal) string {
+	if r.Candidate == "" {
+		return permissions.SingleLineControlEscape(fmt.Sprintf("sandbox likely blocked writes to %s: %s", r.Path, cmp.Or(r.Reason, "not grantable")))
+	}
+	return permissions.SingleLineControlEscape(fmt.Sprintf("sandbox likely blocked writes to %s; commands that write there fail. To allow it: /settings, folders tab, press a", suggestedFolder(r)))
+}
+
+func suggestedFolder(r refusal) string {
+	if r.Var == "" {
+		return r.Candidate
+	}
+	return r.Candidate + " (" + r.Var + ")"
+}
+
+func (c *confinement) widen(env []string, cwd string) func(refusal) refusal {
+	return func(r refusal) refusal {
+		if r.Candidate != "" {
+			blocked := c.blocked.Current()
+			home := cmp.Or(c.home, blocked.Home())
+			var reason string
+			if r.Candidate, r.Var, reason = widenedFolder(r.Candidate, env, home, []string{c.projectRoot, cwd}, blocked); reason != "" {
+				r.Reason = reason
+			}
+		}
+		return r
+	}
+}
+
+func widenedFolder(candidate string, env []string, home string, projects []string, blocked *permissions.BlockedPaths) (folder, variable, reason string) {
+	home = resolvedOrClean(home)
+	projects = slices.Clone(projects)
+	for i, p := range projects {
+		projects[i] = resolvedOrClean(p)
+	}
+	if reason := unsuitableFolder(candidate, home, projects, blocked); reason != "" {
+		return "", "", reason
+	}
+	for _, e := range env {
+		name, value, _ := strings.Cut(e, "=")
+		if !filepath.IsAbs(value) || slices.Contains(strings.Split(value, string(filepath.Separator)), "..") {
+			continue
+		}
+		value, err := filepath.EvalSymlinks(value)
+		if err != nil {
+			continue
+		}
+		if len(value) <= len(folder) || !pathWithin(candidate, value) || unsuitableFolder(value, home, projects, blocked) != "" {
+			continue
+		}
+		folder, variable = value, name
+	}
+	if folder == "" {
+		return candidate, "", ""
+	}
+	return folder, variable, ""
+}
+
+func resolvedOrClean(path string) string {
+	if path == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return filepath.Clean(path)
+}
+
+func unsuitableFolder(folder, home string, projects []string, blocked *permissions.BlockedPaths) string {
+	switch {
+	case filepath.Dir(folder) == folder:
+		return "the filesystem root cannot be a writable folder"
+	case home != "" && pathWithin(filepath.Clean(home), folder):
+		return folder + " holds the home folder"
+	}
+	for _, p := range projects {
+		if p != "" && pathWithin(filepath.Clean(p), folder) {
+			return folder + " holds the project folder"
+		}
+	}
+	if _, holds := blocked.BlockedWithin(folder); holds {
+		return folder + " holds a blocked path"
+	}
+	return ""
+}
+
+func pathWithin(path, base string) bool {
+	return path == base || strings.HasPrefix(path, base+string(filepath.Separator))
 }
 
 type outsideSubjects struct {
@@ -400,7 +536,11 @@ func (c *confinement) prepareReplacement() (folder string, rollback func() error
 }
 
 func (c *confinement) commitReplacement(folder string) {
-	if c == nil || folder == "" {
+	if c == nil {
+		return
+	}
+	c.writes.reset()
+	if folder == "" {
 		return
 	}
 	old := c.tmpDir
@@ -877,6 +1017,7 @@ type confinedRunner struct {
 	conf           *confinement
 	cap            int
 	storesWritable bool
+	active         func() *sessions.Store
 	mu             sync.Mutex
 	pending        map[string][]runner.RunSpec
 }
@@ -911,7 +1052,11 @@ func (r *confinedRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.
 	if err != nil {
 		return res, err
 	}
-	return noteConfinedFailure(res, r.cap, confinedFailureOf(res, proxyRoute, prepared.Helper)), nil
+	failure := confinedFailureOf(res, proxyRoute, prepared.Helper, r.conf.widen(prepared.Env, spec.Cwd))
+	if failure != nil && !failure.plan {
+		err = recordWriteRefusals(r.active, r.conf.writes.fresh(failure.refused))
+	}
+	return noteConfinedFailure(res, r.cap, failure), err
 }
 
 const confinedFailureNote = "codemeld: this command ran inside the confinement boundary; a failure may be a boundary denial and may have left partial changes; codemeld did not re-run it outside the boundary."
@@ -933,6 +1078,7 @@ type confinedFailure struct {
 	proxyRoute bool
 	lines      []string
 	files      []string
+	refused    []refusal
 	unjudged   int
 	plan       bool
 	outside    bool
@@ -945,7 +1091,7 @@ const outsideRunLine = "codemeld: to run this command once outside the sandbox, 
 type refusal struct {
 	Host, Port, Path, Reason string
 	File                     bool
-	Process, Candidate       string
+	Process, Candidate, Var  string
 }
 
 var invocationRefusals = func(helper runner.HelperLaunch) []refusal {
@@ -957,7 +1103,7 @@ var invocationRefusals = func(helper runner.HelperLaunch) []refusal {
 	return h.refusals()
 }
 
-func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.HelperLaunch) *confinedFailure {
+func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.HelperLaunch, widen func(refusal) refusal) *confinedFailure {
 	if !confinedRunFailed(res) {
 		return nil
 	}
@@ -967,7 +1113,11 @@ func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.Help
 	}
 	for _, r := range invocationRefusals(helper) {
 		if r.File {
+			if widen != nil {
+				r = widen(r)
+			}
 			f.files = appendNew(f.files, fileRefusalLine(r))
+			f.refused = append(f.refused, r)
 			continue
 		}
 		dest := r.Path
@@ -987,8 +1137,10 @@ func confinedFailureOf(res runner.RunResult, proxyRoute bool, helper runner.Help
 func fileRefusalLine(r refusal) string {
 	detail := cmp.Or(r.Process, "unknown process")
 	if r.Candidate != "" {
-		detail += "; grant candidate: " + r.Candidate
-	} else if r.Reason != "" {
+		return permissions.SingleLineControlEscape(fmt.Sprintf("codemeld: sandbox likely refused write: %s (%s; to allow, add the writable folder %s in /settings, folders tab, key a)",
+			r.Path, detail, suggestedFolder(r)))
+	}
+	if r.Reason != "" {
 		detail += "; not grantable: " + r.Reason
 	}
 	return permissions.SingleLineControlEscape(fmt.Sprintf("codemeld: sandbox probably refused write: %s (%s)", r.Path, detail))
@@ -1208,7 +1360,7 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 		defer prepared.Helper.Close()
 	}
 	res, failure, err := r.events.execBoundedPrepared(ctx, spec, prepared, r.events.cap, func(res runner.RunResult) *confinedFailure {
-		f := confinedFailureOf(res, proxyRoute, prepared.Helper)
+		f := confinedFailureOf(res, proxyRoute, prepared.Helper, r.conf.widen(prepared.Env, spec.Cwd))
 		if f != nil && mode.Mode(current) == mode.Build && len(f.lines)+len(f.files) > 0 {
 			subject := dispatch.ShellSubject(ctx)
 			var reasons []string
@@ -1226,11 +1378,31 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 			r.failure = &confinedFailure{}
 		}
 		r.failure.merge(failure)
+		if !failure.plan {
+			err = recordWriteRefusals(r.events.active, r.conf.writes.fresh(failure.refused))
+		}
 	}
 	if recErr := r.recordConnectDecisions(prepared.Helper); recErr != nil {
 		err = errors.Join(err, recErr)
 	}
 	return res, err
+}
+
+func recordWriteRefusals(active func() *sessions.Store, refused []refusal) error {
+	if len(refused) == 0 || active == nil {
+		return nil
+	}
+	store := active()
+	if store == nil {
+		return nil
+	}
+	var errs []error
+	for _, w := range refused {
+		if _, err := events.Append(store, events.SandboxWriteRefused{Path: w.Path, Process: w.Process, Folder: w.Candidate, Variable: w.Var, Reason: w.Reason}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (r *confinedShellRunner) recordConnectDecisions(helper runner.HelperLaunch) error {

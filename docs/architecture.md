@@ -77,7 +77,11 @@ resolves to the same folder as codemeld's own temp folder (`os.TempDir()`) is re
 session temp folder (`namesFolder`). A Build command instead keeps codemeld's full environment,
 secret-looking names, `PATH` and `GOCACHE` included: only `TERM=dumb`, the proxy variables, the
 `GIT_CONFIG_GLOBAL=/dev/null` override and the temp folder rewrite apply, and an unset or empty
-`TMPDIR` becomes the session temp folder (`confinement.prepareBuild`).
+`TMPDIR` becomes the session temp folder (`confinement.prepareBuild`); dispatch still removes
+`RIPGREP_CONFIG_PATH` by default (from a command run through the shell as written, an `rg` command
+and a command with leading assignments, except where the command clears or is given its own
+environment), and gives automatically allowed `hg`, `jj` and `ps` their own environments
+(`internal/dispatch/shell.go`).
 
 - **Files.** Reads are allowed everywhere except the blocked paths, which always include
   `~/.codemeld`; the one exception is `~/.codemeld/skills`, readable under the conditions in
@@ -174,6 +178,9 @@ codemeld itself connects only to:
 - the configured model providers, at the base URL you set, for model requests and model discovery;
 - `https://auth.openai.com` and `https://chatgpt.com/backend-api/codex`, only when the ChatGPT
   provider is used;
+- `https://registry.npmjs.org/@openai/codex/latest`, fetched without credentials during ChatGPT model
+  discovery (`lookupCodexVersion` in `internal/provider/openai_chatgpt_client.go`), only when the
+  ChatGPT provider is used;
 - `mcp.exa.ai` for an approved `web_search`, and the page and redirects of an approved `web_fetch`;
 - for a sandboxed shell command, the host and port it asked for through the session proxy, once a
   prompt answer or a saved `domain_grants` entry approved it, and only at a public address that is

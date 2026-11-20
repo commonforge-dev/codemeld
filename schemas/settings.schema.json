@@ -149,12 +149,13 @@
     "retryConfig": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Transient-failure auto-retry. Reserved config under `provider` (not a provider entry): enabled toggles auto-retry, max_attempts caps total attempts including the first, and base_delay_ms/max_delay_ms bound the exponential backoff.",
+      "description": "Transient-failure auto-retry. Reserved config under `provider` (not a provider entry): enabled toggles auto-retry, max_attempts caps total attempts including the first, and base_delay_ms/max_delay_ms bound the exponential backoff; no_output_timeout_minutes is how long one attempt's stream may run without assistant text or a tool call before codemeld cancels it so it can be retried (default 20).",
       "properties": {
         "enabled": { "type": "boolean" },
         "max_attempts": { "type": "integer", "minimum": 1 },
         "base_delay_ms": { "type": "integer", "minimum": 0 },
-        "max_delay_ms": { "type": "integer", "minimum": 0 }
+        "max_delay_ms": { "type": "integer", "minimum": 0 },
+        "no_output_timeout_minutes": { "type": "integer", "minimum": 1 }
       }
     },
     "providerEntry": {

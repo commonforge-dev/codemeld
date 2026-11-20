@@ -1971,7 +1971,7 @@ func TestSettingsPicker_ModelDialogFitsEightyColumnsWithNoteAndError(t *testing.
 	if !strings.Contains(text, levelsHelp) || !strings.Contains(text, modeHelp) {
 		t.Fatalf("dialog does not show both help lines in full:\n%s", strings.Join(lines, "\n"))
 	}
-	for i, prefix := range []string{"Input per million  $ 1", "Output per million $", "", "Quantization levels", "  Quantizations to try"} {
+	for i, prefix := range []string{"Input per million  $ 1", "Output per million $", "  provider list unavailable", "  provider list unavailable", "", "Quantization levels", "  Quantizations to try"} {
 		if !strings.HasPrefix(lines[i], prefix) {
 			t.Errorf("dialog line %d = %q, want it to start with %q", i, lines[i], prefix)
 		}
@@ -1996,10 +1996,12 @@ func TestSettingsPicker_ModelDialogLayout(t *testing.T) {
 	want := []string{
 		"Input per million  $ 0.3",
 		"Output per million $ 1",
+		"  Providers under caps: 39 of 39 (fp4 4, fp8 16, mxfp4 2, unknown 17)",
+		"  Throughput under caps: no data",
 		"",
 		"Quantization levels  fp8 fp4 mxfp4",
 		"  Quantizations to try, first to last; codemeld moves on when no provider serves one. Blank: any.",
-		"  providers per level: fp4 4, fp8 16, mxfp4 2, unknown 17",
+		"  Total providers per level: fp4 4, fp8 16, mxfp4 2, unknown 17",
 		"",
 		"Quantization mode    Preferred",
 		"  If no provider serves selected levels: Preferred accepts any quantization, Required stops with an",
@@ -2011,7 +2013,7 @@ func TestSettingsPicker_ModelDialogLayout(t *testing.T) {
 	f := maxPriceSettings(map[string]provider.MaxPrice{model: {Prompt: 0.3, HasPrompt: true, Completion: 1, HasCompletion: true}})
 	f.quants = map[string]provider.Quantization{model: {Levels: []string{"fp8", "fp4", "mxfp4"}, Mode: "preferred"}}
 	openSettingsTab(a, f)
-	q := &fakeHostQuantizations{counts: map[string]int{"fp4": 4, "fp8": 16, "mxfp4": 2, "unknown": 17}, state: provider.OpenRouterHostsReady}
+	q := &fakeHostQuantizations{offers: countedOffers(map[string]int{"fp4": 4, "fp8": 16, "mxfp4": 2, "unknown": 17}), state: provider.OpenRouterHostsReady}
 	a.openRouterSettings.HostQuantizations = q.query
 	pressEnterOnRow(t, a, settingsRowModels)
 	ed := openEditor(t, a, model)
@@ -2029,6 +2031,230 @@ func TestSettingsPicker_ModelDialogLayout(t *testing.T) {
 		if dim := attrs&tcell.AttrDim != 0; dim != strings.HasPrefix(line, "  ") {
 			t.Errorf("dialog line %d %q drawn dim = %v", i, line, dim)
 		}
+	}
+}
+
+func TestSettingsPicker_ModelDialogCountsProvidersUnderCaps(t *testing.T) {
+	offers := []provider.OpenRouterHostOffer{
+		{Quantization: "fp8", PromptPerM: 0.2, CompletionPerM: 0.8, Priced: true},
+		{Quantization: "fp8", PromptPerM: 0.5, CompletionPerM: 2, Priced: true},
+		{Quantization: "fp4", PromptPerM: 0.1, CompletionPerM: 0.3, Priced: true},
+		{Quantization: "", PromptPerM: 0.3, CompletionPerM: 1, Priced: true},
+		{Quantization: "fp4"},
+	}
+	for _, tc := range []struct {
+		name, prompt, completion string
+		state                    provider.OpenRouterHostsState
+		want                     string
+	}{
+		{"both caps blank", "", "", provider.OpenRouterHostsReady, "Providers under caps: 5 of 5 (fp4 2, fp8 2, unspecified 1)"},
+		{"input cap only", "0.3", "", provider.OpenRouterHostsReady, "Providers under caps: 3 of 5 (fp4 1, fp8 1, unspecified 1)"},
+		{"output cap only", "", "1", provider.OpenRouterHostsReady, "Providers under caps: 3 of 5 (fp4 1, fp8 1, unspecified 1)"},
+		{"both caps", "0.3", "0.8", provider.OpenRouterHostsReady, "Providers under caps: 2 of 5 (fp4 1, fp8 1)"},
+		{"cap below every price", "0.05", "", provider.OpenRouterHostsReady, "Providers under caps: 0 of 5"},
+		{"invalid input cap", "abc", "1", provider.OpenRouterHostsReady, "Providers under caps: enter a valid price"},
+		{"invalid output cap", "0.3", "-1", provider.OpenRouterHostsReady, "Providers under caps: enter a valid price"},
+		{"pending", "0.3", "", provider.OpenRouterHostsPending, "checking providers…"},
+		{"failed", "0.3", "", provider.OpenRouterHostsFailed, "provider list unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(nil)
+			f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {}})
+			openSettingsTab(a, f)
+			a.openRouterSettings.HostQuantizations = (&fakeHostQuantizations{offers: offers, state: tc.state}).query
+			pressEnterOnRow(t, a, settingsRowModels)
+			ed := openEditor(t, a, maxPriceModelID)
+			ed.prompt.SetText(tc.prompt)
+			ed.completion.SetText(tc.completion)
+			if got := ed.underCapsText; got != tc.want {
+				t.Errorf("under-caps line = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("typing into a cap updates the line without saving", func(t *testing.T) {
+		a := New(nil)
+		f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 0.3, HasPrompt: true}})
+		openSettingsTab(a, f)
+		a.openRouterSettings.HostQuantizations = (&fakeHostQuantizations{offers: offers, state: provider.OpenRouterHostsReady}).query
+		pressEnterOnRow(t, a, settingsRowModels)
+		ed := openEditor(t, a, maxPriceModelID)
+		if text, _ := modelDialogText(t, a, 100, 30); !strings.Contains(text, "Providers under caps: 3 of 5 (fp4 1, fp8 1, unspecified 1)") {
+			t.Fatalf("dialog before typing:\n%s", text)
+		}
+		for _, r := range "0.8" {
+			ed.completion.InputHandler()(runeKey(r), func(p tview.Primitive) { a.app.SetFocus(p) })
+		}
+		if text, _ := modelDialogText(t, a, 100, 30); !strings.Contains(text, "Providers under caps: 2 of 5 (fp4 1, fp8 1)") {
+			t.Errorf("dialog after typing an output cap:\n%s", text)
+		}
+		if len(f.wrote) != 0 || a.settingsPicker.maxPrice != ed {
+			t.Errorf("typing wrote %v or closed the dialog", f.wrote)
+		}
+	})
+}
+
+var requiredModeOffers = []provider.OpenRouterHostOffer{
+	{Quantization: "fp8", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "mxfp8", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "fp4", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "mxfp4", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "nvfp4", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "unknown", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "bf16", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "fp8", PromptPerM: 5, CompletionPerM: 5, Priced: true},
+}
+
+func openRequiredModeEditor(t *testing.T, a *App, quant provider.Quantization) *maxPriceEditor {
+	t.Helper()
+	f := maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {Prompt: 1, HasPrompt: true}})
+	f.quants = map[string]provider.Quantization{maxPriceModelID: quant}
+	openSettingsTab(a, f)
+	a.openRouterSettings.HostQuantizations = (&fakeHostQuantizations{offers: requiredModeOffers, state: provider.OpenRouterHostsReady}).query
+	pressEnterOnRow(t, a, settingsRowModels)
+	return openEditor(t, a, maxPriceModelID)
+}
+
+func TestSettingsPicker_ModelDialogRequiredModeCountsOnlyListedLevels(t *testing.T) {
+	const all = "Providers under caps: 8 of 9 (bf16 1, fp4 1, fp8 1, mxfp4 1, mxfp8 1, nvfp4 1, unknown 1, unspecified 1)"
+	for _, tc := range []struct {
+		name, mode, levels, want string
+	}{
+		{"required listed levels", "Required", "fp8 fp4 mxfp4", "Providers under caps: 5 of 9 (fp4 1, fp8 1, mxfp4 1, mxfp8 1, nvfp4 1)"},
+		{"required with unknown listed", "Required", "fp8 unknown", "Providers under caps: 4 of 9 (fp8 1, mxfp8 1, unknown 1, unspecified 1)"},
+		{"required unlisted level", "Required", "fp9", "Providers under caps: 0 of 9"},
+		{"required blank levels", "Required", "  ", all},
+		{"preferred", "Preferred", "fp8 fp4 mxfp4", all},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(nil)
+			ed := openRequiredModeEditor(t, a, provider.Quantization{Levels: []string{"bf16"}, Mode: strings.ToLower(tc.mode)})
+			ed.levels.SetText(tc.levels)
+			if got := ed.underCapsText; got != tc.want {
+				t.Errorf("under-caps line = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSettingsPicker_ModelDialogUnderCapsFollowsModeAndLevels(t *testing.T) {
+	a := New(nil)
+	ed := openRequiredModeEditor(t, a, provider.Quantization{Levels: []string{"fp8"}, Mode: "preferred"})
+	expect := func(want string) {
+		t.Helper()
+		if text, lines := modelDialogText(t, a, 120, 30); !strings.Contains(text, want) {
+			t.Fatalf("dialog does not show %q:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	expect("Providers under caps: 8 of 9 (bf16 1, fp4 1, fp8 1, mxfp4 1, mxfp8 1, nvfp4 1, unknown 1, unspecified 1)")
+
+	a.app.SetFocus(ed.mode)
+	sendFocusedKey(a, keyEv(tcell.KeyRight))
+	expect("Providers under caps: 2 of 9 (fp8 1, mxfp8 1)")
+
+	a.app.SetFocus(ed.levels)
+	for _, r := range " fp4" {
+		sendFocusedKey(a, runeKey(r))
+	}
+	if ed.levels.GetText() != "fp8 fp4" {
+		t.Fatalf("levels field = %q after typing", ed.levels.GetText())
+	}
+	expect("Providers under caps: 5 of 9 (fp4 1, fp8 1, mxfp4 1, mxfp8 1, nvfp4 1)")
+
+	a.app.SetFocus(ed.mode)
+	sendFocusedKey(a, runeKey(' '))
+	expect("Providers under caps: 8 of 9 (bf16 1, fp4 1, fp8 1, mxfp4 1, mxfp8 1, nvfp4 1, unknown 1, unspecified 1)")
+}
+
+var throughputOffers = []provider.OpenRouterHostOffer{
+	{Quantization: "fp8", PromptPerM: 0.1, CompletionPerM: 0.2, Priced: true, P50Throughput: 40.4, HasThroughput: true},
+	{Quantization: "fp8", PromptPerM: 0.2, CompletionPerM: 0.3, Priced: true, P50Throughput: 120.6, HasThroughput: true},
+	{Quantization: "fp4", PromptPerM: 1, CompletionPerM: 2, Priced: true, P50Throughput: 300, HasThroughput: true},
+	{Quantization: "", PromptPerM: 0.1, CompletionPerM: 0.1, Priced: true},
+	{Quantization: "fp8", P50Throughput: 900, HasThroughput: true},
+}
+
+func TestRenderUnderCaps_Throughput(t *testing.T) {
+	for _, tc := range []struct {
+		name, prompt, completion string
+		offers                   []provider.OpenRouterHostOffer
+		state                    provider.OpenRouterHostsState
+		required                 []string
+		want                     string
+	}{
+		{"range with no caps", "", "", throughputOffers, provider.OpenRouterHostsReady, nil, "Throughput under caps: 40\u2013900 tps"},
+		{"offers above a cap excluded", "0.5", "", throughputOffers, provider.OpenRouterHostsReady, nil, "Throughput under caps: 40\u2013121 tps"},
+		{"single offer", "0.15", "", throughputOffers, provider.OpenRouterHostsReady, nil, "Throughput under caps: 40 tps"},
+		{"single value after rounding", "", "", []provider.OpenRouterHostOffer{
+			{Quantization: "fp8", P50Throughput: 39.6, HasThroughput: true},
+			{Quantization: "fp8", P50Throughput: 40.4, HasThroughput: true},
+		}, provider.OpenRouterHostsReady, nil, "Throughput under caps: 40 tps"},
+		{"required level filter", "", "", throughputOffers, provider.OpenRouterHostsReady, []string{"fp4"}, "Throughput under caps: 300 tps"},
+		{"no throughput data", "0.1", "0.1", throughputOffers, provider.OpenRouterHostsReady, nil, "Throughput under caps: no data"},
+		{"invalid cap", "abc", "", throughputOffers, provider.OpenRouterHostsReady, nil, "Throughput under caps: enter a valid price"},
+		{"pending", "", "", nil, provider.OpenRouterHostsPending, nil, "checking providers\u2026"},
+		{"failed", "", "", nil, provider.OpenRouterHostsFailed, nil, "provider list unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := renderUnderCaps(tc.offers, tc.state, tc.prompt, tc.completion, tc.required); got != tc.want {
+				t.Errorf("throughput line = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSettingsPicker_ModelDialogThroughputLineFollowsCaps(t *testing.T) {
+	a := New(nil)
+	openSettingsTab(a, maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {}}))
+	a.openRouterSettings.HostQuantizations = (&fakeHostQuantizations{offers: throughputOffers, state: provider.OpenRouterHostsReady}).query
+	pressEnterOnRow(t, a, settingsRowModels)
+	ed := openEditor(t, a, maxPriceModelID)
+	expect := func(want string) {
+		t.Helper()
+		_, lines := modelDialogText(t, a, 100, 30)
+		i := slices.IndexFunc(lines, func(l string) bool { return strings.HasPrefix(l, "  Providers under caps:") })
+		if i < 0 || i+1 >= len(lines) || lines[i+1] != want {
+			t.Fatalf("line below the under-caps line is not %q:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	expect("  Throughput under caps: 40\u2013900 tps")
+	for _, r := range "0.5" {
+		ed.prompt.InputHandler()(runeKey(r), func(p tview.Primitive) { a.app.SetFocus(p) })
+	}
+	expect("  Throughput under caps: 40\u2013121 tps")
+}
+
+func TestSettingsPicker_ModelDialogModeValueReversedOnlyWhileFocused(t *testing.T) {
+	a := New(nil)
+	openSettingsTab(a, maxPriceSettings(map[string]provider.MaxPrice{maxPriceModelID: {}}))
+	pressEnterOnRow(t, a, settingsRowModels)
+	ed := openEditor(t, a, maxPriceModelID)
+	modeValueReversed := func() bool {
+		t.Helper()
+		screen := drawPrimitive(t, a.pages, 100, 30)
+		cells, sw, _ := screen.GetContents()
+		x, y, _, _ := ed.mode.GetRect()
+		cell := cells[y*sw+x+len("Quantization mode    ")]
+		if string(cell.Runes) != "P" {
+			t.Fatalf("mode value cell = %q, want the first letter of Preferred", string(cell.Runes))
+		}
+		_, _, attrs := cell.Style.Decompose()
+		return attrs&tcell.AttrReverse != 0
+	}
+	if modeValueReversed() {
+		t.Fatal("mode value drawn reversed before it has focus")
+	}
+	a.app.SetFocus(ed.mode)
+	if !modeValueReversed() {
+		t.Fatal("focused mode value not drawn reversed")
+	}
+	sendFocusedKey(a, keyEv(tcell.KeyTab))
+	if a.app.GetFocus() != ed.prompt {
+		t.Fatal("tab did not move focus off the mode")
+	}
+	if modeValueReversed() {
+		t.Error("mode value still drawn reversed after focus left it")
 	}
 }
 
@@ -2768,4 +2994,251 @@ func TestSettingsPicker_ProjectRowRevokeCancelKeepsFileAndRow(t *testing.T) {
 		t.Fatalf("revoked %+v, want the project row", revoked)
 	}
 	assertRows(t, a, permTabIndexFolders, []string{read + " — " + shareLocalPath + " [local]"})
+}
+
+func TestSettingsPicker_FoldersTabShowsWritableFolderStatus(t *testing.T) {
+	active := WritableFoldersView{Sandboxed: true, LayerAdmitted: true}
+	cases := []struct {
+		name string
+		mode string
+		row  WritableFolderRow
+		want string
+	}{
+		{name: "auto edits", mode: "auto_edits", row: WritableFolderRow{Entry: "/ssdtmp/tmp"}, want: "  /ssdtmp/tmp — active in Auto edits"},
+		{name: "build", mode: "build", row: WritableFolderRow{Entry: "/ssdtmp/tmp"}, want: "  /ssdtmp/tmp — active for sandboxed Build commands, approval still required"},
+		{name: "plan", mode: "plan", row: WritableFolderRow{Entry: "/ssdtmp/tmp"}, want: "  /ssdtmp/tmp — inactive in Plan"},
+		{name: "invalid", mode: "auto_edits", row: WritableFolderRow{Entry: "rel", Invalid: `writable_folders: entry "rel": must be an absolute path or start with ~/`}, want: `  rel — invalid: writable_folders: entry "rel": must be an absolute path or start with ~/`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view := active
+			view.Mode, view.Rows = tc.mode, []WritableFolderRow{tc.row}
+			a := New(nil)
+			deps := SettingsDeps{Writable: WritableFolderDeps{List: func() WritableFoldersView { return view }}}
+			deps.tab = permTabIndexFolders
+			a.openSettingsPicker(nil, deps, SessionSettings{})
+
+			want := []string{settingsEmptyRow, "writable folders: sandboxed commands may write here; the grants above cover file tools only", tc.want}
+			if got := permissionsRowsOnTab(a); !slices.Equal(got, want) {
+				t.Fatalf("folders tab rows = %q, want %q", got, want)
+			}
+			if got := a.settingsPicker.addLine.GetText(false); got != "+ add writable folder (a)" {
+				t.Errorf("pinned add line = %q, want %q", got, "+ add writable folder (a)")
+			}
+		})
+	}
+}
+
+func openWritableFolders(a *App, grants []PermissionRow, view *WritableFoldersView, added *[]string, mod func(*SettingsDeps)) {
+	deps := SettingsDeps{Rows: func() []PermissionRow { return grants }, Writable: WritableFolderDeps{
+		List: func() WritableFoldersView { return *view },
+		Add: func(entry string) string {
+			*added = append(*added, entry)
+			view.Rows = append(view.Rows, WritableFolderRow{Entry: entry})
+			return ""
+		},
+	}}
+	deps.tab = permTabIndexFolders
+	if mod != nil {
+		mod(&deps)
+	}
+	a.openSettingsPicker(grants, deps, SessionSettings{})
+}
+
+func pressSettingsKey(a *App, r rune) *tcell.EventKey {
+	return a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyRune, r, tcell.ModNone))
+}
+
+func TestSettingsPicker_WritableAddSubmitsTheEntryAsTyped(t *testing.T) {
+	for _, typed := range []string{"/data/output ", " /data/output", ""} {
+		for _, start := range []struct {
+			name string
+			row  int
+		}{{"grant row", 0}, {"writable entry row", 2}} {
+			t.Run(strconv.Quote(typed)+" from "+start.name, func(t *testing.T) {
+				var got []string
+				view := WritableFoldersView{Rows: []WritableFolderRow{{Entry: "/existing"}}}
+				a := New(nil)
+				openWritableFolders(a, []PermissionRow{localFolderRow}, &view, &got, nil)
+				a.settingsPicker.list.SetCurrentItem(start.row)
+
+				if ev := pressSettingsKey(a, 'a'); ev != nil {
+					t.Fatal("a reached the list, want the picker to consume it")
+				}
+				field, ok := a.app.GetFocus().(*tview.InputField)
+				if !ok {
+					t.Fatal("a opened no focused path field")
+				}
+				field.SetText(typed)
+				sendFieldKey(a, field, tcell.KeyEnter)
+
+				if !slices.Equal(got, []string{typed}) {
+					t.Fatalf("Add received %q, want exactly [%q]", got, typed)
+				}
+			})
+		}
+	}
+}
+
+func TestSettingsPicker_AddKeyOnlyOnFoldersTabAndEnterNeverAdds(t *testing.T) {
+	var added []string
+	view := WritableFoldersView{Rows: []WritableFolderRow{{Entry: "/existing"}}}
+	a := New(nil)
+	openWritableFolders(a, layeredRowsFixture(), &view, &added, nil)
+	pp := a.settingsPicker
+
+	for i := range pp.list.GetItemCount() {
+		pp.list.SetCurrentItem(i)
+		a.settingsPickerKeys(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+		if a.pages.HasPage(settingsDeletePage) {
+			t.Fatalf("Enter on folders-tab row %d opened a dialog", i)
+		}
+	}
+	for _, tab := range []int{0, permTabIndexHosts, permTabIndexOpenRouter, permTabIndexSettings} {
+		pp.activeTab = tab
+		a.renderSettingsTab()
+		pressSettingsKey(a, 'a')
+		if a.pages.HasPage(settingsDeletePage) {
+			t.Fatalf("a on tab %d opened a dialog", tab)
+		}
+	}
+	if len(added) != 0 {
+		t.Fatalf("Add called with %q", added)
+	}
+}
+
+func TestSettingsPicker_WritableAddSelectsTheNewEntry(t *testing.T) {
+	var added []string
+	view := WritableFoldersView{Rows: []WritableFolderRow{{Entry: "/a"}}}
+	a := New(nil)
+	openWritableFolders(a, []PermissionRow{localFolderRow}, &view, &added, nil)
+	pressSettingsKey(a, 'a')
+	a.submitWritableAdd("/b")
+
+	pp := a.settingsPicker
+	if got, _ := pp.list.GetItemText(pp.list.GetCurrentItem()); !strings.HasPrefix(got, "  /b — ") {
+		t.Fatalf("selected row after add = %q, want the new /b entry", got)
+	}
+}
+
+func manyFolderGrants(n int) []PermissionRow {
+	rows := make([]PermissionRow, n)
+	for i := range rows {
+		e := shareFolderGrant
+		e.PathScope = fmt.Sprintf("/proj/d%02d", i)
+		rows[i] = PermissionRow{Entry: e, Layer: permissions.LayerLocal, Path: shareLocalPath}
+	}
+	return rows
+}
+
+func drawSettings(t *testing.T, a *App, fill rune) (tcell.SimulationScreen, []string) {
+	t.Helper()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	screen.SetSize(80, 24)
+	for y := range 24 {
+		for x := range 80 {
+			screen.SetContent(x, y, fill, nil, tcell.StyleDefault)
+		}
+	}
+	a.pages.SetRect(0, 0, 80, 24)
+	a.pages.Draw(screen)
+	screen.Show()
+	return screen, screenRows(screen)
+}
+
+func TestSettingsPicker_PinnedAddLineIsVisibleWithoutScrolling(t *testing.T) {
+	var added []string
+	view := WritableFoldersView{Rows: []WritableFolderRow{{Entry: "/existing"}}}
+	a := New(nil)
+	openWritableFolders(a, manyFolderGrants(40), &view, &added, nil)
+
+	_, rows := drawSettings(t, a, ' ')
+	screen := strings.Join(rows, "\n")
+	if strings.Contains(screen, "/existing") {
+		t.Fatal("the writable entry is on screen; want more rows than fit so the list must scroll")
+	}
+	if !strings.Contains(screen, writableAddLine) {
+		t.Fatalf("pinned add line %q not drawn:\n%s", writableAddLine, screen)
+	}
+
+	a.stepSettingsTab(1)
+	_, rows = drawSettings(t, a, ' ')
+	if screen := strings.Join(rows, "\n"); strings.Contains(screen, writableAddLine) {
+		t.Fatalf("add line drawn on the hosts tab:\n%s", screen)
+	}
+	if _, _, _, h := a.settingsPicker.addLine.GetRect(); h != 0 {
+		t.Fatalf("add line height on the hosts tab = %d, want 0", h)
+	}
+}
+
+func assertSettingsDialogOpaque(t *testing.T, a *App) {
+	t.Helper()
+	screen, _ := drawSettings(t, a, ' ')
+	frame, ok := a.pages.GetPage(settingsDeletePage).(*tview.Flex)
+	if !ok {
+		t.Fatal("no dialog open")
+	}
+	for y := range 24 {
+		for x := range 80 {
+			screen.SetContent(x, y, 'X', nil, tcell.StyleDefault)
+		}
+	}
+	frame.Draw(screen)
+	screen.Show()
+	rows := screenRows(screen)
+	form := frame.GetItem(1).(*tview.Flex).GetItem(1).(*tview.Flex)
+	x, y, w, h := form.GetRect()
+	if h < 4 {
+		t.Fatalf("dialog height = %d, want room for a row below the field", h)
+	}
+	for row := y + 2; row < y+h-1; row++ {
+		line := []rune(rows[row])
+		for col := x + 1; col < x+w-1; col++ {
+			if line[col] != ' ' {
+				t.Fatalf("dialog cell (%d,%d) = %q, want blank; row %q", col, row, line[col], rows[row])
+			}
+		}
+	}
+}
+
+func TestSettingsPicker_AddDialogIsOpaque(t *testing.T) {
+	var added []string
+	view := WritableFoldersView{}
+	a := New(nil)
+	openWritableFolders(a, manyFolderGrants(40), &view, &added, nil)
+	pressSettingsKey(a, 'a')
+	assertSettingsDialogOpaque(t, a)
+}
+
+func TestSettingsPicker_RetentionDialogIsOpaque(t *testing.T) {
+	a := New(nil)
+	openRetentionTab(t, a, &fakeRetention{days: 30})
+	pressEnterOnRow(t, a, 0)
+	assertSettingsDialogOpaque(t, a)
+}
+
+func TestSettingsPicker_FoldersFooterNamesTheAddKey(t *testing.T) {
+	var added []string
+	view := WritableFoldersView{}
+	a := New(nil)
+	openWritableFolders(a, layeredRowsFixture(), &view, &added, func(d *SettingsDeps) {
+		d.Share = func(PermissionRow) ShareResult { return ShareResult{} }
+		d.Approved = true
+	})
+	footer := a.settingsPicker.footer
+	for _, tc := range []struct {
+		row  PermissionRow
+		want string
+	}{
+		{row: projectFolderRow, want: "tab switch   revoke/remove r   add folder a   esc close"},
+		{row: localFolderRow, want: "tab switch   revoke r   share s   toggle enter   add folder a   esc close"},
+	} {
+		selectPermissionRow(t, a, tc.row)
+		if got := footer.GetText(false); got != tc.want {
+			t.Errorf("footer on %s row = %q, want %q", tc.row.Layer, got, tc.want)
+		}
+	}
 }

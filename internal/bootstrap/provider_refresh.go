@@ -238,6 +238,9 @@ func (r *ProviderCatalogRefresher) run(providerID string, entry provider.Provide
 func (r *ProviderCatalogRefresher) discoverAndStore(providerID string, entry provider.ProviderEntry) RefreshResult {
 	failed := RefreshResult{ProviderID: providerID, Outcome: RefreshFailed}
 
+	if providerID == provider.PlatformProviderID {
+		entry.APIKey = provider.ResolvePlatformAPIKey(entry.APIKey)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), refreshDiscoverTimeout)
 	defer cancel()
 	discovered, err := r.discover(ctx, provider.APIKeyDiscoveryConfig{
@@ -288,7 +291,9 @@ func (r *ProviderCatalogRefresher) discoverAndStoreChatGPT() RefreshResult {
 
 	cfg := chatGPTConfig(sess)
 	cfg.HTTPClient = chatGPTDiscoveryHTTPClient
-	err = provider.RefreshChatGPTModelCache(ctx, cfg, func(discovered []provider.ChatGPTStoreModel) error {
+	store, _ := r.readStore(r.path)
+	saved := store.Providers[provider.ChatGPTProviderID].ClientVersion
+	err = provider.RefreshChatGPTModelCache(ctx, cfg, saved, func(discovered []provider.ChatGPTStoreModel, sentVersion string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -303,9 +308,10 @@ func (r *ProviderCatalogRefresher) discoverAndStoreChatGPT() RefreshResult {
 			}
 		}
 		return r.updateStore(r.path, provider.ChatGPTProviderID, config.DiscoveredProvider{
-			RefreshedAt: r.now().UTC().Format(time.RFC3339),
-			Source:      refreshDiscoverSource,
-			Models:      models,
+			RefreshedAt:   r.now().UTC().Format(time.RFC3339),
+			Source:        refreshDiscoverSource,
+			ClientVersion: sentVersion,
+			Models:        models,
 		})
 	})
 	if err != nil {

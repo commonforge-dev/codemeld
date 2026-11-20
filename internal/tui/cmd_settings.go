@@ -40,6 +40,26 @@ type ShareResult struct {
 	LocalErr      error
 }
 
+type WritableFolderRow struct {
+	Entry   string
+	Invalid string
+}
+
+type WritableFoldersView struct {
+	Rows          []WritableFolderRow
+	Unreadable    string
+	Mode          string
+	Sandboxed     bool
+	Degraded      bool
+	LayerAdmitted bool
+}
+
+type WritableFolderDeps struct {
+	List   func() WritableFoldersView
+	Add    func(entry string) string
+	Remove func(entry string) string
+}
+
 // SettingsDeps is the /settings handler's dependency surface. A nil Revoke leaves the
 // overlay read-only and a nil Share leaves it without a share action. Approved is the run's
 // explicit root approval, never inferred from the loaded rows, and Boundary is
@@ -50,6 +70,7 @@ type SettingsDeps struct {
 	Rows     func() []PermissionRow
 	Revoke   func(PermissionRow)
 	Share    func(PermissionRow) ShareResult
+	Writable WritableFolderDeps
 	Approved bool
 	Boundary string
 	tab      int

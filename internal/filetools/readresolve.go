@@ -465,7 +465,7 @@ func walkOpenComponents(dirfd int, base string, segs []string, midFlags, lastFla
 
 func walkOpenDirUnder(boundary, target string) (*os.File, error) {
 	clean := filepath.Clean(target)
-	start, segs := clean, []string(nil)
+	start, segs := "/", []string(nil)
 	if clean != filepath.Clean(boundary) {
 		root := normalizeRoot(boundary)
 		rel, err := filepath.Rel(root, clean)
@@ -476,6 +476,8 @@ func walkOpenDirUnder(boundary, target string) (*os.File, error) {
 		if rel != "." {
 			segs = strings.Split(rel, string(filepath.Separator))
 		}
+	} else if clean != "/" {
+		segs = strings.Split(strings.TrimPrefix(clean, "/"), "/")
 	}
 	startFlags := unix.O_RDONLY
 	if len(segs) > 0 {

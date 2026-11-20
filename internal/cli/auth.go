@@ -73,8 +73,10 @@ const chatGPTDiscoverSource = "auth-login-chatgpt-discovery"
 // own record type. It is best-effort and connect-scoped; runChatGPTLogin swallows its
 // error so a discovery or store-write failure never fails an already-completed login.
 func liveRefreshChatGPTModels(ctx context.Context, cfg provider.ChatGPTClientConfig, modelsPath string) error {
-	return provider.RefreshChatGPTModelCache(ctx, cfg, func(models []provider.ChatGPTStoreModel) error {
-		return config.UpdateDiscoveredModelsProvider(modelsPath, chatGPTProviderID, chatGPTDiscoveredProvider(models))
+	store, _ := config.ReadDiscoveredModels(modelsPath)
+	saved := store.Providers[chatGPTProviderID].ClientVersion
+	return provider.RefreshChatGPTModelCache(ctx, cfg, saved, func(models []provider.ChatGPTStoreModel, sentVersion string) error {
+		return config.UpdateDiscoveredModelsProvider(modelsPath, chatGPTProviderID, chatGPTDiscoveredProvider(models, sentVersion))
 	})
 }
 
@@ -82,7 +84,7 @@ func liveRefreshChatGPTModels(ctx context.Context, cfg provider.ChatGPTClientCon
 // into the shared store's provider entry. The fields are already sanitized selection/
 // capability metadata (the provider whitelist drops prompt-bearing and raw-response
 // fields); the store write redacts secret-shaped values as a defensive backstop.
-func chatGPTDiscoveredProvider(models []provider.ChatGPTStoreModel) config.DiscoveredProvider {
+func chatGPTDiscoveredProvider(models []provider.ChatGPTStoreModel, clientVersion string) config.DiscoveredProvider {
 	out := make([]config.DiscoveredModel, len(models))
 	for i, m := range models {
 		out[i] = config.DiscoveredModel{
@@ -93,7 +95,7 @@ func chatGPTDiscoveredProvider(models []provider.ChatGPTStoreModel) config.Disco
 			Capabilities:    m.Capabilities,
 		}
 	}
-	return config.DiscoveredProvider{Source: chatGPTDiscoverSource, Models: out}
+	return config.DiscoveredProvider{Source: chatGPTDiscoverSource, ClientVersion: clientVersion, Models: out}
 }
 
 // Package-local seams so auth_test can drive the logout command without real

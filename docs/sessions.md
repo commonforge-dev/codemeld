@@ -388,7 +388,7 @@ trip yet, so a live session in the middle of a turn reports clean rather than ac
 the user is still waiting on.
 
 **When codemeld cuts a stream itself: `stream_no_output`.** A round whose stream sends no
-assistant text and no tool call for 30 minutes is cancelled by codemeld, not by the provider. Its
+assistant text and no tool call for the no-output limit (20 minutes by default; set `provider.retry.no_output_timeout_minutes` in the global settings file to change it) is cancelled by codemeld, not by the provider. Its
 `turn_terminal` is `provider_failed` with phase `stream_drop`. When a retry follows,
 `provider_request_retry` carries reason `stream_no_output`; when none follows (retry off, or
 attempts or budget used up), `provider_request_retry_skipped` and `provider_request_failed` carry
@@ -396,11 +396,11 @@ it, the failure with `partial_response_chars` 0 and an `error_detail` saying cod
 stream. So under `stream_drop`, `stream_no_output` is a local cut before any usable output, while
 `stream_eof` and `stream_read_error` are transport failures, which can follow partial output.
 
-The 30 minutes start once the provider has returned the stream, so time spent opening the request
+The limit starts once the provider has returned the stream, so time spent opening the request
 does not count (`provider_round_trip.duration_ms` still covers the whole round). Reasoning text,
 empty chunks, and usage-only chunks are not output and do not restart the clock; the first
 non-empty assistant text or tool call turns the limit off for the rest of the round. Each retry
-starts a fresh 30 minutes, and the retry budget is checked only between attempts, so it never
+starts the limit afresh, and the retry budget is checked only between attempts, so it never
 shortens an attempt that is still streaming. A user cancel or run time limit that lands first is
 recorded as `cancelled`, not as `stream_no_output`.
 

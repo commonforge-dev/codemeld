@@ -2920,8 +2920,8 @@ func TestConfinedFailure_RefusalLinesStayWithinTheOutputCap(t *testing.T) {
 		refusedLine("a.test:443", "not approved (no one to ask)"),
 		refusedLine(long+":443", "not approved (denied)"),
 	}
-	f := confinedFailureOf(failed, true, &refusalHelper{records: records})
-	if f == nil || confinedFailureOf(cmdrunner.RunResult{}, true, &refusalHelper{records: records}) != nil {
+	f := confinedFailureOf(failed, true, &refusalHelper{records: records}, nil)
+	if f == nil || confinedFailureOf(cmdrunner.RunResult{}, true, &refusalHelper{records: records}, nil) != nil {
 		t.Fatalf("failure state = %+v, want one for the failed run and none for a successful one", f)
 	}
 
@@ -3317,5 +3317,78 @@ func TestConfinedShell_BuildOutsideRunLineSurvivesTheMinimumOutputLimit(t *testi
 					stderr, len(stderr), remembered, cap, tc.offered)
 			}
 		})
+	}
+}
+
+func TestWidenedFolder(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"ssd/go-build/e3", "h/cache/x", "w/proj", "w/cache", "s/keys", "s/cache", "d/e/f", "opt/x", "elsewhere"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for link, target := range map[string]string{"cache-link": "ssd/go-build", "ssd/go-build/up": "elsewhere"} {
+		if err := os.Symlink(filepath.Join(root, target), filepath.Join(root, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := func(rel string) string {
+		if rel == "" {
+			return ""
+		}
+		return filepath.Join(root, rel)
+	}
+	home := at("h")
+	blocked := permissions.NewBlockedPaths(home, []permissions.BlockedEntry{{Path: at("s/keys"), Source: "/settings.yaml"}})
+	for _, tc := range []struct {
+		name, candidate string
+		env             []string
+		folder, varName string
+		reason          string
+	}{
+		{"variable names the cache root", "ssd/go-build/e3", []string{"PATH=/usr/bin", "GOCACHE=" + at("ssd/go-build")}, "ssd/go-build", "GOCACHE", ""},
+		{"variable names the cache root through a symlink", "ssd/go-build/e3", []string{"GOCACHE=" + at("cache-link")}, "ssd/go-build", "GOCACHE", ""},
+		{"link/.. resolves away from its lexical parent", "ssd/go-build/e3", []string{"GOCACHE=" + root + "/ssd/go-build/up/.."}, "ssd/go-build/e3", "", ""},
+		{"missing folder behind ..", "ssd/go-build/e3", []string{"GOCACHE=" + root + "/ssd/missing/.."}, "ssd/go-build/e3", "", ""},
+		{"no matching variable", "ssd/go-build/e3", []string{"GOCACHE=" + at("elsewhere"), "REL=ssd"}, "ssd/go-build/e3", "", ""},
+		{"home folder", "h/cache/x", []string{"HOME=" + home}, "h/cache/x", "", ""},
+		{"filesystem root", "opt/x", []string{"ROOT=/"}, "opt/x", "", ""},
+		{"contains the project", "w/cache", []string{"WORK=" + at("w")}, "w/cache", "", ""},
+		{"contains a blocked path", "s/cache", []string{"SECRETS=" + at("s")}, "s/cache", "", ""},
+		{"deepest of two", "d/e/f", []string{"A=" + at("d"), "B=" + at("d/e") + "/", "C=" + at("d")}, "d/e", "B", ""},
+		{"candidate holds the project", "w", nil, "", "", at("w") + " holds the project folder"},
+		{"candidate is the home folder", "h", []string{"HOME=" + home}, "", "", home + " holds the home folder"},
+		{"candidate holds a blocked path", "s", nil, "", "", at("s") + " holds a blocked path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			folder, variable, reason := widenedFolder(at(tc.candidate), tc.env, home, []string{at("w/proj")}, blocked)
+			if folder != at(tc.folder) || variable != tc.varName || reason != tc.reason {
+				t.Errorf("widenedFolder = %q, %q, %q; want %q, %q, %q", folder, variable, reason, at(tc.folder), tc.varName, tc.reason)
+			}
+		})
+	}
+}
+
+func TestWriteRefusalNoticesOncePerFolderAndReason(t *testing.T) {
+	var notices []string
+	w := &writeRefusalReports{seen: map[string]bool{}, notice: func(s string) { notices = append(notices, s) }}
+	w.fresh([]refusal{
+		{File: true, Path: "/dev/shm/a", Reason: "/dev/shm itself"},
+		{File: true, Path: "/dev/shm/b", Reason: "/dev/shm itself"},
+		{File: true, Path: "/p/.hg/t1", Reason: "no-write path"},
+		{File: true, Path: "/p/.hg/t2", Reason: "no-write path"},
+		{File: true, Path: "/p/.hg/t3", Reason: "blocked path"},
+	})
+	w.fresh([]refusal{{File: true, Path: "/dev/shm/c", Reason: "/dev/shm itself"}})
+	want := []string{
+		"sandbox likely blocked writes to /dev/shm/a: /dev/shm itself",
+		"sandbox likely blocked writes to /p/.hg/t1: no-write path",
+		"sandbox likely blocked writes to /p/.hg/t3: blocked path",
+	}
+	if !slices.Equal(notices, want) {
+		t.Errorf("notices = %q, want %q", notices, want)
 	}
 }

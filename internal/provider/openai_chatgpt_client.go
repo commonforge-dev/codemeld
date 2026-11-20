@@ -15,7 +15,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/ssestream"
@@ -35,10 +39,17 @@ const (
 	// chatGPTAccountHeader carries the stored account id alongside the bearer token.
 	// Its value is a credential-derived secret for redaction.
 	chatGPTAccountHeader      = "ChatGPT-Account-ID"
-	chatGPTCodexClientVersion = "0.160.0"
+	chatGPTCodexClientVersion = "0.169.0"
 	// chatGPTCodexOriginator is the Codex client originator/User-Agent identity the
 	// discovery endpoint expects alongside the ChatGPT credentials.
-	chatGPTCodexOriginator = "codex_cli_rs"
+	chatGPTCodexOriginator     = "codex_cli_rs"
+	chatGPTCodexVersionMaxBody = 1 << 20
+)
+
+var (
+	chatGPTCodexVersionURL           = "https://registry.npmjs.org/@openai/codex/latest"
+	chatGPTCodexVersionLookupTimeout = 5 * time.Second
+	codexVersionPattern              = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 )
 
 // chatGPTProviderName is the display name woven into the HTTP-error surface prefix;
@@ -190,8 +201,8 @@ func (c *chatGPTClient) surfaceHTTPError(res *http.Response) error {
 // redacted decode error with no body echo. The client is redirect-pinned, so the credential-bearing request
 // never follows a 3xx off the origin. It performs no caching; the connect-path caller
 // persists the adapted result through the injected store writer.
-func (c *chatGPTClient) discoverModels(ctx context.Context) (chatGPTModelCache, error) {
-	reqURL := c.baseURL + chatGPTModelsPath + "?client_version=" + chatGPTCodexClientVersion
+func (c *chatGPTClient) discoverModels(ctx context.Context, clientVersion string) (chatGPTModelCache, error) {
+	reqURL := c.baseURL + chatGPTModelsPath + "?client_version=" + clientVersion
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return chatGPTModelCache{}, fmt.Errorf("openai-chatgpt: build discovery request: %w", err)
@@ -201,9 +212,9 @@ func (c *chatGPTClient) discoverModels(ctx context.Context) (chatGPTModelCache, 
 	httpReq.Header.Set("Authorization", "Bearer "+c.accessToken)
 	httpReq.Header.Set(chatGPTAccountHeader, c.accountID)
 	// Codex client identity the discovery endpoint requires alongside the credentials.
-	httpReq.Header.Set("version", chatGPTCodexClientVersion)
+	httpReq.Header.Set("version", clientVersion)
 	httpReq.Header.Set("originator", chatGPTCodexOriginator)
-	httpReq.Header.Set("User-Agent", chatGPTCodexOriginator+"/"+chatGPTCodexClientVersion)
+	httpReq.Header.Set("User-Agent", chatGPTCodexOriginator+"/"+clientVersion)
 
 	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -243,16 +254,80 @@ func (c *chatGPTClient) discoverModels(ctx context.Context) (chatGPTModelCache, 
 // import internal/config. The returned error carries only a status/path, never a
 // credential or a raw or prompt-bearing response body (discoverModels drops those by
 // construction).
-func RefreshChatGPTModelCache(ctx context.Context, cfg ChatGPTClientConfig, write func([]ChatGPTStoreModel) error) error {
+func RefreshChatGPTModelCache(ctx context.Context, cfg ChatGPTClientConfig, savedVersion string, write func([]ChatGPTStoreModel, string) error) error {
 	client, ok := NewChatGPTClient(cfg).(*chatGPTClient)
 	if !ok {
 		return errors.New("openai-chatgpt: discovery client construction failed")
 	}
-	cache, err := client.discoverModels(ctx)
+	version := HighestCodexVersion(lookupCodexVersion(ctx, cfg.HTTPClient), savedVersion, chatGPTCodexClientVersion)
+	cache, err := client.discoverModels(ctx, version)
 	if err != nil {
 		return err
 	}
-	return write(chatGPTStoreModels(cache))
+	return write(chatGPTStoreModels(cache), version)
+}
+
+func lookupCodexVersion(ctx context.Context, hc *http.Client) string {
+	lookup := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	if hc != nil {
+		lookup.Transport = hc.Transport
+	}
+	ctx, cancel := context.WithTimeout(ctx, chatGPTCodexVersionLookupTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, chatGPTCodexVersionURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/json")
+	res, err := lookup.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, chatGPTCodexVersionMaxBody+1))
+	if err != nil || len(raw) > chatGPTCodexVersionMaxBody {
+		return ""
+	}
+	var latest struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &latest); err != nil {
+		return ""
+	}
+	return latest.Version
+}
+
+func parseCodexVersion(v string) ([]int, bool) {
+	if !codexVersionPattern.MatchString(v) {
+		return nil, false
+	}
+	parts := strings.Split(v, ".")
+	out := make([]int, len(parts))
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func HighestCodexVersion(versions ...string) string {
+	var best string
+	var bestParts []int
+	for _, v := range versions {
+		parts, ok := parseCodexVersion(v)
+		if ok && (bestParts == nil || slices.Compare(parts, bestParts) > 0) {
+			best, bestParts = v, parts
+		}
+	}
+	return best
 }
 
 // --- request mapping: provider.Request -> Responses API body ----------------

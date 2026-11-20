@@ -5720,9 +5720,9 @@ func TestStartTUI_AuthorizerCarriesTheSelfTestResultAtEverySite(t *testing.T) {
 			swapResolveExecutionCapability(t, tc.resolution)
 			var auth *productionAuthorizer
 			production := newSettingsDeps
-			newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, a *productionAuthorizer) tui.SettingsDeps {
+			newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, a *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 				auth = a
-				return production(app, cache, active, a)
+				return production(app, cache, active, a, writable)
 			}
 			t.Cleanup(func() { newSettingsDeps = production })
 			project := t.TempDir()
@@ -6916,7 +6916,7 @@ func TestProductionAuthorizer_BuildOutsidePromptCarriesTheLastRunsRefusals(t *te
 	prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
 	dispatchOutside(t, d, "touch a")
 	want := []string{
-		"sandbox probably refused write: /home/u/sbtest/a.txt (touch; grant candidate: /home/u/sbtest)",
+		"sandbox likely refused write: /home/u/sbtest/a.txt (touch; to allow, add the writable folder /home/u/sbtest in /settings, folders tab, key a)",
 		"network refused: a.test:80 (not approved (no one to ask))",
 	}
 	if got := prompts.shown[1].OutsideReasons; !slices.Equal(got, want) {

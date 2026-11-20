@@ -36,9 +36,9 @@ const (
 )
 
 const (
-	permTabGlobal        = "commands / tool grants"
-	permTabFolders       = "folders"
-	permTabHosts         = "project hosts"
+	permTabGlobal          = "commands / tool grants"
+	permTabFolders         = "folders"
+	permTabHosts           = "project hosts"
 	permTabOpenRouter      = "openrouter"
 	permTabSettings        = "settings"
 	permTabIndexFolders    = 1
@@ -50,8 +50,15 @@ const (
 
 // settingsFooterHint is the one-row key legend below the list.
 const (
-	settingsFooterHint      = "tab switch   revoke r   toggle enter   esc close"
-	settingsShareFooterHint = "tab switch   revoke r   share s   toggle enter   esc close"
+	settingsFooterHint        = "tab switch   revoke r   toggle enter   esc close"
+	settingsShareFooterHint   = "tab switch   revoke r   share s   toggle enter   esc close"
+	settingsFoldersFooterHint = "tab switch   revoke/remove r   add folder a   esc close"
+	settingsFoldersShareHint  = "tab switch   revoke r   share s   toggle enter   add folder a   esc close"
+)
+
+const (
+	writableHeaderRow = "writable folders: sandboxed commands may write here; the grants above cover file tools only"
+	writableAddLine   = "+ add writable folder (a)"
 )
 
 const discoveryLaunchDirOnly = "launch-dir-only"
@@ -91,12 +98,15 @@ type settingsPickerSession struct {
 	tabBar    *tview.TextView
 	list      *tview.List
 	help      *tview.TextView
+	addLine   *tview.TextView
 	footer    *tview.TextView
+	body      *tview.Flex
 	deps      SettingsDeps
 	maxPrice  *maxPriceEditor
 	models    *openRouterModelsTable
 	session   SessionSettings
 	retention *tview.InputField
+	writable  WritableFoldersView
 }
 
 type maxPriceEditor struct {
@@ -104,9 +114,14 @@ type maxPriceEditor struct {
 	prompt, completion *tview.InputField
 	levels             *tview.InputField
 	mode               *tview.DropDown
+	offers             []provider.OpenRouterHostOffer
+	hosts              provider.OpenRouterHostsState
 	offeredText        string
+	underCapsText      string
+	throughputText     string
 	levelsHelp         *tview.TextView
-	offered            *tview.TextView
+	offered, underCaps *tview.TextView
+	throughput         *tview.TextView
 	modeHelp, errView  *tview.TextView
 	form, rows, frame  *tview.Flex
 }
@@ -126,7 +141,7 @@ type OpenRouterSettings struct {
 	ClearQuantization func(model string) error
 	Models            func() []string
 	ActiveModel       func() (providerID, modelID string)
-	HostQuantizations func(model string, fetched func()) (map[string]int, provider.OpenRouterHostsState)
+	HostQuantizations func(model string, fetched func()) ([]provider.OpenRouterHostOffer, provider.OpenRouterHostsState)
 }
 
 type SessionSettings struct {
@@ -174,6 +189,7 @@ func (a *App) openSettingsPicker(rows []PermissionRow, deps SettingsDeps, sessio
 	})
 
 	pp.help = tview.NewTextView()
+	pp.addLine = tview.NewTextView().SetText(writableAddLine)
 
 	pp.footer = tview.NewTextView()
 	pp.footer.SetDynamicColors(false)
@@ -184,10 +200,12 @@ func (a *App) openSettingsPicker(rows []PermissionRow, deps SettingsDeps, sessio
 		AddItem(pp.tabBar, 1, 0, false).
 		AddItem(tview.NewBox(), 1, 0, false).
 		AddItem(pp.list, 0, 1, true).
+		AddItem(pp.addLine, 0, 0, false).
 		AddItem(pp.help, 1, 0, false).
 		AddItem(pp.footer, 1, 0, false)
 	body.SetBorder(true)
 	body.SetTitle(" settings ")
+	pp.body = body
 
 	pp.activeTab = deps.tab
 	a.renderSettingsTab()
@@ -219,6 +237,11 @@ func (a *App) settingsPickerKeys(ev *tcell.EventKey) *tcell.EventKey {
 		case 's':
 			a.showSettingsShare()
 			return nil
+		case 'a':
+			if pp := a.settingsPicker; pp != nil && pp.writableSection() {
+				a.showWritableAdd()
+				return nil
+			}
 		}
 	}
 	return ev
@@ -393,24 +416,30 @@ func (a *App) showMaxPriceEditor(model string) {
 		mode:       tview.NewDropDown(),
 		levelsHelp: newEditorHelp(),
 		offered:    newEditorHelp(),
+		underCaps:  newEditorHelp(),
+		throughput: newEditorHelp(),
 		modeHelp:   newEditorHelp(),
 		errView:    tview.NewTextView(),
 	}
 	ed.mode.SetLabel("Quantization mode    ")
 	ed.mode.SetLabelStyle(tcell.StyleDefault.Foreground(tcell.ColorDefault).Background(tcell.ColorDefault))
 	ed.mode.SetOptions(quantizationModes, nil)
+	ed.mode.SetFocusedStyle(tcell.StyleDefault.Reverse(true))
 	ed.mode.SetCurrentOption(0)
 	if hasQuant && quant.Mode == "required" {
 		ed.mode.SetCurrentOption(1)
 	}
 	ed.errView.SetWordWrap(true)
 	pp.maxPrice = ed
-	ed.offeredText = a.offeredLevels(pp, ed)
+	a.loadHostOffers(pp, ed)
 
 	order := []tview.Primitive{ed.prompt, ed.completion, ed.levels, ed.mode}
 	move := func(from tview.Primitive, step int) {
 		i := slices.Index(order, from)
 		a.app.SetFocus(order[(i+step+len(order))%len(order)])
+	}
+	for _, field := range []*tview.InputField{ed.prompt, ed.completion, ed.levels} {
+		field.SetChangedFunc(func(string) { ed.renderUnderCaps() })
 	}
 	for _, field := range []*tview.InputField{ed.prompt, ed.completion, ed.levels} {
 		field.SetDoneFunc(func(key tcell.Key) {
@@ -441,12 +470,14 @@ func (a *App) showMaxPriceEditor(model string) {
 		case tcell.KeyLeft, tcell.KeyRight:
 			i, _ := ed.mode.GetCurrentOption()
 			ed.mode.SetCurrentOption(1 - i)
+			ed.renderUnderCaps()
 		case tcell.KeyRune:
 			if ev.Rune() != ' ' {
 				return ev
 			}
 			i, _ := ed.mode.GetCurrentOption()
 			ed.mode.SetCurrentOption(1 - i)
+			ed.renderUnderCaps()
 		default:
 			return ev
 		}
@@ -458,6 +489,8 @@ func (a *App) showMaxPriceEditor(model string) {
 		SetDirection(tview.FlexRow).
 		AddItem(ed.prompt, 1, 0, true).
 		AddItem(ed.completion, 1, 0, false).
+		AddItem(ed.underCaps, 1, 0, false).
+		AddItem(ed.throughput, 1, 0, false).
 		AddItem(nil, 1, 0, false).
 		AddItem(ed.levels, 1, 0, false).
 		AddItem(ed.levelsHelp, 1, 0, false).
@@ -480,7 +513,7 @@ func (a *App) showMaxPriceEditor(model string) {
 		ed.fit(width, height)
 		return x, y, width, height
 	})
-	a.pages.AddPage(openRouterModelsEditPage, ed.frame, true, true)
+	a.pages.AddPage(openRouterModelsEditPage, swallowMouse{wrapOverlayPage(ed.frame)}, true, true)
 	a.app.SetFocus(ed.prompt)
 }
 
@@ -488,6 +521,8 @@ func (ed *maxPriceEditor) fit(screenWidth, screenHeight int) {
 	inner := max(screenWidth-2, 1)
 	levelsHelp := setEditorHelp(ed.levelsHelp, levelsHelpText, inner)
 	offered := setEditorHelp(ed.offered, ed.offeredText, inner)
+	underCaps := setEditorHelp(ed.underCaps, ed.underCapsText, inner)
+	throughput := setEditorHelp(ed.throughput, ed.throughputText, inner)
 	modeHelp := setEditorHelp(ed.modeHelp, modeHelpText, inner)
 	errLines := 1
 	if text := ed.errView.GetText(false); text != "" {
@@ -495,9 +530,11 @@ func (ed *maxPriceEditor) fit(screenWidth, screenHeight int) {
 	}
 	ed.form.ResizeItem(ed.levelsHelp, levelsHelp, 0)
 	ed.form.ResizeItem(ed.offered, offered, 0)
+	ed.form.ResizeItem(ed.underCaps, underCaps, 0)
+	ed.form.ResizeItem(ed.throughput, throughput, 0)
 	ed.form.ResizeItem(ed.modeHelp, modeHelp, 0)
 	ed.form.ResizeItem(ed.errView, errLines, 0)
-	ed.rows.ResizeItem(ed.form, min(2+4+2+levelsHelp+offered+modeHelp+errLines+1, screenHeight), 0)
+	ed.rows.ResizeItem(ed.form, min(2+4+2+levelsHelp+offered+underCaps+throughput+modeHelp+errLines+1, screenHeight), 0)
 }
 
 func newEditorHelp() *tview.TextView {
@@ -513,11 +550,13 @@ func setEditorHelp(view *tview.TextView, text string, inner int) int {
 	return len(lines)
 }
 
-func (a *App) offeredLevels(pp *settingsPickerSession, ed *maxPriceEditor) string {
-	if a.openRouterSettings.HostQuantizations == nil {
-		return renderOfferedLevels(nil, provider.OpenRouterHostsFailed)
+func (a *App) loadHostOffers(pp *settingsPickerSession, ed *maxPriceEditor) {
+	ed.offers, ed.hosts = nil, provider.OpenRouterHostsFailed
+	if a.openRouterSettings.HostQuantizations != nil {
+		ed.offers, ed.hosts = a.openRouterSettings.HostQuantizations(ed.model, func() { a.redrawOfferedLevels(pp, ed) })
 	}
-	return renderOfferedLevels(a.openRouterSettings.HostQuantizations(ed.model, func() { a.redrawOfferedLevels(pp, ed) }))
+	ed.offeredText = renderOfferedLevels(ed.offers, ed.hosts)
+	ed.renderUnderCaps()
 }
 
 func (a *App) redrawOfferedLevels(pp *settingsPickerSession, ed *maxPriceEditor) {
@@ -525,19 +564,96 @@ func (a *App) redrawOfferedLevels(pp *settingsPickerSession, ed *maxPriceEditor)
 		if a.settingsPicker != pp || pp.maxPrice != ed {
 			return
 		}
-		ed.offeredText = a.offeredLevels(pp, ed)
+		a.loadHostOffers(pp, ed)
 	})
 }
 
-func renderOfferedLevels(counts map[string]int, state provider.OpenRouterHostsState) string {
-	switch {
-	case state == provider.OpenRouterHostsPending:
+func hostsStateText(state provider.OpenRouterHostsState) string {
+	switch state {
+	case provider.OpenRouterHostsPending:
 		return "checking providers\u2026"
-	case state == provider.OpenRouterHostsFailed:
+	case provider.OpenRouterHostsFailed:
 		return "provider list unavailable"
-	case len(counts) == 0:
-		return "providers per level: none"
 	}
+	return ""
+}
+
+func renderOfferedLevels(offers []provider.OpenRouterHostOffer, state provider.OpenRouterHostsState) string {
+	if text := hostsStateText(state); text != "" {
+		return text
+	}
+	if len(offers) == 0 {
+		return "Total providers per level: none"
+	}
+	counts := map[string]int{}
+	for _, o := range offers {
+		counts[o.Quantization]++
+	}
+	return fserrors.CollapseControls("Total providers per level: " + levelCounts(counts))
+}
+
+func (ed *maxPriceEditor) renderUnderCaps() {
+	var required []string
+	if _, mode := ed.mode.GetCurrentOption(); mode == "Required" {
+		required = strings.Fields(ed.levels.GetText())
+	}
+	ed.underCapsText, ed.throughputText = renderUnderCaps(ed.offers, ed.hosts, ed.prompt.GetText(), ed.completion.GetText(), required)
+}
+
+func renderUnderCaps(offers []provider.OpenRouterHostOffer, state provider.OpenRouterHostsState, promptText, completionText string, required []string) (underCaps, throughput string) {
+	if text := hostsStateText(state); text != "" {
+		return text, text
+	}
+	prompt, hasPrompt, err := parsePriceField("input", promptText)
+	var completion float64
+	var hasCompletion bool
+	if err == nil {
+		completion, hasCompletion, err = parsePriceField("output", completionText)
+	}
+	if err != nil {
+		return "Providers under caps: enter a valid price", "Throughput under caps: enter a valid price"
+	}
+	counts := map[string]int{}
+	n := 0
+	var tps []float64
+	for _, o := range offers {
+		if (!hasPrompt || o.Priced && o.PromptPerM <= prompt) && (!hasCompletion || o.Priced && o.CompletionPerM <= completion) && matchesRequiredLevel(required, o.Quantization) {
+			counts[o.Quantization]++
+			n++
+			if o.HasThroughput {
+				tps = append(tps, math.Round(o.P50Throughput))
+			}
+		}
+	}
+	underCaps = "Providers under caps: " + strconv.Itoa(n) + " of " + strconv.Itoa(len(offers))
+	if n > 0 {
+		underCaps += " (" + levelCounts(counts) + ")"
+	}
+	throughput = "Throughput under caps: no data"
+	if len(tps) > 0 {
+		lo, hi := slices.Min(tps), slices.Max(tps)
+		throughput = "Throughput under caps: " + strconv.FormatFloat(lo, 'f', 0, 64)
+		if hi != lo {
+			throughput += "\u2013" + strconv.FormatFloat(hi, 'f', 0, 64)
+		}
+		throughput += " tps"
+	}
+	return fserrors.CollapseControls(underCaps), throughput
+}
+
+func matchesRequiredLevel(levels []string, quantization string) bool {
+	if len(levels) == 0 {
+		return true
+	}
+	for _, level := range levels {
+		if level == "unknown" && quantization == "" || provider.OpenRouterQuantizationMatches(level, quantization) {
+			return true
+		}
+	}
+	return false
+}
+
+func levelCounts(counts map[string]int) string {
 	var parts []string
 	for _, level := range slices.Sorted(maps.Keys(counts)) {
 		if level != "" {
@@ -547,7 +663,7 @@ func renderOfferedLevels(counts map[string]int, state provider.OpenRouterHostsSt
 	if n := counts[""]; n > 0 {
 		parts = append(parts, "unspecified "+strconv.Itoa(n))
 	}
-	return fserrors.CollapseControls("providers per level: " + strings.Join(parts, ", "))
+	return strings.Join(parts, ", ")
 }
 
 func (a *App) quantization(model string) (provider.Quantization, bool) {
@@ -629,10 +745,24 @@ func (a *App) showRetentionEditor() {
 			a.submitRetention(field.GetText())
 		}
 	})
-	form := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(field, 1, 0, true)
+	a.showSettingsFieldDialog(" "+retentionRowLabel+" ", field)
+}
+
+// The Box filler is what clears the dialog's interior: a Flex leaves its own cells undrawn.
+func (a *App) showSettingsFieldDialog(title string, field *tview.InputField) {
+	form := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(field, 1, 0, true).
+		AddItem(tview.NewBox(), 0, 1, false)
 	form.SetBorder(true)
-	form.SetTitle(" " + retentionRowLabel + " ")
-	a.pages.AddPage(settingsDeletePage, centeredModal(form), true, true)
+	form.SetTitle(title)
+	frame := tview.NewFlex().
+		AddItem(nil, 0, 3, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(form, 5, 0, true).
+			AddItem(nil, 0, 1, false), 0, 4, true).
+		AddItem(nil, 0, 3, false)
+	a.pages.AddPage(settingsDeletePage, frame, true, true)
 	a.app.SetFocus(field)
 }
 
@@ -768,6 +898,12 @@ func (a *App) renderSettingsTab() {
 			pp.list.AddItem(renderPermissionRow(row), "", 0, nil)
 		}
 	}
+	addHeight := 0
+	if pp.writableSection() {
+		pp.addWritableRows()
+		addHeight = 1
+	}
+	pp.body.ResizeItem(pp.addLine, addHeight, 0)
 	a.updateRowHelp(pp.list.GetCurrentItem())
 }
 
@@ -776,8 +912,13 @@ func (pp *settingsPickerSession) updateFooter(i int) {
 		return
 	}
 	hint := settingsFooterHint
-	if row, ok := pp.rowAt(i); ok && pp.shareable(row) {
+	switch row, ok := pp.rowAt(i); {
+	case ok && pp.shareable(row) && pp.writableSection():
+		hint = settingsFoldersShareHint
+	case ok && pp.shareable(row):
 		hint = settingsShareFooterHint
+	case pp.writableSection():
+		hint = settingsFoldersFooterHint
 	}
 	pp.footer.SetText(hint)
 }
@@ -883,7 +1024,14 @@ func (pp *settingsPickerSession) rowAt(i int) (PermissionRow, bool) {
 // no grant is highlighted, so an empty tab's placeholder can never be revoked.
 func (a *App) showSettingsDelete() {
 	pp := a.settingsPicker
-	if pp == nil || pp.deps.Revoke == nil {
+	if pp == nil {
+		return
+	}
+	if entry, ok := pp.writableEntryAt(pp.list.GetCurrentItem()); ok {
+		a.showWritableRemove(entry)
+		return
+	}
+	if pp.deps.Revoke == nil {
 		return
 	}
 	row, ok := a.settingsHighlightedRow()
@@ -892,6 +1040,99 @@ func (a *App) showSettingsDelete() {
 	}
 	text, action := revokeConfirmText(row)
 	a.showSettingsConfirm(text, action, func() { a.applySettingsRevoke(row) })
+}
+
+func (pp *settingsPickerSession) writableSection() bool {
+	return pp.activeTab == permTabIndexFolders && pp.deps.Writable.List != nil
+}
+
+func (pp *settingsPickerSession) writableEntryAt(i int) (string, bool) {
+	if !pp.writableSection() || pp.writable.Unreadable != "" {
+		return "", false
+	}
+	j := i - (max(len(pp.folders), 1) + 1)
+	if j < 0 || j >= len(pp.writable.Rows) {
+		return "", false
+	}
+	return pp.writable.Rows[j].Entry, true
+}
+
+func (pp *settingsPickerSession) addWritableRows() {
+	pp.writable = pp.deps.Writable.List()
+	pp.list.AddItem(writableHeaderRow, "", 0, nil)
+	if pp.writable.Unreadable != "" {
+		pp.list.AddItem("  settings unreadable: "+fserrors.CollapseControls(pp.writable.Unreadable), "", 0, nil)
+	} else {
+		for _, row := range pp.writable.Rows {
+			pp.list.AddItem("  "+fserrors.CollapseControls(row.Entry)+" — "+writableFolderStatus(pp.writable, row), "", 0, nil)
+		}
+	}
+}
+
+func writableFolderStatus(v WritableFoldersView, row WritableFolderRow) string {
+	switch {
+	case !v.LayerAdmitted:
+		return "not active this launch; restart and approve project settings"
+	case row.Invalid != "":
+		return "invalid: " + fserrors.CollapseControls(row.Invalid)
+	case !v.Sandboxed:
+		return "inactive: sandbox unavailable"
+	case v.Degraded:
+		return "inactive: settings degraded"
+	case v.Mode == modeKeyPlan:
+		return "inactive in Plan"
+	case v.Mode == modeKeyAutoEdits:
+		return "active in Auto edits"
+	}
+	return "active for sandboxed Build commands, approval still required"
+}
+
+func (a *App) showWritableAdd() {
+	pp := a.settingsPicker
+	if pp == nil || pp.deps.Writable.Add == nil {
+		return
+	}
+	field := newMaxPriceField("path ", "")
+	field.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			a.submitWritableAdd(field.GetText())
+		}
+	})
+	a.showSettingsFieldDialog(" add writable folder ", field)
+}
+
+func (a *App) submitWritableAdd(text string) {
+	a.cancelSettingsDelete()
+	pp := a.settingsPicker
+	if pp == nil {
+		return
+	}
+	prev := pp.list.GetCurrentItem()
+	a.Notice(pp.deps.Writable.Add(text))
+	a.renderSettingsTab()
+	for j, row := range pp.writable.Rows {
+		if row.Entry == text && pp.writable.Unreadable == "" {
+			pp.list.SetCurrentItem(max(len(pp.folders), 1) + 1 + j)
+			return
+		}
+	}
+	pp.list.SetCurrentItem(min(prev, pp.list.GetItemCount()-1))
+}
+
+func (a *App) showWritableRemove(entry string) {
+	pp := a.settingsPicker
+	if pp.deps.Writable.Remove == nil {
+		return
+	}
+	text := "Remove this writable folder?\n\n" + shareConfirmFact(entry) +
+		"\n\nIt is removed from the project's .codemeld/settings.yaml for everyone who pulls the repository."
+	a.showSettingsConfirm(text, "Remove", func() {
+		prev := pp.list.GetCurrentItem()
+		a.Notice(pp.deps.Writable.Remove(entry))
+		a.renderSettingsTab()
+		pp.list.SetCurrentItem(min(prev, pp.list.GetItemCount()-1))
+		a.refocusSettingsList()
+	})
 }
 
 func revokeConfirmText(row PermissionRow) (text, action string) {

@@ -14,9 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"io/fs"
 	"maps"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -710,6 +712,159 @@ func TestHeadlessFreshSteps_ModelOverrideValidatesCatalog(t *testing.T) {
 			t.Fatalf("active effort = %+v (ok=%v), want max", sel, ok)
 		}
 	})
+}
+
+func localModelsServer(t *testing.T, status int, body string) (map[string]any, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	composed := map[string]any{
+		"provider": map[string]any{
+			"local": map[string]any{"base_url": srv.URL, "api_key": ""},
+		},
+	}
+	return composed, &hits
+}
+
+func TestHeadlessFreshSteps_ModelOverrideDiscoversNeverFetchedProvider(t *testing.T) {
+	local := &model.Selection{Provider: "local", ID: "m1", Effort: model.EffortNoReasoning}
+
+	t.Run("empty store fetches once and selects", func(t *testing.T) {
+		composed, hits := localModelsServer(t, http.StatusOK, `{"data":[{"id":"m1"}]}`)
+		settings := SettingsPath(t.TempDir())
+		for run := 1; run <= 2; run++ {
+			var stderr bytes.Buffer
+			got, _, err := HeadlessFreshSteps(&stderr, local, "").DetermineModel(composed, nil, t.TempDir(), []string{settings})
+			if err != nil {
+				t.Fatalf("run %d: DetermineModel error = %v", run, err)
+			}
+			active, ok := got.(*model.ActiveState)
+			if !ok {
+				t.Fatalf("run %d: DetermineModel returned %T, want *model.ActiveState", run, got)
+			}
+			if sel, _, ok := active.Current(); !ok || sel.Provider != "local" || sel.ID != "m1" {
+				t.Fatalf("run %d: selection = %+v (ok=%v), want local/m1", run, sel, ok)
+			}
+			if n := hits.Load(); n != 1 {
+				t.Fatalf("run %d: /models requests = %d, want 1", run, n)
+			}
+			if run == 1 && !strings.Contains(stderr.String(), "fetching the model list for local") {
+				t.Fatalf("run 1: stderr = %q, want it to name the provider being fetched", stderr.String())
+			}
+		}
+		store, err := config.ReadDiscoveredModels(config.DiscoveredModelsPath(settings))
+		if err != nil {
+			t.Fatalf("read store: %v", err)
+		}
+		entry, ok := store.Providers["local"]
+		if !ok || len(entry.Models) != 1 || entry.Models[0].ID != "m1" {
+			t.Fatalf("stored local entry = %+v (ok=%v), want one model m1", entry, ok)
+		}
+	})
+
+	t.Run("provider already in store is not fetched again", func(t *testing.T) {
+		composed, hits := localModelsServer(t, http.StatusOK, `{"data":[{"id":"m1"}]}`)
+		settings := SettingsPath(t.TempDir())
+		seedStore(t, config.DiscoveredModelsPath(settings), "local", config.DiscoveredProvider{Models: []config.DiscoveredModel{{ID: "other"}}})
+		_, _, err := HeadlessFreshSteps(&bytes.Buffer{}, local, "").DetermineModel(composed, nil, t.TempDir(), []string{settings})
+		if !errors.Is(err, ErrModelNotInCatalog) {
+			t.Fatalf("err = %v, want ErrModelNotInCatalog", err)
+		}
+		if n := hits.Load(); n != 0 {
+			t.Fatalf("/models requests = %d, want 0", n)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"server error", http.StatusInternalServerError, `{}`},
+		{"list without the id", http.StatusOK, `{"data":[{"id":"other"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			composed, hits := localModelsServer(t, tc.status, tc.body)
+			settings := SettingsPath(t.TempDir())
+			_, _, err := HeadlessFreshSteps(&bytes.Buffer{}, local, "").DetermineModel(composed, nil, t.TempDir(), []string{settings})
+			if !errors.Is(err, ErrModelNotInCatalog) {
+				t.Fatalf("err = %v, want ErrModelNotInCatalog", err)
+			}
+			if n := hits.Load(); n != 1 {
+				t.Fatalf("/models requests = %d, want 1", n)
+			}
+		})
+	}
+
+	t.Run("openai-chatgpt is never discovered", func(t *testing.T) {
+		composed, hits := localModelsServer(t, http.StatusOK, `{"data":[{"id":"m1"}]}`)
+		settings := SettingsPath(t.TempDir())
+		storePath := config.DiscoveredModelsPath(settings)
+		before, _ := os.ReadFile(storePath)
+		var stderr bytes.Buffer
+		sel := &model.Selection{Provider: "openai-chatgpt", ID: "ghost-model", Effort: model.EffortNoReasoning}
+		_, _, err := HeadlessFreshSteps(&stderr, sel, "").DetermineModel(composed, nil, t.TempDir(), []string{settings})
+		if !errors.Is(err, ErrModelNotInCatalog) {
+			t.Fatalf("err = %v, want ErrModelNotInCatalog", err)
+		}
+		if n := hits.Load(); n != 0 {
+			t.Fatalf("/models requests = %d, want 0", n)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("stderr = %q, want no discovery attempt", stderr.String())
+		}
+		if after, _ := os.ReadFile(storePath); !bytes.Equal(before, after) {
+			t.Fatalf("store changed: before %q, after %q", before, after)
+		}
+	})
+}
+
+func TestHeadlessFreshSteps_ModelOverrideDiscoveryUsesOpenAIEnvKey(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != "/models" || r.Header.Get("Authorization") != "Bearer sk-env" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":[{"id":"gpt-x"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	composed := map[string]any{"provider": map[string]any{
+		"openai": map[string]any{"base_url": srv.URL, "api_key": "sk-stale"},
+	}}
+	settings := SettingsPath(t.TempDir())
+	sel := &model.Selection{Provider: "openai", ID: "gpt-x", Effort: model.EffortNoReasoning}
+
+	got, _, err := HeadlessFreshSteps(&bytes.Buffer{}, sel, "").DetermineModel(composed, nil, t.TempDir(), []string{settings})
+	if err != nil {
+		t.Fatalf("DetermineModel error = %v, want selection via the OPENAI_API_KEY discovery", err)
+	}
+	if active, ok := got.(*model.ActiveState); !ok {
+		t.Fatalf("DetermineModel returned %T, want *model.ActiveState", got)
+	} else if s, _, ok := active.Current(); !ok || s.Provider != "openai" || s.ID != "gpt-x" {
+		t.Fatalf("selection = %+v (ok=%v), want openai/gpt-x", s, ok)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("/models requests = %d, want 1", n)
+	}
+	store, err := config.ReadDiscoveredModels(config.DiscoveredModelsPath(settings))
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if entry := store.Providers["openai"]; len(entry.Models) != 1 || entry.Models[0].ID != "gpt-x" {
+		t.Fatalf("stored openai entry = %+v, want one model gpt-x", entry)
+	}
 }
 
 // TestRunHeadless_FinalFlushFailureSurfacesOnCancel pins the Step-7 durability
@@ -6399,7 +6554,7 @@ func TestRunHeadless_BuildOutsideRunWithAnApproverRunsOnlyTheApprovedInvocationU
 
 func TestRunHeadless_BuildOutsidePromptShowsWhatTheSandboxRefusedInsteadOfTheSummary(t *testing.T) {
 	_, _, stderr := runHeadlessOutside(t, strings.NewReader("2\n"), 2)
-	want := "  Last run: the sandbox probably refused:\n  sandbox probably refused write: /srv/data/out.txt (touch; grant candidate: /srv/data)\n"
+	want := "  Last run: the sandbox probably refused:\n  sandbox likely refused write: /srv/data/out.txt (touch; to allow, add the writable folder /srv/data in /settings"
 	if !strings.Contains(stderr, want) {
 		t.Fatalf("stderr missing %q:\n%s", want, stderr)
 	}

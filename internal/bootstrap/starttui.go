@@ -59,7 +59,7 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.13"
+var codemeldVersion = "Beta 0.4.14"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
@@ -139,7 +139,8 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 			recorder.deliver(ctx, app, degraded, notices)
 		}
 	}
-	stopBlockedDelivery := queueBlockedNotices(app, guard.Blocked, recordTransition)
+	writes := &writeRefusalReports{}
+	_, stopBlockedDelivery := queueBlockedNotices(app, guard.Blocked, recordTransition, writes)
 	defer stopBlockedDelivery()
 	filetools.SetSwapReporter(app.CommitProviderError)
 	defer filetools.SetSwapReporter(nil)
@@ -182,6 +183,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	}
 	conf = launchConfinement(execution, owned.folder(), modeActive, cache, result.Home, guard, inherited)
 	conf.own(owned)
+	conf.writes = writes
 	systemOne := newSystemOneCheck(cache, guard.Blocked)
 	registry, err := realizeToolRegistry(result.ToolRegistry, cache, toolEvents.Active, result.Home, result.LaunchDir, guard,
 		generalAgentBinding{parent: generalAgentParent, notices: app, confinement: conf, systemOne: systemOne})
@@ -377,7 +379,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 		}
 		return entry(input, imageParts...)
 	})
-	settingsDeps := newSettingsDeps(app, cache, active, authorizer)
+	settingsDeps := newSettingsDeps(app, cache, active, authorizer, newWritableFolders(result.Home, guard.Blocked.ProjectRoot(), projectBlockedDestinations))
 	reg := tui.MustNewRegistry(append(tui.BuildRegistry(map[string]tui.HandlerFunc{
 		"status":     tui.NewStatusHandler(status),
 		"context":    tui.NewContextHandler(contextSt),
@@ -516,7 +518,7 @@ func (h heldNotices) replay(notices tui.NoticeRenderer) {
 }
 
 // record must not wait on the event loop: /exit calls stop from it and stop records every queued transition.
-func queueBlockedNotices(app *tui.App, blocked *permissions.BlockedPaths, record func(degraded bool, notices tui.NoticeRenderer)) (stop func()) {
+func queueBlockedNotices(app *tui.App, blocked *permissions.BlockedPaths, record func(degraded bool, notices tui.NoticeRenderer), writes *writeRefusalReports) (notice queuedNotice, stop func()) {
 	deliverNotice, spawn := deliverBlockedNotice, spawnBlockedDelivery
 	var mu sync.Mutex
 	var queued []string
@@ -530,13 +532,16 @@ func queueBlockedNotices(app *tui.App, blocked *permissions.BlockedPaths, record
 		default:
 		}
 	}
-	notice := queuedNotice(func(line string) {
+	notice = queuedNotice(func(line string) {
 		mu.Lock()
 		queued = append(queued, line)
 		mu.Unlock()
 		signal()
 	})
 	blocked.SetNotice(notice)
+	if writes != nil {
+		writes.setNotice(notice)
+	}
 	if record != nil {
 		blocked.SetOnDegradedChange(func(degraded bool) {
 			mu.Lock()
@@ -601,7 +606,7 @@ func queueBlockedNotices(app *tui.App, blocked *permissions.BlockedPaths, record
 			}
 		}
 	}()
-	return sync.OnceFunc(func() {
+	return notice, sync.OnceFunc(func() {
 		blocked.SetNotice(nil)
 		blocked.SetOnDegradedChange(nil)
 		close(done)
@@ -639,7 +644,7 @@ func newSystemOneDeps(cache *config.Cache, status func() string) tui.SystemOneDe
 	}
 }
 
-var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
+var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 	return tui.SettingsDeps{
 		Lister: permissionsCacheLister{grants: authorizer.grants},
 		Picker: tui.NewSettingsPicker(app, tui.OpenRouterSettings{
@@ -687,13 +692,13 @@ var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.Acti
 				return err
 			},
 			ActiveModel: func() (string, string) { return activeModelIDs(active) },
-			HostQuantizations: func(model string, fetched func()) (map[string]int, provider.OpenRouterHostsState) {
+			HostQuantizations: func(model string, fetched func()) ([]provider.OpenRouterHostOffer, provider.OpenRouterHostsState) {
 				entry, ok := cache.Provider("openrouter")
 				if !ok {
 					return nil, provider.OpenRouterHostsFailed
 				}
 				authName, authValue := entry.ResolveAuthHeader()
-				return openRouterEndpoints.QuantizationCounts(entry, authName, authValue, model, fetched)
+				return openRouterEndpoints.HostOffers(entry, authName, authValue, model, fetched)
 			},
 		}, tui.SessionSettings{
 			RetentionDays: cache.RetentionDays,
@@ -708,6 +713,7 @@ var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.Acti
 		// deadlock on QueueUpdateDraw from that goroutine.
 		Revoke:   func(row tui.PermissionRow) { authorizer.RevokeRow(row, app) },
 		Share:    authorizer.ShareGrant,
+		Writable: writable.deps(cache, authorizer),
 		Approved: authorizer.display.projectApproved,
 		Boundary: cache.Discovery(),
 	}
@@ -1562,5 +1568,6 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 		broker:        broker,
 		grants:        cache.DomainGrants(),
 		connectGrants: cache.ConnectGrants(),
+		writes:        &writeRefusalReports{seen: map[string]bool{}},
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/fsutil"
 	"codemeld.dev/codemeld/internal/locks"
+	"codemeld.dev/codemeld/internal/provider"
 )
 
 const (
@@ -44,9 +45,10 @@ type DiscoveredModelsStore struct {
 // secret-free refresh metadata. RefreshedAt/Source are advisory only; consumers must
 // still tolerate their absence.
 type DiscoveredProvider struct {
-	RefreshedAt string            `yaml:"refreshed_at,omitempty"`
-	Source      string            `yaml:"source,omitempty"`
-	Models      []DiscoveredModel `yaml:"models"`
+	RefreshedAt   string            `yaml:"refreshed_at,omitempty"`
+	Source        string            `yaml:"source,omitempty"`
+	ClientVersion string            `yaml:"client_version,omitempty"`
+	Models        []DiscoveredModel `yaml:"models"`
 }
 
 // DiscoveredModel is one discovered model's whitelisted selection/capability metadata.
@@ -84,7 +86,9 @@ func ReadDiscoveredModels(path string) (DiscoveredModelsStore, error) {
 // path, preserving every other provider's entry, and republishes the whole store
 // owner-only and atomically under a sidecar lock. The read-merge-write happens under
 // the lock so concurrent updates to different providers cannot lose each other's rows.
-// It stamps the current schema version. An empty path is a no-op (nil error) so a
+// It stamps the current schema version and keeps the numerically highest valid
+// ClientVersion of the new and stored entries, so a discovery that read the store before
+// a concurrent one saved a newer version cannot lower it. An empty path is a no-op (nil error) so a
 // caller with no known settings location silently skips persistence.
 func UpdateDiscoveredModelsProvider(path, providerID string, entry DiscoveredProvider) error {
 	return updateDiscoveredModelsProviderThen(path, providerID, entry, nil)
@@ -128,6 +132,7 @@ func updateDiscoveredModelsProviderThen(path, providerID string, entry Discovere
 	if store.Providers == nil {
 		store.Providers = map[string]DiscoveredProvider{}
 	}
+	entry.ClientVersion = provider.HighestCodexVersion(entry.ClientVersion, store.Providers[providerID].ClientVersion)
 	store.Providers[providerID] = sanitizeProvider(entry)
 	if err := writeDiscoveredModelsStore(path, store); err != nil {
 		return err
@@ -193,6 +198,7 @@ func looksSecret(s string) bool {
 func sanitizeProvider(entry DiscoveredProvider) DiscoveredProvider {
 	entry.RefreshedAt = redactSecret(entry.RefreshedAt)
 	entry.Source = redactSecret(entry.Source)
+	entry.ClientVersion = redactSecret(entry.ClientVersion)
 	if len(entry.Models) == 0 {
 		return entry
 	}

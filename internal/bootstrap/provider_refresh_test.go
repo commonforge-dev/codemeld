@@ -65,6 +65,32 @@ func TestProviderCatalogRefresher_PlatformRetainsEveryDiscoveredModel(t *testing
 	}
 }
 
+func TestProviderCatalogRefresher_OnlyPlatformDiscoveryUsesOpenAIEnvKey(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-env")
+	for _, tc := range []struct {
+		id       string
+		composed map[string]any
+		wantKey  string
+	}{
+		{"openai", platformComposed(), "sk-env"},
+		{"venice", veniceComposed(), "vk-test"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			var gotKey string
+			r, _, _ := newTestRefresher(t, tc.composed, func(_ context.Context, cfg provider.APIKeyDiscoveryConfig) ([]provider.DiscoveredConfiguredModel, error) {
+				gotKey = cfg.Entry.APIKey
+				return []provider.DiscoveredConfiguredModel{{ID: "m1"}}, nil
+			})
+			if res := refreshAndWait(t, r, tc.id, true); res.Outcome != RefreshUpdated {
+				t.Fatalf("outcome = %v, want %v", res.Outcome, RefreshUpdated)
+			}
+			if gotKey != tc.wantKey {
+				t.Fatalf("discovery key = %q, want %q", gotKey, tc.wantKey)
+			}
+		})
+	}
+}
+
 func newTestRefresher(t *testing.T, composed map[string]any, discover discoverFunc) (*ProviderCatalogRefresher, *config.Cache, string) {
 	t.Helper()
 	globalPath := filepath.Join(t.TempDir(), "settings.yaml")
@@ -481,20 +507,29 @@ func TestProviderCatalogRefresher_NoStorePathRefusesBeforeNetwork(t *testing.T) 
 }
 
 type chatGPTDiscoveryStub struct {
-	mu     sync.Mutex
-	reqs   []*http.Request
-	status int
-	body   string
+	mu         sync.Mutex
+	reqs       []*http.Request
+	status     int
+	body       string
+	npmVersion string
 }
 
 func (s *chatGPTDiscoveryStub) RoundTrip(r *http.Request) (*http.Response, error) {
 	s.mu.Lock()
 	s.reqs = append(s.reqs, r)
+	npmVersion := s.npmVersion
 	s.mu.Unlock()
+	status, body := s.status, s.body
+	if r.URL.Host == "registry.npmjs.org" {
+		status, body = http.StatusNotFound, ""
+		if npmVersion != "" {
+			status, body = http.StatusOK, `{"version":"`+npmVersion+`"}`
+		}
+	}
 	return &http.Response{
-		StatusCode: s.status,
+		StatusCode: status,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(s.body)),
+		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    r,
 	}, nil
 }
@@ -552,8 +587,8 @@ func TestProviderCatalogRefresher_ChatGPTForcedWritesSanitizedEntry(t *testing.T
 		t.Fatalf("session resolved from %q with %d prior discovery requests, want %q before any discovery", gotPath, requestsBeforeAuth, testChatGPTSettingsPath)
 	}
 	reqs := stub.requests()
-	if len(reqs) != 1 || reqs[0].URL.Host != "chatgpt.com" || reqs[0].Header.Get("Authorization") != "Bearer renewed-access" {
-		t.Fatalf("discovery requests = %d (first %v), want one pinned chatgpt.com request with the renewed token", len(reqs), reqs)
+	if len(reqs) != 2 || reqs[0].URL.Host != "registry.npmjs.org" || reqs[1].URL.Host != "chatgpt.com" || reqs[1].Header.Get("Authorization") != "Bearer renewed-access" {
+		t.Fatalf("discovery requests = %d (%v), want the npm version lookup then one pinned chatgpt.com request with the renewed token", len(reqs), reqs)
 	}
 
 	store, err := config.ReadDiscoveredModels(storePath)
@@ -580,6 +615,42 @@ func TestProviderCatalogRefresher_ChatGPTForcedWritesSanitizedEntry(t *testing.T
 	}
 	if live, _ := cache.SelectableCatalog().Entry(provider.ChatGPTProviderID); !slices.Contains(live.Models, "gpt-5.7") {
 		t.Errorf("live ChatGPT models = %v, want gpt-5.7 after reload", live.Models)
+	}
+}
+
+func TestProviderCatalogRefresher_ChatGPTSavesAndReusesClientVersion(t *testing.T) {
+	stub := stubChatGPTDiscovery(t, http.StatusOK, chatGPTDiscoveryBody)
+	stub.npmVersion = "0.900.0"
+	r, _, storePath := newChatGPTTestRefresher(t, renewedChatGPTAuth())
+
+	if res := refreshAndWait(t, r, provider.ChatGPTProviderID, true); res.Outcome != RefreshUpdated {
+		t.Fatalf("first refresh outcome = %v, want %v", res.Outcome, RefreshUpdated)
+	}
+	store, err := config.ReadDiscoveredModels(storePath)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if got := store.Providers[provider.ChatGPTProviderID].ClientVersion; got != "0.900.0" {
+		t.Fatalf("stored client_version = %q, want 0.900.0", got)
+	}
+
+	stub.mu.Lock()
+	stub.npmVersion = ""
+	stub.reqs = nil
+	stub.mu.Unlock()
+	if res := refreshAndWait(t, r, provider.ChatGPTProviderID, true); res.Outcome != RefreshUpdated {
+		t.Fatalf("second refresh outcome = %v, want %v", res.Outcome, RefreshUpdated)
+	}
+	reqs := stub.requests()
+	if len(reqs) != 2 || reqs[1].URL.Query().Get("client_version") != "0.900.0" {
+		t.Fatalf("second refresh requests = %v, want discovery with client_version=0.900.0", reqs)
+	}
+	store, err = config.ReadDiscoveredModels(storePath)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if got := store.Providers[provider.ChatGPTProviderID].ClientVersion; got != "0.900.0" {
+		t.Fatalf("stored client_version after failed lookup = %q, want 0.900.0", got)
 	}
 }
 
@@ -682,11 +753,11 @@ func TestProviderCatalogRefresher_ChatGPTOneTimeoutSpansAuthAndDiscovery(t *test
 		t.Fatalf("outcome = %v, want %v", res.Outcome, RefreshUpdated)
 	}
 	reqs := stub.requests()
-	if len(reqs) != 1 {
-		t.Fatalf("discovery requests = %d, want 1", len(reqs))
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want the npm version lookup and 1 discovery", len(reqs))
 	}
-	if authCtx == nil || reqs[0].Context() != authCtx {
-		t.Fatalf("discovery context %p differs from auth context %p, want one shared context", reqs[0].Context(), authCtx)
+	if authCtx == nil || reqs[1].Context() != authCtx {
+		t.Fatalf("discovery context %p differs from auth context %p, want one shared context", reqs[1].Context(), authCtx)
 	}
 	if _, ok := authCtx.Deadline(); !ok {
 		t.Error("shared auth/discovery context has no deadline")
@@ -772,8 +843,8 @@ func TestProviderCatalogRefresher_ChatGPTFailureKeepsPriorCatalog(t *testing.T) 
 			if res := refreshAndWait(t, r, provider.ChatGPTProviderID, true); res.Outcome != RefreshFailed {
 				t.Errorf("outcome = %v, want %v", res.Outcome, RefreshFailed)
 			}
-			if n := len(stub.requests()); n != 1 {
-				t.Errorf("discovery requests = %d, want 1 before the failure", n)
+			if n := len(stub.requests()); n != 2 {
+				t.Errorf("requests = %d, want the npm version lookup and 1 discovery before the failure", n)
 			}
 			store, _ := config.ReadDiscoveredModels(storePath)
 			if got := store.Providers[provider.ChatGPTProviderID]; got.RefreshedAt != stale || len(got.Models) != 1 || got.Models[0].ID != "gpt-prior" {
@@ -816,8 +887,8 @@ func TestProviderCatalogRefresher_ChatGPTCoalesces(t *testing.T) {
 	close(release)
 	wg.Wait()
 
-	if auth.ensureCount() != 1 || len(stub.requests()) != 1 {
-		t.Errorf("session resolutions = %d, discovery requests = %d, want 1 each", auth.ensureCount(), len(stub.requests()))
+	if auth.ensureCount() != 1 || len(stub.requests()) != 2 {
+		t.Errorf("session resolutions = %d, requests = %d, want 1 and 2 (npm version lookup plus discovery)", auth.ensureCount(), len(stub.requests()))
 	}
 	for i, res := range results {
 		if res.Outcome != RefreshUpdated {

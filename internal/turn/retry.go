@@ -34,11 +34,12 @@ const defaultRetryBudget = 60 * time.Second
 // provider.retry settings block (config.Cache.ProviderRetry); MaxAttempts is the
 // total number of attempts including the first.
 type RetryPolicy struct {
-	Enabled     bool
-	MaxAttempts int
-	BaseDelay   time.Duration
-	MaxDelay    time.Duration
-	Budget      time.Duration
+	Enabled       bool
+	MaxAttempts   int
+	BaseDelay     time.Duration
+	MaxDelay      time.Duration
+	Budget        time.Duration
+	NoOutputLimit time.Duration
 }
 
 type IgnoredProviders struct {

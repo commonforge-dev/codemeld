@@ -20,6 +20,8 @@ import (
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/trust"
+
+	"github.com/goccy/go-yaml"
 )
 
 // folderEntry builds a direct folder-grant permission entry for persistence tests.
@@ -2019,6 +2021,257 @@ func TestPersist_DomainGrants_PreReplacementFailureLeavesTheTargetUnchanged(t *t
 					t.Fatalf("target changed after a pre-replacement failure:\n%s", got)
 				}
 			})
+		}
+	}
+}
+
+func persistWritableFolder(t *testing.T, target string, op any) {
+	t.Helper()
+	if reason, cat, err := Persist(target, KeyWritableFolders, op); reason != ReasonNone || cat != "" || err != nil {
+		t.Fatalf("Persist = (%q, %q, %v), want a clean write", reason, cat, err)
+	}
+}
+
+func TestPersist_WritableFolders_AddToAbsentFileAndDuplicate(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "settings.yaml")
+	persistWritableFolder(t, target, WritableFolderAdd("/a"))
+	if got, want := readAt(t, target), "writable_folders:\n- /a\n"; got != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+	persistWritableFolder(t, target, WritableFolderAdd("/b"))
+	want := "writable_folders:\n- /a\n- /b\n"
+	if got := readAt(t, target); got != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+	persistWritableFolder(t, target, WritableFolderAdd("/a"))
+	if got := readAt(t, target); got != want {
+		t.Fatalf("file after duplicate add = %q, want unchanged %q", got, want)
+	}
+}
+
+func TestPersist_WritableFolders_AddKeyToExistingFile(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "settings.yaml")
+	const seed = "# head\nattribution: true # keep\n"
+	writeAt(t, target, seed)
+	persistWritableFolder(t, target, WritableFolderAdd("/a"))
+	if got, want := readAt(t, target), seed+"writable_folders:\n- /a\n"; got != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+}
+
+func TestPersist_WritableFolders_EditKeepsOtherKeysAndComments(t *testing.T) {
+	const before = "# head\nattribution: true # keep\n# above the list\n"
+	const after = "# after the list\nsessions:\n  retention_days: 7 # days\n"
+	for _, tc := range []struct {
+		name, list string
+	}{
+		{"block", "writable_folders:\n  - /a\n  - /b\n"},
+		{"flow", "writable_folders: [/a, /b]\n"},
+	} {
+		for _, op := range []struct {
+			name, list string
+			payload    any
+		}{
+			{"add", "writable_folders:\n- /a\n- /b\n- /c\n", WritableFolderAdd("/c")},
+			{"remove", "writable_folders:\n- /b\n", WritableFolderRemove("/a")},
+		} {
+			t.Run(tc.name+"/"+op.name, func(t *testing.T) {
+				target := filepath.Join(t.TempDir(), "settings.yaml")
+				writeAt(t, target, before+tc.list+after)
+				persistWritableFolder(t, target, op.payload)
+				if got, want := readAt(t, target), before+op.list+after; got != want {
+					t.Fatalf("file =\n%s\nwant\n%s", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestPersist_WritableFolders_RemoveLastAndAbsentEntry(t *testing.T) {
+	root := resolvedTempDir(t)
+	target := filepath.Join(root, "settings.yaml")
+	const seed = "attribution: true\nwritable_folders:\n  - /a\n"
+	writeAt(t, target, seed)
+	persistWritableFolder(t, target, WritableFolderRemove("/missing"))
+	if got := readAt(t, target); got != seed {
+		t.Fatalf("file after removing an absent entry = %q, want unchanged %q", got, seed)
+	}
+	persistWritableFolder(t, target, WritableFolderRemove("/a"))
+	want := "attribution: true\nwritable_folders: []\n"
+	if got := readAt(t, target); got != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+	_, raw, _, err := LoadYAML(target)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	composed, err := Compose(nil, raw)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	if c, out := writableCache(t, composed, root, resolvedTempDir(t)); len(c.writableFolders) != 0 || out != "" {
+		t.Fatalf("writableFolders = %q, stderr = %q; want none", c.writableFolders, out)
+	}
+}
+
+func TestPersist_WritableFolders_ConcurrentAddsBothSurvive(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "settings.yaml")
+	writeAt(t, target, "writable_folders:\n  - /seed\n")
+	var wg sync.WaitGroup
+	for _, entry := range []string{"/one", "/two"} {
+		wg.Go(func() { persistWritableFolder(t, target, WritableFolderAdd(entry)) })
+	}
+	wg.Wait()
+	got := readAt(t, target)
+	if got != "writable_folders:\n- /seed\n- /one\n- /two\n" && got != "writable_folders:\n- /seed\n- /two\n- /one\n" {
+		t.Fatalf("file = %q, want the seed and both additions", got)
+	}
+}
+
+func TestPersist_WritableFolders_RejectsBadPayloadOrExistingValue(t *testing.T) {
+	for _, tc := range []struct {
+		name, seed string
+		payload    any
+	}{
+		{"string slice payload", "writable_folders:\n  - /a\n", []string{"/b"}},
+		{"string payload", "writable_folders:\n  - /a\n", "/b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, target, tc.seed)
+			reason, _, err := Persist(target, KeyWritableFolders, tc.payload)
+			if reason != ReasonRereadParseError || err == nil {
+				t.Fatalf("Persist = (%q, %v), want (%q, an error)", reason, err, ReasonRereadParseError)
+			}
+			if got := readAt(t, target); got != tc.seed {
+				t.Fatalf("file = %q, want unchanged %q", got, tc.seed)
+			}
+		})
+	}
+	for _, seed := range []string{"writable_folders: /a\n", "writable_folders:\n  - 1\n"} {
+		target := filepath.Join(t.TempDir(), "settings.yaml")
+		writeAt(t, target, seed)
+		if step, _, err := RewriteKey(target, KeyWritableFolders, WritableFolderAdd("/b")); step != fsutil.LoadStep || err == nil {
+			t.Fatalf("RewriteKey on %q = (%q, %v), want (%q, an error)", seed, step, err, fsutil.LoadStep)
+		}
+		if got := readAt(t, target); got != seed {
+			t.Fatalf("file = %q, want unchanged %q", got, seed)
+		}
+	}
+}
+
+func TestPersist_WritableFolders_IndentedRootKeepsSiblings(t *testing.T) {
+	const before = "  attribution: true # keep\n"
+	const after = "  sessions:\n    retention_days: 7\n"
+	for _, tc := range []struct {
+		name, list string
+		payload    any
+	}{
+		{"add", "  writable_folders:\n  - /a\n  - /b\n", WritableFolderAdd("/b")},
+		{"remove", "  writable_folders: []\n", WritableFolderRemove("/a")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, target, before+"  writable_folders:\n    - /a\n"+after)
+			persistWritableFolder(t, target, tc.payload)
+			if got, want := readAt(t, target), before+tc.list+after; got != want {
+				t.Fatalf("file = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPersist_WritableFolders_IndentedRootInsertsMissingKey(t *testing.T) {
+	const before = "  attribution: true # keep\n"
+	target := filepath.Join(t.TempDir(), "settings.yaml")
+	writeAt(t, target, before)
+	persistWritableFolder(t, target, WritableFolderAdd("/a"))
+	got := readAt(t, target)
+	if !strings.HasPrefix(got, before) {
+		t.Fatalf("file = %q, want it to start with the untouched %q line", got, before)
+	}
+	var decoded map[string]any
+	if err := yaml.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("decode %q: %v", got, err)
+	}
+	if folders, _ := decoded[writableFoldersKey].([]any); !slices.Equal(folders, []any{"/a"}) || decoded["attribution"] != true {
+		t.Fatalf("decoded = %v, want writable_folders [/a] and attribution true", decoded)
+	}
+}
+
+func TestPersist_WritableFolders_MultilineLastEntryReplacedWhole(t *testing.T) {
+	const tail = "attribution: true\n"
+	for _, tc := range []struct {
+		name, entry string
+		payload     any
+		want        []any
+	}{
+		{"double-quoted/add", "  - \"/a\n    /b\"\n", WritableFolderAdd("/c"), []any{"/a /b", "/c"}},
+		{"double-quoted/remove", "  - /z\n  - \"/a\n    /b\"\n", WritableFolderRemove("/a /b"), []any{"/z"}},
+		{"plain/add", "  - /a\n    /b\n", WritableFolderAdd("/c"), []any{"/a /b", "/c"}},
+		{"plain/remove", "  - /z\n  - /a\n    /b\n", WritableFolderRemove("/a /b"), []any{"/z"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, target, "writable_folders:\n"+tc.entry+tail)
+			persistWritableFolder(t, target, tc.payload)
+			got := readAt(t, target)
+			if !strings.HasSuffix(got, "\n"+tail) {
+				t.Fatalf("file = %q, want it to end with the untouched %q line", got, tail)
+			}
+			var decoded map[string]any
+			if err := yaml.Unmarshal([]byte(got), &decoded); err != nil {
+				t.Fatalf("decode %q: %v", got, err)
+			}
+			if folders, _ := decoded[writableFoldersKey].([]any); !slices.Equal(folders, tc.want) || decoded["attribution"] != true {
+				t.Fatalf("decoded = %v, want writable_folders %v and attribution true", decoded, tc.want)
+			}
+		})
+	}
+}
+
+func TestPersist_WritableFolders_KeepsAnchorsSiblingAliasesUse(t *testing.T) {
+	const sibling = "blocked_paths:\n  - *folder\n"
+	for _, tc := range []struct {
+		name, list, want string
+		payload          any
+		folders          []any
+	}{
+		{"block/add", "writable_folders:\n  - &folder /a\n", "writable_folders:\n- &folder /a\n- /b\n", WritableFolderAdd("/b"), []any{"/a", "/b"}},
+		{"flow/add", "writable_folders: [&folder /a]\n", "writable_folders:\n- &folder /a\n- /b\n", WritableFolderAdd("/b"), []any{"/a", "/b"}},
+		{"block/remove-other", "writable_folders:\n  - /b\n  - &folder /a\n", "writable_folders:\n- &folder /a\n", WritableFolderRemove("/b"), []any{"/a"}},
+		{"flow/remove-other", "writable_folders: [/b, &folder /a]\n", "writable_folders:\n- &folder /a\n", WritableFolderRemove("/b"), []any{"/a"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, target, tc.list+sibling)
+			persistWritableFolder(t, target, tc.payload)
+			got := readAt(t, target)
+			if want := tc.want + sibling; got != want {
+				t.Fatalf("file = %q, want %q", got, want)
+			}
+			var decoded map[string]any
+			if err := yaml.Unmarshal([]byte(got), &decoded); err != nil {
+				t.Fatalf("decode %q: %v", got, err)
+			}
+			folders, _ := decoded[writableFoldersKey].([]any)
+			blocked, _ := decoded["blocked_paths"].([]any)
+			if !slices.Equal(folders, tc.folders) || !slices.Equal(blocked, []any{"/a"}) {
+				t.Fatalf("decoded = %v, want writable_folders %v and blocked_paths [/a]", decoded, tc.folders)
+			}
+		})
+	}
+	for _, seed := range []string{
+		"writable_folders:\n  - &folder /a\n  - /b\n" + sibling,
+		"writable_folders: [&folder /a, /b]\n" + sibling,
+	} {
+		target := filepath.Join(t.TempDir(), "settings.yaml")
+		writeAt(t, target, seed)
+		if reason, _, err := Persist(target, KeyWritableFolders, WritableFolderRemove("/a")); reason == ReasonNone || err == nil || !strings.Contains(err.Error(), "&folder") {
+			t.Fatalf("Persist removing the anchored entry = (%q, %v), want a refusal naming &folder", reason, err)
+		}
+		if got := readAt(t, target); got != seed {
+			t.Fatalf("file = %q, want unchanged %q", got, seed)
 		}
 	}
 }

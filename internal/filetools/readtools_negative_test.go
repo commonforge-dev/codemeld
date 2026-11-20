@@ -302,6 +302,44 @@ func TestReadOnlyTools_ExternalReadAnchorsOutputAtExternalRoot(t *testing.T) {
 	})
 }
 
+func TestReadOnlyTools_ExternalRootSwappedAtRootOpenRefused(t *testing.T) {
+	root := eval(t, t.TempDir())
+	home := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		tool interface {
+			InvokeWithResolvedTarget(context.Context, map[string]any, string) (tools.Result, error)
+		}
+		args map[string]any
+	}{
+		{"list", NewListTool(home, root, root, negTestCap), map[string]any{}},
+		{"tree", NewTreeTool(home, root, root, negTestCap), map[string]any{}},
+		{"glob", NewGlobTool(home, root, root, negTestCap), map[string]any{"pattern": "**/*"}},
+		{"file_count", NewFileCountTool(home, root, root, negTestCap), map[string]any{}},
+		{"grep", NewGrepTool(home, root, root, negTestCap), map[string]any{"pattern": "SENTINEL"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ext := filepath.Join(eval(t, t.TempDir()), "ext")
+			mkdir(t, ext)
+			secret := eval(t, t.TempDir())
+			writeFile(t, filepath.Join(secret, "SENTINEL"), "SENTINEL\n")
+			swapped := false
+			t.Cleanup(SetWalkBeforeRootOpenForTest(func() {
+				if !swapped {
+					swapped = true
+					replaceWithSymlink(t, ext, secret)
+				}
+			}))
+
+			res, err := tc.tool.InvokeWithResolvedTarget(context.Background(), tc.args, ext)
+			assertInBandRejection(t, tc.name, res, err)
+			if strings.Contains(string(res.Stdout), "SENTINEL") {
+				t.Fatalf("%s stdout = %q, want no entry from the swapped-in folder", tc.name, res.Stdout)
+			}
+		})
+	}
+}
+
 // TestReadOnlyTools_TildeFormsRejected pins Done-when 3: the ~user form and an out-of-root ~ form are
 // rejected in-band for every tool, before any read, with no out-of-root canary leaking.
 func TestReadOnlyTools_TildeFormsRejected(t *testing.T) {

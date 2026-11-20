@@ -765,18 +765,28 @@ func TestOpenRouterModels_RemoveClearsCapsThenQuantizations(t *testing.T) {
 }
 
 type fakeHostQuantizations struct {
-	counts  map[string]int
+	offers  []provider.OpenRouterHostOffer
 	state   provider.OpenRouterHostsState
 	calls   []string
 	fetched []func()
 }
 
-func (f *fakeHostQuantizations) query(model string, fetched func()) (map[string]int, provider.OpenRouterHostsState) {
+func countedOffers(counts map[string]int) []provider.OpenRouterHostOffer {
+	var offers []provider.OpenRouterHostOffer
+	for level, n := range counts {
+		for range n {
+			offers = append(offers, provider.OpenRouterHostOffer{Quantization: level, Priced: true})
+		}
+	}
+	return offers
+}
+
+func (f *fakeHostQuantizations) query(model string, fetched func()) ([]provider.OpenRouterHostOffer, provider.OpenRouterHostsState) {
 	f.calls = append(f.calls, model)
 	if f.state == provider.OpenRouterHostsPending {
 		f.fetched = append(f.fetched, fetched)
 	}
-	return f.counts, f.state
+	return f.offers, f.state
 }
 
 func openTableWithHosts(t *testing.T, a *App, q *fakeHostQuantizations) {
@@ -790,7 +800,7 @@ func openTableWithHosts(t *testing.T, a *App, q *fakeHostQuantizations) {
 }
 
 func TestOpenRouterModels_EditDialogShowsTheEditedModelsOfferedLevels(t *testing.T) {
-	const allLevels = "providers per level: bf16 2, fp16 1, fp4 14, fp8 9, int4 7, int8 3, mxfp4 1, nvfp4 3, unknown 12, unspecified 5"
+	const allLevels = "Total providers per level: bf16 2, fp16 1, fp4 14, fp8 9, int4 7, int8 3, mxfp4 1, nvfp4 3, unknown 12, unspecified 5"
 	for _, tc := range []struct {
 		name   string
 		counts map[string]int
@@ -801,13 +811,13 @@ func TestOpenRouterModels_EditDialogShowsTheEditedModelsOfferedLevels(t *testing
 			"ready", map[string]int{"unknown": 12, "nvfp4": 3, "fp8": 9, "fp4": 14, "": 5, "int8": 3, "bf16": 2, "mxfp4": 1, "int4": 7, "fp16": 1},
 			provider.OpenRouterHostsReady, allLevels,
 		},
-		{"only unspecified", map[string]int{"": 4}, provider.OpenRouterHostsReady, "providers per level: unspecified 4"},
-		{"empty successful list", map[string]int{}, provider.OpenRouterHostsReady, "providers per level: none"},
+		{"only unspecified", map[string]int{"": 4}, provider.OpenRouterHostsReady, "Total providers per level: unspecified 4"},
+		{"empty successful list", map[string]int{}, provider.OpenRouterHostsReady, "Total providers per level: none"},
 		{"pending", nil, provider.OpenRouterHostsPending, "checking providers\u2026"},
 		{"failed", nil, provider.OpenRouterHostsFailed, "provider list unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			q := &fakeHostQuantizations{counts: tc.counts, state: tc.state}
+			q := &fakeHostQuantizations{offers: countedOffers(tc.counts), state: tc.state}
 			a := New(nil)
 			openTableWithHosts(t, a, q)
 			ed := openEditor(t, a, "z-ai/glm-4.6")
@@ -844,7 +854,7 @@ func TestOpenRouterModels_OfferedLevelsCompletionRedrawsTheLiveDialogOnTheEventL
 	defer h.stop()
 	a.running.Store(true)
 	defer a.running.Store(false)
-	q.counts, q.state = map[string]int{"fp8": 2}, provider.OpenRouterHostsReady
+	q.offers, q.state = countedOffers(map[string]int{"fp8": 2}), provider.OpenRouterHostsReady
 	q.fetched[0]()
 
 	var offered, prompt, levels string
@@ -853,13 +863,13 @@ func TestOpenRouterModels_OfferedLevelsCompletionRedrawsTheLiveDialogOnTheEventL
 		offered, prompt, levels = ed.offeredText, ed.prompt.GetText(), ed.levels.GetText()
 		focused, live = a.app.GetFocus() == ed.levels, a.settingsPicker.maxPrice == ed
 	})
-	if offered != "providers per level: fp8 2" {
+	if offered != "Total providers per level: fp8 2" {
 		t.Errorf("offered line after the fetch = %q", offered)
 	}
 	if prompt != "0.7" || levels != "fp8 int4" || !focused || !live {
 		t.Errorf("draft after the redraw = %q / %q, focus kept %v, same dialog %v", prompt, levels, focused, live)
 	}
-	if got := screenTextSync(a, h.screen); !strings.Contains(got, "providers per level: fp8 2") {
+	if got := screenTextSync(a, h.screen); !strings.Contains(got, "Total providers per level: fp8 2") {
 		t.Errorf("screen after the fetch does not show the offered line:\n%s", got)
 	}
 }
@@ -885,7 +895,7 @@ func TestOpenRouterModels_OfferedLevelsCompletionForAClosedOrReplacedDialogIsIne
 			tc.leave(t, a)
 			calls := len(q.calls)
 
-			q.counts, q.state = map[string]int{"fp8": 1}, provider.OpenRouterHostsReady
+			q.offers, q.state = countedOffers(map[string]int{"fp8": 1}), provider.OpenRouterHostsReady
 			q.fetched[0]()
 			if len(q.calls) != calls {
 				t.Errorf("host lookups after a stale completion = %q, want none added", q.calls[calls:])
@@ -903,5 +913,86 @@ func TestOpenRouterModels_OfferedLevelsCompletionForAClosedOrReplacedDialogIsIne
 				}
 			}
 		})
+	}
+}
+
+func TestOpenRouterModels_EditorCoversTheModelsPageFooter(t *testing.T) {
+	const footer = "add a   edit enter   remove r   esc back"
+	a := New(nil)
+	openModelsTable(t, a, maxPriceSettings(capsFixture()))
+	if got := screenText(drawPrimitive(t, a.pages, 80, 24)); !strings.Contains(got, footer) {
+		t.Fatalf("models page does not draw its footer:\n%s", got)
+	}
+	openEditor(t, a, maxPriceModelID)
+	if got := screenText(drawPrimitive(t, a.pages, 80, 24)); strings.Contains(got, footer) {
+		t.Errorf("models footer still visible with the editor open:\n%s", got)
+	}
+}
+
+func liveTableRowPos(h *appHarness, row int) (int, int) {
+	var x, y int
+	h.a.app.QueueUpdate(func() { x, y, _, _ = h.a.settingsPicker.models.table.GetRect() })
+	return x + 2, y + row
+}
+
+func TestOpenRouterModels_EditorSwallowsClicksOnTheTableBehind(t *testing.T) {
+	a := New(nil)
+	f := maxPriceSettings(capsFixture())
+	openModelsTable(t, a, f)
+	ed := openEditor(t, a, maxPriceModelID)
+	h := newAppHarnessFor(t, a, 80, 24)
+	defer h.stop()
+
+	x, y := liveTableRowPos(h, 1)
+	liveClickAt(t, h, x, y)
+	var selected string
+	var focus tview.Primitive
+	a.app.QueueUpdate(func() { selected, focus = selectedTableModel(a), a.app.GetFocus() })
+	if selected != maxPriceModelID || focus != ed.prompt {
+		t.Fatalf("after a click on a table row: selected %q, focus %T; want %q and the input field", selected, focus, maxPriceModelID)
+	}
+
+	var cx, cy int
+	a.app.QueueUpdate(func() { cx, cy, _, _ = ed.completion.GetRect() })
+	liveClickAt(t, h, cx+1, cy)
+	var completionFocused bool
+	a.app.QueueUpdate(func() { focus, completionFocused = a.app.GetFocus(), ed.completion.HasFocus() })
+	if !completionFocused {
+		t.Fatalf("click on the output field: focus %T, want the output field", focus)
+	}
+
+	h.screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	waitOnLoop(t, a, "the editor closing", func() bool { return a.settingsPicker.maxPrice != ed })
+	var editing, tableFocused bool
+	a.app.QueueUpdate(func() {
+		editing = a.settingsPicker.maxPrice != nil || a.pages.HasPage(openRouterModelsEditPage)
+		selected, tableFocused = selectedTableModel(a), a.app.GetFocus() == a.settingsPicker.models.table
+	})
+	if editing || selected != maxPriceModelID || !tableFocused {
+		t.Errorf("after Enter: editor open %v, selected %q, table focused %v; want the editor submitted", editing, selected, tableFocused)
+	}
+	if len(f.wrote) != 0 {
+		t.Errorf("writes = %v, want none for unchanged caps", f.wrote)
+	}
+}
+
+func TestOpenRouterModels_AddPageSwallowsClicksOnTheTableBehind(t *testing.T) {
+	a := New(nil)
+	openModelsTable(t, a, maxPriceSettings(capsFixture()))
+	tableKey(a, runeKey('a'))
+	field := a.app.GetFocus()
+	if _, ok := field.(*tview.InputField); !ok || !a.pages.HasPage(openRouterModelsAddPage) {
+		t.Fatal("a opened no focused add page")
+	}
+	h := newAppHarnessFor(t, a, 80, 24)
+	defer h.stop()
+
+	x, y := liveTableRowPos(h, 1)
+	liveClickAt(t, h, x, y)
+	var selected string
+	var focus tview.Primitive
+	a.app.QueueUpdate(func() { selected, focus = selectedTableModel(a), a.app.GetFocus() })
+	if selected != maxPriceModelID || focus != field {
+		t.Errorf("after a click on a table row: selected %q, focus %T; want %q and the add filter", selected, focus, maxPriceModelID)
 	}
 }

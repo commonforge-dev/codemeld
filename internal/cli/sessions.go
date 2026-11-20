@@ -10,6 +10,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -147,6 +148,10 @@ func newSessionsCommand(stdout, stderr io.Writer) *ucli.Command {
 					"the check ran (before_mutating_call, before_final_success, or startup). A startup\n" +
 					"halt has no turn or round to close, so it is reported on its own; an in-turn halt\n" +
 					"is reported with the security_halted turn_terminal that closed its round.\n\n" +
+					"A sandbox_write_refused finding (a warning) names a write the sandbox likely\n" +
+					"refused while a command failed: the folder to allow, the environment variable\n" +
+					"that names it, and the fix (/settings, folders tab, press a). A refusal no\n" +
+					"folder can fix gives its reason instead.\n\n" +
 					"Two findings describe an incomplete agent turn. A turn_terminal recording any\n" +
 					"outcome other than completed or cancelled is an error, named by its turn and\n" +
 					"round. A provider round that carries a turn/round pair but that no turn_terminal\n" +
@@ -696,6 +701,10 @@ type finding struct {
 	Phase            string   `json:"phase,omitempty"`
 	Reason           string   `json:"reason,omitempty"`
 	Path             string   `json:"path,omitempty"`
+	Folder           string   `json:"folder,omitempty"`
+	Variable         string   `json:"variable,omitempty"`
+	Fix              string   `json:"fix,omitempty"`
+	Prediction       string   `json:"prediction,omitempty"`
 	DetectionPoint   string   `json:"detection_point,omitempty"`
 	Outcome          string   `json:"outcome,omitempty"`
 	FailurePhase     string   `json:"failure_phase,omitempty"`
@@ -739,7 +748,7 @@ func classifyFinding(ev sessions.Event) (sev string, isFinding bool) {
 			return sevError, true
 		}
 		return "", false
-	case events.KindModelEffortUnsupported:
+	case events.KindModelEffortUnsupported, events.KindSandboxWriteRefused:
 		return sevWarning, true
 	case events.KindSlashCommand:
 		if slashFailed(ev.Payload) {
@@ -962,6 +971,14 @@ func toFinding(ev sessions.Event, sev string) finding {
 		// The settings path is the only free-form value a halt record carries, and the
 		// human report is line-oriented, so it cannot forge lines of its own.
 		f.Path, f.DetectionPoint = fserrors.CollapseControls(p.Path), p.DetectionPoint
+	case events.KindSandboxWriteRefused:
+		var p events.SandboxWriteRefused
+		_ = json.Unmarshal(ev.Payload, &p)
+		f.Path, f.Folder, f.Variable = fserrors.CollapseControls(p.Path), fserrors.CollapseControls(p.Folder), fserrors.CollapseControls(p.Variable)
+		f.Reason, f.Prediction = fserrors.CollapseControls(p.Reason), "likely"
+		if p.Folder != "" {
+			f.Fix = sandboxWriteFix
+		}
 	case events.KindTurnTerminal:
 		var p events.TurnTerminal
 		_ = json.Unmarshal(ev.Payload, &p)
@@ -1000,9 +1017,12 @@ func findingDetail(f finding) string {
 			parts = append(parts, k+"="+v)
 		}
 	}
+	add("prediction", f.Prediction)
 	add("phase", f.Phase)
 	add("reason", f.Reason)
 	add("path", f.Path)
+	add("folder", f.Folder)
+	add("variable", f.Variable)
 	add("detection_point", f.DetectionPoint)
 	add("outcome", f.Outcome)
 	add("failure_phase", f.FailurePhase)
@@ -1027,6 +1047,9 @@ func findingDetail(f finding) string {
 	}
 	if len(f.Anomalies) > 0 {
 		parts = append(parts, "anomaly="+strings.Join(f.Anomalies, ","))
+	}
+	if f.Fix != "" {
+		parts = append(parts, fmt.Sprintf("fix=%q", f.Fix))
 	}
 	if f.ErrorDetail != "" {
 		parts = append(parts, fmt.Sprintf("error_detail=%q", f.ErrorDetail))
@@ -2362,6 +2385,7 @@ var showKinds = []string{
 	events.KindProviderRoundTrip,
 	events.KindProviderStreamIdle,
 	events.KindQueuedPromptDiscarded,
+	events.KindSandboxWriteRefused,
 	events.KindSecurityStateHalted,
 	events.KindSessionForked,
 	events.KindSessionPruneSummary,
@@ -2718,11 +2742,34 @@ func renderEvent(w io.Writer, n int, e sessions.Event) {
 		writeIndented(w, "    ", connectDecisionText(d))
 		return
 	}
+	var sw events.SandboxWriteRefused
+	if e.Kind == events.KindSandboxWriteRefused && json.Unmarshal(e.Payload, &sw) == nil {
+		writeIndented(w, "    ", sandboxWriteRefusedText(sw))
+		return
+	}
 	if pretty, ok := prettyJSON(e.Payload); ok {
 		writeIndented(w, "    ", pretty)
 	} else {
 		writeIndented(w, "    ", strings.TrimSpace(string(e.Payload)))
 	}
+}
+
+const sandboxWriteFix = "/settings, folders tab, press a"
+
+func sandboxWriteRefusedText(p events.SandboxWriteRefused) string {
+	esc := permissions.SingleLineControlEscape
+	line := "sandbox likely refused write: " + esc(p.Path)
+	if p.Process != "" {
+		line += " (" + esc(p.Process) + ")"
+	}
+	if p.Folder == "" {
+		return line + "\nnot grantable: " + esc(cmp.Or(p.Reason, "unknown reason"))
+	}
+	folder := esc(p.Folder)
+	if p.Variable != "" {
+		folder += " (" + esc(p.Variable) + ")"
+	}
+	return line + "\nto allow it, add the writable folder " + folder + ": " + sandboxWriteFix
 }
 
 func connectDecisionText(d events.ConnectDecision) string {

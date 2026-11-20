@@ -850,9 +850,9 @@ func startPermissionsSettingsTUIWithDiscovered(t *testing.T, seed string, sel *m
 	}
 	var cache *config.Cache
 	production := newSettingsDeps
-	newSettingsDeps = func(app *tui.App, c *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
+	newSettingsDeps = func(app *tui.App, c *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 		cache = c
-		return production(app, c, active, authorizer)
+		return production(app, c, active, authorizer, writable)
 	}
 	t.Cleanup(func() { newSettingsDeps = production })
 
@@ -1346,9 +1346,9 @@ func TestPermissionsRevoke_SessionGrantIsDurableWithoutTouchingSettings(t *testi
 
 	var live *syncGrants
 	production := newSettingsDeps
-	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
+	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 		live = authorizer.grants
-		return production(app, cache, active, authorizer)
+		return production(app, cache, active, authorizer, writable)
 	}
 	defer func() { newSettingsDeps = production }()
 
@@ -3874,9 +3874,9 @@ func startEstimateTUI(t *testing.T, baseURL string, sel *model.Selection, store 
 	t.Cleanup(func() { openRouterEndpoints = prevStore })
 	h := &estimateTUI{t: t}
 	production := newSettingsDeps
-	newSettingsDeps = func(app *tui.App, c *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer) tui.SettingsDeps {
+	newSettingsDeps = func(app *tui.App, c *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
 		h.cache = c
-		return production(app, c, active, authorizer)
+		return production(app, c, active, authorizer, writable)
 	}
 	t.Cleanup(func() { newSettingsDeps = production })
 	openrouter := map[string]any{"base_url": baseURL, "api_key": "or-key"}
@@ -4125,7 +4125,7 @@ func TestF1940_OpenRouterModelsDialog_OfferedLevelsThroughProductionDepsAndStore
 	edit("q/one")
 	<-srv.entered
 	close(srv.release)
-	h.awaitOfferedLevels("  providers per level: fp8 2, nvfp4 1, unspecified 1")
+	h.awaitOfferedLevels("  Total providers per level: fp8 2, nvfp4 1, unspecified 1")
 	expectRequests("after editing q/one", "q/one")
 
 	srv.block()

@@ -434,6 +434,7 @@ type doctorFindings struct {
 		RoundID        string `json:"round_id"`
 		Path           string `json:"path"`
 		DetectionPoint string `json:"detection_point"`
+		Prediction     string `json:"prediction"`
 	} `json:"findings"`
 	Summary struct {
 		Error   int `json:"error"`
@@ -4216,6 +4217,8 @@ func TestSessionsHelp(t *testing.T) {
 				"security_state_halted, and a non-zero tool exit code are errors",
 				"A security_state_halted finding names the protected settings file and the point",
 				"halt has no turn or round to close, so it is reported on its own",
+				"A sandbox_write_refused finding (a warning) names a write the sandbox likely",
+				"that names it, and the fix (/settings, folders tab, press a)",
 			},
 		},
 		{
@@ -5182,6 +5185,45 @@ func TestSessionsDoctor_SecurityStateHaltFindings(t *testing.T) {
 	if got := report.Findings[2]; got.Kind != events.KindTurnTerminal || got.Severity != "error" ||
 		got.Outcome != events.TurnOutcomeSecurityHalted || got.RoundID != haltedRound {
 		t.Errorf("terminal finding = %+v, want a security_halted error on the halted round", got)
+	}
+}
+
+func TestSessionsDoctor_SandboxWriteRefusedFindings(t *testing.T) {
+	path := writeSession(t, "sandboxwrite", []sessions.Record{
+		eventRecord(events.KindSandboxWriteRefused, events.SandboxWriteRefused{
+			Path: "/ssdtmp/go-build/e3/x-a", Process: "go", Folder: "/ssdtmp/go-build", Variable: "GOCACHE",
+		}),
+		eventRecord(events.KindSandboxWriteRefused, events.SandboxWriteRefused{Path: "/etc/x", Process: "sh", Reason: "blocked path"}),
+	})
+
+	out := runDoctor(t, path)
+	for _, want := range []string{
+		"findings: 2 (error: 0, warning: 2, info: 0)",
+		"[warning] sandbox_write_refused",
+		`prediction=likely path=/ssdtmp/go-build/e3/x-a folder=/ssdtmp/go-build variable=GOCACHE fix="/settings, folders tab, press a"`,
+		"prediction=likely reason=blocked path path=/etc/x",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("doctor output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "fix=") != 1 {
+		t.Errorf("want the /settings fix only on the refusal with a folder:\n%s", out)
+	}
+	for _, f := range doctorJSON(t, path).Findings {
+		if f.Prediction != "likely" {
+			t.Errorf("json finding %+v lacks prediction=likely", f)
+		}
+	}
+
+	show := runShow(t, path, "--kind", "sandbox_write_refused")
+	for _, want := range []string{
+		"    sandbox likely refused write: /ssdtmp/go-build/e3/x-a (go)\n    to allow it, add the writable folder /ssdtmp/go-build (GOCACHE): /settings, folders tab, press a\n",
+		"    sandbox likely refused write: /etc/x (sh)\n    not grantable: blocked path\n",
+	} {
+		if !strings.Contains(show, want) {
+			t.Errorf("show output missing %q:\n%s", want, show)
+		}
 	}
 }
 

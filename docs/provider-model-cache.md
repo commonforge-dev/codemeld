@@ -19,9 +19,14 @@ Per provider (`config.DiscoveredProvider` in `internal/config/discovered_models.
 - `models` — sanitized model ids plus whitelisted selection/capability metadata (display name, context
   window, input modalities, reasoning-effort options). Never API keys, auth headers, prompts, or raw
   provider responses.
-- `refreshed_at` — RFC3339 timestamp of the last successful picker refresh (advisory). Only the
-  picker refresh sets it; `/connect` and login-time discovery leave it empty.
+- `refreshed_at` — RFC3339 timestamp of the last successful `ProviderCatalogRefresher` discovery
+  (advisory): the picker refresh or headless `--model` first-use discovery. `/connect` and
+  login-time discovery leave it empty.
 - `source` — a static, secret-free label of where the ids came from.
+- `client_version` — `openai-chatgpt` only: the highest Codex client version a successful discovery saved; a later discovery that saves a lower one keeps the stored value, and a failed discovery saves nothing
+  (`RefreshChatGPTModelCache` in `internal/provider/openai_chatgpt_client.go`). The next discovery
+  sends the highest of this value, the npm registry's current Codex version, and the compiled
+  `chatGPTCodexClientVersion`.
 
 The store's write path (`sanitizeProvider`) redacts any secret-shaped key or value as a backstop, so
 auth material cannot reach disk even if a producer places it in the free-form metadata.
@@ -30,9 +35,9 @@ auth material cannot reach disk even if a producer places it in the free-form me
 
 Ordinary catalog construction, `/model` validation, and picker row rendering read `models.yaml`
 **locally, with no network I/O**. Nothing repopulates it on a startup poll or a plain catalog read — a
-write happens only through one of the three discovery writers below.
+write happens only through one of the four discovery writers below.
 
-Three paths write `models.yaml`, each a credentialed, redirect-refusing `/models` request. API-key
+Four paths write `models.yaml`, each a credentialed, redirect-refusing `/models` request. API-key
 discovery goes through `provider.DiscoverAPIKeyModels`; ChatGPT discovery goes through
 `provider.RefreshChatGPTModelCache` with the stored login session:
 
@@ -47,6 +52,10 @@ discovery goes through `provider.DiscoverAPIKeyModels`; ChatGPT discovery goes t
   already-configured API-key provider through `provider.DiscoverAPIKeyModels`, or — only on a forced
   (CTRL-R) refresh — `openai-chatgpt` through `provider.RefreshChatGPTModelCache`. The service itself
   imports no TUI code.
+- **Headless `codemeld run --model`** (`overrideDetermineModelStep` in
+  `internal/bootstrap/headless.go`) runs `ProviderCatalogRefresher` once when the selected id is not in
+  the catalog and the API-key provider has no `models.yaml` entry yet, then validates the selection
+  again. It never discovers `openai-chatgpt`.
 
 ## Reasoning-effort capabilities
 
@@ -147,8 +156,14 @@ classification carrying no API key, auth header, provider body, or raw upstream 
 This is provider egress, not telemetry: the only outbound traffic is the provider's own credentialed
 `/models` request — to an API-key provider's configured base URL, or to the pinned ChatGPT discovery
 base URL `https://chatgpt.com/backend-api/codex` — plus, for `openai-chatgpt`, session traffic to
-`https://auth.openai.com` for login and session renewal. Discovery runs only when the user connects a
-provider, logs in to ChatGPT, or the model picker requests a refresh. A forced picker refresh of
+`https://auth.openai.com` for login and session renewal. ChatGPT discovery also makes the one
+uncredentialed request, `GET https://registry.npmjs.org/@openai/codex/latest`, to read the current
+Codex client version (`lookupCodexVersion` in `internal/provider/openai_chatgpt_client.go`); a failed
+lookup falls back to the saved or built-in version. The lookup has its own 5-second limit, and its
+time counts against the overall 15-second discovery limit, so a slow lookup leaves discovery less
+time. Discovery runs only when the user connects a provider, logs in to ChatGPT, the model picker
+requests a refresh, or a headless `codemeld run --model` names an API-key provider with no entry in
+`models.yaml` (first use). A forced picker refresh of
 `openai-chatgpt` renews a near-expiry stored session before discovery but never starts a login: with
 no stored session it ends as `credential_unavailable`. None of these clients follows a redirect. No
 data is sent anywhere else, and nothing but sanitized model metadata is written to the cache.

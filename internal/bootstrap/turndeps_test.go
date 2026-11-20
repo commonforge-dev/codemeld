@@ -998,7 +998,59 @@ func TestTurnController_DispatchWiresRetryAndRollback(t *testing.T) {
 	}
 }
 
-const togetherIgnoredNotice = "Provider together failing to respond. Removing for rest of this session"
+func TestTurnController_DispatchUsesConfiguredNoOutputLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		retry string
+		want  time.Duration
+	}{
+		{"configured", "  retry:\n    no_output_timeout_minutes: 7\n", 7 * time.Minute},
+		{"absent", "", 20 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var turns sync.WaitGroup
+			defer swapGoTurn(waitableGoTurn(&turns))()
+
+			client := &stubTurnClient{fn: func(context.Context, provider.Request) (provider.Response, error) {
+				return provider.Response{Stream: newStream(contentChunk("Hi"), finishChunk("stop"))}, nil
+			}}
+			defer swapTurnProviderClient(func(provider.ClientConfig) provider.Client { return client })()
+
+			var deps turn.Deps
+			defer swapToolLoop(func(d turn.Deps, disp turn.ToolDispatcher, n int) *turn.ToolLoop {
+				deps = d
+				return turn.NewToolLoop(d, disp, n)
+			})()
+
+			settings := writeGlobalSettings(t, t.TempDir(), "provider:\n"+tc.retry+"  openai:\n    base_url: https://api.openai.com/v1\n    api_key: sk-test\n", 0o600)
+			seedOpenAIDiscoveredWithEfforts(t, settings, []string{"medium"}, "gpt-5.5")
+			_, raw, cat, err := config.LoadYAML(settings)
+			if err != nil {
+				t.Fatalf("config.LoadYAML = (%q, %v)", cat, err)
+			}
+			composed, err := config.Compose(raw, nil)
+			if err != nil {
+				t.Fatalf("config.Compose: %v", err)
+			}
+			cache, err := config.NewCache(composed, t.TempDir(), []string{settings})
+			if err != nil {
+				t.Fatalf("config.NewCache: %v", err)
+			}
+
+			ctl := newTurnController(context.Background(), &recordingSurface{}, cache, turnSelection("openai", "gpt-5.5", model.EffortDefault), nil, nil)
+			if err := ctl.dispatch(mkStore(t), time.Time{}); err != nil {
+				t.Fatalf("dispatch error = %v, want nil", err)
+			}
+			turns.Wait()
+
+			if deps.Retry.NoOutputLimit != tc.want {
+				t.Fatalf("Deps.Retry.NoOutputLimit = %v, want %v", deps.Retry.NoOutputLimit, tc.want)
+			}
+		})
+	}
+}
+
+const togetherIgnoredNotice ="Provider together failing to respond. Removing for rest of this session"
 
 func unavailableUpstreamDrop() *ssestream.Stream[openai.ChatCompletionChunk] {
 	body := `{"error":{"code":502,"message":"Upstream error from Together: service unavailable","metadata":{"error_type":"provider_unavailable"}}}`
