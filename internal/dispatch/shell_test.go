@@ -4055,6 +4055,159 @@ func TestDispatchShell_ClearedEnvironmentJJNeverReachesTheRunner(t *testing.T) {
 	}
 }
 
+func TestDispatchShell_AutoAllowedGitRunsWithIsolationFlags(t *testing.T) {
+	prependFixturePrograms(t, "git")
+	global := []string{"git", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "--no-pager"}
+	owned := func(tail ...string) []string { return append(slices.Clone(global), tail...) }
+	for _, tc := range []struct {
+		input string
+		want  [][]string
+	}{
+		{"git status", [][]string{owned("status")}},
+		{"git -C . status", [][]string{owned("-C", ".", "status")}},
+		{"git -C . log -p", [][]string{owned("-C", ".", "log", "--no-ext-diff", "--no-textconv", "-p")}},
+		{"git diff", [][]string{owned("diff", "--no-ext-diff", "--no-textconv")}},
+		{"git diff --stat", [][]string{owned("diff", "--no-ext-diff", "--no-textconv", "--stat")}},
+		{"git diff HEAD~0 -- file", [][]string{owned("diff", "--no-ext-diff", "--no-textconv", "HEAD~0", "--", "file")}},
+		{"git log --patch", [][]string{owned("log", "--no-ext-diff", "--no-textconv", "--patch")}},
+		{"git log -p -1", [][]string{owned("log", "--no-ext-diff", "--no-textconv", "-p", "-1")}},
+		{"git show --stat", [][]string{owned("show", "--no-ext-diff", "--no-textconv", "--stat")}},
+		{"git 'diff'", [][]string{owned("diff", "--no-ext-diff", "--no-textconv")}},
+		{"git status | wc -l", [][]string{owned("status"), {"wc", "-l"}}},
+		{"git status && git show", [][]string{owned("status"), owned("show", "--no-ext-diff", "--no-textconv")}},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			cwd := t.TempDir()
+			run := &fakeRunner{}
+
+			if _, err := DispatchShell(context.Background(), tc.input, t.TempDir(), cwd, modeAuthorizer{mode: "build", root: cwd}, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(run.calls) != len(tc.want) {
+				t.Fatalf("runner calls = %d, want %d", len(run.calls), len(tc.want))
+			}
+			for i, want := range tc.want {
+				if !slices.Equal(run.calls[i].Argv, want) {
+					t.Fatalf("call %d Argv = %v, want exactly %v", i, run.calls[i].Argv, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDispatchShell_NonAutoGitKeepsTheOriginalArgv(t *testing.T) {
+	prependFixturePrograms(t, "git")
+	for _, tc := range []struct {
+		input    string
+		wantArgv []string
+	}{
+		{"git --no-pager diff", []string{"git", "--no-pager", "diff"}},
+		{"VAR=x git diff", []string{"git", "diff"}},
+		{"git status 2>/dev/null", []string{"sh", "-c", "git status 2>/dev/null"}},
+		{"git diff >/dev/null 2>&1", []string{"sh", "-c", "git diff >/dev/null 2>&1"}},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			cwd := t.TempDir()
+			run := &fakeRunner{}
+			_, err := DispatchShell(context.Background(), tc.input, t.TempDir(), cwd, modeAuthorizer{mode: "plan", root: cwd}, run)
+			var denied *DeniedError
+			if !errors.As(err, &denied) || len(run.calls) != 0 {
+				t.Fatalf("DispatchShell(%q) error = %v, runner calls = %d, want a denial before the runner", tc.input, err, len(run.calls))
+			}
+
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			if _, err := DispatchShell(context.Background(), tc.input, t.TempDir(), cwd, auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			if len(run.calls) != 1 {
+				t.Fatalf("runner calls = %d, want 1", len(run.calls))
+			}
+			if !slices.Equal(run.calls[0].Argv, tc.wantArgv) {
+				t.Fatalf("Argv = %v, want exactly %v", run.calls[0].Argv, tc.wantArgv)
+			}
+		})
+	}
+}
+
+func gitFixture(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@example.invalid"}, args...)...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func TestDispatchShell_AutoAllowedGitRunsNoRepositoryConfiguredProgram(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	for _, tc := range []struct {
+		key, input, wantOut string
+		control             []string
+	}{
+		{"core.fsmonitor", "git status", "tracked.txt", []string{"status"}},
+		{"core.fsmonitor", "git diff", "+again", []string{"diff"}},
+		{"diff.external", "git diff", "+again", []string{"diff"}},
+		{"diff.marker.textconv", "git diff", "+again", []string{"diff"}},
+		{"diff.marker.textconv", "git log -p", "+changed", []string{"log", "-p"}},
+		{"diff.marker.textconv", "git show", "+changed", []string{"show"}},
+		{"core.pager", "git status", "tracked.txt", nil},
+		{"core.pager", "git diff", "+again", nil},
+		{"core.pager", "git log -p", "+changed", nil},
+		{"core.pager", "git show", "+changed", nil},
+		{"core.fsmonitor", "git -C . status", "tracked.txt", []string{"-C", ".", "status"}},
+		{"core.fsmonitor", "git diff --stat", "tracked.txt", []string{"diff", "--stat"}},
+		{"diff.marker.textconv", "git diff HEAD~0 -- tracked.txt", "+again", []string{"diff", "HEAD~0", "--", "tracked.txt"}},
+		{"diff.marker.textconv", "git log --patch", "+changed", []string{"log", "--patch"}},
+		{"diff.marker.textconv", "git log -p -1", "+changed", []string{"log", "-p", "-1"}},
+		{"core.pager", "git show --stat", "tracked.txt", nil},
+		{"diff.marker.textconv", "git 'diff'", "+again", []string{"diff"}},
+	} {
+		t.Run(tc.key+" "+tc.input, func(t *testing.T) {
+			cwd := t.TempDir()
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+			t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+			gitFixture(t, cwd, "init", "-q", ".")
+			writeFile(t, filepath.Join(cwd, ".gitattributes"), "*.txt diff=marker\n")
+			writeFile(t, filepath.Join(cwd, "tracked.txt"), "seed\n")
+			gitFixture(t, cwd, "add", ".")
+			gitFixture(t, cwd, "commit", "-qm", "seed")
+			writeFile(t, filepath.Join(cwd, "tracked.txt"), "seed\nchanged\n")
+			gitFixture(t, cwd, "commit", "-qam", "changed")
+			writeFile(t, filepath.Join(cwd, "tracked.txt"), "seed\nchanged\nagain\n")
+			marker := filepath.Join(home, "marker")
+			script := writeFixtureProgram(t, home, "hook", `touch `+marker+`; [ -f "$1" ] && cat "$1"; exit 0`)
+			gitFixture(t, cwd, "config", tc.key, script)
+
+			if tc.control != nil {
+				control := exec.Command("git", tc.control...)
+				control.Dir = cwd
+				if out, err := control.CombinedOutput(); err != nil {
+					t.Fatalf("control %s: %v\n%s", tc.input, err, out)
+				}
+				if _, err := os.Stat(marker); err != nil {
+					t.Fatalf("control %s did not create the marker: the fixture proves nothing", tc.input)
+				}
+				removeAll(t, []string{marker})
+			}
+
+			res, err := DispatchShell(context.Background(), tc.input, home, cwd, modeAuthorizer{mode: "build", root: cwd}, realPipelineRunner{cap: 64})
+			if err != nil {
+				t.Fatalf("DispatchShell(%q): %v", tc.input, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("marker exists after %q: git ran the program %s names", tc.input, tc.key)
+			}
+			if out := string(res.Stdout); !strings.Contains(out, tc.wantOut) {
+				t.Fatalf("output of %q = %q, want it to contain %q", tc.input, out, tc.wantOut)
+			}
+		})
+	}
+}
+
 func TestDispatchShell_PromptApprovedHgKeepsTheOrdinaryEnvironment(t *testing.T) {
 	prependFixturePrograms(t, "hg")
 	for _, tc := range []struct{ name, input string }{
@@ -5954,6 +6107,452 @@ func TestDispatchShell_OutsideMarkReachesOnlyItsCallsNextRunOfTheSubject(t *test
 		}
 		if want := []outsideRun{{"ls", false}}; !slices.Equal(run.runs, want) {
 			t.Fatalf("runs %+v, want %+v", run.runs, want)
+		}
+	})
+}
+
+type pipeHeadRunner struct {
+	fakePipelineRunner
+	mark   string
+	heads  []string
+	feeds  []string
+	leaked []string
+}
+
+func (r *pipeHeadRunner) PreflightPipeline(ctx context.Context, _ []runner.RunSpec) error {
+	if IsPipeHead(ctx) {
+		r.leaked = append(r.leaked, "preflight")
+	}
+	return ErrPipelineUnsupported
+}
+
+func (r *pipeHeadRunner) ExecutionContext(ctx context.Context) context.Context {
+	if IsPipeHead(ctx) {
+		r.leaked = append(r.leaked, "execution context")
+	}
+	return ctx
+}
+
+func (r *pipeHeadRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
+	if IsPipeHead(ctx) {
+		r.heads = append(r.heads, ShellSubject(ctx))
+	}
+	if FeedsPipe(ctx) {
+		r.feeds = append(r.feeds, spec.Argv[0])
+	}
+	if ShellSubject(ctx) == r.mark {
+		MarkPipeHeadOutside(ctx)
+	}
+	return r.fakeRunner.Exec(ctx, spec)
+}
+
+func TestDispatchShell_PipeHeadIsOnlyEachGroupsFirstRunAndItsMarkFailsThatGroup(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta", "gamma", "delta", "magick")
+	for _, tc := range []struct {
+		command, mark string
+		exits         []int
+		heads         []string
+		want          int
+	}{
+		{"alpha | beta", "alpha", []int{3, 0}, []string{"alpha"}, 3},
+		{"alpha | beta", "", []int{3, 0}, []string{"alpha"}, 0},
+		{"alpha | beta", "beta", []int{3, 0}, []string{"alpha"}, 0},
+		{"alpha", "", []int{3}, []string{"alpha"}, 3},
+		{"alpha | beta; gamma | delta", "alpha", []int{0, 0, 5, 0}, []string{"alpha", "gamma"}, 0},
+		{"alpha | beta; gamma | delta", "gamma", []int{0, 0, 5, 0}, []string{"alpha", "gamma"}, 5},
+		{"command -v magick | beta", "beta", []int{0}, nil, 0},
+	} {
+		t.Run(tc.command+" marking "+tc.mark, func(t *testing.T) {
+			run := &pipeHeadRunner{mark: tc.mark}
+			for _, code := range tc.exits {
+				run.fakeRunner.results = append(run.fakeRunner.results, runner.RunResult{ExitCode: code})
+			}
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			res, err := DispatchShell(context.Background(), tc.command, t.TempDir(), t.TempDir(), auth, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(run.leaked) != 0 || !slices.Equal(run.heads, tc.heads) || res.ExitCode != tc.want {
+				t.Fatalf("heads %q, leaked to %q, exit %d; want %q, none, exit %d", run.heads, run.leaked, res.ExitCode, tc.heads, tc.want)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_OnlyAStageFeedingAFollowingProcessIsMarked(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta", "gamma", "delta", "magick")
+	for _, tc := range []struct {
+		command string
+		feeds   []string
+	}{
+		{"alpha | beta", []string{"alpha"}},
+		{"alpha | beta | gamma", []string{"alpha", "beta"}},
+		{"alpha", nil},
+		{"alpha | beta; gamma | delta", []string{"alpha", "gamma"}},
+		{"alpha && beta", nil},
+		{"alpha | command -v magick", nil},
+		{"alpha | beta \"$(gamma)\"", nil},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			run := &pipeHeadRunner{}
+			for range 4 {
+				run.fakeRunner.results = append(run.fakeRunner.results, runner.RunResult{})
+			}
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			if _, err := DispatchShell(context.Background(), tc.command, t.TempDir(), t.TempDir(), auth, run); err != nil {
+				t.Fatal(err)
+			}
+			var feeds []string
+			for _, argv0 := range run.feeds {
+				feeds = append(feeds, filepath.Base(argv0))
+			}
+			if len(run.calls) == 0 || !slices.Equal(feeds, tc.feeds) {
+				t.Fatalf("marked %q of %d runs, want %q", feeds, len(run.calls), tc.feeds)
+			}
+		})
+	}
+}
+
+type entryMatchingRunner struct {
+	fakePipelineRunner
+	unsaved bool
+	asked   []permissions.MatchRequest
+}
+
+func (r *entryMatchingRunner) MatchOutsideEntry(_ context.Context, req permissions.MatchRequest) (string, bool) {
+	r.asked = append(r.asked, req)
+	return "saved", !r.unsaved
+}
+
+func TestDispatchShell_SavedCommandWithMergedStderrRunsAsStagesWithOnlyTheFirstMerged(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta", "gamma", "delta", "sh")
+	for _, tc := range []struct {
+		command  string
+		plain    string
+		argv     []string
+		streamed []string
+		dir      string
+	}{
+		{command: "alpha 2>&1", plain: "alpha", argv: []string{"alpha"}},
+		{command: "alpha run  2>&1", plain: "alpha run", argv: []string{"alpha run"}},
+		{command: "alpha\t 2>&1", plain: "alpha", argv: []string{"alpha"}},
+		{command: "sh script.sh 2>&1", plain: "sh script.sh", argv: []string{"sh script.sh"}},
+		{command: "./prog 2>&1", plain: "./prog", argv: []string{"./prog"}},
+		{command: "alpha ~/x 2>&1", plain: "alpha ~/x", argv: []string{"alpha {home}/x"}},
+		{command: "alpha 2>&1 | beta -60", plain: "alpha | beta -60", argv: []string{"alpha", "beta -60"}},
+		{command: "alpha 2>&1 |  beta", plain: "alpha | beta", argv: []string{"alpha", "beta"}},
+		{command: "alpha 2>&1 | alpha | alpha", plain: "alpha | alpha | alpha", argv: []string{"alpha", "alpha", "alpha"}},
+		{command: "alpha 2>&1 | beta && alpha", plain: "alpha | beta && alpha", argv: []string{"alpha", "beta", "alpha"}},
+		{command: "alpha 2>&1 | beta; gamma | delta", plain: "alpha | beta; gamma | delta", argv: []string{"alpha", "beta"}, streamed: []string{"gamma", "delta"}},
+		{command: "  cd sub && alpha 2>&1 | beta ", plain: "cd sub && alpha | beta", argv: []string{"alpha", "beta"}, dir: "sub"},
+	} {
+		for _, perStage := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s per stage %v", tc.command, perStage), func(t *testing.T) {
+				home, cwd := t.TempDir(), mustEval(t, t.TempDir())
+				writeFixtureProgram(t, cwd, "prog", "exit 0")
+				mkdir(t, filepath.Join(cwd, "sub"))
+				dispatchOne := func(command string, run Runner) *fakeAuthorizer {
+					auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+					var bound Authorizer = auth
+					if perStage {
+						bound = struct{ Authorizer }{auth}
+					}
+					if _, err := DispatchShell(context.Background(), command, home, cwd, bound, run); err != nil {
+						t.Fatalf("DispatchShell(%q): %v", command, err)
+					}
+					return auth
+				}
+				run := &entryMatchingRunner{}
+				auth := dispatchOne(tc.command, run)
+				plain := dispatchOne(tc.plain, &fakePipelineRunner{})
+
+				if !reflect.DeepEqual(auth.requests, plain.requests) || !reflect.DeepEqual(auth.modeCtxs, plain.modeCtxs) {
+					t.Fatalf("requests = %+v in %+v, want those of %q: %+v in %+v", auth.requests, auth.modeCtxs, tc.plain, plain.requests, plain.modeCtxs)
+				}
+				if len(run.asked) == 0 || !reflect.DeepEqual(run.asked[0], auth.requests[0]) {
+					t.Fatalf("matched on %+v, want the first question about the first request %+v", run.asked, auth.requests[0])
+				}
+				body := "Whole command: " + strings.TrimSpace(tc.command)
+				for i, got := range auth.displays {
+					want := PromptDisplay{Action: "Run command", Subject: plain.displays[i].Subject, Body: body}
+					if got != want || plain.displays[i].Body != "" {
+						t.Fatalf("display %d = %+v, want %+v, and no body for %q", i, got, want, tc.plain)
+					}
+				}
+				var argv []string
+				for i, spec := range run.calls {
+					if spec.MergeStderr != (i == 0) || spec.Cwd != filepath.Join(cwd, tc.dir) {
+						t.Fatalf("run %d = %+v, want only the first merged, in %q", i, spec, filepath.Join(cwd, tc.dir))
+					}
+					argv = append(argv, strings.Join(spec.Argv, " "))
+				}
+				var streamed []string
+				for _, specs := range slices.Concat(run.preflights, run.runs) {
+					for _, spec := range specs {
+						if spec.MergeStderr {
+							t.Fatalf("pipeline spec = %+v, want no merged stage streamed", spec)
+						}
+						streamed = append(streamed, strings.Join(spec.Argv, " "))
+					}
+				}
+				wantArgv := strings.ReplaceAll(strings.Join(tc.argv, "\n"), "{home}", home)
+				if strings.Join(argv, "\n") != wantArgv || !slices.Equal(streamed, slices.Concat(tc.streamed, tc.streamed)) {
+					t.Fatalf("ran %q, streamed %q; want %q and %q", argv, streamed, wantArgv, tc.streamed)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchShell_UnrecognizedMergedStderrKeepsItsRouteWithoutANewError(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta", "gamma", "sh", "env")
+	bin, _, _ := strings.Cut(os.Getenv("PATH"), string(os.PathListSeparator))
+	for _, command := range []string{
+		`alpha\ 2>&1`,
+		`alpha\ 2>&1 | beta`,
+		"alpha '~/\xff' 2>&1",
+		"nosuchprogram 2>&1",
+		"alpha 2>&1 | nosuchprogram",
+		"alpha 2>&1 | beta && nosuchprogram",
+
+		"alpha 2>&1|beta",
+		"alpha 2>&1 |beta",
+		"alpha 2>&1  | beta",
+		"alpha 2>&1 |\tbeta",
+		"alpha 2>&1\t| beta",
+		"alpha\t2>&1",
+		"alpha\t2>&1 | beta",
+		"alpha 2>&1| beta",
+		"alpha 2>& 1",
+		"alpha 2> &1",
+		"alpha 2 >&1",
+		"alpha 02>&1",
+		"alpha 1>&2",
+		"alpha 2>&1;",
+		"alpha 2>&1 || beta",
+		"alpha 2>&1 2>&1",
+
+		"alpha | beta 2>&1",
+		"alpha | beta 2>&1 | gamma",
+		"alpha; beta 2>&1",
+		"alpha; beta 2>&1 | gamma",
+		"alpha > out 2>&1",
+		"sh -c alpha 2>&1",
+		"cd sub && cd '' && alpha 2>&1",
+		"cd sub && cd . && alpha 2>&1",
+		"X=1 alpha 2>&1",
+		"X=1 alpha 2>&1 | beta",
+		"env -i PATH=" + bin + " alpha 2>&1",
+		"alpha\u00a0 2>&1",
+		"alpha x\v 2>&1",
+		"alpha x\f 2>&1",
+
+		"alpha 2>&1 | beta > out",
+		"alpha 2>&1 | beta 2>&1",
+		"alpha 2>&1 | beta &",
+		"alpha 2>&1 | X=1 beta",
+		"alpha 2>&1 | sh",
+		"sh script.sh 2>&1 | beta",
+		`alpha 2>&1 | beta # \ ; gamma`,
+		"alpha 2>&1 | beta x\u00a0 | gamma",
+
+		"alpha *.log 2>&1",
+		"alpha # 2>&1 | beta",
+		"alpha 2>&1 | beta *.log",
+		"alpha 2>&1 | beta ^FAIL",
+		`alpha 2>&1 | beta; gamma "EXIT=$?"`,
+
+		"alpha",
+		"alpha | beta",
+		"alpha; beta",
+		"alpha && beta | gamma",
+		"alpha '2>&1 | beta'",
+		"alpha $(beta) 2>&1",
+	} {
+		t.Run(fmt.Sprintf("%q", command), func(t *testing.T) {
+			home, cwd := t.TempDir(), t.TempDir()
+			mkdir(t, filepath.Join(cwd, "sub"))
+			dispatchOne := func(run Runner) (*fakeAuthorizer, string) {
+				auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+				_, err := DispatchShell(context.Background(), command, home, cwd, auth, run)
+				return auth, fmt.Sprint(err)
+			}
+			run, without := &entryMatchingRunner{}, &fakePipelineRunner{}
+			got, gotErr := dispatchOne(run)
+			if strings.HasPrefix(gotErr, "codemeld: not run: ") {
+				if len(got.requests)+len(run.calls)+len(run.runs) != 0 {
+					t.Fatalf("requests %+v, runs %+v; want the refusal to authorize and run nothing", got.requests, run.calls)
+				}
+				return
+			}
+			want, wantErr := dispatchOne(without)
+			if gotErr != wantErr || !reflect.DeepEqual(got.requests, want.requests) || !reflect.DeepEqual(got.displays, want.displays) ||
+				!reflect.DeepEqual(run.calls, without.calls) || !reflect.DeepEqual(run.runs, without.runs) {
+				t.Fatalf("got %v %+v %+v, want %v %+v %+v as without the matcher", gotErr, got.requests, run.calls, wantErr, want.requests, without.calls)
+			}
+			for _, display := range got.displays {
+				if display.Body != "" {
+					t.Fatalf("display = %+v, want no body outside the two forms", display)
+				}
+			}
+			if strings.Contains(command, ">") && !strings.Contains(command, "'2>&1") && !strings.Contains(command, "$(") &&
+				(gotErr != "<nil>" || len(got.requests) != 1 || got.requests[0].Kind != "literal") {
+				t.Fatalf("err %v, requests %+v; want one literal request and no error", gotErr, got.requests)
+			}
+		})
+	}
+
+	t.Run("no entry", func(t *testing.T) {
+		run := &entryMatchingRunner{unsaved: true}
+		auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+		if _, err := DispatchShell(context.Background(), "alpha 2>&1 | beta", t.TempDir(), t.TempDir(), auth, run); err != nil {
+			t.Fatal(err)
+		}
+		if len(run.asked) == 0 || len(auth.requests) != 1 || auth.requests[0].Kind != "literal" || auth.displays[0].Body != "" ||
+			!slices.Equal(run.calls[0].Argv, []string{"sh", "-c", "alpha 2>&1 | beta"}) || run.calls[0].MergeStderr {
+			t.Fatalf("requests %+v, runs %+v; want the unmerged literal route", auth.requests, run.calls)
+		}
+	})
+}
+
+func TestDispatchShell_MergedStderrRouteKeepsItsOwnRefusals(t *testing.T) {
+	prependFixturePrograms(t, "cat", "alpha", "beta")
+	home, cwd, ssh, guard := blockedSSHGuard(t)
+	for _, suffix := range []string{"", " | beta"} {
+		command := "cat " + ssh + "/k 2>&1" + suffix
+		run := &entryMatchingRunner{}
+		auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+		_, err := DispatchShell(context.Background(), command, home, cwd, auth, run, guard)
+		var refusal *securitystate.Refusal
+		if !errors.As(err, &refusal) || refusal.SubjectKind != "direct" || refusal.Subject != "cat "+ssh+"/k" || len(auth.requests)+len(run.calls) != 0 {
+			t.Fatalf("%q: err = %v, want the stage refused before any approval", command, err)
+		}
+	}
+
+	run := &entryMatchingRunner{}
+	auth := &fakeAuthorizer{bySubject: map[string]authBehavior{"alpha": {decision: grantDecision()}, "beta": {decision: denyDecision("no")}}}
+	_, err := DispatchShell(context.Background(), "alpha 2>&1 | beta", home, cwd, auth, run)
+	var denied *DeniedError
+	if !errors.As(err, &denied) || len(run.calls)+len(run.preflights) != 0 {
+		t.Fatalf("err = %v, runs = %+v; want a denied stage to run nothing", err, run.calls)
+	}
+}
+
+type savedEntryRunner struct {
+	fakePipelineRunner
+	entries []string
+}
+
+func (r *savedEntryRunner) MatchOutsideEntry(_ context.Context, req permissions.MatchRequest) (string, bool) {
+	var grants []permissions.PermissionEntry
+	for _, entry := range r.entries {
+		grants = append(grants, permissions.PermissionEntry{Kind: "direct", Subject: entry, PathScope: "*", GrantKind: "global"})
+	}
+	result := permissions.Match(req, grants)
+	if !result.Matched {
+		return "", false
+	}
+	return result.Grant.Subject, true
+}
+
+func sandboxedEntryText(entry, command, reason string) string {
+	return `codemeld: not run: "` + entry + `" is in outside_sandbox_commands (.codemeld/settings.local.yaml), but this call would keep it in the sandbox` + "\n" +
+		"Reason: " + reason + ".\n" +
+		"Instead: run `" + command + "` on its own, or as `" + command + " 2>&1 | <command that needs no shell>`; a failure of `" + command + "` is then the call's exit status, so PIPESTATUS is not needed"
+}
+
+func TestDispatchShell_RefusesACallThatWouldKeepASavedOutsideCommandSandboxed(t *testing.T) {
+	prependFixturePrograms(t, "mise", "tail", "echo", "sh")
+	const needsShell, piped = "the call needs the shell", "the command receives piped input"
+	for _, tc := range []struct {
+		command, entry, reason string
+	}{
+		{`mise run check 2>&1 | tail -6; echo "EXIT=${PIPESTATUS[0]}"`, "mise run check", needsShell},
+		{`cd {cwd} && mise run check 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"`, "mise run check", needsShell},
+		{"mise run check 2>&1; echo x", "mise run check", needsShell},
+		{"mise run check 2>&1|tail", "mise run check", needsShell},
+		{"mise run check 2>/dev/null", "mise run check", needsShell},
+		{"sh -c 'mise run check'", "mise run check", needsShell},
+		{"echo x | mise run check", "mise run check", piped},
+		{"echo x | mise run check; echo y", "mise run check", piped},
+		{"echo x | mise run check -v", "mise run :*", piped},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			home, cwd := t.TempDir(), mustEval(t, t.TempDir())
+			run := &savedEntryRunner{entries: []string{"tail -60", tc.entry}}
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			_, err := DispatchShell(context.Background(), strings.ReplaceAll(tc.command, "{cwd}", cwd), home, cwd, auth, run)
+			var malformed *MalformedCommandError
+			command := "mise run check"
+			if strings.HasSuffix(tc.entry, "*") {
+				command = "mise run check -v"
+			}
+			if !errors.As(err, &malformed) || err.Error() != sandboxedEntryText(tc.entry, command, tc.reason) {
+				t.Fatalf("err = %v, want the refusal naming %q because %s", err, tc.entry, tc.reason)
+			}
+			if len(auth.requests)+auth.batchCalls+len(run.calls)+len(run.preflights)+len(run.runs) != 0 {
+				t.Fatalf("requests %+v, runs %+v %+v; want nothing authorized or started", auth.requests, run.calls, run.runs)
+			}
+		})
+	}
+}
+
+func TestDispatchShell_CallsThatRunTheSavedCommandOutsideOrNeverNameItAreNotRefused(t *testing.T) {
+	prependFixturePrograms(t, "mise", "tail", "echo", "sh", "env")
+	for _, tc := range []struct {
+		command  string
+		entries  []string
+		subjects []string
+	}{
+		{"mise run check", nil, []string{"mise run check"}},
+		{"mise run check | tail -60", nil, []string{"mise run check", "tail -60"}},
+		{"mise run check; echo done", nil, []string{"mise run check", "echo done"}},
+		{"mise run check 2>&1", nil, []string{"mise run check"}},
+		{"mise run check 2>&1 | tail -60", nil, []string{"mise run check", "tail -60"}},
+		{"echo x | mise run check", []string{"echo x"}, []string{"echo x", "mise run check"}},
+		{"echo x | mise run check; echo x", []string{"echo x"}, []string{"echo x", "mise run check", "echo x"}},
+
+		{"notmise run check 2>&1", nil, []string{"notmise run check 2>&1"}},
+		{"mise run check-dev 2>&1", nil, []string{"mise run check-dev 2>&1"}},
+		{"echo 'mise run check' 2>&1", nil, []string{"echo 'mise run check' 2>&1"}},
+		{"X=1 mise run check 2>&1", nil, []string{"X=1 mise run check 2>&1"}},
+		{"env -i mise run check 2>&1", nil, []string{"env -i mise run check 2>&1"}},
+		{"mise run check > out.log 2>&1", nil, []string{"mise run check > out.log 2>&1"}},
+		{"mise run check | sh", nil, []string{"mise run check | sh"}},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			run := &savedEntryRunner{entries: append([]string{"mise run check"}, tc.entries...)}
+			auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+			if _, err := DispatchShell(context.Background(), tc.command, t.TempDir(), t.TempDir(), auth, run); err != nil {
+				t.Fatalf("DispatchShell: %v", err)
+			}
+			var subjects []string
+			for _, req := range auth.requests {
+				subjects = append(subjects, req.Subject)
+			}
+			if !slices.Equal(subjects, tc.subjects) || len(run.calls)+len(run.runs) == 0 {
+				t.Fatalf("authorized %q, ran %+v %+v; want %q authorized and run", subjects, run.calls, run.runs, tc.subjects)
+			}
+		})
+	}
+
+	t.Run("substitution", func(t *testing.T) {
+		run := &savedEntryRunner{entries: []string{"mise run check"}}
+		_, err := DispatchShell(context.Background(), "mise run check $(echo x)", t.TempDir(), t.TempDir(), &fakeAuthorizer{}, run)
+		var unsupported *UnsupportedConstructError
+		if !errors.As(err, &unsupported) {
+			t.Fatalf("err = %v, want the existing unsupported-construct refusal", err)
+		}
+	})
+
+	t.Run("no matcher or no entry", func(t *testing.T) {
+		for _, run := range []Runner{&fakePipelineRunner{}, &savedEntryRunner{entries: []string{"mise run check-dev"}}} {
+			for _, command := range []string{"mise run check 2>/dev/null", "echo x | mise run check"} {
+				auth := &fakeAuthorizer{fallback: &authBehavior{decision: grantDecision()}}
+				if _, err := DispatchShell(context.Background(), command, t.TempDir(), t.TempDir(), auth, run); err != nil || len(auth.requests) == 0 {
+					t.Fatalf("%q with %T: err = %v, requests %+v; want it authorized as before", command, run, err, auth.requests)
+				}
+			}
 		}
 	})
 }

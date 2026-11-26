@@ -40,6 +40,9 @@ type RunSpec struct {
 	Stdin                []byte
 	ExceptionalAuthority string
 	Helper               HelperLaunch
+	// MergeStderr is honored by Exec and ExecBounded only: Pipeline ignores it.
+	MergeStderr   bool
+	StdoutCapture int
 }
 
 // HelperLaunch.Close must be idempotent: the runner and the wrapper that prepared the spec both call it.
@@ -186,6 +189,9 @@ func (DirectExecRunner) Exec(ctx context.Context, spec RunSpec) (RunResult, erro
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if spec.MergeStderr {
+		cmd.Stderr = &stdout
+	}
 
 	start := time.Now()
 	err := cmd.Start()
@@ -259,6 +265,9 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 	}
 	cmd.Stdout = outW
 	cmd.Stderr = errW
+	if spec.MergeStderr {
+		cmd.Stderr = outW
+	}
 	inv := killGroupOnCancel(cmd, spec.InvocationID, outR, errR, inW)
 
 	start := time.Now()
@@ -280,7 +289,7 @@ func (DirectExecRunner) ExecBounded(ctx context.Context, spec RunSpec, maxCaptur
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stdoutCap = drainStream(outR, maxCapture)
+		stdoutCap = drainStream(outR, max(spec.StdoutCapture, maxCapture))
 	}()
 	go func() {
 		defer wg.Done()

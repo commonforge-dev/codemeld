@@ -27,6 +27,8 @@ const (
 	defaultRetentionDays          = 30
 	minMaxToolOutputBytes         = 256
 	defaultMaxToolOutputBytes     = 65536
+	minMaxPipeBytes               = 256
+	defaultMaxPipeBytes           = 16777216
 	// defaultMode is the launch default interaction mode applied when
 	// mode.default is omitted.
 	defaultMode = "build"
@@ -92,6 +94,7 @@ type Cache struct {
 	agentInstrMaxFileBytes int
 	retentionDays          int
 	maxToolOutputBytes     int
+	maxPipeBytes           int
 	vcsPriority            []string
 	vcsForce               string
 	modeDefault            string
@@ -118,6 +121,8 @@ type Cache struct {
 	permissions       []permissions.PermissionEntry
 
 	layeredPermissions []permissions.PermissionEntry
+
+	localAdmitted bool
 
 	declaredCommands []permissions.DeclaredCommand
 
@@ -155,6 +160,10 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 	if err != nil {
 		return nil, err
 	}
+	maxPipeBytes, err := resolveMaxPipeBytes(composed)
+	if err != nil {
+		return nil, err
+	}
 	retentionDays, err := resolveRetentionDays(composed)
 	if err != nil {
 		return nil, err
@@ -180,6 +189,7 @@ func NewCache(composed map[string]any, projectRoot string, layerPaths []string, 
 		agentInstrMaxFileBytes: nestedIntOr(composed, "agent_instructions", "max_file_bytes", defaultAgentInstrMaxFileBytes),
 		retentionDays:          retentionDays,
 		maxToolOutputBytes:     maxToolOutputBytes,
+		maxPipeBytes:           maxPipeBytes,
 		vcsPriority:            vcsPriorityOr(composed),
 		vcsForce:               nestedStringOr(composed, "vcs", "force", ""),
 		providers:              providers,
@@ -331,6 +341,8 @@ func (c *Cache) SetRetentionDays(days int) (PersistReason, fserrors.Category, er
 // MaxToolOutputBytes returns sessions.max_tool_output_bytes (default
 // 65536, minimum 256).
 func (c *Cache) MaxToolOutputBytes() int { return c.maxToolOutputBytes }
+
+func (c *Cache) MaxPipeBytes() int { return c.maxPipeBytes }
 
 // VCSPriority returns a copy of the vcs.priority tie-break order
 // (default [git, hg, jj]); mutating it does not change the cache.
@@ -674,6 +686,14 @@ func (c *Cache) LayeredPermissions() []permissions.PermissionEntry {
 	return slices.Clone(c.layeredPermissions)
 }
 
+func (c *Cache) SetLocalAdmitted(admitted bool) {
+	c.localAdmitted = admitted
+}
+
+func (c *Cache) LocalAdmitted() bool {
+	return c.localAdmitted
+}
+
 func layerRank(kind permissions.LayerKind) int {
 	switch kind {
 	case permissions.LayerLocal:
@@ -975,6 +995,25 @@ func resolveMaxToolOutputBytes(m map[string]any) (int, error) {
 	n := nestedIntOr(m, "sessions", "max_tool_output_bytes", defaultMaxToolOutputBytes)
 	if n < minMaxToolOutputBytes {
 		return 0, fmt.Errorf("sessions.max_tool_output_bytes must be >= %d, got %d", minMaxToolOutputBytes, n)
+	}
+	return n, nil
+}
+
+func resolveMaxPipeBytes(m map[string]any) (int, error) {
+	v, _ := nestedRaw(m, "sessions", "max_pipe_bytes")
+	switch n := v.(type) {
+	case uint64:
+		if n > math.MaxInt {
+			return math.MaxInt, nil
+		}
+	case float64:
+		if n >= math.MaxInt {
+			return math.MaxInt, nil
+		}
+	}
+	n := nestedIntOr(m, "sessions", "max_pipe_bytes", defaultMaxPipeBytes)
+	if n < minMaxPipeBytes {
+		return 0, fmt.Errorf("sessions.max_pipe_bytes must be >= %d, got %d", minMaxPipeBytes, n)
 	}
 	return n, nil
 }

@@ -162,7 +162,7 @@ promised to finish it and quietly get forgotten.
 The reference check does not wait for release: `mise run check` and `mise run check-race` run it
 too, as their last step. The secret scan and the vulnerability gate run only in `release-check`.
 
-The first two scan the exact set of files that ship to the public repository. They guard the
+The scanners share a shipping-file subset that excludes the gate scripts and the reference allowlist. They guard the
 public surface against two things a path-based ignore list cannot catch: a banned reference, or
 a secret, sitting *inside* a shipping file (an ignore list excludes whole paths, never file
 contents). That file list is built by `find` over the shipping roots, not from the VCS

@@ -241,8 +241,8 @@ func TestProductionDispatcher_BashEmitsToolExecEventsAndCapsModelOutput(t *testi
 	if err != nil {
 		t.Fatalf("Dispatch error = %v, want nil", err)
 	}
-	if res.Content != "AAAA" {
-		t.Fatalf("tool result content = %q, want capped model output %q", res.Content, "AAAA")
+	if want := "AAAA\n" + outputCutNotice("stdout", 4, 12); res.Content != want {
+		t.Fatalf("tool result content = %q, want %q", res.Content, want)
 	}
 	starts := kindEvents(t, store, events.KindToolExecStart)
 	ends := kindEvents(t, store, events.KindToolExecEnd)
@@ -2243,6 +2243,102 @@ func TestRealizeToolRegistry_CapPropagatesToVCSActions(t *testing.T) {
 	}
 	if end.OriginalBytes == nil || end.OriginalBytes.Stdout != outLen {
 		t.Fatalf("original_bytes.stdout = %v, want %d", end.OriginalBytes, outLen)
+	}
+}
+
+func TestProductionDispatcher_VCSDiffOverTheLimitGetsAnOutputNotice(t *testing.T) {
+	const cap = 256
+	const outLen = 512
+	root := t.TempDir()
+	tmpl := &vcs.Template{
+		Name:    "git",
+		Source:  "/etc/codemeld/vcs/git.yaml",
+		Actions: map[string]vcs.ActionSpec{"diff": {Argv: []string{"printf", "%s", strings.Repeat("A", outLen)}}},
+	}
+	cache, err := config.NewCache(map[string]any{
+		"sessions": map[string]any{"max_tool_output_bytes": cap},
+	}, root, nil)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	store := mkStore(t)
+	storeFn := func() *sessions.Store { return store }
+	reg, err := (&toolRegistryFactory{active: &ActiveVCS{Template: tmpl, RepoRoot: root}}).realize(cache, storeFn, t.TempDir(), root, securitystate.Policy{})
+	if err != nil {
+		t.Fatalf("realize error = %v", err)
+	}
+	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()}, t.TempDir(), root, storeFn, cap, securitystate.Policy{})
+
+	res, err := d.Dispatch(context.Background(), structuredCall("c1", "vcs_diff", nil))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v", err)
+	}
+	if want := strings.Repeat("A", cap) + "\n" + outputCutNotice("stdout", cap, outLen); res.Content != want {
+		t.Fatalf("content = %q, want %q", res.Content, want)
+	}
+}
+
+func TestProductionDispatcher_VCSCwdEscapeOverTheLimitGetsAStderrNotice(t *testing.T) {
+	const cap = 256
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), strings.Repeat("d", 120), strings.Repeat("e", 120), strings.Repeat("f", 120))
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(outside)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	tmpl := &vcs.Template{
+		Name:    "git",
+		Source:  "/etc/codemeld/vcs/git.yaml",
+		Actions: map[string]vcs.ActionSpec{"diff": {Argv: []string{"git", "diff"}, Cwd: outside}},
+	}
+	cache, err := config.NewCache(map[string]any{
+		"sessions": map[string]any{"max_tool_output_bytes": cap},
+	}, root, nil)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	store := mkStore(t)
+	storeFn := func() *sessions.Store { return store }
+	reg, err := (&toolRegistryFactory{active: &ActiveVCS{Template: tmpl, RepoRoot: root}}).realize(cache, storeFn, t.TempDir(), root, securitystate.Policy{})
+	if err != nil {
+		t.Fatalf("realize error = %v", err)
+	}
+	d := newProductionToolDispatcher(reg, &fakeDispatchRunner{}, &recordingAuthorizer{decision: allow()}, t.TempDir(), root, storeFn, cap, securitystate.Policy{})
+
+	res, err := d.Dispatch(context.Background(), structuredCall("c1", "vcs_diff", nil))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v", err)
+	}
+	stderr := "codemeld: vcs_diff: cwd escapes repo root: " + resolved
+	if want := "\n" + outputCutNotice("stderr", cap, len(stderr)); !strings.HasSuffix(res.Content, want) {
+		t.Fatalf("content = %q, want suffix %q", res.Content, want)
+	}
+}
+
+func TestProductionDispatcher_ReadOverTheLimitKeepsOnlyItsOwnIndicator(t *testing.T) {
+	const cap = 256
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "big.txt"), []byte(strings.Repeat("A", 2000)), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cache, err := config.NewCache(map[string]any{"sessions": map[string]any{"max_tool_output_bytes": cap}}, project, nil)
+	if err != nil {
+		t.Fatalf("config.NewCache: %v", err)
+	}
+	h := newReadToolsHarness(t, project, t.TempDir(), mode.Build, cache)
+
+	res, err := h.dispatcher.Dispatch(context.Background(), structuredCall("c1", filetools.ReadToolName, map[string]any{"path": "big.txt"}))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v", err)
+	}
+	if !strings.Contains(res.Content, filetools.MetadataPrefix) || strings.Contains(res.Content, "codemeld: output cut") {
+		t.Fatalf("content = %q, want the read tool's own indicator and no output notice", res.Content)
 	}
 }
 
@@ -8605,7 +8701,7 @@ func TestProductionDispatcher_ConfinedVCSSharesTheRealizedConfinement(t *testing
 	if !slices.Equal(got.Env, helperLaunchEnv(t, want)) {
 		t.Fatalf("vcs env = %v, want the fixed environment %v", got.Env, want)
 	}
-	wantHelperArgv(t, got.Argv, filepath.Join(conf.lookupPath, "git"), "status", "--short")
+	wantHelperArgv(t, got.Argv, filepath.Join(conf.lookupPath, "git"), "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "--no-pager", "status", "--short")
 	if policy, _ := decodeFrame(t, got.Stdin); policy.Mode != string(mode.Plan) {
 		t.Fatalf("vcs policy = %+v, want plan", policy)
 	}

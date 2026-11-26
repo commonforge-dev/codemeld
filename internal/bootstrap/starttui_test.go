@@ -5609,6 +5609,53 @@ func TestStartTUI_SettingsDepsBindLiveRowsRevokeAndShare(t *testing.T) {
 	}
 }
 
+func TestStartTUI_SettingsOutsideRemoveSandboxesTheNextRun(t *testing.T) {
+	root := mustCanonical(t, t.TempDir())
+	conf := proxyRouteUnitConfinement(t, root, savedOutsidePrograms...)
+	conf.mode = fixedMode(string(mode.Build))
+	conf.outside = &outsideSubjects{}
+	conf.writable = savedOutsideReader(t, root, "mise run check", "web_fetch", "go test :*")
+	t.Setenv("PATH", conf.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	run := func() (*confineInner, error) {
+		inner := &confineInner{}
+		_, err := dispatch.DispatchShell(context.Background(), "mise run check", "", root, &capturingAuthorizer{decision: allow()}, shellAdapter(conf, inner))
+		return inner, err
+	}
+	if inner, err := run(); err != nil || !ranOutside(inner) {
+		t.Fatalf("before remove: err = %v, ran outside = %v; want the saved entry to run outside", err, ranOutside(inner))
+	}
+
+	deps := captureSettingsDeps(t)
+	result := &BootstrapResult{
+		Home: t.TempDir(), LaunchDir: root, ProjectRoot: root, Session: mkStore(t),
+		TrustDecision: trust.Decision{Trusted: true, Reason: trust.ReasonTrusted, Root: root},
+	}
+	_, restore := startCaptured(t, context.Background(), result, io.Discard)
+	defer restore()
+
+	rows, unreadable := deps.Outside.List()
+	if unreadable != "" || len(rows) != 3 || rows[0] != (tui.WritableFolderRow{Entry: "mise run check"}) || rows[1].Invalid == "" || rows[2] != (tui.WritableFolderRow{Entry: "go test :*"}) {
+		t.Fatalf("listed rows = %+v, unreadable %q; want three entries with only web_fetch invalid", rows, unreadable)
+	}
+	if msg := deps.Outside.Remove("mise run check"); !strings.Contains(msg, "removed") {
+		t.Fatalf("Remove = %q, want a success line", msg)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, ".codemeld", "settings.local.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := raw["outside_sandbox_commands"], []any{"web_fetch", "go test :*"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("outside_sandbox_commands read back = %#v, want %#v", got, want)
+	}
+	inner, err := run()
+	requireSandboxedRuns(t, inner, err, 1)
+}
+
 func TestStartTUI_SettingsDepsCarryExplicitApprovalAndBoundary(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -7830,6 +7877,116 @@ func TestStartTUI_SavedNetworkAnswersWriteToTheRunsTargets(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = l.awaitReturn(t)
+		})
+	}
+}
+
+func captureStartedAuthorizer(t *testing.T) **productionAuthorizer {
+	t.Helper()
+	var captured *productionAuthorizer
+	production := newSettingsDeps
+	newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
+		captured = authorizer
+		return production(app, cache, active, authorizer, writable)
+	}
+	t.Cleanup(func() { newSettingsDeps = production })
+	return &captured
+}
+
+func TestStartTUI_AlwaysOutsideSavesTheCommandAndLaterRunsSkipThePrompt(t *testing.T) {
+	const exact, prefix = "", " :*"
+	tilde, homeVar := permissions.ExactSubject("touch", []string{"~/a"}), permissions.ExactSubject("touch", []string{"$HOME/a"})
+	for _, tc := range []struct {
+		command, scope string
+		unwrapped      bool
+		outside        []string
+		sandboxed      []string
+	}{
+		{command: "touch a", scope: "touch a" + exact, unwrapped: true, sandboxed: []string{"FOO=bar touch a", "env -i PATH=/usr/bin:/bin touch a"}},
+		{command: "touch a", scope: "touch" + prefix, unwrapped: true, outside: []string{"touch b"}, sandboxed: []string{"FOO=bar touch b"}},
+		{command: "FOO=bar touch a", scope: "touch a" + exact, sandboxed: []string{"touch a", "FOO=baz touch a"}},
+		{command: "FOO=bar touch a", scope: "touch" + prefix, outside: []string{"FOO=bar touch b"}, sandboxed: []string{"touch b"}},
+		{command: "A=1 B=2 touch a", scope: "touch a" + exact, sandboxed: []string{"B=2 A=1 touch a"}},
+		{command: "env -i PATH=/usr/bin:/bin touch a", scope: "touch a" + exact, sandboxed: []string{"touch a"}},
+		{command: "env -i PATH=/usr/bin:/bin touch a", scope: "touch" + prefix, outside: []string{"env -i PATH=/usr/bin:/bin touch b"}, sandboxed: []string{"touch b"}},
+		{command: "touch ~/a", scope: tilde + exact, sandboxed: []string{"touch '~/a'"}},
+		{command: "touch ~/a", scope: tilde + prefix, outside: []string{"touch ~/a b"}, sandboxed: []string{"touch '~/a' b"}},
+		{command: "touch '~/a'", scope: tilde + exact, sandboxed: []string{"touch ~/a"}},
+		{command: "touch $HOME/a", scope: homeVar + exact, sandboxed: []string{"touch '$HOME/a'"}},
+		{command: "touch $HOME/a", scope: homeVar + prefix, sandboxed: []string{"touch '$HOME/a' b"}},
+		{command: "FOO=bar touch ~/a", scope: tilde + exact, sandboxed: []string{"touch ~/a", "FOO=bar touch '~/a'"}},
+		{command: "FOO=bar touch ~/a", scope: "touch" + prefix, outside: []string{"FOO=bar touch '~/b'"}, sandboxed: []string{"touch ~/b"}},
+		{command: "env -i PATH=/usr/bin:/bin touch ~/a", scope: tilde + prefix, sandboxed: []string{"touch ~/a", "env -i PATH=/usr/bin:/bin touch '~/a'"}},
+		{command: "env -i PATH=/usr/bin:/bin FOO=bar touch $HOME/a", scope: homeVar + exact, sandboxed: []string{"env -i PATH=/usr/bin:/bin touch $HOME/a", "env -i PATH=/usr/bin:/bin FOO=bar touch '$HOME/a'"}},
+	} {
+		t.Run(tc.command+"/"+tc.scope, func(t *testing.T) {
+			root := mustCanonical(t, t.TempDir())
+			const committed = "# shared\n"
+			writeProjectSettings(t, root, committed)
+			writeLocalProjectSettings(t, root, "# mine\npermissions: []\n")
+			captured := captureStartedAuthorizer(t)
+			result := &BootstrapResult{
+				Home: t.TempDir(), LaunchDir: root, ProjectRoot: root, Session: mkStore(t),
+				TrustDecision: trust.Decision{Trusted: true, Reason: trust.ReasonTrusted, Root: root},
+			}
+			_, restore := startCaptured(t, context.Background(), result, io.Discard)
+			defer restore()
+			auth := *captured
+			if auth == nil || auth.saveOutside == nil {
+				t.Fatal("StartTUI did not wire the outside save function")
+			}
+
+			network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+			swapInvocationRefusals(t, network)
+			prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowSession, tui.OptionAlwaysOutside}}
+			auth.prompts.show = alwaysOutsideShower(prompts, tc.scope)
+			inner := &confineInner{exitCode: 1, stderr: []byte("boom")}
+			d := newProductionToolDispatcher(tools.NewRegistry(), inner, auth, t.TempDir(), root, auth.activeStore, 65536, securitystate.Policy{})
+			d.confinement = outsideConfinement(t, root, mode.Build)
+			d.confinement.outside = auth.outside
+			d.confinement.writable = auth.writable
+
+			got := dispatchOutside(t, d, tc.command)
+			if len(prompts.shown) != 2 || prompts.shown[1].ExceptionalAuthority != wantOutsideAuthority || !prompts.shown[1].OfferAlwaysOutside {
+				t.Fatalf("prompts = %+v, want the second to be the outside prompt offering to save", prompts.shown)
+			}
+			wantRuns(t, inner, 1, 1)
+			if !strings.Contains(got.Content, wantOutsideRetriedLine) || auth.outside.has(tc.command) || len(auth.outside.subjects) != 0 {
+				t.Fatalf("content = %q, remembered = %v; want the outside run's result in the same call and nothing remembered", got.Content, auth.outside.subjects)
+			}
+			decisions := decisionPayloads(t, result.Session)
+			if last := decisions[len(decisions)-1]; last.Outcome != "granted" || last.GrantKind != "" {
+				t.Fatalf("last decision = %+v, want a granted allow once", last)
+			}
+
+			data, list := readOutsideCommands(t, root)
+			if len(list) != 1 || (list[0] == tc.scope) != tc.unwrapped || !strings.Contains(data, "# mine") || !strings.Contains(data, "permissions: []") {
+				t.Fatalf("local settings after saving:\n%s", data)
+			}
+			if got, err := os.ReadFile(projectSettingsPath(root)); err != nil || string(got) != committed {
+				t.Fatalf("committed settings = %q, %v; want them unchanged", got, err)
+			}
+
+			dispatchOutside(t, d, tc.command)
+			dispatchOutside(t, d, tc.command)
+			if len(prompts.shown) != 2 {
+				t.Fatalf("prompts = %d, want none after saving", len(prompts.shown))
+			}
+			wantRuns(t, inner, 3, 1)
+
+			unconfined, confined := 3, 1
+			for _, command := range tc.outside {
+				prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
+				dispatchOutside(t, d, command)
+				unconfined++
+				wantRuns(t, inner, unconfined, confined)
+			}
+			for _, command := range tc.sandboxed {
+				prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
+				dispatchOutside(t, d, command)
+				confined++
+				wantRuns(t, inner, unconfined, confined)
+			}
 		})
 	}
 }

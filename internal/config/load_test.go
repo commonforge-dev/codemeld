@@ -862,3 +862,29 @@ func TestValidateLocalSettingsBytes_AcceptsWhatTheProjectLayerAlsoAccepts(t *tes
 		t.Fatalf("project cat = %q, err = %v; want LoadOK and nil", cat, err)
 	}
 }
+
+func TestValidateGlobalSettingsBytes_RejectsOutsideSandboxCommands(t *testing.T) {
+	content := "outside_sandbox_commands: [\"mise run check\"]\n"
+	path := writeFile(t, content, 0o600)
+	raw, cat, err := ValidateGlobalSettingsBytes([]byte(content), path)
+	if cat != SchemaValidationError || err == nil || raw != nil {
+		t.Fatalf("raw = %v, cat = %q, err = %v; want an outside_sandbox_commands rejection", raw, cat, err)
+	}
+	want := "outside_sandbox_commands is project-only and must be moved to the project's .codemeld/settings.local.yaml"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q missing %q", err.Error(), want)
+	}
+}
+
+func TestValidateProjectSettingsBytes_OutsideSandboxCommandsShape(t *testing.T) {
+	ok := "outside_sandbox_commands: [\"mise run check\", \"go test :*\"]\n"
+	raw, cat, err := ValidateProjectSettingsBytes([]byte(ok), writeFile(t, ok, 0o600))
+	if cat != LoadOK || err != nil || raw["outside_sandbox_commands"] == nil {
+		t.Fatalf("raw = %v, cat = %q, err = %v; want the key accepted", raw, cat, err)
+	}
+	for _, bad := range []string{"outside_sandbox_commands: \"mise run check\"\n", "outside_sandbox_commands: [\"\"]\n", "outside_sandbox_commands: [3]\n"} {
+		if _, cat, _ := ValidateProjectSettingsBytes([]byte(bad), writeFile(t, bad, 0o600)); cat != SchemaValidationError {
+			t.Fatalf("%q: cat = %q, want %q", bad, cat, SchemaValidationError)
+		}
+	}
+}

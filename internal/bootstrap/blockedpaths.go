@@ -129,49 +129,91 @@ func readLockedSettingsInfo(path string) (data []byte, info fs.FileInfo, found b
 }
 
 type writableFoldersReader struct {
-	path, home, projectRoot string
+	path, localPath, home, projectRoot string
+	localAdmitted                      bool
 
-	mu      sync.Mutex
-	info    fs.FileInfo
-	folders []string
+	mu        sync.Mutex
+	info      fs.FileInfo
+	folders   []string
+	localInfo fs.FileInfo
+	outside   []permissions.PermissionEntry
 }
 
 func newWritableFoldersReader(cache *config.Cache) *writableFoldersReader {
-	r := &writableFoldersReader{home: cache.LaunchHome(), projectRoot: cache.ProjectRoot()}
+	r := &writableFoldersReader{home: cache.LaunchHome(), projectRoot: cache.ProjectRoot(), localAdmitted: cache.LocalAdmitted()}
 	if r.projectRoot != "" && slices.Contains(cache.LayerPaths(), projectSettingsPath(r.projectRoot)) {
 		r.path = projectSettingsPath(r.projectRoot)
+	}
+	if r.localAdmitted {
+		r.localPath = config.LocalSettingsPath(r.projectRoot)
 	}
 	return r
 }
 
 func (r *writableFoldersReader) current() []string {
-	if r.path == "" || r.home == "" {
+	if r == nil || r.path == "" || r.home == "" {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	info, err := os.Lstat(r.path)
-	if err == nil && r.info != nil && sameSettingsStat(r.info, nil, info, nil) {
-		return slices.Clone(r.folders)
+	r.refresh()
+	return slices.Clone(r.folders)
+}
+
+func (r *writableFoldersReader) outsideSandboxEntries() []permissions.PermissionEntry {
+	if r == nil || r.localPath == "" || r.home == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, info, reread := rereadSettings(r.localPath, r.localInfo, config.ValidateLocalSettingsBytes)
+	if !reread {
+		return slices.Clone(r.outside)
+	}
+	items, _ := raw["outside_sandbox_commands"].([]any)
+	var outside []permissions.PermissionEntry
+	for _, item := range items {
+		if subject, ok := item.(string); ok && subject != "" {
+			outside = append(outside, permissions.PermissionEntry{Kind: "direct", Subject: subject, PathScope: "*", GrantKind: "global"})
+		}
+	}
+	r.localInfo, r.outside = info, outside
+	return slices.Clone(r.outside)
+}
+
+func (r *writableFoldersReader) refresh() {
+	raw, info, reread := rereadSettings(r.path, r.info, config.ValidateProjectSettingsBytes)
+	if !reread {
+		return
 	}
 	r.info, r.folders = nil, nil
-	if err != nil {
-		return nil
-	}
-	data, settled, found, err := readLockedSettingsInfo(r.path)
-	if err != nil || !found {
-		return nil
-	}
-	raw, _, err := config.ValidateProjectSettingsBytes(data, r.path)
-	if err != nil {
-		return nil
+	if info == nil {
+		return
 	}
 	folders, _, err := permissions.ParseWritableFolders(raw["writable_folders"], r.home, r.projectRoot)
 	if err != nil {
-		return nil
+		folders = nil
 	}
-	r.info, r.folders = settled, folders
-	return slices.Clone(folders)
+	r.info, r.folders = info, folders
+}
+
+func rereadSettings(path string, cached fs.FileInfo, validate func([]byte, string) (map[string]any, config.LoadFailure, error)) (raw map[string]any, info fs.FileInfo, reread bool) {
+	current, err := os.Lstat(path)
+	if err == nil && cached != nil && sameSettingsStat(cached, nil, current, nil) {
+		return nil, cached, false
+	}
+	if err != nil {
+		return nil, nil, true
+	}
+	data, settled, found, err := readLockedSettingsInfo(path)
+	if err != nil || !found {
+		return nil, nil, true
+	}
+	raw, _, err = validate(data, path)
+	if err != nil {
+		return nil, nil, true
+	}
+	return raw, settled, true
 }
 
 func blockedEntriesFromLayers(home string, layers []securitystate.LayerSnapshot) ([]permissions.BlockedEntry, error) {
@@ -302,13 +344,17 @@ func (r *blockedReread) rereadProject(file *blockedSettingsFile, validate settin
 		file.record(before, beforeErr)
 		return
 	case err != nil:
+		file.problem = "can't be read"
 		return
 	}
 	defer func() { _ = parent.Close() }()
-	release, _, err := locks.AcquireAt(parent, name+".lock", 0)
+	release, reason, err := locks.AcquireAt(parent, name+".lock", 0)
 	if release == nil {
-		if unsafeSettingsLock(err) {
+		switch {
+		case unsafeSettingsLock(err):
 			file.problem = "has an unsafe settings lock file"
+		case reason == locks.ReasonLockAcquireError:
+			file.problem = "can't be read"
 		}
 		return
 	}
@@ -472,5 +518,7 @@ func sameSettingsStat(a fs.FileInfo, aErr error, b fs.FileInfo, bErr error) bool
 	if aErr != nil || bErr != nil {
 		return errors.Is(aErr, fs.ErrNotExist) && errors.Is(bErr, fs.ErrNotExist)
 	}
-	return a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() && os.SameFile(a, b)
+	aCtime, aOK := settingsCtime(a)
+	bCtime, bOK := settingsCtime(b)
+	return a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() && a.Mode() == b.Mode() && aOK == bOK && aCtime == bCtime && os.SameFile(a, b)
 }

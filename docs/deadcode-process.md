@@ -17,7 +17,7 @@ noise is suppressed.
 
 Output format: `file.go:line:col: unreachable func: Name`
 
-`deadcode-test` answers a different question — "what functions can no test reach?" — so
+`deadcode-test` asks "what functions are unreachable from main and test entry points combined?" — so
 run it separately and triage its output separately.
 
 ## Stale allowlist warnings

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/goccy/go-yaml"
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
@@ -244,13 +245,13 @@ func TestBuildPromptRequest_Mapping(t *testing.T) {
 			name: "ineligible redirect leaves the literal without chooser metadata",
 			req: permissions.MatchRequest{
 				Kind:      "literal",
-				Subject:   "./p.sh u.txt 2>&1 | sed -n 1,18p",
+				Subject:   "./p.sh u.txt 1>&2 | sed -n 1,18p",
 				PathScope: "/work/proj",
 			},
-			disp: PromptDisplay{Action: "Run command", Subject: "./p.sh u.txt 2>&1 | sed -n 1,18p"},
+			disp: PromptDisplay{Action: "Run command", Subject: "./p.sh u.txt 1>&2 | sed -n 1,18p"},
 			want: tui.PromptRequest{
 				Action:                  "Run command",
-				Subject:                 "./p.sh u.txt 2>&1 | sed -n 1,18p",
+				Subject:                 "./p.sh u.txt 1>&2 | sed -n 1,18p",
 				Kind:                    tui.SubjectLiteralCommand,
 				RunFolder:               "/work/proj",
 				ProjectRoot:             "/work/proj",
@@ -405,6 +406,54 @@ func TestBuildPromptRequest_Mapping(t *testing.T) {
 				t.Fatalf("buildPromptRequest mismatch\n got: %#v\nwant: %#v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBuildPromptRequest_StderrOntoStdoutCompoundGrantCoversASiblingCommand(t *testing.T) {
+	canonical := func(command string) string {
+		t.Helper()
+		c, err := permissions.CanonicalLiteralForm(command)
+		if err != nil {
+			t.Fatalf("CanonicalLiteralForm(%q): %v", command, err)
+		}
+		return c
+	}
+	req := permissions.MatchRequest{Kind: "literal", Subject: canonical("mise run check 2>&1 | tail -60"), PathScope: "/work/proj"}
+	display := PromptDisplay{Action: "Run command", Subject: "mise run check 2>&1 | tail -60", ProjectRoot: "/work/proj", LaunchDir: "/work/proj"}
+
+	got, err := buildPromptRequest(req, display, permissions.ScopeEscalation{})
+	if err != nil {
+		t.Fatalf("buildPromptRequest returned error: %v", err)
+	}
+	if got.Compound == nil {
+		t.Fatalf("prompt for %q carries no per-stage chooser metadata", display.Subject)
+	}
+	wantStages := [][]string{{"mise", "run", "check"}, {"tail", "-60"}}
+	if !reflect.DeepEqual(got.Compound.Stages, wantStages) || !reflect.DeepEqual(got.Compound.Operators, []string{"|"}) {
+		t.Fatalf("chooser stages = %v, operators = %v, want %v joined by one pipe", got.Compound.Stages, got.Compound.Operators, wantStages)
+	}
+
+	scopes := []string{"mise run :*", "tail :*"}
+	stageSubjects := make([]string, len(scopes))
+	for i, scope := range scopes {
+		s, err := permissions.CompoundStageScopeSubject(*got.Compound, i, scope)
+		if err != nil {
+			t.Fatalf("CompoundStageScopeSubject(stage %d, %q): %v", i, scope, err)
+		}
+		stageSubjects[i] = s
+	}
+	stored, err := permissions.EncodeCompoundSubject(got.Compound.Wrapped, stageSubjects, got.Compound.Operators)
+	if err != nil {
+		t.Fatalf("EncodeCompoundSubject: %v", err)
+	}
+	if want := "compound/v1 B mise run :* | tail :*"; stored != want {
+		t.Fatalf("stored subject = %q, want %q", stored, want)
+	}
+
+	grants := []permissions.PermissionEntry{{Kind: "literal", Subject: stored, PathScope: "/work/proj", GrantKind: "session"}}
+	sibling := permissions.MatchRequest{Kind: "literal", Subject: canonical("mise run build 2>&1 | tail -20"), PathScope: "/work/proj"}
+	if res := permissions.Match(sibling, grants); !res.Matched {
+		t.Fatalf("Match(%q, %q) = no match, want the stored grant to cover it without a prompt", sibling.Subject, stored)
 	}
 }
 
@@ -700,6 +749,11 @@ func TestMapOutcome(t *testing.T) {
 			name: "global grant preserves stored subject",
 			in:   tui.PromptDecision{Option: tui.OptionAllowGlobal, StoredSubject: "ls -la /tmp"},
 			want: permissions.PromptOutcome{Choice: permissions.PromptAllowGlobal, StoredSubject: "ls -la /tmp"},
+		},
+		{
+			name: "always outside approves once and carries the chosen subject",
+			in:   tui.PromptDecision{Option: tui.OptionAlwaysOutside, StoredSubject: "mise run :*"},
+			want: permissions.PromptOutcome{Choice: permissions.PromptAllowOnce, StoredSubject: "mise run :*"},
 		},
 		{
 			name: "grant on a non-direct subject stores no subject",
@@ -2564,5 +2618,116 @@ func TestMarkOutside_OnlyARememberedBuildShellSubject(t *testing.T) {
 	}
 	if got := markOutside(dispatch.PromptDisplay{}, permissions.MatchRequest{Kind: "direct", Subject: "git rebase main"}, permissions.ModeContext{Mode: string(mode.Build)}, nil); got.ExceptionalAuthority != "" {
 		t.Fatalf("authority without a remembered set = %q, want none", got.ExceptionalAuthority)
+	}
+}
+
+func TestBuildPromptRequest_OffersAlwaysOutsideOnlyForASingleDirectOutsidePrompt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		kind      string
+		authority string
+		offer     bool
+		want      bool
+	}{
+		{"direct outside offered", "direct", "running outside the sandbox", true, true},
+		{"direct outside not offered by the caller", "direct", "running outside the sandbox", false, false},
+		{"literal outside", "literal", "running outside the sandbox", true, false},
+		{"direct network access", "direct", "network access", true, false},
+		{"direct ordinary prompt", "direct", "", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := permissions.MatchRequest{Kind: tc.kind, Subject: "mise run check", PathScope: "/proj"}
+			if tc.kind == "direct" {
+				req.SubjectTokens = []string{"mise", "run", "check"}
+			}
+			pr, err := buildPromptRequest(req, PromptDisplay{ExceptionalAuthority: tc.authority, OfferAlwaysOutside: tc.offer}, permissions.ScopeEscalation{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pr.OfferAlwaysOutside != tc.want {
+				t.Fatalf("OfferAlwaysOutside = %v, want %v", pr.OfferAlwaysOutside, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckExceptionalChoice_AcceptsAlwaysOutsideOnlyWhereOffered(t *testing.T) {
+	always := tui.PromptDecision{Option: tui.OptionAlwaysOutside, StoredSubject: "mise run check"}
+	for _, tc := range []struct {
+		name string
+		pr   tui.PromptRequest
+		ok   bool
+	}{
+		{"offered outside prompt", tui.PromptRequest{ExceptionalAuthority: "running outside the sandbox", OfferAlwaysOutside: true}, true},
+		{"outside prompt without the offer", tui.PromptRequest{ExceptionalAuthority: "running outside the sandbox"}, false},
+		{"other authority with the offer flag", tui.PromptRequest{ExceptionalAuthority: "network access", OfferAlwaysOutside: true}, false},
+		{"ordinary prompt", tui.PromptRequest{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkExceptionalChoice(tc.pr, always); (err == nil) != tc.ok {
+				t.Fatalf("checkExceptionalChoice = %v, want accepted %v", err, tc.ok)
+			}
+		})
+	}
+	offered := tui.PromptRequest{ExceptionalAuthority: "running outside the sandbox", OfferAlwaysOutside: true}
+	if err := checkExceptionalChoice(offered, tui.PromptDecision{Option: tui.OptionAllowSession}); err == nil {
+		t.Fatal("allow for this session accepted on the offered outside prompt")
+	}
+}
+
+func readOutsideCommands(t *testing.T, root string) (string, []any) {
+	t.Helper()
+	data, err := os.ReadFile(config.LocalSettingsPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := raw["outside_sandbox_commands"].([]any)
+	return string(data), list
+}
+
+func TestAddOutsideCommand_SavesToTheLocalFileOnly(t *testing.T) {
+	root := t.TempDir()
+	committed := "# shared\nwritable_folders: []\n"
+	writeProjectSettings(t, root, committed)
+	writeLocalProjectSettings(t, root, "# mine\npermissions: []\n")
+	local := filepath.Join(root, ".codemeld", "settings.local.yaml")
+
+	for i, subject := range []string{"mise run check", "go test :*"} {
+		msg, saved := addOutsideCommand(root, true, subject)
+		if want := subject + " added to outside_sandbox_commands in " + local; !saved || msg != want {
+			t.Fatalf("add %q = %q, %v; want %q, saved", subject, msg, saved, want)
+		}
+		data, list := readOutsideCommands(t, root)
+		if len(list) != i+1 || list[i] != subject || !strings.Contains(data, "# mine") || !strings.Contains(data, "permissions: []") {
+			t.Fatalf("local file after adding %q:\n%s", subject, data)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(root, ".codemeld", "settings.yaml")); err != nil || string(data) != committed {
+		t.Fatalf("committed settings = %q, %v; want it unchanged", data, err)
+	}
+}
+
+func TestAddOutsideCommand_RefusesWithoutWriting(t *testing.T) {
+	root := t.TempDir()
+	if msg, saved := addOutsideCommand(root, false, "mise run check"); saved || msg != "refused: project settings are not available for this launch (no approved project root); nothing written" {
+		t.Fatalf("unapproved add = %q, %v; want the unavailable refusal", msg, saved)
+	}
+	mustNotExist(t, config.LocalSettingsPath(root), "an unapproved project writes nothing")
+
+	writeLocalProjectSettings(t, root, "# mine\noutside_sandbox_commands: [\"mise run check\"]\n")
+	before, err := os.ReadFile(config.LocalSettingsPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, saved := addOutsideCommand(root, true, "mise run check")
+	if saved || !strings.Contains(msg, "mise run check is already in outside_sandbox_commands") || !strings.HasSuffix(msg, "; nothing written") {
+		t.Fatalf("duplicate add = %q, %v; want the already-listed refusal", msg, saved)
+	}
+	if after, err := os.ReadFile(config.LocalSettingsPath(root)); err != nil || string(after) != string(before) {
+		t.Fatalf("local file after the refusal = %q, %v; want it unchanged", after, err)
 	}
 }

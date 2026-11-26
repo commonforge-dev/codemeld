@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -73,6 +74,7 @@ const (
 	// OptionAllowGlobal creates a global grant (option 5).
 	OptionAllowGlobal
 	OptionAllowProject
+	OptionAlwaysOutside
 )
 
 var promptOptionsInOrder = []promptOptionRow{
@@ -96,12 +98,13 @@ var hostFreshOptionsInOrder = []promptOptionRow{
 }
 
 var promptMnemonics = map[PromptOption]rune{
-	OptionAllowOnce:    'o',
-	OptionDeny:         'd',
-	OptionAllowSession: 's',
-	OptionAllowFolder:  'f',
-	OptionAllowGlobal:  'g',
-	OptionAllowProject: 'p',
+	OptionAllowOnce:     'o',
+	OptionDeny:          'd',
+	OptionAllowSession:  's',
+	OptionAllowFolder:   'f',
+	OptionAllowGlobal:   'g',
+	OptionAllowProject:  'p',
+	OptionAlwaysOutside: 'a',
 }
 
 type PromptRequest struct {
@@ -242,6 +245,7 @@ type PromptRequest struct {
 
 	ExceptionalAuthority string
 	OutsideReasons       []string
+	OfferAlwaysOutside   bool
 }
 
 func (r PromptRequest) isHost() bool { return r.Kind == SubjectHost }
@@ -359,6 +363,9 @@ const hostDirectHTTPDisclosure = "This is a plain http:// request. https:// is t
 func promptOptionsFor(req PromptRequest) []promptOptionRow {
 	if !req.isHost() {
 		if req.ExceptionalAuthority != "" {
+			if req.OfferAlwaysOutside {
+				return append(slices.Clone(hostFreshOptionsInOrder), promptOptionRow{OptionAlwaysOutside, alwaysOutsideLabel})
+			}
 			return hostFreshOptionsInOrder
 		}
 		return displayedPromptOptions(req)
@@ -478,7 +485,7 @@ func renderPromptPreview(req PromptRequest) string {
 	var b strings.Builder
 	leadWithCommand := req.isShellSubject() && !req.isBatched() && req.Subject != ""
 	if leadWithCommand && req.ExceptionalAuthority != "" {
-		b.WriteString(tview.Escape(req.Action))
+		b.WriteString(tview.Escape(PromptAction(req.Action, req.ExceptionalAuthority)))
 		b.WriteString("\n")
 	}
 	if leadWithCommand {
@@ -486,7 +493,7 @@ func renderPromptPreview(req PromptRequest) string {
 		b.WriteString(tview.Escape(req.Subject))
 		b.WriteString("\n")
 	} else {
-		b.WriteString(tview.Escape(req.Action))
+		b.WriteString(tview.Escape(PromptAction(req.Action, req.ExceptionalAuthority)))
 		b.WriteString("\n")
 	}
 	if req.isBatched() {
@@ -533,11 +540,22 @@ const ExceptionalSandboxNotice = "⚠ This command still runs inside the sandbox
 
 const outsideSandboxNotice = "⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once."
 
+const outsideSandboxAuthority = "running outside the sandbox"
+
 func ExceptionalNotice(authority string) string {
-	if authority == "running outside the sandbox" {
+	if authority == outsideSandboxAuthority {
 		return outsideSandboxNotice
 	}
 	return fmt.Sprintf(ExceptionalSandboxNotice, authority)
+}
+
+const outsideRetryTitle = "Command failed in the sandbox; run it again outside the sandbox"
+
+func PromptAction(action, authority string) string {
+	if authority == outsideSandboxAuthority {
+		return outsideRetryTitle
+	}
+	return action
 }
 
 func OutsideReasonRows(reasons []string) []string {
@@ -556,6 +574,12 @@ func OutsideReasonRows(reasons []string) []string {
 }
 
 const exceptionalAllowOnceExplanation = "allow this once — approves this invocation only; nothing is saved and an identical repeat asks again."
+
+const outsideAllowOnceExplanation = "allow this once — runs the command again, once, outside the sandbox; nothing is saved."
+
+const alwaysOutsideLabel = "always run outside the sandbox in this project"
+
+const alwaysOutsideExplanation = alwaysOutsideLabel + " — saves the command to .codemeld/settings.local.yaml; matching commands then run outside the sandbox. They still ask unless already allowed."
 
 // promptFactLines bounds every variable value it renders. Rows stay logical so the overlay can fit them to a physical-row budget.
 func promptFactLines(req PromptRequest) []string {
@@ -603,7 +627,15 @@ func promptFactLines(req PromptRequest) []string {
 		}
 	}
 	if req.ExceptionalAuthority != "" {
-		return append(lines, "", exceptionalAllowOnceExplanation)
+		if req.ExceptionalAuthority == outsideSandboxAuthority {
+			lines = append(lines, "", outsideAllowOnceExplanation)
+		} else {
+			lines = append(lines, "", exceptionalAllowOnceExplanation)
+		}
+		if req.OfferAlwaysOutside {
+			lines = append(lines, alwaysOutsideExplanation)
+		}
+		return lines
 	}
 
 	// When this tool's grant folds a capability, state what the stored
@@ -779,7 +811,7 @@ func (a *App) buildPromptOverlay(req PromptRequest, decisionCh chan<- PromptDeci
 			a.completePrompt(decisionCh, PromptDecision{Option: opt})
 			return
 		}
-		if req.IsDirectCommand() && opt.createsGrant() {
+		if req.IsDirectCommand() && (opt.createsGrant() || opt == OptionAlwaysOutside) {
 			a.showScopeChooser(req, opt, decisionCh)
 			return
 		}
@@ -1264,7 +1296,7 @@ func (a *App) buildScopeChooser(req PromptRequest, opt PromptOption, decisionCh 
 	info.SetDynamicColors(false)
 	info.SetWrap(true)
 	info.SetWordWrap(true)
-	info.SetText(scopeChooserHelp(opts))
+	info.SetText(scopeChooserHelp(opts, opt == OptionAlwaysOutside))
 
 	list := tview.NewList()
 	list.ShowSecondaryText(false)
@@ -1314,7 +1346,7 @@ func scopeBoundaryStep(ev *tcell.EventKey) (int, bool) {
 
 func (a *App) showProgramConfirm(req PromptRequest, opt PromptOption, subject string, decisionCh chan<- PromptDecision, scopeList *tview.List) {
 	body, list := a.buildProgramConfirm(req, opt, subject, decisionCh, scopeList)
-	a.pages.AddPage(promptScopeConfirmPage, wrapOverlayPage(centeredModal(body)), true, true)
+	a.pages.AddPage(promptScopeConfirmPage, wrapOverlayPage(body), true, true)
 	a.app.SetFocus(list)
 }
 
@@ -1329,6 +1361,7 @@ func (a *App) buildProgramConfirm(req PromptRequest, opt PromptOption, subject s
 	return a.buildProgramConfirmList(
 		req.CanonicalProgram,
 		programGrantEffect(req, opt, subject),
+		opt == OptionAlwaysOutside,
 		func() { a.finalizeScope(opt, subject, decisionCh) },
 		func() { a.cancelProgramConfirm(scopeList) },
 	)
@@ -1350,6 +1383,8 @@ func programGrantEffect(req PromptRequest, opt PromptOption, subject string) str
 	case OptionAllowGlobal:
 		lifetime = "permanent — saved globally"
 		coverage = "any folder (all paths)"
+	case OptionAlwaysOutside:
+		return "Saved to outside_sandbox_commands: " + subject + "\nEvery " + req.CanonicalProgram + " command then runs outside the sandbox here. It may still ask."
 	default:
 		return ""
 	}
@@ -1371,10 +1406,10 @@ func runFolderCoverage(req PromptRequest) string {
 // widget serves both the direct-command finalize-or-cancel flow and the
 // simple-compound per-stage advance-or-return flow; the classification only sets the
 // copy and never decides what confirm or cancel do.
-func (a *App) buildProgramConfirmList(program, effect string, onConfirm, onCancel func()) (tview.Primitive, *tview.List) {
+func (a *App) buildProgramConfirmList(program, effect string, outside bool, onConfirm, onCancel func()) (tview.Primitive, *tview.List) {
 	info := tview.NewTextView()
 	info.SetDynamicColors(false)
-	text := programConfirmWarning(permissions.IsDestructiveProgram(program))
+	text := programConfirmWarning(permissions.IsDestructiveProgram(program), outside)
 	if effect != "" {
 		text += "\n\n" + effect
 	}
@@ -1383,7 +1418,11 @@ func (a *App) buildProgramConfirmList(program, effect string, onConfirm, onCance
 	list := tview.NewList()
 	list.ShowSecondaryText(false)
 	applyPickerListColors(list)
-	list.AddItem("Confirm program-wide grant", "", 0, nil)
+	confirm := "Confirm program-wide grant"
+	if outside {
+		confirm = "Save program-wide pattern"
+	}
+	list.AddItem(confirm, "", 0, nil)
 	list.AddItem("Cancel", "", 0, nil)
 	list.SetCurrentItem(0)
 	list.SetSelectedFunc(func(index int, _ string, _ string, _ rune) {
@@ -1511,6 +1550,7 @@ func (a *App) showCompoundProgramConfirm(program string, onConfirm func(), stage
 	body, list := a.buildProgramConfirmList(
 		program,
 		"",
+		false,
 		func() {
 			a.pages.RemovePage(promptScopeConfirmPage)
 			onConfirm()
@@ -1520,7 +1560,7 @@ func (a *App) showCompoundProgramConfirm(program string, onConfirm func(), stage
 			a.app.SetFocus(stageList)
 		},
 	)
-	a.pages.AddPage(promptScopeConfirmPage, wrapOverlayPage(centeredModal(body)), true, true)
+	a.pages.AddPage(promptScopeConfirmPage, wrapOverlayPage(body), true, true)
 	a.app.SetFocus(list)
 }
 

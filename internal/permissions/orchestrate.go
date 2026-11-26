@@ -735,25 +735,8 @@ func buildGrant(req MatchRequest, grantKind, storedSubject string) PermissionEnt
 	if subject == "" {
 		subject = req.Subject
 	}
-	// A batch fallback already carries the encoded request identity; a chooser
-	// subject is command-only, so the request's home expansion state, ordered assignments and
-	// clear-environment state are wrapped around it. An unencodable combination falls back to the
-	// exact request identity rather than storing a subject broader than the prompt displayed.
-	if req.Kind == subjectKindDirect && !isDirectEnvSubject(subject) && !isDirectHomeSubject(subject) {
-		if expands, ok := requestHomeExpansion(req.Subject, req.SubjectTokens, req.Assignments, req.ClearEnvironment); ok {
-			wrapped, err := wrapHomeState(subject, req.SubjectTokens, expands)
-			if err != nil {
-				wrapped = req.Subject
-			}
-			subject = wrapped
-		}
-	}
-	if req.Kind == subjectKindDirect && (len(req.Assignments) > 0 || req.ClearEnvironment) && !isDirectEnvSubject(subject) {
-		encoded, err := EncodeDirectEnvSubject(req.Assignments, req.ClearEnvironment, subject)
-		if err != nil {
-			encoded = req.Subject
-		}
-		subject = encoded
+	if req.Kind == subjectKindDirect {
+		subject = DirectSubjectForRequest(req, subject)
 	}
 	entry := PermissionEntry{
 		Kind:      req.Kind,
@@ -765,6 +748,31 @@ func buildGrant(req MatchRequest, grantKind, storedSubject string) PermissionEnt
 		entry.ArgumentHash = ComputeArgumentHash(subject)
 	}
 	return entry
+}
+
+func DirectSubjectForRequest(req MatchRequest, chosen string) string {
+	subject := chosen
+	// A batch fallback already carries the encoded request identity; a chooser
+	// subject is command-only, so the request's home expansion state, ordered assignments and
+	// clear-environment state are wrapped around it. An unencodable combination falls back to the
+	// exact request identity rather than storing a subject broader than the prompt displayed.
+	if !isDirectEnvSubject(subject) && !isDirectHomeSubject(subject) {
+		if expands, ok := requestHomeExpansion(req.Subject, req.SubjectTokens, req.Assignments, req.ClearEnvironment); ok {
+			wrapped, err := wrapHomeState(subject, req.SubjectTokens, expands)
+			if err != nil {
+				wrapped = req.Subject
+			}
+			subject = wrapped
+		}
+	}
+	if (len(req.Assignments) > 0 || req.ClearEnvironment) && !isDirectEnvSubject(subject) {
+		encoded, err := EncodeDirectEnvSubject(req.Assignments, req.ClearEnvironment, subject)
+		if err != nil {
+			encoded = req.Subject
+		}
+		subject = encoded
+	}
+	return subject
 }
 
 func grantOutcome(grantKind string) string {

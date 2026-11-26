@@ -26,9 +26,9 @@ here; every other status below is still the historical one.
 `<program>:*`, and the original assessment located it in `prompt_scope.go`. Both are out of date.
 `ProgramSubject` is defined in `internal/permissions/direct_scope.go` and returns the program, a
 space, then `:*` — the stored form is `<program> :*` — and the production prompt comments in
-`prompt.go` and `prompt_scope.go` already use that form, so no comment edit is needed. The bare `:*`
-wildcard token is recognized in `internal/permissions/normalize_direct.go` by `isBareWildcardToken`
-and `matchesDirectScope`; the historical sections now cite these symbols by name rather than by
+`prompt.go` and `prompt_scope.go` already use that form, so no comment edit is needed. `isBareWildcardToken` in
+`normalize_direct.go` and `matchesDirectScope` in `normalize_direct_match.go` recognize the
+wildcard; the historical sections now cite these symbols by name rather than by
 line number.
 
 **The permissions picker was renamed, not removed.** It is now the settings picker:
@@ -1000,7 +1000,7 @@ forever at `:667`. Pinned by `TestPromptGate_SerializesConcurrentPrompts`
 (`:187-189`), cancelled context (`:190-192` via `:133-141`), `show` error (`:195-197`), unknown
 option (`:285-288`). The zero value of that struct is **not** a deny — `PromptAllowOnce` is the
 `iota` zero at `orchestrate.go:14`. The behaviour is safe only because both callers check the error
-first and return before touching the outcome (`orchestrate.go:233-235`, `dispatch/tool.go:277-279`).
+first and return before touching the outcome (`orchestrate.go:233-235`, `internal/dispatch/tool.go:277-279`).
 Any future refactor that drops an error check turns a gate failure into an allow.
 
 **Event-loop ownership.** `PromptUser` is the only prompt entry point invoked off the loop. It does
@@ -1025,15 +1025,14 @@ exactly three sources and never from a display label: the direct-command subject
 to rows at `:144`, `:152`, `:160`); `permissions.EncodeCompoundSubject` for a recognized compound
 (`prompt.go:956`, falling back to `""` — the byte-exact concrete subject — when the backend refuses
 the shape, `:957-959`); and the passthrough of `req.CapabilityStoredSubject` (`:543`). The byte form
-is load-bearing downstream: `isBareWildcardToken` and `matchesDirectScope` in
-`permissions/normalize_direct.go` recognize a widened grant only when the last raw token is exactly
+is load-bearing downstream: `isBareWildcardToken` in `internal/permissions/normalize_direct.go` and `matchesDirectScope` in `internal/permissions/normalize_direct_match.go` recognize a widened grant only when the last raw token is exactly
 `:*`, so the single space in `ProgramSubject`'s `<program> :*` is contractual, and
-`permissions/matcher.go:110` keys capability subjects by exact string. An approval shared by two or
+`internal/permissions/matcher.go:110` keys capability subjects by exact string. An approval shared by two or
 more unresolved stages deliberately carries no stored subject, because one choice cannot select a
 scope for every stage: the batched prompt offers no chooser (`prompt.go:518-525`) and
 `AuthorizeBatch` clears the subject before building each stage's grant
 (`orchestrate.go:207-217`). A batch with exactly one unresolved stage is not that case — it renders
-the ordinary single-stage prompt with its scope chooser (`bootstrap/authdeps.go:292-295`), so its
+the ordinary single-stage prompt with its scope chooser (`internal/bootstrap/authdeps.go:292-295`), so its
 selected subject is kept and becomes the grant's subject, while cache keys and events stay on the
 stage's own concrete subject.
 
@@ -1057,7 +1056,7 @@ classifier that legitimately spans both is `permissions.IsDestructiveProgram`: c
 **The TUI does not re-validate the request.** `prompt.go:1-5` states it renders caller-supplied,
 already-normalized data; the only derivations are eligibility and display
 (`OmitFolderOption` at `:416`/`:636`, `CrossModeMarkerNotice` at `:435`). Display strings originate
-from model-supplied tool arguments through `dispatch/tool.go:370-393`, which is explicitly
+from model-supplied tool arguments through `internal/dispatch/tool.go:370-393`, which is explicitly
 best-effort (`:403-405`). The reverse direction is equally trusting, though it is not the direct
 bootstrap-to-disk path it looks like — it runs through the permissions layer in three steps.
 `mapOutcome` (`promptgate.go:284-297`) maps the decision into a `permissions.PromptOutcome`, copying
@@ -1109,7 +1108,7 @@ behaviour rather than internals. The duplication of the acquire/show/map sequenc
 the error return*. No change is recommended: making the zero value a deny would require a new
 sentinel choice value in `internal/permissions` and would touch the orchestration contract, which is
 outside an audit's authority and outside this slice's file budget. What this report can do is name
-it, so a future reader does not "simplify" `orchestrate.go:233-235` or `dispatch/tool.go:277-279`
+it, so a future reader does not "simplify" `orchestrate.go:233-235` or `internal/dispatch/tool.go:277-279`
 into an outcome-first branch.
 
 **C5 — retain. `renderPromptFacts`' six conditional blocks.** The 76 lines (`prompt.go:367-442`) are
@@ -1178,7 +1177,7 @@ used at `prompt.go:416`, `:636`, `prompt_folder.go:67`). The fourth, inside `Cro
 (`prompt_folder.go:105`), forwards that function's own `outOfRootFileWrite` parameter — and its sole
 production caller, `renderPromptFacts` (`prompt.go:435`), supplies the same combined verdict, so all
 four sites see it. No test change follows from this: the two bootstrap sites that pass
-`OutOfRootFileWrite` directly (`bootstrap/authdeps_test.go:882`, `:1543`) each assert that field is
+`OutOfRootFileWrite` directly (`internal/bootstrap/authdeps_test.go:882`, `:1543`) each assert that field is
 true first (`:879-883`, `:1537-1544`), so they cover the write signal only and their expectations
 match production for the case they exercise; the read-scope half is pinned separately at
 `prompt_folder_test.go:69-85`. The recommendation is the rename of the parameter and its doc
@@ -1221,7 +1220,7 @@ outOfRootFileWrite)` (`prompt_folder.go:105-107`), and the `launch-dir-only` bou
 `WouldCreateSettingsFile` set (`:108-110`). With an empty root, `OmitFolderOption`
 (`prompt_folder.go:51-56`) is false in exactly two shapes: the run folder is *contained* in the
 cleaned empty root — `""`, `"."`, or a relative path such as `"sub"`, all of which
-`permissions.IsDescendantOrEqual` accepts against `"."` (`permissions/scope.go:55-71`) — or the run
+`permissions.IsDescendantOrEqual` accepts against `"."` (`internal/permissions/scope.go:55-71`) — or the run
 folder is absolute and therefore out of root, with the eligibility flag true (`OutOfRootFileWrite ||
 OutOfRootReadScope`, `prompt.go:250-252`). Either shape, under a `launch-dir-only` boundary with a
 settings file to create, reaches `filepath.Join("", ".codemeld", "settings.yaml")` — a relative path.
@@ -1261,15 +1260,15 @@ folder-unavailable explanation"), `prompt_folder.go:90` (same possessive, inside
 `-` marker is also missing, `:85-91`), `prompt_scope.go:169` (sentence ends on the dangling word
 "matching."). The same artifact appears in the tests at `prompt_test.go:635`, `:1932-1934`, `:2050`.
 *Statements that no longer match the code* — `prompt.go:255-257` names the read capability's members
-as "read + grep + glob + list + tree", but the table at `permissions/capability.go:20` also contains
+as "read + grep + glob + list + tree", but the table at `internal/permissions/capability.go:20` also contains
 `file_count`, and the doc omits `CapabilityWriteTree` entirely although the switch handles it
 (`:269-270`); `prompt_scope.go:114-115` documented `ProgramSubject` as returning `` `<program>:*` ``
 while the code returned `<program> :*` (now produced by `ProgramSubject` in
 `internal/permissions/direct_scope.go`, and since corrected in the prompt comments), and the space
 is what lets `:*` arrive as a standalone token for the bare-wildcard check in
-`permissions/normalize_direct.go` (`isBareWildcardToken`, `matchesDirectScope`); `prompt.go:74`
+`internal/permissions/normalize_direct.go` (`isBareWildcardToken`) and `internal/permissions/normalize_direct_match.go` (`matchesDirectScope`); `prompt.go:74`
 calls them "the five options" where four are routinely rendered (`prompt_folder.go:66-78`); `picker_settings_test.go:5-6` says there is "no
-production registration" although `bootstrap/starttui.go:269` and
+production registration" although `internal/bootstrap/starttui.go:269` and
 `internal/tui/registry.go:412` now register it.
 *Process references in production comments* — 17 references in the two focused prompt files, of two
 kinds: nine internal task ids (`prompt_scope.go:186, 207, 209`; `prompt_folder.go:6` and `:100`,
@@ -1414,8 +1413,8 @@ table below: six intentional test-only seams (`internal/fsutil` `SetSyncFileForT
 `HeadlessDriver` flag accessors); four of deliberately deferred behaviour
 (`internal/sessionfork`'s fork functions, dead while `sessions.ReaderSupportedVersion == 1`); and
 eight of not-yet-integrated foundation (`internal/tui/cmd_compact.go`'s four unregistered handler
-helpers plus `turn/request.go BuildCompactionSummaryRequest`, `provider_refresh.go
-RefreshOutcome.String`, and `filetools/readresolve.go IsDirectorySymlink` and `ClassifyEntry`).
+helpers plus `internal/turn/request.go BuildCompactionSummaryRequest`, `provider_refresh.go
+RefreshOutcome.String`, and `internal/filetools/readresolve.go IsDirectorySymlink` and `ClassifyEntry`).
 The finding the gate cannot produce is the inverse one: **111 of the 129 allowlist entries are no
 longer reported**, i.e. their "remove this line once X lands" condition has been met (or the function
 is gone). Three of those are this slice's own surface and are now demonstrably reachable from
@@ -1431,7 +1430,7 @@ never deletion authority for the function it names.
 
 **C25 — retain. `B4`'s flagged `ResumeDeps.Fork` is a live seam for dormant behaviour.** Confirmed
 as slice B predicted: the field (`cmd_resume.go:199`) has one call site (`:380`), is wired in production
-to a documented no-op (`bootstrap/resumedeps.go:48`, `:383`), and is unreachable only because
+to a documented no-op (`internal/bootstrap/resumedeps.go:48`, `:383`), and is unreachable only because
 `sessions.ReaderSupportedVersion == 1` (rationale at `resumedeps.go:373-382`, matching the
 `internal/sessionfork` allowlist block). Four tests drive the branch by forcing the fake loader's
 `older` flag *and* asserting the fork call: the `"older schema"` subtest of
@@ -1440,7 +1439,7 @@ to a documented no-op (`bootstrap/resumedeps.go:48`, `:383`), and is unreachable
 `…FlushesCommandEvent` (`:999-1033`). A fifth site forces the flag without asserting fork behaviour —
 the `"older schema"` row of `TestResumeHandler_NonSwitchingBranchesDoNotCancelOrWait` (`:550-553`),
 which pins the no-cancel/no-wait invariant. Two further citations are neither: `:180` is the
-`fakeForker.OfferFork` double, and `bootstrap/resumedeps_test.go:633-641` pins the *production*
+`fakeForker.OfferFork` double, and `internal/bootstrap/resumedeps_test.go:633-641` pins the *production*
 seam's no-op contract with no loader and no `older` flag at all. It is not dead code and not a
 removable seam.
 
@@ -1448,7 +1447,7 @@ removable seam.
 
 | ID | Class | Affected files and symbols | Evidence | Expected benefit | Risk | Preserved behaviour | Non-goals | Follow-up task justified? |
 |----|-------|----------------------------|----------|------------------|------|---------------------|-----------|---------------------------|
-| C17 | simplify locally (comments) | `internal/tui/prompt.go:194, 255-257, 265, 433, 466, 487, 632`; `prompt_scope.go:26, 38, 43, 114-115, 169, 186, 207, 209`; `prompt_folder.go:6, 17, 23, 37, 41, 45, 59, 81, 85-91, 100`; `app.go:1569, 1573` (missing seam docs per **C22**); tests `prompt_test.go:635, 1932-1934, 2050`; `picker_settings_test.go:5-6` | Six broken sentences from stripped subjects, four statements contradicted by the code at the time (`capability.go:20`, the `ProgramSubject` form produced by `permissions/direct_scope.go`, `prompt_folder.go:66-78`, `starttui.go:269`), 17 internal process references (nine task ids and eight ADR identifiers), one task-history line, two undocumented test seams | The authorization surface's comments stop misdescribing what the code does; the repo's no-process-references rule holds here too | Very low — comment text only; no `//go:` directives involved | Every statement that is still true, especially the fail-closed and label-never-becomes-subject explanations | Do not delete a comment that records a non-obvious invariant; do not "fix" `prompt.go:265` by deleting the fallback branch without checking `capability.go:17-21` | **Yes** — comment-only, mechanical, no test impact |
+| C17 | simplify locally (comments) | `internal/tui/prompt.go:194, 255-257, 265, 433, 466, 487, 632`; `prompt_scope.go:26, 38, 43, 114-115, 169, 186, 207, 209`; `prompt_folder.go:6, 17, 23, 37, 41, 45, 59, 81, 85-91, 100`; `app.go:1569, 1573` (missing seam docs per **C22**); tests `prompt_test.go:635, 1932-1934, 2050`; `picker_settings_test.go:5-6` | Six broken sentences from stripped subjects, four statements contradicted by the code at the time (`capability.go:20`, the `ProgramSubject` form produced by `internal/permissions/direct_scope.go`, `prompt_folder.go:66-78`, `starttui.go:269`), 17 internal process references (nine task ids and eight ADR identifiers), one task-history line, two undocumented test seams | The authorization surface's comments stop misdescribing what the code does; the repo's no-process-references rule holds here too | Very low — comment text only; no `//go:` directives involved | Every statement that is still true, especially the fail-closed and label-never-becomes-subject explanations | Do not delete a comment that records a non-obvious invariant; do not "fix" `prompt.go:265` by deleting the fallback branch without checking `capability.go:17-21` | **Yes** — comment-only, mechanical, no test impact |
 | C10 | simplify locally | `internal/tui/prompt.go:663, 684`; `app.go:960`; tests `prompt_test.go:377, 709, 752, 801, 985, 1086, 1179`, `key_esc_test.go:196` | Three sibling page names are constants (`prompt.go:27-33`); the base page is a literal at 3 production and 8 test sites, including a switch that mixes both forms | One name for the page the focus-restore switch and both teardown paths share | Very low — a constant introduction | The page name string itself (`"prompt"`) must not change: `restoreModalFocusOnTerminalFocus` matches on it | Do not rename the page; do not fold the four page constants into a slice | **Yes** — bundle with C11 |
 | C11 | simplify locally (naming) | `internal/tui/prompt_folder.go:51` `OmitFolderOption` param and doc `:36-50`; callers `prompt.go:416, 636`, `prompt_folder.go:67, 105` | Three callers pass `folderGrantEligibleOutOfRoot()` (`prompt.go:250-252`) directly (`prompt.go:416, 636`, `prompt_folder.go:67`); the fourth (`prompt_folder.go:105`, inside `CrossModeMarkerNotice`) forwards its own parameter, which its only production caller `renderPromptFacts` (`prompt.go:435`) supplies as the same combined verdict. No production site passes the bare write field | The parameter name stops contradicting every caller | Very low — parameter name and doc text only; no signature, behaviour, or test change | The fail-closed containment rule and the out-of-root re-enable for writes *and* reads | Do not change the signature shape or the containment logic; do not merge the two out-of-root request fields; do not change `authdeps_test.go:882, 1543`, which correctly cover the write signal only | **Yes** — bundle with C10 |
 | C8 | simplify locally (declaration) | `internal/tui/prompt.go:186` `PromptRequest.SessionScope`; writer `internal/bootstrap/promptgate.go:224` and its comment `:207`; expectations `promptgate_test.go` (11 sites), fixtures `prompt_test.go` (9 sites) | No production reader anywhere; duplicates `RunFolder` (`promptgate.go:223`), the field every renderer actually consumes | Removes a field that a reader must otherwise assume is meaningful in an authorization struct | Low–medium — touches a cross-package struct and a field-mapping test table | The mapping of `req.PathScope` onto `RunFolder`, which is what `OmitFolderOption` and `CrossModeMarkerNotice` read | Do not remove `RunFolder`; do not repurpose the field instead of deleting it | **Yes** — small, but it crosses `internal/tui` and `internal/bootstrap`, so it needs its own task |
@@ -1457,13 +1456,13 @@ removable seam.
 | C19 | test coverage | `internal/tui/prompt.go` `completePrompt:992-1000`, `dismissPrompt:1006-1013`, cleanup branches `:675-683`, scope-chooser ESC seam `:737`, queued setup mutations `:659-665` (`AddPage` `:663`, `SetFocus` `:664`); test home `prompt_test.go` | Zero tests name the guard symbols; the one post-decision child-page assertion (`prompt_test.go:411-413`) is vacuous because that flow never opens the chooser, and every other child-page check is mid-flow (`:1695`, `:1349`, `:1853`), so no cleanup branch would fail on deletion; ESC-deny is covered for compound (`:1747`, `:1812`) but not for the scope chooser; no deterministic assertion pins `PromptUser`'s queueing of both setup mutations — the live-loop harness (`prompt_test.go:1170`, `:1173-1176`) leaves direct off-loop writes to incidental `-race` detection, which the everyday `test-fast` gate does not run (`mise.toml:69-71`) — and the mirror contract is pinned for `HandleEsc` alone (`key_esc_test.go:79-98`) | Pins the surface's most important guarantee — one decision, every abandonment is a deny, and the overlay is mounted and torn down on the event loop | Low — additive tests | The default-deny envelope, the single-send guard, the page-cleanup set, and `PromptUser`'s off-loop queueing of *both* setup mutations | Do not weaken the guard to make a test easier; do not move the existing `key_esc_test.go:182` test out of the central ESC file; do not satisfy the cleanup half with an assertion that passes when the branch is deleted | **Yes** — small additive test task, and a prerequisite for C12. **Acceptance**: not complete until it covers all four — the one-shot guard, the scope-chooser ESC deny, each of the three cleanup branches by an assertion that fails when that branch is removed, and a test proving both `PromptUser` UI mutations (`prompt.go:663`, `:664`) are still queued when `PromptUser` is invoked off the event loop |
 | C18 | consolidate test setup | `internal/tui/prompt_test.go`: attach barrier (5 copies), loop+goroutine (6), teardown (6), cancel block (2); existing `promptHarness:1156`/`startPrompt:1164`; superseded `runPromptApp:689`; dead `typeText:1206` | ~150 duplicated arrange/teardown lines against a harness that already exists and is used 18 times in this file (20 across `internal/tui/*_test.go`) | Removes the duplication and the second, superseded harness | Medium — these drive a real tview loop; a shared fixture can mask a per-test setup difference | Every assertion; the `SimpleCompound` stage literals (`:1641-1644` and siblings) that double as expectations at `:1665-1668, 1722, 1784, 1873`; the option-label lists | Do not fold assertions into the harness; do not replace the attach barrier with a sleep; do not touch the literals that are oracles | **Yes**, scoped to arrange-only with a diff that touches no assertion — bundle with **A13**/**B15** |
 | C20 | simplify locally (tests) | `internal/tui/prompt_test.go:54-63, 69, 72, 448-455, 1344, 1848, 2006-2011, 2137-2143`, 11 `time.Sleep` sites; `prompt_scope_test.go:215-216`; barrier `harness_test.go:55` | One map-iterated table, one parallel-array pair correctly indexed but only half length-checked (`prompt_test.go:54-63`, read at `:69` and `:72` under the same index, with a length assertion for `wantLabels` at `:64-66` and none for `wantOptions`, so a short `wantOptions` panics at `:71`; the adjacent `prompt_scope_test.go:215-216` arrays are indexed at different loop depths and are not a pair), two 200 ms negative waits, and copy asserted as literals where constants exist | Deterministic failure order and expectations that cannot pass by construction | Low–medium — rewriting a wait can change what a test actually observes | The negative assertions' meaning (no decision was sent) and the exact expected copy | Do not convert the paired accept/reject cases into a table that loses the pairing; do not assert copy through the constant where the test's point is the rendered string | **Yes**, bundle with C18 |
-| C16 | defer | `internal/bootstrap/promptgate.go:184-200` `Build`; `internal/bootstrap/authdeps.go:267-283` batched path reaching `a.prompts.gate/show` at `:273, 276, 277` | Same five-step boundary twice; the second bypasses the builder's API | One place to harden the authorization boundary | Medium–high — it is the authorization path; both callers are behaviour-pinned by `promptgate_test.go:695, 752` and the batch tests at `:415-470` | Capacity-one serialization, the ctx-gated acquire, and the outcome mapping | Do not change the gate's capacity; do not merge the single and batched *request builders*, which legitimately differ | Deferred — an `internal/bootstrap` change, outside this slice's authority |
+| C16 | defer | `internal/bootstrap/promptgate.go:184-200` `Build`; `internal/bootstrap/authdeps.go:267-283` batched path reaching `a.prompts.gate` and `a.prompts.show` at `:273, 276, 277` | Same five-step boundary twice; the second bypasses the builder's API | One place to harden the authorization boundary | Medium–high — it is the authorization path; both callers are behaviour-pinned by `promptgate_test.go:695, 752` and the batch tests at `:415-470` | Capacity-one serialization, the ctx-gated acquire, and the outcome mapping | Do not change the gate's capacity; do not merge the single and batched *request builders*, which legitimately differ | Deferred — an `internal/bootstrap` change, outside this slice's authority |
 | C15 | defer (investigation) | `internal/tui/prompt.go:659` (unguarded `QueueUpdateDraw`) vs `app.go:943, 1558, 1801`; permit release `internal/bootstrap/promptgate.go:193` | Every sibling *production* off-loop entry point guards on `running.Load()` — the only other unguarded caller is the test-only `RunOnEventLoopForTest` (`app.go:1573-1575`); a stopped loop parks the caller and permanently loses the permit; no test covers a not-running TUI | Would close a shutdown-time hang path | High to decide, low to describe — what a pending prompt *should* do at shutdown is a product question | The blocking contract (`PromptUser` must not return before a decision) and the default-deny envelope | Do not add a running-guard that returns a zero `PromptDecision` — the zero option is `OptionAllowOnce` (`prompt.go:61`) | Deferred — behaviour question, not maintainability; record only |
 | C1 | retain | `internal/tui/prompt.go` `buildPromptOverlay:455-647`, selected-callback `:502-546` | Assembly sharing three locals, plus a five-route selected-callback that is decision-routing policy (`:509`, `:518`, `:526`, `:530`, `:537-545`); the only cohesive repeat inside it is C12's list construction | None — extraction trades lexical sharing for parameter threading | A split invites the option slice and the index mapping drifting apart, which is the reachability guarantee | The single `opts` slice driving both render and mapping (`:491`, `:498-500`, `:508`) | Do not split by widget; do not compute options twice | No |
 | C2 | retain | `internal/tui/prompt.go` `completePrompt:992-1000`, `dismissPrompt:1006-1013`, `defaultDenyPromptDecision:1028-1033` | Two senders, one buffered channel, both nil the handle before sending; `dismissPrompt` additionally refuses when no prompt is open | None — merging loses either the open-check or the single deny-envelope source | A merged sender could block the event loop on a second send | Single-send-per-prompt and the identical deny envelope for the deny option and every ESC | Do not merge the two senders; do not build the envelope at the call sites | No — but see C19 |
 | C4 | retain (hazard recorded) | `internal/bootstrap/promptgate.go:187-197, 285-288`; `internal/permissions/orchestrate.go:14, 233-235`; `internal/dispatch/tool.go:277-279` | `PromptOutcome{}.Choice == PromptAllowOnce`; every gate failure returns that struct with a non-nil error | None here — a deny sentinel is a permissions-package contract change | Any refactor that reads the outcome before the error converts a gate failure into an allow | The error-first check at both call sites | Do not restructure either caller to branch on the outcome first; do not introduce a sentinel in this audit | No — record only |
 | C5 | retain | `internal/tui/prompt.go` `renderPromptFacts:367-442`; tests `prompt_test.go:109-135, 137-165, 416-445, 565-581, 586-600, 625-648, 1503-1538` | Six independent disclosures, each with its own assertion — requested target `prompt_test.go:125`, root mismatch `:567, 575, 578`, escalation `:591` (negative `:597`), capability coverage `:1524, 1527` (negative `:1532-1537`), folder-grant destination `:154-155` and `:428-432`, cross-mode notice `:631` (suppressed `:638`, `:645`); purity is what lets them be asserted without a screen | None — a split separates the folder gate at `:416` from the option list it explains | Losing purity would force the disclosure tests onto a live loop | Disclosure order, the mismatch marker, and the `CrossModeMarkerNotice` gate staying inside the renderer | Do not move the notice decision to the caller; do not make the function take the App | No |
-| C6 | retain | `internal/tui/prompt.go:543, 834, 955-961`; `prompt_scope.go:101-118, 139-163` | Three producers, one field, no label ever becomes a subject; the compound path defers to the backend encoder and falls back to byte-exact | None — the three differ in what they may widen | A shared "subject builder" would have to pick one widening policy | The `:*` byte form (`ProgramSubject` in `permissions/direct_scope.go`; recognized by `isBareWildcardToken` and `matchesDirectScope` in `permissions/normalize_direct.go`), the empty-string fallback, and the batched no-subject rule | Do not unify the three producers; do not synthesize a compound subject when the encoder refuses | No |
+| C6 | retain | `internal/tui/prompt.go:543, 834, 955-961`; `prompt_scope.go:101-118, 139-163` | Three producers, one field, no label ever becomes a subject; the compound path defers to the backend encoder and falls back to byte-exact | None — the three differ in what they may widen | A shared "subject builder" would have to pick one widening policy | The `:*` byte form (`ProgramSubject` in `internal/permissions/direct_scope.go`; recognized by `isBareWildcardToken` in `internal/permissions/normalize_direct.go` and `matchesDirectScope` in `internal/permissions/normalize_direct_match.go`), the empty-string fallback, and the batched no-subject rule | Do not unify the three producers; do not synthesize a compound subject when the encoder refuses | No |
 | C7 | retain | `internal/tui/prompt.go` `compoundStageScopeHelp:980-987`; flag `prompt_scope.go:196, 234` | The advisory is derived from the rows actually offered, so it cannot claim a scope the chooser withholds | None — reading `NoWiden` instead would be shorter and less safe | A destructive stage could show the Program breadth warning with no Program row | Copy derived from offered rows | Do not route the help text through `NoWiden` | No |
 | C9 | retain | `internal/tui/prompt_scope.go:196` `NoWiden`; assertions `prompt_scope_test.go:221, 271, 290, 312` | Production never reads it, but it is the only direct handle the destructive-suppression tests have | None — deleting it forces those assertions to infer intent from row count | The tests would silently weaken to a row-count check | The destructive stage's exact-only truncation (`:233`) and fixed `DefaultIdx` (`:228`) | Do not delete it as "unused"; do not make production read it (C7) | No |
 | C13 | retain | `internal/tui/prompt.go` `finalizeScope:829-835` vs `showCompoundProgramConfirm:919-933`; cleanup `PromptUser:675-683` | Two owners for one confirm page, made safe by the unconditional cleanup in `PromptUser` | None — unifying moves page ownership away from the function that knows whether a decision is sent | A compound-aware branch inside `finalizeScope` would couple the two flows | The unconditional removal of all three child pages before focus restore | Do not unify the two teardown owners; do not drop the cleanup in `PromptUser` | No — but C19 should cover the untested cleanup branches |

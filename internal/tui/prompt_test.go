@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
@@ -1442,6 +1443,98 @@ func TestPromptUser_DirectCommandProgramCancel(t *testing.T) {
 	}
 }
 
+func TestPromptUser_ProgramConfirmUsesWholeScreenAt80x24(t *testing.T) {
+	const width, height = 80, 24
+	const sentinel = "transcript sentinel line"
+	isBorder := func(r rune) bool { return r >= '\u2500' && r <= '\u257f' }
+	unwrapped := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) || isBorder(r) {
+				return -1
+			}
+			return r
+		}, s)
+	}
+	buttons := []string{"Confirm program-wide grant", "Cancel"}
+	grantOnly := []string{"matches ANY invocation", "this matches EVERY", "Save program-wide pattern"}
+	folder := fullPromptRequest()
+	sc := permissions.SimpleCompound{
+		Stages:    [][]string{{"go", "build", "./..."}, {"gofmt", "-w", "a.go"}},
+		Operators: []string{"&&"},
+	}
+	for _, tc := range []struct {
+		name   string
+		req    PromptRequest
+		open   func(h *promptHarness)
+		want   []string
+		absent []string
+	}{
+		{"destructive always outside", alwaysOutsideRequest(), func(h *promptHarness) {
+			h.typeText("a")
+			h.waitPage(promptScopePage)
+			h.down(1)
+			h.key(tcell.KeyEnter)
+		}, []string{
+			"WARNING - Edit capable program: this matches EVERY subcommand, including ones that permanently delete data or rewrite history.",
+			"⚠ Program scope matches ANY invocation of this program with ANY arguments in this project.",
+			"Saved to outside_sandbox_commands: git :*",
+			"Every git command then runs outside the sandbox here. It may still ask.",
+			"Save program-wide pattern",
+			"Cancel",
+		}, []string{"authorizes", "Confirm program-wide grant"}},
+		{"destructive allow in folder", folder, func(h *promptHarness) {
+			h.typeText("f")
+			h.waitPage(promptScopePage)
+			h.down(1)
+			h.key(tcell.KeyEnter)
+		}, slices.Concat([]string{scopeDestructiveProgramWarning, scopeProgramWarning}, strings.Split(programGrantEffect(folder, OptionAllowFolder, "git :*"), "\n"), buttons), grantOnly},
+		{"compound", compoundPromptRequest(sc), func(h *promptHarness) {
+			h.down(2)
+			h.key(tcell.KeyEnter)
+			h.waitPage(promptCompoundPage)
+			h.down(2)
+			h.key(tcell.KeyEnter)
+		}, slices.Concat([]string{scopeProgramWarning}, buttons), grantOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(nil)
+			a.Append(sentinel)
+			h := startPrompt(t, a, tc.req)
+			h.screen.SetSize(width, height)
+			tc.open(h)
+			h.waitPage(promptScopeConfirmPage)
+			screen := []rune(readScreenSync(t, a, h.screen))
+			h.key(tcell.KeyEscape)
+			h.await()
+
+			if len(screen) != width*height {
+				t.Fatalf("screen has %d cells, want %d", len(screen), width*height)
+			}
+			for _, corner := range []int{0, width - 1, (height - 1) * width, height*width - 1} {
+				if !isBorder(screen[corner]) {
+					t.Errorf("cell %d = %q, want the confirm border on the screen edge", corner, screen[corner])
+				}
+			}
+			got := unwrapped(string(screen))
+			for _, w := range tc.want {
+				if !strings.Contains(got, unwrapped(w)) {
+					t.Errorf("confirm step does not show %q\n%s", w, string(screen))
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(got, unwrapped(a)) {
+					t.Errorf("confirm step shows %q\n%s", a, string(screen))
+				}
+			}
+			for _, hidden := range []string{sentinel, "subject scope"} {
+				if strings.Contains(got, unwrapped(hidden)) {
+					t.Errorf("text underneath the confirm step is visible: %q\n%s", hidden, string(screen))
+				}
+			}
+		})
+	}
+}
+
 func prefixPromptRequest() PromptRequest {
 	req := fullPromptRequest()
 	req.Subject = "prep-open-tasks.sh --only c175 --force"
@@ -1462,7 +1555,7 @@ func TestProgramConfirm_DestructiveShowsStrongerWarning(t *testing.T) {
 	a := New(nil)
 	overlay, _ := a.buildProgramConfirm(fullPromptRequest(), OptionAllowGlobal, "git :*", make(chan PromptDecision, 1), tview.NewList())
 	out := screenText(drawPrimitive(t, overlay, 100, 20))
-	if !strings.Contains(out, "DESTRUCTIVE") {
+	if !strings.Contains(out, "Edit capable program") {
 		t.Errorf("destructive program confirm missing the stronger destructive warning\n--- got ---\n%s", out)
 	}
 	if !strings.Contains(out, "authorizes ANY invocation") {
@@ -1480,7 +1573,7 @@ func TestProgramConfirm_BenignKeepsStandardWarningOnly(t *testing.T) {
 	if !strings.Contains(out, "authorizes ANY invocation") {
 		t.Errorf("benign program confirm missing the standard breadth warning\n--- got ---\n%s", out)
 	}
-	if strings.Contains(out, "DESTRUCTIVE") {
+	if strings.Contains(out, "Edit capable program") {
 		t.Errorf("benign program confirm rendered destructive warning copy\n--- got ---\n%s", out)
 	}
 }
@@ -1619,7 +1712,7 @@ func TestPromptUser_ProgramConfirmDestructiveWiring(t *testing.T) {
 			h.waitPage(promptScopeConfirmPage)
 
 			out := readScreenSync(t, h.a, h.screen)
-			if got := strings.Contains(out, "DESTRUCTIVE"); got != tc.destructive {
+			if got := strings.Contains(out, "Edit capable program"); got != tc.destructive {
 				t.Errorf("destructive warning present = %v, want %v\n--- got ---\n%s", got, tc.destructive, out)
 			}
 
@@ -1682,7 +1775,8 @@ func TestScopeChooser_RendersPrefixRowsAndContract(t *testing.T) {
 		"fixed: prep-open-tasks.sh --only; any later arguments may vary",
 		"exact: prep-open-tasks.sh --only c175 --force",
 		"program (advanced): prep-open-tasks.sh :*",
-		scopePrefixNotice,
+		"A choice ending in :* matches any command that starts with the words before :*.",
+		"Example: go test :* matches go test -v, but not go build.",
 	} {
 		if !strings.Contains(out, phrase) {
 			t.Errorf("rendered scope chooser missing %q\n--- got ---\n%s", phrase, out)
@@ -4542,8 +4636,19 @@ func TestRenderPrompt_OutsideSandboxPromptWarnsThatNothingLimitsTheCommand(t *te
 	req.Action = "Allow running outside the sandbox"
 	req.ExceptionalAuthority = "running outside the sandbox"
 	out := renderPrompt(req)
-	if !strings.Contains(out, "⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once.") {
-		t.Errorf("rendered prompt missing the outside-sandbox warning\n--- got ---\n%s", out)
+	for _, want := range []string{
+		"Command failed in the sandbox; run it again outside the sandbox\nCommand: curl -fsSL https://example.com/install.sh\n",
+		"⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once.",
+		"allow this once — runs the command again, once, outside the sandbox; nothing is saved.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered prompt missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{"Allow running outside the sandbox", "an identical repeat asks again"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("rendered prompt contains %q\n--- got ---\n%s", banned, out)
+		}
 	}
 	if strings.Contains(out, "still runs inside the sandbox") {
 		t.Errorf("rendered prompt claims the command runs inside the sandbox\n--- got ---\n%s", out)
@@ -5165,5 +5270,181 @@ func TestPromptConnect_ALongDestinationIsShownWholeEscapedAndPagedToItsSuffix(t 
 	}
 	if !endsOnAStepMultiple {
 		t.Fatalf("test premise broken: no case ends paging on a multiple of the %d-row step", promptInfoScrollStep)
+	}
+}
+
+func alwaysOutsideRequest() PromptRequest {
+	req := fullPromptRequest()
+	req.Action = "Allow running outside the sandbox"
+	req.ExceptionalAuthority = "running outside the sandbox"
+	req.OfferAlwaysOutside = true
+	return req
+}
+
+func TestPromptOverlay_AlwaysOutsideListedOnlyWhenOffered(t *testing.T) {
+	rows := promptOptionsFor(alwaysOutsideRequest())
+	if !equalOptions(rows, []PromptOption{OptionAllowOnce, OptionDeny, OptionAlwaysOutside}) || rows[2].Label != "always run outside the sandbox in this project" {
+		t.Fatalf("offered rows = %+v, want allow once, deny and always run outside the sandbox in this project", rows)
+	}
+	plain := alwaysOutsideRequest()
+	plain.OfferAlwaysOutside = false
+	if got := promptOptionsFor(plain); !equalOptions(got, []PromptOption{OptionAllowOnce, OptionDeny}) {
+		t.Fatalf("unoffered options = %v, want allow once and deny", optionValues(got))
+	}
+	h := startPrompt(t, New(nil), plain)
+	h.assertRunesInert("aA", 0)
+	h.typeText("o")
+	if d := h.await(); d.Option != OptionAllowOnce {
+		t.Fatalf("decision = %+v, want allow once", d)
+	}
+}
+
+func TestPromptUser_AlwaysOutsideReturnsTheChosenScope(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		choose func(h *promptHarness)
+		want   string
+	}{
+		{"mnemonic and prefix scope", func(h *promptHarness) {
+			h.typeText("a")
+			h.waitPage(promptScopePage)
+			h.key(tcell.KeyEnter)
+		}, "git log :*"},
+		{"cursor and exact scope", func(h *promptHarness) {
+			h.down(2)
+			h.key(tcell.KeyEnter)
+			h.waitPage(promptScopePage)
+			h.key(tcell.KeyUp)
+			h.key(tcell.KeyUp)
+			h.key(tcell.KeyEnter)
+		}, "git log --oneline"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := startPrompt(t, New(nil), alwaysOutsideRequest())
+			tc.choose(h)
+			if d := h.await(); d.Option != OptionAlwaysOutside || d.StoredSubject != tc.want {
+				t.Fatalf("decision = %+v, want always outside with subject %q", d, tc.want)
+			}
+		})
+	}
+}
+
+func TestPromptFactLines_AlwaysOutsideAddsItsExplanation(t *testing.T) {
+	const explanation = "always run outside the sandbox in this project — saves the command to .codemeld/settings.local.yaml; matching commands then run outside the sandbox. They still ask unless already allowed."
+	offered := promptFactLines(alwaysOutsideRequest())
+	plainReq := alwaysOutsideRequest()
+	plainReq.OfferAlwaysOutside = false
+	plain := promptFactLines(plainReq)
+	if !slices.Equal(withoutLine(offered, explanation), plain) || len(offered) != len(plain)+1 {
+		t.Fatalf("offered lines:\n%s\n--- plain ---\n%s\nwant the plain lines plus the explanation", strings.Join(offered, "\n"), strings.Join(plain, "\n"))
+	}
+	if !slices.Contains(plain, "allow this once — runs the command again, once, outside the sandbox; nothing is saved.") {
+		t.Fatalf("plain lines lost the allow-once explanation:\n%s", strings.Join(plain, "\n"))
+	}
+}
+
+func TestProgramGrantEffect_AlwaysOutsideStatesTheProgramRunsOutside(t *testing.T) {
+	const want = "Saved to outside_sandbox_commands: git :*\nEvery git command then runs outside the sandbox here. It may still ask."
+	if got := programGrantEffect(alwaysOutsideRequest(), OptionAlwaysOutside, "git :*"); got != want {
+		t.Errorf("effect = %q, want %q", got, want)
+	}
+}
+
+func TestProgramConfirm_WordingPerOption(t *testing.T) {
+	const (
+		grantWarn   = "⚠ Program scope authorizes ANY invocation of this program with ANY arguments within the chosen path scope."
+		grantEdit   = "WARNING - Edit capable program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history."
+		outsideWarn = "⚠ Program scope matches ANY invocation of this program with ANY arguments in this project."
+		outsideEdit = "WARNING - Edit capable program: this matches EVERY subcommand, including ones that permanently delete data or rewrite history."
+	)
+	a := New(nil)
+	for _, tc := range []struct {
+		opt                PromptOption
+		warn, edit, button string
+	}{
+		{OptionAllowSession, grantWarn, grantEdit, "Confirm program-wide grant"},
+		{OptionAllowFolder, grantWarn, grantEdit, "Confirm program-wide grant"},
+		{OptionAllowGlobal, grantWarn, grantEdit, "Confirm program-wide grant"},
+		{OptionAlwaysOutside, outsideWarn, outsideEdit, "Save program-wide pattern"},
+	} {
+		for _, req := range []PromptRequest{fullPromptRequest(), benignProgramRequest()} {
+			flagged := permissions.IsDestructiveProgram(req.CanonicalProgram)
+			overlay, list := a.buildProgramConfirm(req, tc.opt, req.CanonicalProgram+" :*", make(chan PromptDecision, 1), tview.NewList())
+			out := screenText(drawPrimitive(t, overlay, 200, 24))
+			name := fmt.Sprintf("option %d program %s", tc.opt, req.CanonicalProgram)
+			if label, _ := list.GetItemText(0); label != tc.button {
+				t.Errorf("%s: confirm button = %q, want %q", name, label, tc.button)
+			}
+			for text, want := range map[string]bool{
+				grantWarn:   tc.warn == grantWarn,
+				outsideWarn: tc.warn == outsideWarn,
+				grantEdit:   flagged && tc.edit == grantEdit,
+				outsideEdit: flagged && tc.edit == outsideEdit,
+			} {
+				if strings.Contains(out, text) != want {
+					t.Errorf("%s: shows %q = %v, want %v\n%s", name, text, !want, want, out)
+				}
+			}
+		}
+	}
+}
+
+func TestScopeChooser_WordingPerOptionAt80x24(t *testing.T) {
+	const (
+		grantFirst   = "Choose the subject scope this grant stores:"
+		grantWarn    = "⚠ Program scope authorizes ANY invocation of this program with ANY arguments within the chosen path scope."
+		outsideFirst = "Choose which commands always run outside the sandbox:"
+		outsideWarn  = "⚠ Program scope matches ANY invocation of this program with ANY arguments in this project."
+		note1        = "A choice ending in :* matches any command that starts with the words before :*."
+		note2        = "Example: go test :* matches go test -v, but not go build."
+	)
+	unwrapped := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) || (r >= '\u2500' && r <= '\u257f') {
+				return -1
+			}
+			return r
+		}, s)
+	}
+	a := New(nil)
+	for _, tc := range []struct {
+		opt          PromptOption
+		want, absent []string
+	}{
+		{OptionAllowSession, []string{grantFirst, note1, note2, grantWarn}, []string{outsideFirst, outsideWarn}},
+		{OptionAllowFolder, []string{grantFirst, note1, note2, grantWarn}, []string{outsideFirst, outsideWarn}},
+		{OptionAllowGlobal, []string{grantFirst, note1, note2, grantWarn}, []string{outsideFirst, outsideWarn}},
+		{OptionAlwaysOutside, []string{outsideFirst, note1, note2, outsideWarn}, []string{grantFirst, grantWarn}},
+	} {
+		overlay, _ := a.buildScopeChooser(alwaysOutsideRequest(), tc.opt, make(chan PromptDecision, 1))
+		screen := screenText(drawPrimitive(t, overlay, 80, 24))
+		got := unwrapped(screen)
+		for _, w := range tc.want {
+			if !strings.Contains(got, unwrapped(w)) {
+				t.Errorf("option %d: chooser does not show %q\n%s", tc.opt, w, screen)
+			}
+		}
+		for _, w := range tc.absent {
+			if strings.Contains(got, unwrapped(w)) {
+				t.Errorf("option %d: chooser shows %q\n%s", tc.opt, w, screen)
+			}
+		}
+	}
+}
+
+func TestRenderPrompt_ShellPromptShowsItsBody(t *testing.T) {
+	batched := batchedPromptRequest()
+	batched.Pipeline = ""
+	for name, req := range map[string]PromptRequest{
+		"single":  {Action: "Run command", Subject: "mise run check", Kind: SubjectDirectCommand, RunFolder: "/work"},
+		"batched": batched,
+		"outside": exceptionalDirectRequest(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			req.Body = "Whole command: mise run check 2>&1 | tail -60"
+			if out := renderPrompt(req); !strings.Contains(out, req.Body) {
+				t.Errorf("rendered prompt missing %q\n--- got ---\n%s", req.Body, out)
+			}
+		})
 	}
 }

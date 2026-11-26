@@ -357,7 +357,7 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	if composed == nil {
 		composed = map[string]any{}
 	}
-	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths, result.Home)
+	cache, err := newLaunchCache(result, composed)
 	if err != nil {
 		return fmt.Errorf("bootstrap: headless build config cache: %w", err)
 	}
@@ -447,7 +447,9 @@ func (d *HeadlessDriver) Run(ctx context.Context, result *BootstrapResult) (retE
 	authorizer.executionConstrained = execution.SelfTestPassed
 	authorizer.blocked = guard.Blocked
 	authorizer.systemOne = systemOne
-	conf.outside = &outsideSubjects{}
+	if terminal != nil {
+		conf.outside = &outsideSubjects{}
+	}
 	authorizer.outside = conf.outside
 	d.authorizer = authorizer
 

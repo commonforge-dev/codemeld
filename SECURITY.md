@@ -127,9 +127,9 @@ run unconfined where it should be confined, as a security issue.
 
 ### Project approval state
 
-`~/.codemeld/global/approved-projects.yaml` holds the project roots you approved,
-and nothing else. It lives outside every repository, and the structured file
-tools refuse to write it. Deleting it discards those approvals: the next launch
+`~/.codemeld/global/approved-projects.yaml` contains the project roots you
+approved plus its format version, in per-user global state rather than
+project-local configuration. The structured file tools refuse to write it. Deleting it discards those approvals: the next launch
 on a terminal asks again for a project that has its own codemeld settings or
 version-control templates, while a project with none of those is not asked
 about. A non-interactive run never prompts and never recreates the approvals,
@@ -187,6 +187,17 @@ further than described here are still welcome.
   blocked or no-write path, codemeld grants its subfolders one by one, which
   leaves a timing race that a program still running from an earlier command
   could use to gain write access through a symlink.
+- **Top-level project entry swaps.** A concurrent same-user process outside the
+  sandbox could swap a top-level project entry for a symlink between the policy
+  step and the Landlock rule step, widening a write root. The previous item
+  covers only carved-out subfolder swaps.
+- **Mercurial and Jujutsu structured reads.** Git read-only commands are isolated
+  from `core.fsmonitor`, `core.pager`, `diff.external` and textconv drivers in
+  repository config only; other git-configured programs, such as clean/process
+  filters, are not. Mercurial and Jujutsu structured (built-in tool) reads and
+  read-only child agents' VCS reads are not isolated, so a hostile repository
+  config can run a program there (confined when the sandbox is on, unconfined
+  when it is off).
 
 Outside the boundary — any host where the self-test did not pass, or a Build
 command you approved to run once

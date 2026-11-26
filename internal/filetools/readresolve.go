@@ -463,18 +463,22 @@ func walkOpenComponents(dirfd int, base string, segs []string, midFlags, lastFla
 	return fd, nil
 }
 
+var walkBeforeBoundaryOpen = func() {}
+
 func walkOpenDirUnder(boundary, target string) (*os.File, error) {
 	clean := filepath.Clean(target)
-	start, segs := "/", []string(nil)
+	var segs []string
 	if clean != filepath.Clean(boundary) {
 		root := normalizeRoot(boundary)
 		rel, err := filepath.Rel(root, clean)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil, &os.PathError{Op: "open", Path: target, Err: errors.New("folder is not inside the read boundary")}
 		}
-		start = root
+		if root != "/" {
+			segs = strings.Split(strings.TrimPrefix(root, "/"), "/")
+		}
 		if rel != "." {
-			segs = strings.Split(rel, string(filepath.Separator))
+			segs = append(segs, strings.Split(rel, string(filepath.Separator))...)
 		}
 	} else if clean != "/" {
 		segs = strings.Split(strings.TrimPrefix(clean, "/"), "/")
@@ -483,11 +487,12 @@ func walkOpenDirUnder(boundary, target string) (*os.File, error) {
 	if len(segs) > 0 {
 		startFlags = dirSearchOnly
 	}
-	dirfd, err := unix.Open(start, startFlags|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	walkBeforeBoundaryOpen()
+	dirfd, err := unix.Open("/", startFlags|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: target, Err: err}
 	}
-	fd, err := walkOpenComponents(dirfd, start, segs, walkDirSearchFlags, walkDirOpenFlags)
+	fd, err := walkOpenComponents(dirfd, "/", segs, walkDirSearchFlags, walkDirOpenFlags)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: target, Err: err}
 	}

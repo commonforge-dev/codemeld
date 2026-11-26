@@ -27,7 +27,7 @@ func fullComposed() map[string]any {
 		"discovery":          map[string]any{"boundary": "project-root"},
 		"agent":              map[string]any{"max_concurrency": 7},
 		"agent_instructions": map[string]any{"max_file_bytes": 4096},
-		"sessions":           map[string]any{"retention_days": 90, "max_tool_output_bytes": 2048},
+		"sessions":           map[string]any{"retention_days": 90, "max_tool_output_bytes": 2048, "max_pipe_bytes": 1048576},
 		"vcs":                map[string]any{"priority": []any{"hg", "git", "jj"}, "force": "hg"},
 		"mode":               map[string]any{"default": "plan"},
 		"attribution":        false,
@@ -98,6 +98,9 @@ func TestCacheAccessors(t *testing.T) {
 	}
 	if got := c.MaxToolOutputBytes(); got != 2048 {
 		t.Errorf("MaxToolOutputBytes() = %d, want 2048", got)
+	}
+	if got := c.MaxPipeBytes(); got != 1048576 {
+		t.Errorf("MaxPipeBytes() = %d, want 1048576", got)
 	}
 	if got := c.VCSPriority(); !reflect.DeepEqual(got, []string{"hg", "git", "jj"}) {
 		t.Errorf("VCSPriority() = %v, want [hg git jj]", got)
@@ -181,6 +184,9 @@ func TestCacheDefaults(t *testing.T) {
 	if got := c.MaxToolOutputBytes(); got != 65536 {
 		t.Errorf("MaxToolOutputBytes() default = %d, want 65536", got)
 	}
+	if got := c.MaxPipeBytes(); got != 16777216 {
+		t.Errorf("MaxPipeBytes() default = %d, want 16777216", got)
+	}
 	if got := c.VCSPriority(); !reflect.DeepEqual(got, []string{"git", "hg", "jj"}) {
 		t.Errorf("VCSPriority() default = %v, want [git hg jj]", got)
 	}
@@ -258,6 +264,84 @@ func TestCacheAcceptsMaxToolOutputBytesAtMinimum(t *testing.T) {
 	}, "/root", nil)
 	if got := c.MaxToolOutputBytes(); got != 256 {
 		t.Errorf("MaxToolOutputBytes() = %d, want 256", got)
+	}
+}
+
+func TestCacheMaxPipeBytesMinimum(t *testing.T) {
+	c := newCacheOrFatal(t, map[string]any{
+		"sessions": map[string]any{"max_pipe_bytes": 256},
+	}, "/root", nil)
+	if got := c.MaxPipeBytes(); got != 256 {
+		t.Errorf("MaxPipeBytes() = %d, want 256", got)
+	}
+	_, err := NewCache(map[string]any{
+		"sessions": map[string]any{"max_pipe_bytes": 255},
+	}, "/root", nil)
+	if err == nil || err.Error() != "sessions.max_pipe_bytes must be >= 256, got 255" {
+		t.Fatalf("NewCache(max_pipe_bytes=255) error = %v, want minimum error", err)
+	}
+}
+
+func TestCacheMaxPipeBytesFromLoadedFile(t *testing.T) {
+	cases := []struct {
+		yaml string
+		want int
+	}{
+		{"9223372036854775808", math.MaxInt},
+		{"18446744073709551615", math.MaxInt},
+		{"1.0e+20", math.MaxInt},
+		{"1048576", 1048576},
+		{"256", 256},
+	}
+	for _, tc := range cases {
+		t.Run(tc.yaml, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.yaml")
+			if err := os.WriteFile(path, []byte("sessions:\n  max_pipe_bytes: "+tc.yaml+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, raw, cat, err := LoadYAML(path)
+			if err != nil {
+				t.Fatalf("LoadYAML(%s) = (%q, %v)", path, cat, err)
+			}
+			c := newCacheOrFatal(t, raw, "/root", []string{path})
+			if got := c.MaxPipeBytes(); got != tc.want {
+				t.Errorf("MaxPipeBytes() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+	path := filepath.Join(t.TempDir(), "settings.yaml")
+	if err := os.WriteFile(path, []byte("sessions:\n  max_pipe_bytes: 255\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, raw, _, err := LoadYAML(path)
+	if err == nil {
+		_, err = NewCache(raw, "/root", []string{path})
+	}
+	if err == nil {
+		t.Fatal("max_pipe_bytes: 255 loaded, want an error")
+	}
+}
+
+func TestCacheGlobalFileWithoutMaxPipeBytesLoadsDefaultAndStaysUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.yaml")
+	content := []byte("sessions:\n  retention_days: 30\n  max_tool_output_bytes: 65536\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, raw, cat, err := LoadYAML(path)
+	if err != nil {
+		t.Fatalf("LoadYAML(%s) = (%q, %v)", path, cat, err)
+	}
+	c := newCacheOrFatal(t, raw, "/root", []string{path})
+	if got := c.MaxPipeBytes(); got != 16777216 {
+		t.Errorf("MaxPipeBytes() = %d, want 16777216", got)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(content) {
+		t.Errorf("settings file changed after load:\n%s\nwant:\n%s", after, content)
 	}
 }
 

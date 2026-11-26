@@ -54,6 +54,7 @@ type confinement struct {
 	approvals     *connectApprovals
 	outside       *outsideSubjects
 	writes        *writeRefusalReports
+	pipeBytes     int
 }
 
 type writeRefusalReports struct {
@@ -585,25 +586,99 @@ func (c *confinement) cleanupAll() error {
 var confinementProbePins = []string{"GOTOOLCHAIN=local", "MISE_OFFLINE=1"}
 
 func (c *confinement) resolve(ctx context.Context) (current, tmpDir string, confined bool, err error) {
+	current, tmpDir, confined, _, err = c.resolveOutside(ctx, runner.RunSpec{})
+	return current, tmpDir, confined, err
+}
+
+func (c *confinement) resolveOutside(ctx context.Context, spec runner.RunSpec) (current, tmpDir string, confined bool, matched map[string]string, err error) {
 	if c == nil || !c.constrained {
-		return "", "", false, nil
+		return "", "", false, nil, nil
 	}
+	current = c.currentMode(ctx)
+	switch mode.Mode(current) {
+	case mode.Plan, mode.AutoEdits, mode.Build:
+		if mode.Mode(current) == mode.Build {
+			if matched := c.savedOutside(ctx); matched != nil {
+				return current, "", false, matched, nil
+			}
+			entry, sameProgram := c.savedHead(ctx, spec)
+			once := dispatch.TakeRunOutside(ctx)
+			if sameProgram || (once && entry == "") {
+				subject := dispatch.ShellSubject(ctx)
+				if once {
+					c.outside.remove(subject)
+				}
+				if sameProgram {
+					dispatch.MarkPipeHeadOutside(ctx)
+					matched = map[string]string{subject: entry}
+				}
+				return current, "", false, matched, nil
+			}
+		}
+		if c.tmpDir == "" {
+			return current, "", true, nil, fmt.Errorf("bootstrap: confined %s run has no private temporary folder", current)
+		}
+		return current, c.tmpDir, true, nil, nil
+	}
+	return current, "", true, nil, fmt.Errorf("bootstrap: confined run refused for unrecognized mode %q", current)
+}
+
+func (c *confinement) currentMode(ctx context.Context) string {
 	current, ok := vcs.ConfinementMode(ctx)
 	if !ok && c.mode != nil {
 		current = c.mode()
 	}
-	switch mode.Mode(current) {
-	case mode.Plan, mode.AutoEdits, mode.Build:
-		if mode.Mode(current) == mode.Build && dispatch.TakeRunOutside(ctx) {
-			c.outside.remove(dispatch.ShellSubject(ctx))
-			return current, "", false, nil
-		}
-		if c.tmpDir == "" {
-			return current, "", true, fmt.Errorf("bootstrap: confined %s run has no private temporary folder", current)
-		}
-		return current, c.tmpDir, true, nil
+	return current
+}
+
+func (c *confinement) savedOutside(ctx context.Context) map[string]string {
+	reqs := dispatch.ShellRequests(ctx)
+	if len(reqs) == 0 {
+		return nil
 	}
-	return current, "", true, fmt.Errorf("bootstrap: confined run refused for unrecognized mode %q", current)
+	entries := c.writable.outsideSandboxEntries()
+	if len(entries) == 0 {
+		return nil
+	}
+	matched := make(map[string]string, len(reqs))
+	for _, req := range reqs {
+		result := permissions.Match(req, entries)
+		if !result.Matched {
+			return nil
+		}
+		matched[req.Subject] = result.Grant.Subject
+	}
+	return matched
+}
+
+func (c *confinement) savedHead(ctx context.Context, spec runner.RunSpec) (entry string, sameProgram bool) {
+	if !dispatch.IsPipeHead(ctx) || len(spec.Argv) == 0 {
+		return "", false
+	}
+	subject := dispatch.ShellSubject(ctx)
+	entries := c.writable.outsideSandboxEntries()
+	var req permissions.MatchRequest
+	for _, r := range dispatch.ShellRequests(ctx) {
+		if r.Subject != subject {
+			continue
+		}
+		// ShellQuote replaces invalid bytes, so different argvs can share one subject.
+		result := permissions.Match(r, entries)
+		if r.Kind != matchKindDirect || !result.Matched {
+			return "", false
+		}
+		req, entry = r, result.Grant.Subject
+	}
+	if entry == "" {
+		return "", false
+	}
+	program := spec.Argv[0]
+	if filepath.IsAbs(program) || !strings.Contains(program, "/") {
+		return entry, true
+	}
+	// An earlier sandboxed stage can repoint a folder in a relative program's path.
+	keepAbsolute := req.ClearEnvironment || slices.ContainsFunc(req.Assignments, func(a string) bool { return strings.HasPrefix(a, "PATH=") })
+	return entry, permissions.ResolveRelativeProgram(program, spec.Cwd, keepAbsolute) == req.SubjectTokens[0]
 }
 
 func (c *confinement) prepare(spec runner.RunSpec, tmpDir string, blocked *permissions.BlockedPaths, proxyURL string) (runner.RunSpec, error) {
@@ -1025,6 +1100,8 @@ type confinedRunner struct {
 var (
 	_ runner.Runner         = (*confinedRunner)(nil)
 	_ runner.PipelineRunner = (*confinedRunner)(nil)
+
+	_ dispatch.OutsideEntryMatcher = (*confinedShellRunner)(nil)
 )
 
 func (r *confinedRunner) NewInvocationID() string { return r.inner.NewInvocationID() }
@@ -1049,14 +1126,17 @@ func (r *confinedRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.
 		defer prepared.Helper.Close()
 	}
 	res, err := bounded.ExecBounded(ctx, prepared, r.cap)
-	if err != nil {
-		return res, err
+	if err == nil {
+		failure := confinedFailureOf(res, proxyRoute, prepared.Helper, r.conf.widen(prepared.Env, spec.Cwd))
+		if failure != nil && !failure.plan {
+			err = recordWriteRefusals(r.active, r.conf.writes.fresh(failure.refused))
+		}
+		res = noteConfinedFailure(res, r.cap, failure)
 	}
-	failure := confinedFailureOf(res, proxyRoute, prepared.Helper, r.conf.widen(prepared.Env, spec.Cwd))
-	if failure != nil && !failure.plan {
-		err = recordWriteRefusals(r.active, r.conf.writes.fresh(failure.refused))
+	if recErr := recordConnectDecisions(r.active, prepared.Helper); recErr != nil {
+		err = errors.Join(err, recErr)
 	}
-	return noteConfinedFailure(res, r.cap, failure), err
+	return res, err
 }
 
 const confinedFailureNote = "codemeld: this command ran inside the confinement boundary; a failure may be a boundary denial and may have left partial changes; codemeld did not re-run it outside the boundary."
@@ -1085,8 +1165,6 @@ type confinedFailure struct {
 	remembered *outsideSubjects
 	subjects   []string
 }
-
-const outsideRunLine = "codemeld: to run this command once outside the sandbox, run it again; you will be asked first."
 
 type refusal struct {
 	Host, Port, Path, Reason string
@@ -1171,13 +1249,6 @@ func (f *confinedFailure) merge(g *confinedFailure) {
 }
 
 func (f *confinedFailure) additions(room int) string {
-	if !f.outside || len(outsideRunLine)+1 > room {
-		return f.refusalAdditions(room)
-	}
-	return f.refusalAdditions(room-len(outsideRunLine)-1) + outsideRunLine + "\n"
-}
-
-func (f *confinedFailure) refusalAdditions(room int) string {
 	var out string
 	if len(f.lines) == 0 {
 		if f.proxyRoute && len(proxyRouteNote)+1 <= room {
@@ -1234,13 +1305,21 @@ func noteConfinedFailure(res runner.RunResult, cap int, f *confinedFailure) runn
 func withConfinedFailure(stderr []byte, cap int, f *confinedFailure) ([]byte, int) {
 	out, kept, add := renderConfinedFailure(stderr, cap, f)
 	if f.outside && !f.listsRefusal(add) {
-		for _, s := range f.subjects {
-			f.remembered.remove(s)
-		}
-		f.outside, f.subjects = false, nil
+		f.forget()
+		f.outside = false
 		out, kept, _ = renderConfinedFailure(stderr, cap, f)
 	}
 	return out, kept
+}
+
+func (f *confinedFailure) forget() {
+	if f == nil {
+		return
+	}
+	for _, s := range f.subjects {
+		f.remembered.remove(s)
+	}
+	f.subjects = nil
 }
 
 func (f *confinedFailure) listsRefusal(add string) bool {
@@ -1332,6 +1411,7 @@ type confinedShellRunner struct {
 type confinedPipeline struct {
 	subjects []runner.RunSpec
 	specs    []runner.RunSpec
+	entries  []string
 }
 
 func (r *confinedShellRunner) NewInvocationID() string { return r.events.NewInvocationID() }
@@ -1344,13 +1424,25 @@ func (r *confinedShellRunner) Confined(ctx context.Context) (bool, error) {
 	return confined, err
 }
 
+func (r *confinedShellRunner) MatchOutsideEntry(ctx context.Context, req permissions.MatchRequest) (entry string, ok bool) {
+	c := r.conf
+	if c == nil || !c.constrained || mode.Mode(c.currentMode(ctx)) != mode.Build {
+		return "", false
+	}
+	result := permissions.Match(req, c.writable.outsideSandboxEntries())
+	if !result.Matched {
+		return "", false
+	}
+	return result.Grant.Subject, true
+}
+
 func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
-	current, tmpDir, confined, err := r.conf.resolve(ctx)
+	current, tmpDir, confined, matched, err := r.conf.resolveOutside(ctx, spec)
 	if err != nil {
 		return runner.RunResult{}, err
 	}
 	if !confined {
-		return r.events.Exec(ctx, spec)
+		return r.events.Exec(withOutsideEntries(ctx, matched[dispatch.ShellSubject(ctx)]), spec)
 	}
 	prepared, proxyRoute, err := r.conf.confine(ctx, spec, current, tmpDir, false)
 	if err != nil {
@@ -1358,6 +1450,9 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 	}
 	if prepared.Helper != nil {
 		defer prepared.Helper.Close()
+	}
+	if dispatch.FeedsPipe(ctx) {
+		prepared.StdoutCapture = r.conf.pipeBytes
 	}
 	res, failure, err := r.events.execBoundedPrepared(ctx, spec, prepared, r.events.cap, func(res runner.RunResult) *confinedFailure {
 		f := confinedFailureOf(res, proxyRoute, prepared.Helper, r.conf.widen(prepared.Env, spec.Cwd))
@@ -1382,7 +1477,7 @@ func (r *confinedShellRunner) Exec(ctx context.Context, spec runner.RunSpec) (ru
 			err = recordWriteRefusals(r.events.active, r.conf.writes.fresh(failure.refused))
 		}
 	}
-	if recErr := r.recordConnectDecisions(prepared.Helper); recErr != nil {
+	if recErr := recordConnectDecisions(r.events.active, prepared.Helper); recErr != nil {
 		err = errors.Join(err, recErr)
 	}
 	return res, err
@@ -1405,14 +1500,14 @@ func recordWriteRefusals(active func() *sessions.Store, refused []refusal) error
 	return errors.Join(errs...)
 }
 
-func (r *confinedShellRunner) recordConnectDecisions(helper runner.HelperLaunch) error {
+func recordConnectDecisions(active func() *sessions.Store, helper runner.HelperLaunch) error {
 	h, ok := helper.(interface {
 		connectDecisions() []events.ConnectDecision
 	})
-	if !ok || r.events.active == nil {
+	if !ok || active == nil {
 		return nil
 	}
-	store := r.events.active()
+	store := active()
 	if store == nil {
 		return nil
 	}
@@ -1428,7 +1523,8 @@ func (r *confinedShellRunner) recordConnectDecisions(helper runner.HelperLaunch)
 
 func (r *confinedShellRunner) PreflightPipeline(ctx context.Context, specs []runner.RunSpec) error {
 	r.pending = nil
-	if _, _, confined, _ := r.conf.resolve(ctx); confined {
+	_, _, confined, matched, _ := r.conf.resolveOutside(ctx, runner.RunSpec{})
+	if confined {
 		return runner.ErrPipelineUnsupported
 	}
 	prepared := cloneSpecs(specs)
@@ -1436,7 +1532,13 @@ func (r *confinedShellRunner) PreflightPipeline(ctx context.Context, specs []run
 	if err := r.events.preflightPrepared(ctx, subjects, prepared); err != nil {
 		return err
 	}
-	r.pending = &confinedPipeline{subjects: subjects, specs: prepared}
+	var entries []string
+	if matched != nil {
+		for _, subject := range dispatch.ShellStageSubjects(ctx) {
+			entries = append(entries, matched[subject])
+		}
+	}
+	r.pending = &confinedPipeline{subjects: subjects, specs: prepared, entries: entries}
 	return nil
 }
 
@@ -1446,5 +1548,5 @@ func (r *confinedShellRunner) Pipeline(ctx context.Context, _ []runner.RunSpec) 
 	if pending == nil {
 		return nil, errors.New("bootstrap: pipeline run without a successful preflight")
 	}
-	return r.events.pipelinePrepared(ctx, pending.subjects, pending.specs)
+	return r.events.pipelinePrepared(withOutsideEntries(ctx, pending.entries...), pending.subjects, pending.specs)
 }

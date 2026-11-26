@@ -43,6 +43,7 @@ const (
 	helperTouch     = "CODEMELD_RUNNER_TOUCH"
 	helperDumpEnv   = "CODEMELD_RUNNER_DUMP_ENV" // when "1", write every environment entry to stderr, one per line
 	helperChannel   = "CODEMELD_RUNNER_CHANNEL"
+	helperAlternate = "CODEMELD_RUNNER_ALTERNATE"
 )
 
 func TestMain(m *testing.M) {
@@ -66,6 +67,13 @@ func runHelper() {
 	}
 	if s := os.Getenv(helperStderr); s != "" {
 		_, _ = os.Stderr.WriteString(s)
+	}
+	if n := os.Getenv(helperAlternate); n != "" {
+		count, _ := strconv.Atoi(n)
+		for i := range count {
+			_, _ = fmt.Fprintf(os.Stdout, "o%d;", i)
+			_, _ = fmt.Fprintf(os.Stderr, "e%d;", i)
+		}
 	}
 	if n := os.Getenv(helperRepeat); n != "" {
 		count, _ := strconv.Atoi(n)
@@ -850,32 +858,37 @@ func execBoundedWithin(t *testing.T, timeout time.Duration, spec RunSpec, maxCap
 
 func TestDirectExecRunner_ExecBoundedOverCapRunsToCompletion(t *testing.T) {
 	const size = 200_000
-	marker := filepath.Join(t.TempDir(), "done")
-	spec := helperSpec(t, DirectExecRunner{}.NewInvocationID(), map[string]string{
-		helperRepeat:    strconv.Itoa(size),
-		helperErrRepeat: strconv.Itoa(size + 1),
-		helperTouch:     marker,
-		helperExit:      "4",
-	})
+	for _, tc := range []struct{ stdoutCapture, keptStdout int }{{0, 100}, {50, 100}, {300, 300}} {
+		t.Run(fmt.Sprintf("stdout capture %d", tc.stdoutCapture), func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "done")
+			spec := helperSpec(t, DirectExecRunner{}.NewInvocationID(), map[string]string{
+				helperRepeat:    strconv.Itoa(size),
+				helperErrRepeat: strconv.Itoa(size + 1),
+				helperTouch:     marker,
+				helperExit:      "4",
+			})
+			spec.StdoutCapture = tc.stdoutCapture
 
-	res, err := execBoundedWithin(t, 20*time.Second, spec, 100)
-	if err != nil {
-		t.Fatalf("ExecBounded error: %v", err)
-	}
-	if res.ExitCode != 4 {
-		t.Fatalf("ExitCode = %d, want 4", res.ExitCode)
-	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("last side effect not observed: %v", err)
-	}
-	if !bytes.Equal(res.Stdout, bytes.Repeat([]byte("a"), 100)) || !bytes.Equal(res.Stderr, bytes.Repeat([]byte("e"), 100)) {
-		t.Fatalf("retained stdout %d / stderr %d bytes, want the 100-byte prefix of each", len(res.Stdout), len(res.Stderr))
-	}
-	if res.StdoutTotal != size || res.StderrTotal != size+1 {
-		t.Fatalf("totals = %d/%d, want %d/%d", res.StdoutTotal, res.StderrTotal, size, size+1)
-	}
-	if res.InvocationID != spec.InvocationID || res.LaunchErrCategory != "" {
-		t.Fatalf("InvocationID=%q LaunchErrCategory=%q", res.InvocationID, res.LaunchErrCategory)
+			res, err := execBoundedWithin(t, 20*time.Second, spec, 100)
+			if err != nil {
+				t.Fatalf("ExecBounded error: %v", err)
+			}
+			if res.ExitCode != 4 {
+				t.Fatalf("ExitCode = %d, want 4", res.ExitCode)
+			}
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("last side effect not observed: %v", err)
+			}
+			if !bytes.Equal(res.Stdout, bytes.Repeat([]byte("a"), tc.keptStdout)) || !bytes.Equal(res.Stderr, bytes.Repeat([]byte("e"), 100)) {
+				t.Fatalf("retained stdout %d / stderr %d bytes, want %d / 100", len(res.Stdout), len(res.Stderr), tc.keptStdout)
+			}
+			if res.StdoutTotal != size || res.StderrTotal != size+1 {
+				t.Fatalf("totals = %d/%d, want %d/%d", res.StdoutTotal, res.StderrTotal, size, size+1)
+			}
+			if res.InvocationID != spec.InvocationID || res.LaunchErrCategory != "" {
+				t.Fatalf("InvocationID=%q LaunchErrCategory=%q", res.InvocationID, res.LaunchErrCategory)
+			}
+		})
 	}
 }
 
@@ -945,6 +958,34 @@ func TestDirectExecRunner_ExecKeepsFullOutputWithZeroTotals(t *testing.T) {
 	}
 	if res.StdoutTotal != 0 || res.StderrTotal != 0 {
 		t.Fatalf("Exec totals = %d/%d, want 0/0", res.StdoutTotal, res.StderrTotal)
+	}
+}
+
+func TestDirectExecRunner_MergeStderrKeepsWriteOrderInStdout(t *testing.T) {
+	const writes = 10_000
+	var ordered strings.Builder
+	for i := range writes {
+		fmt.Fprintf(&ordered, "o%d;e%d;", i, i)
+	}
+	all := ordered.String()
+	r := DirectExecRunner{}
+	spec := func() RunSpec {
+		s := helperSpec(t, r.NewInvocationID(), map[string]string{helperAlternate: strconv.Itoa(writes), helperExit: "3"})
+		s.MergeStderr = true
+		return s
+	}
+
+	res, err := r.Exec(context.Background(), spec())
+	if err != nil || res.ExitCode != 3 || string(res.Stdout) != all || len(res.Stderr) != 0 {
+		t.Fatalf("Exec = exit %d, %d stdout, %d stderr bytes, %v; want all %d bytes in write order in stdout", res.ExitCode, len(res.Stdout), len(res.Stderr), err, len(all))
+	}
+	for _, limit := range []int{len(all) + 1, 100} {
+		res, err := execBoundedWithin(t, 20*time.Second, spec(), limit)
+		if err != nil || res.ExitCode != 3 || string(res.Stdout) != all[:min(limit, len(all))] || len(res.Stderr) != 0 ||
+			res.StdoutTotal != int64(len(all)) || res.StderrTotal != 0 {
+			t.Fatalf("ExecBounded(%d) = exit %d, %d stdout, %d stderr bytes, totals %d/%d, %v; want the ordered prefix of %d bytes",
+				limit, res.ExitCode, len(res.Stdout), len(res.Stderr), res.StdoutTotal, res.StderrTotal, err, len(all))
+		}
 	}
 }
 

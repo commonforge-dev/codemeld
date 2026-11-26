@@ -32,7 +32,12 @@
       "additionalProperties": false,
       "properties": {
         "retention_days": { "type": "integer", "minimum": 0 },
-        "max_tool_output_bytes": { "type": "integer", "minimum": 256 }
+        "max_tool_output_bytes": { "type": "integer", "minimum": 256 },
+        "max_pipe_bytes": {
+          "type": "integer",
+          "minimum": 256,
+          "description": "Cap in bytes on what one sandboxed command in a pipe hands to the next. Defaults to 16777216 (16 MiB) when omitted, is global-only (a per-project settings file carrying it fails to load), and has no maximum. The larger of it and max_tool_output_bytes applies to a pipe."
+        }
       }
     },
     "vcs": {
@@ -122,6 +127,11 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
       "description": "Project-settings-only list of declared folder strings. Entries are parsed and validated as absolute folders (including expanded ~-relative paths), and invalid paths are skipped with notices. Each effective folder widens the write area of commands Auto runs inside the confinement boundary, still subject to blocked paths and the protected codemeld folders; the folders do not yet authorize codemeld's own in-process file writes. Rejected in the global settings file."
+    },
+    "outside_sandbox_commands": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "List of commands that Build runs outside the sandbox, read only from the project's .codemeld/settings.local.yaml. A list in the project's committed .codemeld/settings.yaml is ignored, though a value that is not a list of non-empty strings still fails validation there. Each entry matches like a saved direct command grant; a matching command runs outside when every command in its shell call matches, or when it is first in its pipe group (so it takes no piped input); the other commands stay sandboxed. When such a first command ran outside in a mixed call and failed, and the last command of its pipe succeeded, the pipe fails with the first command's exit status. A call codemeld hands to the shell whole (redirections, and wrappers such as sh, bash or xargs as a command) stays sandboxed, with two exceptions, written with these spaces: 'X 2>&1' and 'X 2>&1 | ...', where X is a matching command and no command in the call sets a variable or needs the shell. Those run as separate commands under the rules above, with X's stderr sent into its stdout; other redirections keep the call sandboxed. Applies in Build only. It turns off the sandbox for matching commands and never approves a command: each still needs its ordinary approval. Rejected in the global settings file."
     },
     "web_research": {
       "type": "object",

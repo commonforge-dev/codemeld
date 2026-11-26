@@ -105,10 +105,10 @@ the shell is read from disk when it runs.
 `~/.codemeld` is protected: codemeld's tools and commands may neither read nor write it. Skills in
 `~/.codemeld/skills` are a narrow exception, so their scripts can run.
 
-The exception applies only to Plan and Auto edits shell commands that run confined: on a supported
+The exception applies to confined Plan, Auto edits, and Build shell commands: on a supported
 Linux host whose startup self-test passed (see
-[Confined shell commands](../README.md#confined-shell-commands-linux)). It does not apply to Build or
-to any command running outside the sandbox. A command you approve outside the sandbox is not checked
+[Confined shell commands](../README.md#confined-shell-commands-linux)). It does not apply to
+any command running outside the sandbox. A command you approve outside the sandbox is not checked
 against blocked paths at all.
 
 Confined commands may read and run files in the skills folder, at its real location after symlinks,

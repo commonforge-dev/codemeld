@@ -401,31 +401,9 @@ func TestOpenJournal_RefusesUnsafeScopeBeforeCreatingStorage(t *testing.T) {
 	})
 
 	t.Run("per-file snapshot cap is inclusive", func(t *testing.T) {
-		for _, tc := range []struct {
-			name    string
-			size    int
-			wantErr bool
-		}{
-			{"exactly the cap", maxSnapshotBytesPerFile, false},
-			{"one byte over", maxSnapshotBytesPerFile + 1, true},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				f := newFixture(t)
-				target := f.seed(t, "big.bin", strings.Repeat("x", tc.size))
-				j, err := OpenJournal(JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), Declared: []string{target}})
-				if tc.wantErr {
-					if err == nil {
-						t.Fatal("OpenJournal accepted a snapshot over the per-file cap")
-					}
-					assertGone(t, filepath.Join(f.home, ".codemeld", journalsDirName))
-					return
-				}
-				if err != nil {
-					t.Fatalf("OpenJournal refused a snapshot at exactly the cap: %v", err)
-				}
-				j.Close()
-			})
-		}
+		assertSnapshotCapInclusive(t, "snapshot", func(f *fixture, target string) JournalConfig {
+			return JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), Declared: []string{target}}
+		})
 	})
 
 	t.Run("aggregate snapshot cap", func(t *testing.T) {
@@ -805,6 +783,35 @@ func TestOpenJournal_RefusesADeletePathOfAKindItCannotRestore(t *testing.T) {
 	assertGone(t, filepath.Join(f.home, ".codemeld", journalsDirName))
 }
 
+func assertSnapshotCapInclusive(t *testing.T, label string, config func(f *fixture, target string) JournalConfig) {
+	t.Helper()
+	for _, tc := range []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{"exactly the cap", maxSnapshotBytesPerFile, false},
+		{"one byte over", maxSnapshotBytesPerFile + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			target := f.seed(t, "big.bin", strings.Repeat("x", tc.size))
+			j, err := OpenJournal(config(f, target))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("OpenJournal accepted a %s over the per-file cap", label)
+				}
+				assertGone(t, filepath.Join(f.home, ".codemeld", journalsDirName))
+				return
+			}
+			if err != nil {
+				t.Fatalf("OpenJournal refused a %s at exactly the cap: %v", label, err)
+			}
+			j.Close()
+		})
+	}
+}
+
 func TestOpenJournal_CapsTheUnionOfWriteAndDeletePaths(t *testing.T) {
 	t.Run("a path in both forms counts once", func(t *testing.T) {
 		f := newFixture(t)
@@ -844,31 +851,9 @@ func TestOpenJournal_CapsTheUnionOfWriteAndDeletePaths(t *testing.T) {
 	})
 
 	t.Run("the per-snapshot cap is inclusive for a delete path", func(t *testing.T) {
-		for _, tc := range []struct {
-			name    string
-			size    int
-			wantErr bool
-		}{
-			{"exactly the cap", maxSnapshotBytesPerFile, false},
-			{"one byte over", maxSnapshotBytesPerFile + 1, true},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				f := newFixture(t)
-				target := f.seed(t, "big.bin", strings.Repeat("x", tc.size))
-				j, err := OpenJournal(JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), DeclaredDelete: []string{target}})
-				if tc.wantErr {
-					if err == nil {
-						t.Fatal("OpenJournal accepted a delete snapshot over the per-file cap")
-					}
-					assertGone(t, filepath.Join(f.home, ".codemeld", journalsDirName))
-					return
-				}
-				if err != nil {
-					t.Fatalf("OpenJournal refused a delete snapshot at exactly the cap: %v", err)
-				}
-				j.Close()
-			})
-		}
+		assertSnapshotCapInclusive(t, "delete snapshot", func(f *fixture, target string) JournalConfig {
+			return JournalConfig{Home: f.home, ProjectRoot: f.project, Invocation: f.invocation(), DeclaredDelete: []string{target}}
+		})
 	})
 
 	t.Run("the aggregate snapshot cap spans both forms", func(t *testing.T) {

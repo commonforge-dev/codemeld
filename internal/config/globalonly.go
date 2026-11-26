@@ -38,6 +38,9 @@ func firstGlobalOnlyViolation(m map[string]any) (string, bool) {
 	if nestedKeyPresent(m, "sessions", "max_tool_output_bytes") {
 		return "sessions.max_tool_output_bytes", true
 	}
+	if nestedKeyPresent(m, "sessions", "max_pipe_bytes") {
+		return "sessions.max_pipe_bytes", true
+	}
 	if v, ok := m["provider"]; ok {
 		return providerViolationKey(v), true
 	}

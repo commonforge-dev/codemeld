@@ -5,15 +5,10 @@ package dispatch
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/runner"
@@ -177,6 +172,12 @@ type ConfinementReporter interface {
 	Confined(ctx context.Context) (bool, error)
 }
 
+// OutsideEntryMatcher is asked before authorization to choose a route, so an implementation must
+// only read state.
+type OutsideEntryMatcher interface {
+	MatchOutsideEntry(ctx context.Context, req permissions.MatchRequest) (entry string, ok bool)
+}
+
 func executionExpired(ctx context.Context, run Runner) (bool, error) {
 	clock, ok := run.(ExecutionClock)
 	if !ok {
@@ -203,7 +204,8 @@ func (e *UnsupportedConstructError) Error() string {
 
 // MalformedCommandError reports a shell command codemeld could not parse or resolve before
 // authorization: a split or canonicalization failure, a model-supplied `cd` prefix naming a path
-// that will not resolve, or a direct or staged stage whose program is not found. Like
+// that will not resolve, a direct or staged stage whose program is not found, or a call that would keep
+// a saved outside-sandbox command in the sandbox. Like
 // UnsupportedConstructError no prompt is shown and no grant can authorize it, so the caller delivers
 // the wrapped reason to the agent as the tool result rather than failing the turn. Scope resolution without a `cd` hint, authorization, and execution
 // failures are infrastructure faults and are never wrapped in it.
@@ -235,13 +237,22 @@ func (e *DeniedError) Error() string {
 }
 
 type shellCall struct {
-	mu      sync.Mutex
-	outside map[string]bool
+	mu       sync.Mutex
+	outside  map[string]bool
+	requests []permissions.MatchRequest
 }
 
 type shellCallKey struct{}
 
 type shellSubjectKey struct{}
+
+type shellStageSubjectsKey struct{}
+
+// ShellStageSubjects names the request subject of each spec handed to PreflightPipeline, in order.
+func ShellStageSubjects(ctx context.Context) []string {
+	subjects, _ := ctx.Value(shellStageSubjectsKey{}).([]string)
+	return subjects
+}
 
 func MarkRunOutside(ctx context.Context, subject string) {
 	call, ok := ctx.Value(shellCallKey{}).(*shellCall)
@@ -251,6 +262,28 @@ func MarkRunOutside(ctx context.Context, subject string) {
 	call.mu.Lock()
 	defer call.mu.Unlock()
 	call.outside[subject] = true
+}
+
+func setShellRequests(ctx context.Context, reqs []permissions.MatchRequest) {
+	call, ok := ctx.Value(shellCallKey{}).(*shellCall)
+	if !ok {
+		return
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	call.requests = reqs
+}
+
+// ShellRequests returns every authorized request of the current shell call, so a runner that sees
+// one pipeline stage at a time can still judge the whole call.
+func ShellRequests(ctx context.Context) []permissions.MatchRequest {
+	call, ok := ctx.Value(shellCallKey{}).(*shellCall)
+	if !ok {
+		return nil
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	return slices.Clone(call.requests)
 }
 
 func ShellSubject(ctx context.Context) string {
@@ -336,11 +369,31 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 			if reroute {
 				return dispatchConfinedShell(ctx, split.LiteralInput, stages, scope, home, authorizer, runner, modeCtx, policy)
 			}
+			if err := refusePipedEntry(ctx, runner, stages, operators, scope, home); err != nil {
+				return tools.Result{}, err
+			}
 			batch, ok := authorizer.(BatchAuthorizer)
 			if !ok {
 				batch = perStageBatchAuthorizer{authorizer}
 			}
-			return dispatchStaged(ctx, stages, operators, scope, home, batch, runner, modeCtx, policy)
+			return dispatchStaged(ctx, stages, operators, scope, home, batch, runner, modeCtx, policy, "")
+		}
+		if stages, operators, ok := savedMergedStages(ctx, runner, split.LiteralInput, scope, home); ok {
+			if err := refusePipedEntry(ctx, runner, stages, operators, scope, home); err != nil {
+				return tools.Result{}, err
+			}
+			batch, ok := authorizer.(BatchAuthorizer)
+			if !ok {
+				batch = perStageBatchAuthorizer{authorizer}
+			}
+			mergedFrom := strings.TrimSpace(input)
+			if len(operators) == 0 {
+				return dispatchDirect(ctx, stages, scope, home, batch, runner, modeCtx, policy, mergedFrom)
+			}
+			return dispatchStaged(ctx, stages, operators, scope, home, batch, runner, modeCtx, policy, mergedFrom)
+		}
+		if err := refuseLiteralEntry(ctx, runner, split.LiteralInput, scope, home); err != nil {
+			return tools.Result{}, err
 		}
 		ask, err := refuseReadOnlyLiteral(split.LiteralInput, scope, home, modeCtx, policy)
 		if err != nil {
@@ -356,6 +409,9 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 	if reroute {
 		return dispatchConfinedShell(ctx, split.LiteralInput, split.Stages, scope, home, authorizer, runner, modeCtx, policy)
 	}
+	if err := refusePipedEntry(ctx, runner, split.Stages, nil, scope, home); err != nil {
+		return tools.Result{}, err
+	}
 	// A direct pipeline authorizes its stages through the batched seam so its remaining
 	// (non-read-only) stages can resolve into one command-level approval. Batching is a
 	// TUI presentation feature: the interactive authorizer implements BatchAuthorizer and renders the
@@ -366,7 +422,112 @@ func DispatchShell(ctx context.Context, input string, home string, processCWD st
 	if !ok {
 		batch = perStageBatchAuthorizer{authorizer}
 	}
-	return dispatchDirect(ctx, split.Stages, scope, home, batch, runner, modeCtx, policy)
+	return dispatchDirect(ctx, split.Stages, scope, home, batch, runner, modeCtx, policy, "")
+}
+
+func savedMergedStages(ctx context.Context, run Runner, command string, scope string, home string) ([]permissions.StageNormalization, []string, bool) {
+	matcher, ok := run.(OutsideEntryMatcher)
+	if !ok {
+		return nil, nil, false
+	}
+	saved, rest, piped := strings.Cut(command, " 2>&1 | ")
+	if !piped {
+		var found bool
+		if saved, found = strings.CutSuffix(command, " 2>&1"); !found {
+			return nil, nil, false
+		}
+	}
+	head, err := permissions.SplitCommand(saved)
+	// SplitCommand trims characters the shell keeps in a word and can strip even an empty cd prefix.
+	if err != nil || len(head.Stages) != 1 || head.LiteralInput != strings.Trim(saved, " \t") ||
+		len(head.Stages[0].Assignments) > 0 || head.Stages[0].ClearEnvironment {
+		return nil, nil, false
+	}
+	stages, parsedIn := head.Stages, permissions.StageSolo
+	var operators []string
+	if piped {
+		var wrapped bool
+		wrapped, stages, operators, ok = permissions.SimpleCompoundStages(saved + " | " + rest)
+		if !ok || wrapped || !onlyStagedOperators(operators) {
+			return nil, nil, false
+		}
+		parsedIn = permissions.StageInCompound
+	}
+	for _, stage := range stages {
+		// StageNeedsShell reads Source, whose trimming can change the stage's last word.
+		parsed, err := permissions.NormalizeDirectStage(stage.Source, parsedIn)
+		if err != nil || !slices.Equal(parsed.Tokens, stage.Tokens) {
+			return nil, nil, false
+		}
+	}
+	resolveStagePrograms(stages, scope)
+	if slices.ContainsFunc(stages, func(stage permissions.StageNormalization) bool { return permissions.StageNeedsShell(stage, scope) }) ||
+		verifyStagePrograms(stages, scope, home) != nil {
+		return nil, nil, false
+	}
+	first, err := stageRequest(stages[0], scope, home, permissions.ModeContext{}, "")
+	if err != nil {
+		return nil, nil, false
+	}
+	if _, ok := matcher.MatchOutsideEntry(ctx, first.Req); !ok {
+		return nil, nil, false
+	}
+	return stages, operators, true
+}
+
+func savedEntries(ctx context.Context, run Runner, stages []permissions.StageNormalization, scope string, home string) []string {
+	matcher, ok := run.(OutsideEntryMatcher)
+	if !ok {
+		return nil
+	}
+	entries := make([]string, len(stages))
+	for i, stage := range stages {
+		req, err := stageRequest(stage, scope, home, permissions.ModeContext{}, "")
+		if err != nil {
+			continue
+		}
+		if entry, ok := matcher.MatchOutsideEntry(ctx, req.Req); ok {
+			entries[i] = entry
+		}
+	}
+	return entries
+}
+
+func refuseLiteralEntry(ctx context.Context, run Runner, literalInput string, scope string, home string) error {
+	canonical, err := permissions.CanonicalLiteralForm(literalInput)
+	if err != nil {
+		return nil
+	}
+	stages := permissions.LiteralStages(canonical)
+	resolveStagePrograms(stages, scope)
+	for i, entry := range savedEntries(ctx, run, stages, scope, home) {
+		if entry != "" {
+			return sandboxedEntryError(entry, stages[i], "the call needs the shell")
+		}
+	}
+	return nil
+}
+
+func refusePipedEntry(ctx context.Context, run Runner, stages []permissions.StageNormalization, operators []string, scope string, home string) error {
+	entries := savedEntries(ctx, run, stages, scope, home)
+	if !slices.Contains(entries, "") {
+		return nil
+	}
+	for i, entry := range entries {
+		piped := i > 0 && (i > len(operators) || operators[i-1] == "|")
+		if entry != "" && piped {
+			return sandboxedEntryError(entry, stages[i], "the command receives piped input")
+		}
+	}
+	return nil
+}
+
+func sandboxedEntryError(entry string, stage permissions.StageNormalization, reason string) error {
+	command := strings.TrimSpace(stage.Source)
+	return &MalformedCommandError{Err: fmt.Errorf("codemeld: not run: %q is in outside_sandbox_commands (.codemeld/settings.local.yaml), but this call would keep it in the sandbox\n"+
+		"Reason: %s.\n"+
+		"Instead: run `%s` on its own, or as `%s 2>&1 | <command that needs no shell>`; a failure of `%s` is then the call's exit status, so PIPESTATUS is not needed",
+		entry, reason, command, command, command)}
 }
 
 // confinedStagesNeedShell asks for confinement only when a stage needs the shell or names a program
@@ -487,634 +648,4 @@ func (p perStageBatchAuthorizer) AuthorizeBatch(ctx context.Context, reqs []Batc
 		}
 	}
 	return decisions, nil
-}
-
-// dispatchLiteral handles an I/O-redirection or wrapper/literal route: the whole
-// prefix-stripped command is one literal subject. It is canonicalized for matching, authorized as a
-// single MatchRequest with kind "literal" and no SubjectTokens, and — only if authorized — executed
-// exactly as written through `sh -c` so accepted redirection and wrapper forms run verbatim.
-func dispatchLiteral(ctx context.Context, literalInput string, scope string, authorizer Authorizer, run Runner, modeCtx permissions.ModeContext) (tools.Result, error) {
-	canonical, err := permissions.CanonicalLiteralForm(literalInput)
-	if err != nil {
-		return tools.Result{}, &MalformedCommandError{Err: err}
-	}
-	req := permissions.MatchRequest{
-		Kind:      "literal",
-		Subject:   canonical,
-		PathScope: scope,
-	}
-	decision, err := authorizer.Authorize(ctx, req, PromptDisplay{Action: ActionRunCommand, Subject: literalInput, WholeCommand: true}, modeCtx)
-	if err != nil {
-		return tools.Result{}, err
-	}
-	if decision.DenyEnvelope != "" {
-		return tools.Result{}, &DeniedError{Envelope: decision.DenyEnvelope, WrapUp: decision.WrapUp}
-	}
-	if err := ctx.Err(); err != nil {
-		return tools.Result{}, err
-	}
-
-	// The shell decides what this text runs, so an `rg` anywhere in it — including behind a
-	// wrapper — must not pick up an inherited ripgrep configuration.
-	env := execEnvWithout(nil, ripgrepConfigEnv)
-	// An automatic ps literal keeps the ordinary shell environment except for the libxo encoder
-	// search path; an approved argv must not select an encoder it did not name.
-	if decision.ReadOnlyAuto && permissions.LiteralRunsPS(canonical) {
-		env = execEnvWithout(nil, ripgrepConfigEnv, psEncoderPathEnv)
-	}
-	// One `sh -c` shares one environment, so a literal that reaches hg at all takes the isolated
-	// one; the read-only programs that may share it need nothing beyond PATH.
-	if decision.ReadOnlyAuto && permissions.LiteralRunsHg(canonical) {
-		env = hgAutoEnv()
-	}
-
-	authority, _ := permissions.ClassifyExceptional(req, modeCtx)
-	// Execute the exact prefix-stripped command through the shell so accepted redirection and
-	// wrapper forms (e.g. `git status > out`, `sh -c "git status"`) run as the agent wrote them.
-	spec := runner.RunSpec{
-		InvocationID:         run.NewInvocationID(),
-		Argv:                 []string{"sh", "-c", literalInput},
-		Cwd:                  scope,
-		Env:                  env,
-		ExceptionalAuthority: authority,
-	}
-	res, err := run.Exec(context.WithValue(ctx, shellSubjectKey{}, canonical), spec)
-	if err != nil {
-		return tools.Result{}, err
-	}
-	return toResult(res.Stdout, res.Stderr, res.ExitCode, res.Duration), nil
-}
-
-// dispatchDirect handles a direct pipeline: every stage is authorized before any stage runs, so an
-// unauthorized later stage cannot let an earlier authorized stage execute. The stages are handed to
-// the batched authorizer as one set — it resolves each without prompting and issues one
-// command-level approval for the remainder — and a decision carrying a deny envelope
-// denies the whole pipeline: *DeniedError is returned and nothing runs. When every stage authorizes,
-// the pipeline runs through runPipeGroup. The final stage's stdout/exit code and the concatenated
-// stderr of every executed stage form the result.
-func dispatchDirect(ctx context.Context, stages []permissions.StageNormalization, scope string, home string, batch BatchAuthorizer, run Runner, modeCtx permissions.ModeContext, guard securitystate.Policy) (tools.Result, error) {
-	if err := verifyStagePrograms(stages, scope, home); err != nil {
-		return tools.Result{}, err
-	}
-	asks, err := refuseReadOnlyStages(stages, scope, home, modeCtx, guard)
-	if err != nil {
-		return tools.Result{}, err
-	}
-	var pipeline string
-	if len(stages) > 1 {
-		sources := make([]string, len(stages))
-		for i, stage := range stages {
-			sources[i] = stage.Source
-		}
-		pipeline = strings.Join(sources, " | ")
-	}
-
-	// Pass 1: authorize every stage before any runs. A denied stage denies the whole pipeline.
-	auto, err := authorizeStages(ctx, stages, scope, home, batch, modeCtx, pipeline, asks)
-	if err != nil {
-		return tools.Result{}, err
-	}
-
-	// Pass 2: every stage authorized — run the pipe group.
-	group, err := runPipeGroup(ctx, stages, auto, scope, home, run)
-	if err != nil {
-		return tools.Result{}, err
-	}
-	return toResult(group.stdout, group.stderr, group.exitCode, group.duration), nil
-}
-
-// authorizeStages returns, per stage, whether the active mode allowed it because it classified
-// read-only.
-func authorizeStages(ctx context.Context, stages []permissions.StageNormalization, scope string, home string, batch BatchAuthorizer, modeCtx permissions.ModeContext, pipeline string, asks []bool) ([]bool, error) {
-	reqs := make([]BatchAuthRequest, len(stages))
-	for i, stage := range stages {
-		req, err := stageRequest(stage, scope, home, modeCtx, pipeline)
-		if err != nil {
-			return nil, err
-		}
-		req.ModeCtx.ShellPathAsk = i < len(asks) && asks[i]
-		reqs[i] = req
-	}
-	decisions, err := batch.AuthorizeBatch(ctx, reqs)
-	if err != nil {
-		return nil, err
-	}
-	auto := make([]bool, len(stages))
-	for i, decision := range decisions {
-		if decision.DenyEnvelope != "" {
-			return nil, &DeniedError{Envelope: decision.DenyEnvelope, WrapUp: decision.WrapUp}
-		}
-		if i < len(auto) {
-			auto[i] = decision.ReadOnlyAuto
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return auto, nil
-}
-
-func stageRequest(stage permissions.StageNormalization, scope string, home string, modeCtx permissions.ModeContext, pipeline string) (BatchAuthRequest, error) {
-	expands := make([]bool, len(stage.Tokens))
-	for i := range expands {
-		expands[i] = home != "" && i < len(stage.ExecForms) && stage.ExecForms[i].Expand
-	}
-	subject, err := permissions.DirectStageRequestSubject(stage.Tokens, stage.Assignments, stage.ClearEnvironment, expands)
-	if err != nil {
-		return BatchAuthRequest{}, err
-	}
-	stageCtx := modeCtx
-	stageCtx.LiteralRoute = false
-	stageCtx.Stages = []permissions.StageNormalization{stage}
-	return BatchAuthRequest{
-		Req: permissions.MatchRequest{
-			Kind:             "direct",
-			Subject:          subject,
-			SubjectTokens:    stage.Tokens,
-			Assignments:      stage.Assignments,
-			ClearEnvironment: stage.ClearEnvironment,
-			PathScope:        scope,
-		},
-		Display: PromptDisplay{Action: ActionRunCommand, Subject: stage.Source, Pipeline: pipeline},
-		ModeCtx: stageCtx,
-	}, nil
-}
-
-func dispatchStaged(ctx context.Context, stages []permissions.StageNormalization, operators []string, scope string, home string, batch BatchAuthorizer, run Runner, modeCtx permissions.ModeContext, guard securitystate.Policy) (tools.Result, error) {
-	if err := verifyStagePrograms(stages, scope, home); err != nil {
-		return tools.Result{}, err
-	}
-	asks, err := refuseReadOnlyStages(stages, scope, home, modeCtx, guard)
-	if err != nil {
-		return tools.Result{}, err
-	}
-	auto, err := authorizeStages(ctx, stages, scope, home, batch, modeCtx, "", asks)
-	if err != nil {
-		return tools.Result{}, err
-	}
-
-	var stdout []byte
-	var stderr []byte
-	var duration time.Duration
-	exitCode := 0
-	for start := 0; start < len(stages); {
-		end := start + 1
-		for end < len(stages) && operators[end-1] == "|" {
-			end++
-		}
-		if start > 0 && !runsAfter(operators[start-1], exitCode) {
-			start = end
-			continue
-		}
-		if expired, err := executionExpired(ctx, run); err != nil {
-			return tools.Result{}, err
-		} else if expired {
-			return toResult(stdout, stderr, -1, duration), nil
-		}
-		group, err := runPipeGroup(ctx, stages[start:end], auto[start:end], scope, home, run)
-		if err != nil {
-			return tools.Result{}, err
-		}
-		stderr = append(stderr, group.stderr...)
-		duration += group.duration
-		exitCode = group.exitCode
-		stdout = append(stdout, group.stdout...)
-		start = end
-	}
-	return toResult(stdout, stderr, exitCode, duration), nil
-}
-
-type pipeGroupResult struct {
-	stdout   []byte
-	stderr   []byte
-	exitCode int
-	duration time.Duration
-}
-
-type stagePlan struct {
-	builtin bool
-	result  runner.RunResult
-	spec    runner.RunSpec
-	subject string
-}
-
-// runPipeGroup executes one `|`-joined group for both the direct and the staged route. Only
-// ErrPipelineUnsupported from the preflight falls back to the sequential loop; every other preflight
-// error returns before any process or event, and a post-launch error returns without retrying, so no
-// stage can execute twice.
-func runPipeGroup(ctx context.Context, stages []permissions.StageNormalization, autoAllowed []bool, scope string, home string, run Runner) (pipeGroupResult, error) {
-	plans, err := planStages(stages, autoAllowed, scope, home, run)
-	if err != nil {
-		return pipeGroupResult{}, err
-	}
-	pipeliner, ok := run.(PipelineRunner)
-	specs, streamable := pipelineSpecs(plans)
-	if ok && streamable {
-		err := pipeliner.PreflightPipeline(ctx, specs)
-		switch {
-		case err == nil:
-			started := time.Now()
-			results, perr := pipeliner.Pipeline(ctx, specs)
-			if perr != nil {
-				return pipeGroupResult{}, perr
-			}
-			return adaptPipelineResults(results, time.Since(started)), nil
-		case !errors.Is(err, ErrPipelineUnsupported):
-			return pipeGroupResult{}, err
-		}
-	}
-	return runStagesSequentially(ctx, plans, run)
-}
-
-func planStages(stages []permissions.StageNormalization, autoAllowed []bool, scope string, home string, run Runner) ([]stagePlan, error) {
-	plans := make([]stagePlan, len(stages))
-	for i, stage := range stages {
-		if res, answered := builtinLookupResult(stage); answered {
-			plans[i] = stagePlan{builtin: true, result: res}
-			continue
-		}
-		authority, _ := permissions.ExceptionalAuthority(stage.Tokens)
-		spec := runner.RunSpec{
-			InvocationID:         run.NewInvocationID(),
-			Argv:                 execArgv(stage, home),
-			Cwd:                  scope,
-			Assignments:          stage.Assignments,
-			ExceptionalAuthority: authority,
-		}
-		// a direct stage's leading KEY=VALUE assignments are stripped from the authorization
-		// subject but must still take effect when the stage runs, so an accepted command like
-		// `FOO=bar ls` executes with FOO=bar rather than the parent environment alone. Layer them over
-		// the inherited environment (later duplicates win in exec, matching shell override semantics).
-		// An `env -i` stage instead takes its assignments as the whole environment. A stage with no
-		// assignments and no clear state leaves Env nil so the runner inherits the parent environment.
-		pinName, pin := probeEnvPin(stage)
-		switch {
-		case stage.ClearEnvironment && pin != "":
-			spec.Env = append(slices.Clone(stage.Assignments), pin)
-		case stage.ClearEnvironment:
-			spec.Env = stage.Assignments
-		case i < len(autoAllowed) && autoAllowed[i] && stageRunsHg(stage):
-			spec.Env = hgAutoEnv()
-		case i < len(autoAllowed) && autoAllowed[i] && stageRunsJJ(stage):
-			spec.Argv = jjAutoArgv(spec.Argv)
-			spec.Env = jjAutoEnv()
-		case i < len(autoAllowed) && autoAllowed[i] && stageRunsPS(stage):
-			spec.Env = execEnvWithout(nil, psEncoderPathEnv)
-		case pin != "" && len(stage.Assignments) > 0:
-			spec.Env = execEnvWithout(append(slices.Clone(stage.Assignments), pin), ripgrepConfigEnv, pinName)
-		case pin != "":
-			spec.Env = execEnvWithout([]string{pin}, pinName)
-		case len(stage.Assignments) > 0 || stageRunsRipgrep(stage):
-			spec.Env = execEnvWithout(stage.Assignments, ripgrepConfigEnv)
-		}
-		if err := resolveArgv0FromChildPath(&spec, stage); err != nil {
-			return nil, err
-		}
-		req, err := stageRequest(stage, scope, home, permissions.ModeContext{}, "")
-		if err != nil {
-			return nil, err
-		}
-		plans[i] = stagePlan{spec: spec, subject: req.Req.Subject}
-	}
-	return plans, nil
-}
-
-// resolveArgv0FromChildPath pins Argv[0] to the executable the stage's own PATH selects, because the
-// runner's exec resolves a bare argv against codemeld's PATH — the wrong environment for a stage that
-// cleared it or set its own. Only a stage that clears the environment or assigns PATH is resolved,
-// and only over the absolute entries of the computed child PATH in order: a relative entry would be
-// resolved against the run directory, so one grant would authorize a different file at every
-// descendant of its path scope. A stage whose program cannot be found there fails here rather than
-// falling back to codemeld's PATH.
-func resolveArgv0FromChildPath(spec *runner.RunSpec, stage permissions.StageNormalization) error {
-	if !stage.ClearEnvironment && !assignsPath(stage.Assignments) {
-		return nil
-	}
-	program := spec.Argv[0]
-	if filepath.Base(program) != program {
-		return nil
-	}
-	resolved, ok := lookPathEntries(childEnvValue(spec.Env, "PATH"), program)
-	if !ok {
-		return fmt.Errorf("dispatch: %q not found in the requested PATH", program)
-	}
-	argv := slices.Clone(spec.Argv)
-	argv[0] = resolved
-	spec.Argv = argv
-	return nil
-}
-
-func lookPathEntries(pathValue string, program string) (string, bool) {
-	for _, dir := range strings.Split(pathValue, string(os.PathListSeparator)) {
-		if !filepath.IsAbs(dir) {
-			continue
-		}
-		if resolved, err := exec.LookPath(filepath.Join(dir, program)); err == nil {
-			return resolved, true
-		}
-	}
-	return "", false
-}
-
-func verifyStagePrograms(stages []permissions.StageNormalization, scope string, home string) error {
-	for i, stage := range stages {
-		if _, answered := builtinLookupResult(stage); answered {
-			continue
-		}
-		program := execArgv(stage, home)[0]
-		if !stageProgramResolves(stage, program, scope) {
-			return &MalformedCommandError{Err: fmt.Errorf("shell stage %d: program %q not found", i, program)}
-		}
-	}
-	return nil
-}
-
-// stageProgramResolves mirrors how the runner launches argv[0]: a separator-bearing name is opened
-// relative to the stage's working directory with no PATH search, and a bare name is searched on the
-// PATH the stage runs with.
-func stageProgramResolves(stage permissions.StageNormalization, program string, scope string) bool {
-	if stage.ProgramUnescapedSeparator {
-		return true
-	}
-	if filepath.Base(program) != program {
-		if !filepath.IsAbs(program) {
-			program = filepath.Join(scope, program)
-		}
-		info, err := os.Stat(program)
-		return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
-	}
-	if stage.ClearEnvironment || assignsPath(stage.Assignments) {
-		_, ok := lookPathEntries(childEnvValue(stage.Assignments, "PATH"), program)
-		return ok
-	}
-	_, err := exec.LookPath(program)
-	return err == nil
-}
-
-func resolveStagePrograms(stages []permissions.StageNormalization, scope string) {
-	for i := range stages {
-		stage := &stages[i]
-		if len(stage.Tokens) == 0 {
-			continue
-		}
-		resolved := permissions.ResolveRelativeProgram(stage.Tokens[0], scope, stage.ClearEnvironment || assignsPath(stage.Assignments))
-		if resolved != stage.Tokens[0] {
-			stage.ExecProgram = stage.Tokens[0]
-			stage.Tokens[0] = resolved
-		}
-	}
-}
-
-func assignsPath(assignments []string) bool {
-	return slices.ContainsFunc(assignments, func(a string) bool { return strings.HasPrefix(a, "PATH=") })
-}
-
-// childEnvValue reports the value the child process sees for name. The last entry wins, matching how
-// exec resolves a duplicated variable.
-func childEnvValue(env []string, name string) string {
-	value := ""
-	for _, entry := range env {
-		if rest, ok := strings.CutPrefix(entry, name+"="); ok {
-			value = rest
-		}
-	}
-	return value
-}
-
-// ripgrepConfigEnv names the file ripgrep reads extra options from. Those options include
-// `--pre=COMMAND`, so an inherited value runs a program the authorized argv never named.
-const ripgrepConfigEnv = "RIPGREP_CONFIG_PATH"
-
-// psEncoderPathEnv names the FreeBSD libxo encoder search path. An inherited value can make an
-// otherwise automatic ps invocation load an encoder absent from the authorized argv.
-const psEncoderPathEnv = "XO_ENCODER_PATH"
-
-func stageRunsRipgrep(stage permissions.StageNormalization) bool {
-	return len(stage.Tokens) > 0 && stage.Tokens[0] == "rg"
-}
-
-func stageRunsPS(stage permissions.StageNormalization) bool {
-	return len(stage.Tokens) > 0 && stage.Tokens[0] == "ps"
-}
-
-// Under Go's default GOTOOLCHAIN=auto, even `go version` inside a module that asks for a newer Go
-// downloads and runs that toolchain.
-const goToolchainEnv = "GOTOOLCHAIN"
-
-func stageRunsGoProbe(stage permissions.StageNormalization) bool {
-	return len(stage.Tokens) > 0 && stage.Tokens[0] == "go" && permissions.ProbeStageReadOnly(stage.Tokens)
-}
-
-// `mise version` checks online for a newer mise about once a day unless it runs offline.
-const miseOfflineEnv = "MISE_OFFLINE"
-
-func stageRunsMiseProbe(stage permissions.StageNormalization) bool {
-	return len(stage.Tokens) > 0 && stage.Tokens[0] == "mise" && permissions.ProbeStageReadOnly(stage.Tokens)
-}
-
-func probeEnvPin(stage permissions.StageNormalization) (name string, assignment string) {
-	switch {
-	case stageRunsGoProbe(stage):
-		name, assignment = goToolchainEnv, goToolchainEnv+"=local"
-	case stageRunsMiseProbe(stage):
-		name, assignment = miseOfflineEnv, miseOfflineEnv+"=1"
-	default:
-		return "", ""
-	}
-	if slices.ContainsFunc(stage.Assignments, func(a string) bool { return strings.HasPrefix(a, name+"=") }) {
-		return "", ""
-	}
-	return name, assignment
-}
-
-func stageRunsHg(stage permissions.StageNormalization) bool {
-	return len(stage.Tokens) > 0 && stage.Tokens[0] == "hg"
-}
-
-// hgAutoEnv is the whole environment a mode-auto-allowed Mercurial process runs with. hg reads
-// aliases, hooks, defaults, and extensions from configuration the approved argv never names, and
-// HGPLAIN alone does not stop them, so nothing ambient survives: HGRCPATH and HGRCSKIPREPO drop the
-// user and repository hgrc files, and PATH is preserved only so executables still resolve.
-func hgAutoEnv() []string {
-	return []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HGRCPATH=" + os.DevNull,
-		"HGRCSKIPREPO=1",
-		"HGPLAIN=+strictflags",
-	}
-}
-
-func stageRunsJJ(stage permissions.StageNormalization) bool {
-	return len(stage.Tokens) > 0 && stage.Tokens[0] == "jj"
-}
-
-// jjAutoEnv is the whole environment a mode-auto-allowed Jujutsu process runs with: JJ_CONFIG= drops
-// the user and system configuration files, JJ_PAGER cannot reach the child at all, and PATH is
-// preserved only so executables still resolve. No environment variable disables jj's repository or
-// workspace configuration, so jjAutoFlags carries the rest.
-func jjAutoEnv() []string {
-	return []string{
-		"PATH=" + os.Getenv("PATH"),
-		"JJ_CONFIG=",
-	}
-}
-
-// jjAutoFlags is the isolation jjAutoEnv cannot express. A command-line --config outranks every
-// configuration file, which is the only way to stop a repository-configured ui.pager or
-// ui.diff-formatter from launching a program; --ignore-working-copy keeps the read from writing a
-// working-copy commit or an operation.
-var jjAutoFlags = []string{
-	"--no-pager",
-	"--config", "ui.paginate=never",
-	"--config", `ui.diff-formatter=":color-words"`,
-	"--ignore-working-copy",
-}
-
-func jjAutoArgv(argv []string) []string {
-	prefixed := make([]string, 0, len(argv)+len(jjAutoFlags))
-	prefixed = append(prefixed, argv[0])
-	prefixed = append(prefixed, jjAutoFlags...)
-	return append(prefixed, argv[1:]...)
-}
-
-func execEnvWithout(assignments []string, excluded ...string) []string {
-	env := os.Environ()
-	kept := env[:0]
-	for _, entry := range env {
-		name, _, _ := strings.Cut(entry, "=")
-		if slices.Contains(excluded, name) {
-			continue
-		}
-		kept = append(kept, entry)
-	}
-	return append(kept, assignments...)
-}
-
-func pipelineSpecs(plans []stagePlan) ([]runner.RunSpec, bool) {
-	if len(plans) < 2 {
-		return nil, false
-	}
-	specs := make([]runner.RunSpec, len(plans))
-	for i, plan := range plans {
-		if plan.builtin {
-			return nil, false
-		}
-		specs[i] = plan.spec
-	}
-	return specs, true
-}
-
-// adaptPipelineResults takes elapsed rather than summing the per-stage durations because concurrent
-// stages overlap, so their sum overstates how long the group took.
-func adaptPipelineResults(results []runner.PipelineResult, elapsed time.Duration) pipeGroupResult {
-	group := pipeGroupResult{duration: elapsed}
-	for _, res := range results {
-		group.stderr = append(group.stderr, res.Stderr...)
-	}
-	if last := len(results) - 1; last >= 0 {
-		group.stdout = results[last].Stdout
-		group.exitCode = results[last].ExitCode
-	}
-	return group
-}
-
-func runStagesSequentially(ctx context.Context, plans []stagePlan, run Runner) (pipeGroupResult, error) {
-	var group pipeGroupResult
-	var stdin []byte
-	for _, plan := range plans {
-		if expired, err := executionExpired(ctx, run); err != nil {
-			return pipeGroupResult{}, err
-		} else if expired {
-			group.exitCode = -1
-			return group, nil
-		}
-		res := plan.result
-		if !plan.builtin {
-			spec := plan.spec
-			spec.Stdin = stdin
-			var err error
-			res, err = run.Exec(context.WithValue(ctx, shellSubjectKey{}, plan.subject), spec)
-			if err != nil {
-				return pipeGroupResult{}, err
-			}
-		}
-		// Non-zero exits and launch failures are result-level outcomes: keep chaining and carry the
-		// final stage's exit code. stderr from every executed stage is accumulated in order.
-		group.stderr = append(group.stderr, res.Stderr...)
-		group.duration += res.Duration
-		group.stdout = res.Stdout
-		group.exitCode = res.ExitCode
-		stdin = res.Stdout
-	}
-	return group, nil
-}
-
-// builtinLookupResult answers an accepted `command -v <name>` stage from the $PATH resolution
-// normalization already captured (permissions.StageNormalization.LookupPath), printing it the way
-// the shell builtin would. `command` is a builtin with no executable to launch, so the authorized
-// lookup is completed here rather than handed to the runner; a second resolution at execution time
-// could return a different path than the one that was authorized.
-func builtinLookupResult(stage permissions.StageNormalization) (runner.RunResult, bool) {
-	if stage.LookupPath == "" {
-		return runner.RunResult{}, false
-	}
-	return runner.RunResult{Stdout: []byte(stage.LookupPath + "\n")}, true
-}
-
-func runsAfter(operator string, prevExitCode int) bool {
-	switch operator {
-	case "&&":
-		return prevExitCode == 0
-	case "||":
-		return prevExitCode != 0
-	default:
-		return true
-	}
-}
-
-func onlyStagedOperators(operators []string) bool {
-	for _, op := range operators {
-		if op != "&&" && op != "||" && op != ";" && op != "|" {
-			return false
-		}
-	}
-	return len(operators) > 0
-}
-
-// execArgv builds the runner argv for a direct stage, expanding a bare leading `~` / `$HOME`
-// against home for execution only (StageNormalization.ExecForms). The canonical stage.Tokens —
-// used as the authorization subject — are left untouched, so a stored grant still holds the
-// literal `~`/`$HOME` form. Expansion is skipped when home is empty (leaving the
-// literal token, which fails as it did before) so an unresolved home never yields a bare-root path.
-// A stage with no expandable token returns stage.Tokens unchanged.
-func execArgv(stage permissions.StageNormalization, home string) []string {
-	argv := stage.Tokens
-	copied := false
-	if stage.ExecProgram != "" && len(argv) > 0 {
-		argv = append([]string{stage.ExecProgram}, argv[1:]...)
-		copied = true
-	}
-	if home == "" {
-		return argv
-	}
-	for i := range argv {
-		if i < len(stage.ExecForms) && stage.ExecForms[i].Expand {
-			if !copied {
-				argv = append([]string(nil), argv...)
-				copied = true
-			}
-			argv[i] = home + stage.ExecForms[i].Suffix
-		}
-	}
-	return argv
-}
-
-// toResult adapts a runner outcome to the shared tools.Result returned to the dispatch caller.
-func toResult(stdout, stderr []byte, exitCode int, duration time.Duration) tools.Result {
-	return tools.Result{
-		ExitCode: exitCode,
-		Stdout:   stdout,
-		Stderr:   stderr,
-		Duration: duration,
-	}
 }

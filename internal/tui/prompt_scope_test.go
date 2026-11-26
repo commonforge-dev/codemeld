@@ -215,7 +215,7 @@ func TestBuildScopeOptions_ExactAndProgramUnchanged(t *testing.T) {
 
 func TestScopeChooserHelp_StatesPrefixContractOnlyWhenOffered(t *testing.T) {
 	withPrefix, _ := scopeOptionsFor(t, "git", []string{"log", "--oneline"}, "")
-	help := scopeChooserHelp(withPrefix)
+	help := scopeChooserHelp(withPrefix, false)
 	if !strings.Contains(help, scopePrefixNotice) {
 		t.Errorf("help omits the prefix contract when Prefix rows are offered:\n%q", help)
 	}
@@ -224,7 +224,7 @@ func TestScopeChooserHelp_StatesPrefixContractOnlyWhenOffered(t *testing.T) {
 	}
 
 	noPrefix, _ := scopeOptionsFor(t, "make", nil, "")
-	bare := scopeChooserHelp(noPrefix)
+	bare := scopeChooserHelp(noPrefix, false)
 	if strings.Contains(bare, scopePrefixNotice) {
 		t.Errorf("help claims a prefix contract with no Prefix row offered:\n%q", bare)
 	}
@@ -238,7 +238,7 @@ func TestScopeChooserHelp_StatesPrefixContractOnlyWhenOffered(t *testing.T) {
 // standard breadth warning (both present), while a benign program shows only the
 // standard breadth warning and no destructive copy.
 func TestProgramConfirmWarning_DestructivePrependsAdvisory(t *testing.T) {
-	destructive := programConfirmWarning(true)
+	destructive := programConfirmWarning(true, false)
 	if !strings.Contains(destructive, scopeDestructiveProgramWarning) {
 		t.Errorf("destructive confirm copy missing the stronger destructive advisory:\n%q", destructive)
 	}
@@ -246,12 +246,61 @@ func TestProgramConfirmWarning_DestructivePrependsAdvisory(t *testing.T) {
 		t.Errorf("destructive confirm copy dropped the standard breadth warning:\n%q", destructive)
 	}
 
-	benign := programConfirmWarning(false)
+	benign := programConfirmWarning(false, false)
 	if benign != scopeProgramWarning {
 		t.Errorf("benign confirm copy = %q, want only the standard breadth warning %q", benign, scopeProgramWarning)
 	}
-	if strings.Contains(benign, "DESTRUCTIVE") {
+	if strings.Contains(benign, "Edit capable program") {
 		t.Errorf("benign confirm copy leaked destructive advisory:\n%q", benign)
+	}
+}
+
+func TestScopeChooserHelp_OutsideSaveHasItsOwnFirstLineAndWarning(t *testing.T) {
+	const (
+		grantFirst   = "Choose the subject scope this grant stores:"
+		grantWarn    = "⚠ Program scope authorizes ANY invocation of this program with ANY arguments within the chosen path scope."
+		outsideFirst = "Choose which commands always run outside the sandbox:"
+		outsideWarn  = "⚠ Program scope matches ANY invocation of this program with ANY arguments in this project."
+	)
+	opts, _ := scopeOptionsFor(t, "git", []string{"log", "--oneline"}, "")
+	for _, tc := range []struct {
+		outside                       bool
+		first, warn, unwant1, unwant2 string
+	}{
+		{false, grantFirst, grantWarn, outsideFirst, outsideWarn},
+		{true, outsideFirst, outsideWarn, grantFirst, grantWarn},
+	} {
+		help := scopeChooserHelp(opts, tc.outside)
+		if !strings.HasPrefix(help, tc.first+"\n") || !strings.HasSuffix(help, "\n"+tc.warn) {
+			t.Errorf("outside=%v help = %q, want first line %q and warning %q", tc.outside, help, tc.first, tc.warn)
+		}
+		for _, banned := range []string{tc.unwant1, tc.unwant2} {
+			if strings.Contains(help, banned) {
+				t.Errorf("outside=%v help contains %q:\n%s", tc.outside, banned, help)
+			}
+		}
+	}
+}
+
+func TestProgramConfirmWarning_OutsideSaveHasItsOwnWarnings(t *testing.T) {
+	const (
+		grantWarn   = "⚠ Program scope authorizes ANY invocation of this program with ANY arguments within the chosen path scope."
+		grantEdit   = "WARNING - Edit capable program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history."
+		outsideWarn = "⚠ Program scope matches ANY invocation of this program with ANY arguments in this project."
+		outsideEdit = "WARNING - Edit capable program: this matches EVERY subcommand, including ones that permanently delete data or rewrite history."
+	)
+	for _, tc := range []struct {
+		destructive, outside bool
+		want                 string
+	}{
+		{false, false, grantWarn},
+		{true, false, grantEdit + "\n\n" + grantWarn},
+		{false, true, outsideWarn},
+		{true, true, outsideEdit + "\n\n" + outsideWarn},
+	} {
+		if got := programConfirmWarning(tc.destructive, tc.outside); got != tc.want {
+			t.Errorf("programConfirmWarning(%v, %v) = %q, want %q", tc.destructive, tc.outside, got, tc.want)
+		}
 	}
 }
 
@@ -623,7 +672,7 @@ func TestBuildScopeOptions_PathRowWildcardsATailAndKeepsOtherRows(t *testing.T) 
 func TestScopeChooserHelp_DescribesTheBoundaryAsAnAuthorizationCheck(t *testing.T) {
 	tree := newContainmentTree(t)
 	withPath, _ := scopeOptionsFor(t, "chmod", []string{"+x", tree.entry}, tree.home)
-	help := scopeChooserHelp(withPath)
+	help := scopeChooserHelp(withPath, false)
 	for _, want := range []string{scopePathNotice, scopePrefixNotice, scopeProgramWarning} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help missing %q:\n%s", want, help)
@@ -642,7 +691,7 @@ func TestScopeChooserHelp_DescribesTheBoundaryAsAnAuthorizationCheck(t *testing.
 	}
 
 	withoutPath, _ := scopeOptionsFor(t, "chmod", []string{"+x", tree.entry}, "")
-	if got := scopeChooserHelp(withoutPath); strings.Contains(got, scopePathNotice) {
+	if got := scopeChooserHelp(withoutPath, false); strings.Contains(got, scopePathNotice) {
 		t.Errorf("help states the path notice with no path row:\n%s", got)
 	}
 }

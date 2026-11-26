@@ -93,6 +93,27 @@ func assertContainmentRejections(t *testing.T, invokePath func(path string) (too
 	}
 }
 
+func assertToolContainment(t *testing.T, secretContent, canary string, invoke func(t *testing.T, root string) func(path string) (tools.Result, error)) {
+	t.Helper()
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	writeFile(t, filepath.Join(outsideDir, "secret.go"), secretContent)
+	if err := os.Symlink(outsideDir, filepath.Join(root, "escape")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	mkdirAll(t, filepath.Join(root, "realdir"))
+	if err := os.Symlink(filepath.Join(root, "realdir"), filepath.Join(root, "indirlink")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	assertContainmentRejections(t, invoke(t, root), canary, []pathCase{
+		{"symlink escape dir", "escape"},
+		{"absolute outside", outsideDir},
+		{"dotdot traversal", "../" + filepath.Base(outsideDir)},
+		{"in-root directory symlink", "indirlink"},
+	})
+}
+
 // assertExplicitRootEqualsDefault pins that every rootPathForms spelling of the project root returns the
 // same output lines as an omitted path. baseArgs carry the tool's non-path arguments (e.g. the glob/grep
 // pattern); a nil baseArgs means the tool has none.

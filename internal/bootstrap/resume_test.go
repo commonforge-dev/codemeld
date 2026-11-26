@@ -1974,23 +1974,7 @@ func TestRunResume_UnchangedTrustedSettingsComposeAsBefore(t *testing.T) {
 
 	race := runResumePostGateRace(t, home, projectRoot, "y\n", func() {})
 
-	want := []string{SettingsPath(home), projectSettingsPath(projectRoot)}
-	if !slices.Equal(race.res.ConfigLayerPaths, want) {
-		t.Fatalf("ConfigLayerPaths = %v, want %v", race.res.ConfigLayerPaths, want)
-	}
-	agent, _ := race.res.Config["agent"].(map[string]any)
-	if fmt.Sprint(agent["max_concurrency"]) != "7" {
-		t.Fatalf("agent.max_concurrency = %v, want the project override 7", agent["max_concurrency"])
-	}
-	if !race.res.TrustDecision.Trusted {
-		t.Fatalf("decision = %#v, want the ordinary trusted resume intact", race.res.TrustDecision)
-	}
-	if race.projectLayer == nil {
-		t.Fatal("step-4 project layer = nil, want the verified map handed to attribution")
-	}
-	if countNotices(race.stderr) != 0 {
-		t.Fatalf("stderr = %q, want no ignored-settings notice for matching content", race.stderr)
-	}
+	assertUnchangedTrustedSettingsCompose(t, race, home, projectRoot, "resume")
 }
 
 func TestRunResume_UntrustedAtTheGateNeverReadsProjectSettings(t *testing.T) {

@@ -55,9 +55,11 @@ type confineInner struct {
 	stdout     []byte
 	stderr     []byte
 	stderrSize int64
+	stdoutSize int64
 	launchErr  fserrors.Category
 	err        error
 	results    []cmdrunner.RunResult
+	pipeExits  []int
 }
 
 func (f *confineInner) NewInvocationID() string { return ids.NewV7() }
@@ -90,7 +92,7 @@ func (f *confineInner) result(spec cmdrunner.RunSpec) (cmdrunner.RunResult, erro
 	return cmdrunner.RunResult{
 		InvocationID: spec.InvocationID, ExitCode: f.exitCode, LaunchErrCategory: f.launchErr,
 		Stdout: f.stdout, Stderr: slices.Clone(f.stderr),
-		StdoutTotal: int64(len(f.stdout)), StderrTotal: max(f.stderrSize, int64(len(f.stderr))),
+		StdoutTotal: max(f.stdoutSize, int64(len(f.stdout))), StderrTotal: max(f.stderrSize, int64(len(f.stderr))),
 	}, f.err
 }
 
@@ -102,7 +104,11 @@ func (f *confineInner) PreflightPipeline(_ context.Context, specs []cmdrunner.Ru
 func (f *confineInner) Pipeline(_ context.Context, specs []cmdrunner.RunSpec, maxCapture int) ([]cmdrunner.PipelineResult, error) {
 	f.pipelines = append(f.pipelines, specs)
 	f.pipeCap = maxCapture
-	return make([]cmdrunner.PipelineResult, len(specs)), nil
+	results := make([]cmdrunner.PipelineResult, len(specs))
+	for i, code := range f.pipeExits {
+		results[i].ExitCode = code
+	}
+	return results, nil
 }
 
 func (f *confineInner) calls() int {
@@ -2187,6 +2193,29 @@ func TestRunHeadless_PartialStateNoteFollowsTheConfinementFlag(t *testing.T) {
 	}
 }
 
+func TestRunHeadless_OutputCutNoticeIsPersistedWithTheToolMessage(t *testing.T) {
+	const limit, total = 65536, 835584
+	t.Setenv("TMPDIR", t.TempDir())
+	swapResolveExecutionCapability(t, constrainedResolution)
+	inner := &confineInner{stdout: bytes.Repeat([]byte("a"), limit), stdoutSize: total}
+	result := headlessResult(t, t.TempDir(), mode.NewActiveState(mode.Plan, mode.SourceDefault))
+	runHeadlessShell(t, result, inner, "touch x")
+	if len(inner.bounded) != 1 {
+		t.Fatalf("bounded runs = %d, want the command run through the sandbox", len(inner.bounded))
+	}
+
+	reloaded := reloadStore(t, result.Session)
+	notice := "\ncodemeld: output cut: stdout shows 65536 of 835584 bytes; the rest is missing. Narrow the command to see it."
+	toolMsgs := messagesByRole(reloaded, "tool")
+	if len(toolMsgs) != 1 || !strings.HasSuffix(toolMsgs[0].Content.Text(), notice) {
+		t.Fatalf("tool messages = %d, want one ending with %q", len(toolMsgs), notice)
+	}
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloaded, events.KindToolExecEnd)
+	if len(ends) != 1 || !ends[0].Truncated || ends[0].OriginalBytes == nil || *ends[0].OriginalBytes != (events.OriginalBytes{Stdout: total}) {
+		t.Fatalf("tool_exec_end = %+v, want truncated with original stdout %d", ends, total)
+	}
+}
+
 func TestRunHeadless_AutoEditsConfinedFailureThroughTheRealHelper(t *testing.T) {
 	home, project, bin := realConfinementHost(t)
 	const probe = "/tmp/codemeld-confine-probe"
@@ -2936,9 +2965,13 @@ func TestConfinedFailure_RefusalLinesStayWithinTheOutputCap(t *testing.T) {
 			{"two lines and the marker", two, "b\n" + lines[0] + "\n" + lines[1] + "\n" + omittedLine(2) + "\n" + confinedFailureNote},
 			{"lines before the marker", two - 1, "boom\n" + lines[0] + "\n" + lines[1] + "\n" + confinedFailureNote},
 		} {
-			res := noteConfinedFailure(cmdrunner.RunResult{ExitCode: 1, Stderr: []byte("boom"), StderrTotal: 1000}, tc.cap, f)
+			stdout := bytes.Repeat([]byte("o"), 3*tc.cap)
+			res := noteConfinedFailure(cmdrunner.RunResult{ExitCode: 1, Stdout: stdout, StdoutTotal: 1 << 20, Stderr: []byte("boom"), StderrTotal: 1000}, tc.cap, f)
 			if string(res.Stderr) != tc.want {
 				t.Fatalf("%s: stderr = %q, want %q", tc.name, res.Stderr, tc.want)
+			}
+			if !bytes.Equal(res.Stdout, bytes.Repeat([]byte("o"), 3*tc.cap)) || res.StdoutTotal != 1<<20 {
+				t.Fatalf("%s: stdout %d bytes of %d, want the %d held bytes of %d untouched", tc.name, len(res.Stdout), res.StdoutTotal, 3*tc.cap, 1<<20)
 			}
 			kept := len(tc.want) - len(strings.TrimPrefix(strings.TrimPrefix(tc.want, "boom"), "b"))
 			if res.StderrTotal != 1000+int64(len(tc.want)-kept) {
@@ -3188,7 +3221,11 @@ func TestConfinedShell_ProxyRefusalNoteIsTheRecordedEndAndKeepsTheTimeoutNote(t 
 	})
 }
 
-const wantOutsideRunLine = "codemeld: to run this command once outside the sandbox, run it again; you will be asked first."
+const (
+	wantOutsideRetriedLine  = "codemeld: this command failed in the sandbox; the user had it run again outside the sandbox.\n"
+	wantOutsideDeclinedLine = "codemeld: the user chose not to run this command outside the sandbox."
+	staleOutsideRunText     = "run it again; you will be asked"
+)
 
 func outsideConfinement(t *testing.T, projectRoot string, m mode.Mode) *confinement {
 	t.Helper()
@@ -3198,16 +3235,16 @@ func outsideConfinement(t *testing.T, projectRoot string, m mode.Mode) *confinem
 	return conf
 }
 
-func TestConfinedShell_BuildRefusalRemembersTheSubjectAndOffersTheOutsideRun(t *testing.T) {
+func TestConfinedShell_BuildRefusalRunsAgainInTheSameCallUnlessReadOnly(t *testing.T) {
 	network := refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
 	file := refusal{File: true, Path: "/x/y", Process: "ls"}
 	for _, tc := range []struct {
-		name       string
-		mode       mode.Mode
-		command    string
-		exit       int
-		records    [][]refusal
-		remembered bool
+		name    string
+		mode    mode.Mode
+		command string
+		exit    int
+		records [][]refusal
+		retried bool
 	}{
 		{"build network refusal", mode.Build, "ls", 1, [][]refusal{{network}}, true},
 		{"build file refusal", mode.Build, "ls", 1, [][]refusal{{file}}, true},
@@ -3217,28 +3254,35 @@ func TestConfinedShell_BuildRefusalRemembersTheSubjectAndOffersTheOutsideRun(t *
 		{"auto edits refusal", mode.AutoEdits, "ls", 1, [][]refusal{{network}}, false},
 		{"plan refusal", mode.Plan, "ls", 1, [][]refusal{{network}}, false},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			swapInvocationRefusals(t, tc.records...)
-			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: tc.exit, stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
-			d.confinement = outsideConfinement(t, d.processCWD, tc.mode)
-			got, err := d.Dispatch(context.Background(), bashCall("c1", tc.command))
-			if err != nil {
-				t.Fatal(err)
-			}
-			stderr := dispatchedStderr(t, got.Content)
-			lines := 0
-			if tc.remembered {
-				lines = 1
-			}
-			if strings.Count(stderr, wantOutsideRunLine) != lines || d.confinement.outside.has("ls") != tc.remembered {
-				t.Fatalf("stderr = %q, remembered = %v; want %d outside-run lines and remembered %v", stderr, d.confinement.outside.has("ls"), lines, tc.remembered)
-			}
-			if tc.name == "build network refusal" {
-				if want := "boom\n" + refusedLine("a.test:80", network.Reason) + "\n" + wantOutsideRunLine + "\n" + confinedFailureNote; stderr != want {
-					t.Fatalf("stderr = %q, want %q", stderr, want)
+		for _, readOnly := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/read-only=%v", tc.name, readOnly), func(t *testing.T) {
+				swapInvocationRefusals(t, tc.records...)
+				inner := &confineInner{exitCode: tc.exit, stderr: []byte("boom")}
+				d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: permissions.Decision{Outcome: "allow_once", ReadOnlyAuto: readOnly}})
+				d.confinement = outsideConfinement(t, d.processCWD, tc.mode)
+				got, err := d.Dispatch(context.Background(), bashCall("c1", tc.command))
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-		})
+				stages := strings.Count(tc.command, ";") + 1
+				want := stages
+				if tc.retried && !readOnly {
+					want *= 2
+				}
+				if len(inner.bounded) != want || len(inner.execs) != 0 {
+					t.Fatalf("confined/unconfined runs = %d/%d, want %d/0", len(inner.bounded), len(inner.execs), want)
+				}
+				stderr := dispatchedStderr(t, got.Content)
+				if len(d.confinement.outside.subjects) != 0 || strings.Contains(stderr, staleOutsideRunText) {
+					t.Fatalf("stderr = %q, remembered = %v; want nothing remembered and no request to run it again", stderr, d.confinement.outside.subjects)
+				}
+				if tc.name == "build network refusal" && readOnly {
+					if want := "boom\n" + refusedLine("a.test:80", network.Reason) + "\n" + confinedFailureNote; stderr != want {
+						t.Fatalf("stderr = %q, want %q", stderr, want)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -3274,17 +3318,30 @@ func TestOutsideSubjects_ReasonsAreReplacedOnRememberAndDroppedWithTheSubject(t 
 	}
 }
 
-type outsideAuthorizer struct{ marked bool }
+type outsideAuthorizer struct {
+	marked  bool
+	subject string
+}
 
 func (a *outsideAuthorizer) Authorize(ctx context.Context, req permissions.MatchRequest, _ dispatch.PromptDisplay, _ permissions.ModeContext) (permissions.Decision, error) {
-	if !a.marked {
+	if !a.marked && (a.subject == "" || a.subject == req.Subject) {
 		a.marked = true
 		dispatch.MarkRunOutside(ctx, req.Subject)
 	}
 	return allow(), nil
 }
 
-func TestConfinedShell_BuildOutsideRunLineSurvivesTheMinimumOutputLimit(t *testing.T) {
+type secondCallDenier struct{ calls int }
+
+func (a *secondCallDenier) Authorize(context.Context, permissions.MatchRequest, dispatch.PromptDisplay, permissions.ModeContext) (permissions.Decision, error) {
+	a.calls++
+	if a.calls > 1 {
+		return deny("denied"), nil
+	}
+	return allow(), nil
+}
+
+func TestConfinedShell_BuildOutsideDeclinedLineSurvivesTheMinimumOutputLimit(t *testing.T) {
 	const cap = 256
 	network := refusal{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}
 	file := refusal{File: true, Path: "/x/y", Process: "ls"}
@@ -3301,7 +3358,8 @@ func TestConfinedShell_BuildOutsideRunLineSurvivesTheMinimumOutputLimit(t *testi
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			swapInvocationRefusals(t, []refusal{tc.refusal})
-			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: 1, stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
+			auth := &secondCallDenier{}
+			d := dispatcherFor(t, tools.NewRegistry(), &confineInner{exitCode: 1, stderr: []byte("boom")}, auth)
 			d.outputCap = cap
 			d.confinement = outsideConfinement(t, d.processCWD, mode.Build)
 			got, err := d.Dispatch(context.Background(), bashCall("c1", "ls"))
@@ -3309,12 +3367,11 @@ func TestConfinedShell_BuildOutsideRunLineSurvivesTheMinimumOutputLimit(t *testi
 				t.Fatal(err)
 			}
 			stderr := dispatchedStderr(t, got.Content)
-			remembered := d.confinement.outside.has("ls")
-			offers := strings.Count(stderr, wantOutsideRunLine)
-			if len(stderr) > cap || remembered != tc.offered || offers > 1 || (offers == 1) != tc.offered ||
-				(tc.offered && strings.Count(stderr, tc.line+"\n") != 1) {
-				t.Fatalf("stderr = %q (%d bytes), remembered = %v; want within %d, offered and remembered = %v with the refusal listed when offered",
-					stderr, len(stderr), remembered, cap, tc.offered)
+			declined := strings.HasSuffix(stderr, "\n"+wantOutsideDeclinedLine)
+			if len(stderr) > cap || (auth.calls == 2) != tc.offered || declined != tc.offered ||
+				(tc.offered && strings.Count(stderr, tc.line+"\n") != 1) || len(d.confinement.outside.subjects) != 0 {
+				t.Fatalf("stderr = %q (%d bytes), asked %d times; want within %d, asked again and declined = %v with the refusal listed when asked",
+					stderr, len(stderr), auth.calls, cap, tc.offered)
 			}
 		})
 	}
@@ -3390,5 +3447,715 @@ func TestWriteRefusalNoticesOncePerFolderAndReason(t *testing.T) {
 	}
 	if !slices.Equal(notices, want) {
 		t.Errorf("notices = %q, want %q", notices, want)
+	}
+}
+
+type capturingAuthorizer struct {
+	decision    permissions.Decision
+	reqs        []permissions.MatchRequest
+	onAuthorize func()
+}
+
+func (a *capturingAuthorizer) Authorize(_ context.Context, req permissions.MatchRequest, _ dispatch.PromptDisplay, _ permissions.ModeContext) (permissions.Decision, error) {
+	a.reqs = append(a.reqs, req)
+	if a.onAuthorize != nil {
+		a.onAuthorize()
+	}
+	return a.decision, nil
+}
+
+var savedOutsidePrograms = []string{"mise", "go", "rm", "sh", "env", "tail", "tee", "touch", "echo", "cat", "grep"}
+
+func savedOutsideReader(t *testing.T, project string, entries ...string) *writableFoldersReader {
+	t.Helper()
+	quoted := make([]string, len(entries))
+	for i, e := range entries {
+		quoted[i] = strconv.Quote(e)
+	}
+	writeLocalProjectSettings(t, project, "outside_sandbox_commands: ["+strings.Join(quoted, ", ")+"]\n")
+	cache, err := config.NewCache(map[string]any{}, project, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.SetLocalAdmitted(true)
+	return newWritableFoldersReader(cache)
+}
+
+func savedOutsideConfinement(t *testing.T, m mode.Mode, entries ...string) *confinement {
+	t.Helper()
+	project := t.TempDir()
+	conf := proxyRouteUnitConfinement(t, project, savedOutsidePrograms...)
+	conf.mode = fixedMode(string(m))
+	conf.outside = &outsideSubjects{}
+	conf.writable = savedOutsideReader(t, project, entries...)
+	t.Setenv("PATH", conf.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return conf
+}
+
+func ranOutside(inner *confineInner) bool { return len(inner.execs)+len(inner.pipelines) > 0 }
+
+func requireSandboxedRuns(t *testing.T, inner *confineInner, err error, runs int) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("dispatch: %v, want the command run in the sandbox", err)
+	}
+	if ranOutside(inner) || len(inner.bounded) != runs {
+		t.Fatalf("unconfined %d, pipelines %d, confined %d; want %d confined runs and none outside", len(inner.execs), len(inner.pipelines), len(inner.bounded), runs)
+	}
+	for _, spec := range inner.bounded {
+		if len(spec.Argv) == 0 || spec.Argv[0] != "/proc/self/exe" {
+			t.Fatalf("confined argv = %q, want the sandbox helper", spec.Argv)
+		}
+	}
+}
+
+func TestConfinedShell_SavedOutsideCommandsRunOutsideAsPipeHeadsOrWhenEveryStageMatches(t *testing.T) {
+	entries := []string{"mise run check", "go test :*"}
+	dispatchIn := func(t *testing.T, command string) (*confinement, *confineInner, *capturingAuthorizer, error) {
+		conf := savedOutsideConfinement(t, mode.Build, entries...)
+		inner := &confineInner{stdout: []byte("piped")}
+		auth := &capturingAuthorizer{decision: allow()}
+		_, err := dispatch.DispatchShell(context.Background(), command, "", conf.projectRoot, auth, shellAdapter(conf, inner))
+		return conf, inner, auth, err
+	}
+	for _, tc := range []struct {
+		command string
+		runs    int
+	}{
+		{"mise run checkx", 1},
+		{"env X=1 mise run check", 1},
+		{"X=1 mise run check", 1},
+		{"env -i mise run check", 1},
+		{"mise run 'check x'", 1},
+		{"mise run check-dev", 1},
+	} {
+		t.Run("sandboxed/"+tc.command, func(t *testing.T) {
+			_, inner, _, err := dispatchIn(t, tc.command)
+			requireSandboxedRuns(t, inner, err, tc.runs)
+		})
+	}
+	check := []string{"mise run check"}
+	for _, tc := range []struct {
+		command            string
+		outside, sandboxed []string
+	}{
+		{"mise run check | tail -60", check, []string{"tail -60"}},
+		{"mise run check | tee out.txt", check, []string{"tee out.txt"}},
+		{"mise run check; rm -rf x", check, []string{"rm -rf x"}},
+		{"touch x && mise run check", check, []string{"touch x"}},
+		{"X=1 mise run check | tail", nil, []string{"mise run check", "tail"}},
+		{"env X=1 mise run check | tail", nil, []string{"mise run check", "tail"}},
+		{"env -i mise run check | tail", nil, []string{"sh -c env -i mise run check | tail"}},
+		{"mise run checkx | tail", nil, []string{"mise run checkx", "tail"}},
+		{"mise run check-dev | tail", nil, []string{"mise run check-dev", "tail"}},
+		{"mise run 'check x' | tail", nil, []string{"mise run check x", "tail"}},
+		{"mise run check | sh", nil, []string{"sh -c mise run check | sh"}},
+		{"sh | mise run check", nil, []string{"sh -c sh | mise run check"}},
+		{"mise run check && sh", nil, []string{"sh -c mise run check && sh"}},
+		{"mise run check > out.txt", nil, []string{"sh -c mise run check > out.txt"}},
+	} {
+		t.Run("per stage/"+tc.command, func(t *testing.T) {
+			conf, inner, _, err := dispatchIn(t, tc.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cwd, err := filepath.EvalSymlinks(conf.projectRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var outside, sandboxed []string
+			for _, spec := range inner.execs {
+				if spec.Stdin != nil || spec.Env != nil || spec.Cwd != cwd {
+					t.Fatalf("outside spec = %+v, want the command as it runs alone in %s, with no piped input", spec, cwd)
+				}
+				outside = append(outside, strings.Join(spec.Argv, " "))
+			}
+			for _, spec := range inner.bounded {
+				if len(spec.Argv) < 3 || spec.Argv[0] != "/proc/self/exe" {
+					t.Fatalf("confined argv = %q, want the sandbox helper", spec.Argv)
+				}
+				sandboxed = append(sandboxed, strings.Join(append([]string{filepath.Base(spec.Argv[2])}, spec.Argv[3:]...), " "))
+			}
+			if len(inner.pipelines) != 0 || !slices.Equal(outside, tc.outside) || !slices.Equal(sandboxed, tc.sandboxed) {
+				t.Fatalf("pipelines %d, outside %q, sandboxed %q; want none, %q, %q", len(inner.pipelines), outside, sandboxed, tc.outside, tc.sandboxed)
+			}
+		})
+	}
+	for _, tc := range []struct{ command, refusal string }{
+		{`"mise run check"`, `program "mise run check" not found`},
+		{`"mise run check" | tail`, `program "mise run check" not found`},
+		{"echo x | mise run check", "would keep it in the sandbox"},
+		{"echo x | mise run check; mise run check", "would keep it in the sandbox"},
+		{"echo x | mise run check | tail", "would keep it in the sandbox"},
+		{"sh -c 'mise run check'", "would keep it in the sandbox"},
+	} {
+		t.Run("refused/"+tc.command, func(t *testing.T) {
+			_, inner, _, err := dispatchIn(t, tc.command)
+			if err == nil || !strings.Contains(err.Error(), tc.refusal) || len(inner.execs)+len(inner.pipelines)+len(inner.bounded) != 0 {
+				t.Fatalf("err = %v, runs %d/%d/%d; want the %q refusal and nothing run", err, len(inner.execs), len(inner.pipelines), len(inner.bounded), tc.refusal)
+			}
+		})
+	}
+	for _, command := range []string{"mise run check", "go test ./...", "mise run check && go test ./x", "go test ./a | go test ./b"} {
+		t.Run("outside/"+command, func(t *testing.T) {
+			_, inner, auth, err := dispatchIn(t, command)
+			if err != nil || !ranOutside(inner) || len(inner.bounded) != 0 {
+				t.Fatalf("err = %v, unconfined %d, pipelines %d, confined %d; want every run outside", err, len(inner.execs), len(inner.pipelines), len(inner.bounded))
+			}
+			if len(auth.reqs) == 0 {
+				t.Fatalf("no authorization asked; the saved entry must not approve the command")
+			}
+		})
+	}
+	for _, command := range []string{"mise  run  check", `mise run "check"`} {
+		t.Run("same tokens/"+command, func(t *testing.T) {
+			conf, inner, auth, err := dispatchIn(t, command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := len(auth.reqs) > 0
+			for _, req := range auth.reqs {
+				want = want && permissions.Match(req, conf.writable.outsideSandboxEntries()).Matched
+			}
+			if got := ranOutside(inner); got != want || got == (len(inner.bounded) > 0) {
+				t.Fatalf("ran outside = %v, confined %d; want outside = %v as permissions.Match decides for %+v", got, len(inner.bounded), want, auth.reqs)
+			}
+		})
+	}
+}
+
+func TestConfinedShell_SavedOutsideCommandsKeepModesAndDenials(t *testing.T) {
+	for _, m := range []mode.Mode{mode.Plan, mode.AutoEdits} {
+		t.Run(string(m), func(t *testing.T) {
+			conf := savedOutsideConfinement(t, m, "mise run check")
+			inner := &confineInner{}
+			_, err := dispatch.DispatchShell(context.Background(), "mise run check", "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, shellAdapter(conf, inner))
+			requireSandboxedRuns(t, inner, err, 1)
+			if policy, _ := decodeFrame(t, inner.bounded[0].Stdin); policy.Mode != string(m) {
+				t.Fatalf("policy mode = %q, want %q", policy.Mode, m)
+			}
+
+			inner = &confineInner{results: []cmdrunner.RunResult{{ExitCode: 3}, {}}}
+			res, err := dispatch.DispatchShell(context.Background(), "mise run check | tail", "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, shellAdapter(conf, inner))
+			requireSandboxedRuns(t, inner, err, 2)
+			if res.ExitCode != 0 {
+				t.Fatalf("mixed pipe exit = %d, want the last stage's 0", res.ExitCode)
+			}
+		})
+	}
+	t.Run("no sandbox", func(t *testing.T) {
+		conf := savedOutsideConfinement(t, mode.Build, "mise run check")
+		conf.constrained = false
+		inner := &confineInner{pipeExits: []int{3, 0}}
+		res, err := dispatch.DispatchShell(context.Background(), "mise run check | tail", "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, shellAdapter(conf, inner))
+		if err != nil || len(inner.pipelines) != 1 || len(inner.execs)+len(inner.bounded) != 0 || res.ExitCode != 0 || len(res.Stderr) != 0 {
+			t.Fatalf("err = %v, pipelines %d, runs %d/%d, result %+v; want one streaming pipeline with the last status and no note", err, len(inner.pipelines), len(inner.execs), len(inner.bounded), res)
+		}
+	})
+	t.Run("denied", func(t *testing.T) {
+		conf := savedOutsideConfinement(t, mode.Build, "mise run check")
+		inner := &confineInner{}
+		auth := &capturingAuthorizer{decision: deny("no")}
+		_, err := dispatch.DispatchShell(context.Background(), "mise run check", "", conf.projectRoot, auth, shellAdapter(conf, inner))
+		var denied *dispatch.DeniedError
+		if !errors.As(err, &denied) || len(auth.reqs) != 1 || len(inner.execs)+len(inner.bounded)+len(inner.pipelines) != 0 {
+			t.Fatalf("err = %v, asked %d, ran %d/%d/%d; want the prompt asked once, denied, nothing run", err, len(auth.reqs), len(inner.execs), len(inner.bounded), len(inner.pipelines))
+		}
+	})
+}
+
+func TestConfinedShell_SavedOutsideCommandRunsOutsideOnItsFirstRunAndIsNoted(t *testing.T) {
+	d := dispatcherFor(t, tools.NewRegistry(), &confineInner{stderr: []byte("boom")}, &recordingAuthorizer{decision: allow()})
+	d.confinement = savedOutsideConfinement(t, mode.Build, "mise run check")
+	d.processCWD = d.confinement.projectRoot
+	got, err := d.Dispatch(context.Background(), bashCall("c1", "mise run check"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := d.runner.(*confineInner)
+	if len(inner.execs) != 1 || len(inner.bounded) != 0 || d.confinement.outside.has("mise run check") {
+		t.Fatalf("unconfined/confined = %d/%d; want one run outside with no earlier failure", len(inner.execs), len(inner.bounded))
+	}
+	note := "codemeld: ran outside the sandbox: matches outside_sandbox_commands entry \"mise run check\" in .codemeld/settings.local.yaml\n"
+	if stderr := dispatchedStderr(t, got.Content); !strings.HasPrefix(stderr, note) || strings.Contains(stderr, staleOutsideRunText) {
+		t.Fatalf("stderr = %q, want the note line and no outside prompt line", stderr)
+	}
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, d.active()), events.KindToolExecEnd)
+	if len(ends) != 1 || !strings.HasPrefix(ends[0].Stderr, note) {
+		t.Fatalf("tool_exec_end = %+v, want the note line in stderr", ends)
+	}
+}
+
+func TestConfinedShell_CommittedOutsideSandboxCommandStaysSandboxed(t *testing.T) {
+	project := t.TempDir()
+	conf := proxyRouteUnitConfinement(t, project, savedOutsidePrograms...)
+	conf.mode = fixedMode(string(mode.Build))
+	conf.outside = &outsideSubjects{}
+	writeProjectSettings(t, project, "outside_sandbox_commands: [\"mise run check\"]\n")
+	cache, err := config.NewCache(map[string]any{}, project, []string{projectSettingsPath(project)}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.SetLocalAdmitted(true)
+	conf.writable = newWritableFoldersReader(cache)
+	t.Setenv("PATH", conf.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	inner := &confineInner{}
+	_, err = dispatch.DispatchShell(context.Background(), "mise run check", "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, shellAdapter(conf, inner))
+	requireSandboxedRuns(t, inner, err, 1)
+}
+
+func TestConfinedShell_SavedOutsidePipelineNotesEveryStage(t *testing.T) {
+	conf := savedOutsideConfinement(t, mode.Build, "go test :*")
+	inner := &confineInner{pipeExits: []int{3, 0}}
+	r := shellAdapter(conf, inner)
+	r.events.cap = 4096
+	store := mkStore(t)
+	r.events.active = func() *sessions.Store { return store }
+	if res, err := dispatch.DispatchShell(context.Background(), "go test ./a | go test ./b", "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, r); err != nil || res.ExitCode != 0 {
+		t.Fatalf("result = %+v, %v; want the last stage's exit 0", res, err)
+	}
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+	if len(inner.pipelines) != 1 || len(ends) != 2 {
+		t.Fatalf("pipelines = %d, ends = %d; want one unconfined pipeline with two ends", len(inner.pipelines), len(ends))
+	}
+	for _, end := range ends {
+		if !strings.HasPrefix(end.Stderr, outsideEntryNote("go test :*")) {
+			t.Fatalf("tool_exec_end stderr = %q, want the note line", end.Stderr)
+		}
+	}
+}
+
+func TestConfinedShell_FailedSavedOutsideHeadFailsItsPipe(t *testing.T) {
+	for _, tc := range []struct {
+		command             string
+		exits               []int
+		want, outside, runs int
+	}{
+		{"mise run check | tail", []int{3, 0}, 3, 1, 2},
+		{"mise run check | tail", []int{-1, 0}, -1, 1, 2},
+		{"mise run check | tail", []int{3, 1}, 1, 1, 2},
+		{"mise run check | tail", []int{0, 4}, 4, 1, 2},
+		{"mise run check | tail", []int{0, 0}, 0, 1, 2},
+		{"mise run check | tee x | tail", []int{3, 1, 0}, 3, 1, 3},
+		{"mise run checkx | tail", []int{3, 0}, 0, 0, 2},
+		{"touch x; mise run check", []int{0, 3}, 3, 1, 2},
+		{"mise run check; touch x", []int{3, 0}, 0, 1, 2},
+		{"mise run check | tail && touch x", []int{3, 0, 0}, 3, 1, 2},
+		{"mise run check | tail || touch x", []int{3, 0, 0}, 0, 1, 3},
+		{"mise run check | tail; touch x", []int{3, 0, 0}, 0, 1, 3},
+		{"mise run checkx | tail && touch x", []int{3, 0, 0}, 0, 0, 3},
+	} {
+		t.Run(fmt.Sprintf("%s %v", tc.command, tc.exits), func(t *testing.T) {
+			conf := savedOutsideConfinement(t, mode.Build, "mise run check")
+			inner := &confineInner{}
+			for _, code := range tc.exits {
+				inner.results = append(inner.results, cmdrunner.RunResult{ExitCode: code})
+			}
+			r := shellAdapter(conf, inner)
+			r.events.cap = 4096
+			res, err := dispatch.DispatchShell(context.Background(), tc.command, "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, r)
+			if err != nil || res.ExitCode != tc.want || len(inner.execs) != tc.outside || len(inner.execs)+len(inner.bounded) != tc.runs {
+				t.Fatalf("err = %v, exit %d, outside %d, confined %d; want exit %d with %d of %d runs outside", err, res.ExitCode, len(inner.execs), len(inner.bounded), tc.want, tc.outside, tc.runs)
+			}
+		})
+	}
+	t.Run("every stage saved without a streaming runner", func(t *testing.T) {
+		conf := savedOutsideConfinement(t, mode.Build, "go test :*")
+		inner := &confineInner{results: []cmdrunner.RunResult{{ExitCode: 3}, {}}}
+		r := &confinedShellRunner{events: &shellEventRunner{inner: struct{ dispatch.Runner }{inner}, cap: 4096}, conf: conf}
+		res, err := dispatch.DispatchShell(context.Background(), "go test ./a | go test ./b", "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, r)
+		if err != nil || res.ExitCode != 0 || len(inner.execs) != 2 {
+			t.Fatalf("err = %v, exit %d, outside %d; want both outside with the last stage's exit 0", err, res.ExitCode, len(inner.execs))
+		}
+	})
+}
+
+func TestConfinedShell_SavedHeadConsumesItsAllowOnceMark(t *testing.T) {
+	conf := savedOutsideConfinement(t, mode.Build, "mise run check")
+	conf.outside.add("mise run check", nil)
+	inner := &confineInner{stdout: []byte("piped")}
+	_, err := dispatch.DispatchShell(context.Background(), "mise run check; touch x", "", conf.projectRoot, &outsideAuthorizer{}, shellAdapter(conf, inner))
+	if err != nil || len(inner.execs) != 1 || inner.execs[0].Stdin != nil || len(inner.bounded) != 1 || conf.outside.has("mise run check") {
+		t.Fatalf("err = %v, unconfined/confined = %d/%d, remembered = %v; want only the first check outside and the subject forgotten",
+			err, len(inner.execs), len(inner.bounded), conf.outside.has("mise run check"))
+	}
+}
+
+func TestConfinedShell_SavedRelativeHeadRunsOutsideOnlyAsTheMatchedProgram(t *testing.T) {
+	envEntry := func(clear bool, program string) func(string) (string, error) {
+		return func(dir string) (string, error) {
+			return permissions.DirectRequestSubject([]string{strings.ReplaceAll(program, "{dir}", dir)}, []string{"PATH=" + dir}, clear)
+		}
+	}
+	bareEntry := func(string) (string, error) { return "tool", nil }
+	for _, tc := range []struct {
+		name, command      string
+		entry              func(dir string) (string, error)
+		onPath, once       bool
+		outside, sandboxed int
+		exit               int
+	}{
+		{name: "absolute", command: "./link/tool | tail", outside: 1, sandboxed: 1, exit: 3},
+		{name: "repointed", command: "touch x; ./link/tool | tail", sandboxed: 3},
+		{name: "repointed after allow once", command: "touch x; ./link/tool | tail", once: true, sandboxed: 3},
+		{name: "repointed name on PATH", command: "touch x; ./link/tool | tail", entry: bareEntry, onPath: true, sandboxed: 3},
+		{name: "name on PATH", command: "./link/tool | tail", entry: bareEntry, onPath: true, outside: 1, sandboxed: 1, exit: 3},
+		{name: "assigned PATH", command: "PATH={dir} ./link/tool | tail", entry: envEntry(false, "{dir}/tool"), onPath: true, outside: 1, sandboxed: 1, exit: 3},
+		{name: "bare name in a cleared environment", command: "env -i PATH={dir} tool | tail", entry: envEntry(true, "tool"), outside: 1, sandboxed: 1, exit: 3},
+		{name: "bare name on an assigned PATH", command: "PATH={dir} tool | tail", entry: envEntry(false, "tool"), outside: 1, sandboxed: 1, exit: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := savedOutsideConfinement(t, mode.Build)
+			root, err := filepath.EvalSymlinks(conf.projectRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir, other, link := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "link")
+			for _, d := range []string{dir, other} {
+				if err := os.Mkdir(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(d, "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(dir, link); err != nil {
+				t.Fatal(err)
+			}
+			if tc.onPath {
+				t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			}
+			entry := dir + "/tool"
+			if tc.entry != nil {
+				if entry, err = tc.entry(dir); err != nil {
+					t.Fatal(err)
+				}
+			}
+			conf.writable = savedOutsideReader(t, conf.projectRoot, entry)
+			inner := &confineInner{results: []cmdrunner.RunResult{{ExitCode: 3}, {}}}
+			if strings.HasPrefix(tc.command, "touch") {
+				inner.results = append([]cmdrunner.RunResult{{}}, inner.results...)
+				inner.onBounded = func(cmdrunner.RunSpec) {
+					if len(inner.bounded) != 1 {
+						return
+					}
+					if err := errors.Join(os.Remove(link), os.Symlink(other, link)); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			var auth dispatch.Authorizer = &capturingAuthorizer{decision: allow()}
+			if tc.once {
+				auth = &outsideAuthorizer{subject: entry}
+				conf.outside.add(entry, nil)
+			}
+			r := shellAdapter(conf, inner)
+			r.events.cap = 4096
+			res, err := dispatch.DispatchShell(context.Background(), strings.ReplaceAll(tc.command, "{dir}", dir), "", root, auth, r)
+			if err != nil || len(inner.execs) != tc.outside || len(inner.bounded) != tc.sandboxed || res.ExitCode != tc.exit {
+				t.Fatalf("err = %v, outside %d, confined %d, exit %d; want %d, %d, exit %d", err, len(inner.execs), len(inner.bounded), res.ExitCode, tc.outside, tc.sandboxed, tc.exit)
+			}
+		})
+	}
+}
+
+type shellRoute struct {
+	reqs   []permissions.MatchRequest
+	runs   []string
+	result string
+}
+
+func routeOf(ctx context.Context, conf *confinement, command string, withMatcher bool) (shellRoute, *confineInner) {
+	conf.outside = &outsideSubjects{}
+	inner := &confineInner{stdout: []byte("piped")}
+	r := shellAdapter(conf, inner)
+	r.events.cap = 4096
+	var run dispatch.Runner = r
+	if !withMatcher {
+		run = struct {
+			dispatch.Runner
+			dispatch.PipelineRunner
+			dispatch.ConfinementReporter
+			dispatch.ExecutionClock
+		}{r, r, r, r}
+	}
+	auth := &capturingAuthorizer{decision: allow()}
+	res, err := dispatch.DispatchShell(ctx, command, "", conf.projectRoot, auth, run)
+	route := shellRoute{reqs: auth.reqs, result: fmt.Sprintf("%v exit %d %q %q", err, res.ExitCode, res.Stdout, res.Stderr)}
+	for _, spec := range inner.execs {
+		route.runs = append(route.runs, fmt.Sprintf("outside %q merged %v", spec.Argv, spec.MergeStderr))
+	}
+	for _, spec := range inner.bounded {
+		route.runs = append(route.runs, fmt.Sprintf("confined %q merged %v", spec.Argv, spec.MergeStderr))
+	}
+	for _, specs := range inner.pipelines {
+		route.runs = append(route.runs, fmt.Sprintf("pipeline of %d", len(specs)))
+	}
+	return route, inner
+}
+
+func requireRouteWithoutTheMatcher(t *testing.T, ctx context.Context, conf *confinement, command string) (shellRoute, *confineInner) {
+	t.Helper()
+	got, inner := routeOf(ctx, conf, command, true)
+	want, _ := routeOf(ctx, conf, command, false)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("route = %+v, want %+v as without the matcher", got, want)
+	}
+	return got, inner
+}
+
+func TestConfinedShell_OtherRedirectionsStaySandboxedOrAreRefused(t *testing.T) {
+	prefix := []string{"mise run check :*"}
+	for _, tc := range []struct {
+		command string
+		entries []string
+		direct  bool
+		refused bool
+	}{
+		{command: "mise run check 2>&1|tail", refused: true},
+		{command: "mise run check 2>& 1"},
+		{command: "mise run check 1>&2", refused: true},
+		{command: "mise run check &> out"},
+		{command: "mise run check > out 2>&1"},
+		{command: "mise run check 2>&1 > out"},
+		{command: "mise run check 2>&1 || echo x", refused: true},
+		{command: "mise run check 2>&1; echo x", refused: true},
+		{command: "mise run check 2>&1 | tail > out"},
+		{command: "mise run check 2>&1 | sh"},
+		{command: "mise run check 2>&1 | while read l", refused: true},
+		{command: `mise run check 2>&1 | tail -5; echo "EXIT=$?"`, refused: true},
+		{command: "mise run check 2>&1 | cat *.log", refused: true},
+		{command: "mise run check # 2>&1 | tail"},
+		{command: "echo 'mise run check 2>&1 | tail'", direct: true},
+		{command: "mise run 'check 2>&1 | tail'", direct: true},
+		{command: `mise run check\ 2>&1`},
+		{command: "X=1 mise run check 2>&1"},
+		{command: "env -i mise run check 2>&1"},
+		{command: "mise run checkx 2>&1"},
+		{command: "echo x | mise run check 2>&1", refused: true},
+
+		{command: `mise run check 2>&1 | cat # \ ; go test ./x`, refused: true},
+		{command: `mise run check 2>&1 | cat *.log \ && echo x`, refused: true},
+		{command: "mise run check\u00a0 2>&1"},
+		{command: "mise run check\v 2>&1"},
+		{command: "mise run check\f 2>&1"},
+		{command: "mise run check\u00a0 2>&1 | tail", entries: []string{"mise :*"}, refused: true},
+		{command: "./prog 2>&1", entries: []string{"./prog"}},
+		{command: "./prog 2>&1 | tail", entries: []string{"./prog"}},
+		{command: "mise run check # 2>&1 | tail", entries: prefix, refused: true},
+		{command: "mise run check 2>&1 | tail 2>&1", refused: true},
+		{command: "mise run check 2>&1 | tail 2>&1 | cat", refused: true},
+		{command: "mise run check 2>&1 | tail && mise run check 2>&1", refused: true},
+	} {
+		t.Run(fmt.Sprintf("%q %v", tc.command, tc.entries), func(t *testing.T) {
+			entries := tc.entries
+			if entries == nil {
+				entries = []string{"mise run check", "go test :*"}
+			}
+			conf := savedOutsideConfinement(t, mode.Build, entries...)
+			if err := os.WriteFile(filepath.Join(conf.projectRoot, "prog"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.refused {
+				got, inner := routeOf(context.Background(), conf, tc.command, true)
+				if !strings.Contains(got.result, "would keep it in the sandbox") || len(got.reqs) != 0 || inner.calls() != 0 {
+					t.Fatalf("route = %+v, want the refusal with nothing authorized or run", got)
+				}
+				return
+			}
+			got, inner := requireRouteWithoutTheMatcher(t, context.Background(), conf, tc.command)
+			requireSandboxedRuns(t, inner, nil, 1)
+			if len(got.reqs) != 1 || (got.reqs[0].Kind == "direct") != tc.direct || !strings.HasPrefix(got.result, "<nil> ") {
+				t.Fatalf("route = %+v, want one request without error, direct = %v", got, tc.direct)
+			}
+		})
+	}
+}
+
+func TestConfinedShell_SavedCommandWithMergedStderrRunsOutsideAndTheRestSandboxed(t *testing.T) {
+	check := []string{"mise run check"}
+	for _, tc := range []struct {
+		command            string
+		outside, sandboxed []string
+		failed             int
+	}{
+		{"mise run check 2>&1", check, nil, 3},
+		{"mise run check  2>&1", check, nil, 3},
+		{"mise run check 2>&1 | tail -60", check, []string{"tail -60"}, 3},
+		{"cd {project} && mise run check 2>&1 | tail -60", check, []string{"tail -60"}, 3},
+		{"mise run check 2>&1 | grep FAIL | tail -5", check, []string{"grep FAIL", "tail -5"}, 3},
+		{"mise run check 2>&1 | tail -5 && echo done", check, []string{"tail -5", "echo done"}, 3},
+		{"mise run check 2>&1 | tail -5 && go test ./x", []string{"mise run check", "go test ./x"}, []string{"tail -5"}, 3},
+		{"mise run check 2>&1 | go test ./x", []string{"mise run check", "go test ./x"}, nil, 0},
+		{"cd {project} && ./prog 2>&1", []string{"./prog"}, nil, 3},
+		{"cd {project} && ./prog 2>&1 | tail", []string{"./prog"}, []string{"tail"}, 3},
+	} {
+		for _, headExit := range []int{0, 3} {
+			t.Run(fmt.Sprintf("%s exiting %d", tc.command, headExit), func(t *testing.T) {
+				conf := savedOutsideConfinement(t, mode.Build)
+				project, err := filepath.EvalSymlinks(conf.projectRoot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(project, "prog"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				conf.writable = savedOutsideReader(t, conf.projectRoot, "mise run check", "go test :*", project+"/prog")
+				processCWD := project
+				if strings.HasPrefix(tc.command, "cd ") {
+					processCWD = t.TempDir()
+				}
+				inner := &confineInner{results: []cmdrunner.RunResult{{ExitCode: headExit, Stdout: []byte("merged")}}, stdout: []byte("piped")}
+				r := shellAdapter(conf, inner)
+				r.events.cap = 4096
+				auth := &capturingAuthorizer{decision: allow()}
+				res, err := dispatch.DispatchShell(context.Background(), strings.ReplaceAll(tc.command, "{project}", project), "", processCWD, auth, r)
+				if err != nil || len(inner.pipelines) != 0 || len(inner.execs) == 0 {
+					t.Fatalf("err = %v, pipelines = %d, outside = %d; want the check outside and nothing streamed", err, len(inner.pipelines), len(inner.execs))
+				}
+				for _, req := range auth.reqs {
+					if req.Kind != "direct" {
+						t.Fatalf("requests = %+v, want only direct ones", auth.reqs)
+					}
+				}
+				wantExit := 0
+				if headExit != 0 {
+					wantExit = tc.failed
+				}
+				if res.ExitCode != wantExit {
+					t.Fatalf("exit = %d, want %d", res.ExitCode, wantExit)
+				}
+				if head := inner.execs[0]; !head.MergeStderr || head.Stdin != nil || head.Cwd != project {
+					t.Fatalf("head = %+v, want it merged, outside, in %s, with no piped input", head, project)
+				}
+				var outside, sandboxed []string
+				for i, spec := range inner.execs {
+					if i > 0 && spec.MergeStderr {
+						t.Fatalf("spec = %+v, want only the head merged", spec)
+					}
+					outside = append(outside, strings.Join(spec.Argv, " "))
+				}
+				for i, spec := range inner.bounded {
+					if spec.MergeStderr || spec.Argv[0] != "/proc/self/exe" {
+						t.Fatalf("confined spec = %+v, want the sandbox helper and no merge", spec)
+					}
+					if _, stdin := decodeFrame(t, spec.Stdin); i == 0 && string(stdin) != "merged" {
+						t.Fatalf("stdin = %q, want only the head's merged output", stdin)
+					}
+					sandboxed = append(sandboxed, strings.Join(append([]string{filepath.Base(spec.Argv[2])}, spec.Argv[3:]...), " "))
+				}
+				wantOutside, wantSandboxed := tc.outside, tc.sandboxed
+				if headExit != 0 && strings.Contains(tc.command, " 2>&1 | tail -5 && ") {
+					wantOutside, wantSandboxed = check, []string{"tail -5"}
+				}
+				if !slices.Equal(outside, wantOutside) || !slices.Equal(sandboxed, wantSandboxed) {
+					t.Fatalf("outside %q, sandboxed %q; want %q, %q", outside, sandboxed, wantOutside, wantSandboxed)
+				}
+				const note = "codemeld: ran outside the sandbox: "
+				if strings.Count(string(res.Stderr), note) != len(outside) || strings.Contains(string(res.Stdout), note) {
+					t.Fatalf("stdout %q, stderr %q; want one note per outside run, on stderr", res.Stdout, res.Stderr)
+				}
+			})
+		}
+	}
+}
+
+func TestConfinedShell_MergedStderrFormsStayLiteralWhereNoEntryApplies(t *testing.T) {
+	for _, command := range []string{"mise run check 2>&1", "mise run check 2>&1 | tail -60"} {
+		for _, tc := range []struct {
+			name          string
+			mode          mode.Mode
+			pinned        mode.Mode
+			unconstrained bool
+			entry         string
+		}{
+			{name: "plan", mode: mode.Plan, entry: "mise run check"},
+			{name: "auto edits", mode: mode.AutoEdits, entry: "mise run check"},
+			{name: "no sandbox", mode: mode.Build, unconstrained: true, entry: "mise run check"},
+			{name: "no matching entry", mode: mode.Build, entry: "go test :*"},
+			{name: "a call pinned to plan", mode: mode.Build, pinned: mode.Plan, entry: "mise run check"},
+		} {
+			t.Run(tc.name+"/"+command, func(t *testing.T) {
+				conf := savedOutsideConfinement(t, tc.mode, tc.entry)
+				conf.constrained = !tc.unconstrained
+				ctx := context.Background()
+				if tc.pinned != "" {
+					ctx = vcs.WithConfinementMode(ctx, string(tc.pinned))
+				}
+				got, inner := requireRouteWithoutTheMatcher(t, ctx, conf, command)
+				if len(got.reqs) != 1 || got.reqs[0].Kind != "literal" || got.reqs[0].Subject != command {
+					t.Fatalf("requests = %+v, want the literal request", got.reqs)
+				}
+				if !tc.unconstrained {
+					requireSandboxedRuns(t, inner, nil, 1)
+				}
+			})
+		}
+		t.Run("a call pinned to build/"+command, func(t *testing.T) {
+			conf := savedOutsideConfinement(t, mode.Plan, "mise run check")
+			got, inner := routeOf(vcs.WithConfinementMode(context.Background(), string(mode.Build)), conf, command, true)
+			if len(inner.execs) != 1 || !inner.execs[0].MergeStderr {
+				t.Fatalf("route = %+v, want the call's own mode to decide", got)
+			}
+		})
+	}
+	req := permissions.MatchRequest{Kind: "direct", Subject: "mise run check", SubjectTokens: []string{"mise", "run", "check"}}
+	if entry, ok := (&confinedShellRunner{}).MatchOutsideEntry(context.Background(), req); ok {
+		t.Fatalf("entry = %q, want no match without a confinement", entry)
+	}
+	conf := savedOutsideConfinement(t, mode.Build, "mise run :*")
+	if entry, ok := (&confinedShellRunner{conf: conf}).MatchOutsideEntry(context.Background(), req); !ok || entry != "mise run :*" {
+		t.Fatalf("entry = %q, %v; want the matching entry", entry, ok)
+	}
+}
+
+func TestConfinedShell_MergedHeadStaysMergedWhenItsRouteNoLongerRunsOutside(t *testing.T) {
+	for _, command := range []string{"mise run check 2>&1", "mise run check 2>&1 | tail"} {
+		for name, change := range map[string]func(*testing.T, *confinement){
+			"entry removed": func(t *testing.T, conf *confinement) {
+				conf.writable = savedOutsideReader(t, conf.projectRoot, "go test :*")
+			},
+			"mode changed": func(_ *testing.T, conf *confinement) { conf.mode = fixedMode(string(mode.Plan)) },
+		} {
+			t.Run(name+"/"+command, func(t *testing.T) {
+				conf := savedOutsideConfinement(t, mode.Build, "mise run check")
+				inner := &confineInner{results: []cmdrunner.RunResult{{ExitCode: 3, Stdout: []byte("merged")}, {}}}
+				r := shellAdapter(conf, inner)
+				r.events.cap = 4096
+				auth := &capturingAuthorizer{decision: allow(), onAuthorize: func() { change(t, conf) }}
+				res, err := dispatch.DispatchShell(context.Background(), command, "", conf.projectRoot, auth, r)
+				runs, exit := 1, 3
+				if strings.Contains(command, "|") {
+					runs, exit = 2, 0
+				}
+				requireSandboxedRuns(t, inner, err, runs)
+				if !inner.bounded[0].MergeStderr || (runs == 2 && inner.bounded[1].MergeStderr) || res.ExitCode != exit {
+					t.Fatalf("specs = %+v, exit %d; want only the head merged and the last stage's exit %d", inner.bounded, res.ExitCode, exit)
+				}
+				if runs == 2 {
+					if _, stdin := decodeFrame(t, inner.bounded[1].Stdin); string(stdin) != "merged" {
+						t.Fatalf("stdin = %q, want only the head's merged output", stdin)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestConfinedShell_SavedHeadIsNotJudgedByAnotherCommandWithTheSameSubject(t *testing.T) {
+	const saved, other = "mise run '�'", "mise run '\xff'"
+	for _, command := range []string{saved + "; " + other, other + "; " + saved, saved + " 2>&1 | tail && " + other} {
+		conf := savedOutsideConfinement(t, mode.Build, saved)
+		inner := &confineInner{}
+		_, err := dispatch.DispatchShell(context.Background(), command, "", conf.projectRoot, &capturingAuthorizer{decision: allow()}, shellAdapter(conf, inner))
+		if err != nil || len(inner.bounded) == 0 {
+			t.Fatalf("%q: err = %v, confined = %d; want both run", command, err, len(inner.bounded))
+		}
+		for _, spec := range inner.execs {
+			if slices.Contains(spec.Argv, "\xff") {
+				t.Fatalf("%q: ran %q outside, which matches no entry", command, spec.Argv)
+			}
+		}
 	}
 }

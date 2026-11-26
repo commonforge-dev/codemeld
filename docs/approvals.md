@@ -81,8 +81,9 @@ program codemeld treats as destructive, the whole command is stored exactly. Apa
 global approval, an approval applies in its folder and below.
 
 codemeld writes the shared `.codemeld/settings.yaml` only when you share an approval into it or
-remove one through `/settings`, add a shared entry with `/blocked add`, or remove a shared entry
-in `/blocked` after you confirm it.
+remove one through `/settings`, add a shared entry with `/blocked add`, remove a shared entry
+in `/blocked` after you confirm it, or add or remove a `writable_folders` entry in the `/settings`
+folders tab.
 
 ## Reviewing and revoking approvals
 
@@ -197,6 +198,12 @@ commands, such as `xargs rg` or a script, keep the inherited value, and so does 
 allowed `ps` run directly, even with leading assignments (`ripgrepConfigEnv` in
 `internal/dispatch/shell.go`). A command that clears its environment with `env -i`, or an
 automatically allowed `hg` or `jj` command, which gets its own environment, is outside these rules.
+
+Known limit: Git read-only commands are isolated from `core.fsmonitor`, `core.pager`,
+`diff.external` and textconv drivers in repository config only; other git-configured programs, such
+as clean/process filters, are not. Mercurial and Jujutsu structured (built-in tool) reads and
+read-only child agents' VCS reads are not isolated, so a hostile repository config can run a program
+there (confined when the sandbox is on, unconfined when it is off).
 
 These commands are proven read-only by codemeld's own rules. In Plan and Auto edits only, never
 Build, the opt-in [System One check](system-one.md) can also allow a `direct` or `literal` shell
@@ -413,16 +420,83 @@ deletion, history rewrite or network program is asked with allow once or deny on
 network only as described under [Sandboxed network](#sandboxed-network).
 
 <a id="outside-the-sandbox"></a>**Running a command once outside the sandbox.** In Build, when a sandboxed command fails and the
-sandbox refused it a network destination or a file, codemeld remembers that command
-(`confinedShellRunner.Exec`, `internal/bootstrap/confinedrunner.go`). The next time the model runs
-the same command, unless Build runs it without asking as read-only, the prompt asks to allow running
-outside the sandbox, offers allow once or deny only, and warns that nothing but your user account
-limits what the command can read, write or reach (`markOutside`, `internal/bootstrap/promptgate.go`).
-A saved grant or an earlier approval of that command does not skip this prompt
-(`withoutOutsideApprovals`), and nothing runs outside the sandbox without it: allow once runs that
-one invocation without the sandbox and forgets the command, so an identical run after it is
-sandboxed again; deny refuses it and forgets the command (`settleOutside`). A
-[headless run](#headless-runs-codemeld-run) without `--prompt-for-approval` refuses this prompt.
+sandbox refused it a network destination or a file, codemeld asks right away, in the same tool call,
+whether to run the command again outside the sandbox, unless Build runs it without asking as
+read-only (`productionToolDispatcher.Dispatch`, `internal/bootstrap/tooldispatch.go`). The prompt
+offers allow once or deny, plus a third choice for a single direct command in an approved project,
+and warns that nothing but your user account limits what the command can read, write or reach
+(`markOutside`, `internal/bootstrap/promptgate.go`). The prompt's "always run outside the sandbox in
+this project" choice saves the command to `.codemeld/settings.local.yaml`, with the scope chooser for
+a prefix form, and runs the command again outside; headless runs have no such choice. A saved grant
+or an earlier approval of that command does not skip this prompt (`withoutOutsideApprovals`), while
+a command saved in `outside_sandbox_commands` runs outside the sandbox in the cases described below.
+Otherwise nothing runs outside the sandbox without this prompt: allow once runs the command again,
+once, without the sandbox, and the model gets that run's result; deny keeps the sandboxed result and
+tells the model you chose not to run it outside. Nothing is remembered after the tool call, so an
+identical run later is sandboxed again (`confinedFailure.forget`). A
+[headless run](#headless-runs-codemeld-run) without `--prompt-for-approval` does not ask and returns
+the sandboxed result (`HeadlessDriver.Run`, `internal/bootstrap/headless.go`).
+
+<a id="outside-sandbox-commands"></a>**Commands that always run outside the sandbox.** The project's
+per-user `.codemeld/settings.local.yaml` can list commands under `outside_sandbox_commands`, for
+commands that can never pass in the sandbox, such as a test suite that starts its own sandbox. Each
+entry matches like a saved direct command grant, for example `mise run check` or `go test :*`. In
+Build, when every command in a shell call matches an entry, the whole call runs outside the sandbox
+from its first run. Otherwise codemeld decides for each command: one that matches runs outside only
+when it is first in its pipe group (the commands joined by `|`), so it takes no piped input, and
+every other command stays sandboxed. In `mise run check | tail -60` only the check runs outside;
+`echo x | mise run check` is refused, as described below. A first command given by a relative path stays
+sandboxed if its folder resolves differently by the time it runs, as when an earlier command
+repointed a symbolic link (`confinement.savedHead`). When a first command that ran outside this way
+fails and the last command of its pipe succeeds, the pipe fails with the first command's exit status,
+so a following `&&` does not run (`runStagesSequentially`, `internal/dispatch/shell_stages.go`); after
+`;` the call's status is that of its last group, as in a shell. A call in which every command matches
+keeps the last command's status. A call codemeld hands to the shell whole (redirections, and wrappers
+such as `sh`, `bash` or `xargs` as a command) stays sandboxed or is refused, as described below
+(`confinement.resolveOutside`, `internal/bootstrap/confinedrunner.go`), with two exceptions: a matching
+command followed by `2>&1`, either at the end of the call (`mise run check 2>&1`) or piped onward
+(`mise run check 2>&1 | tail -60`), written with a space before `2>&1`, exactly one between it and
+`|`, and a space after that `|`. For these two, codemeld reads the list before approval and runs the
+call as separate commands under the rules above (`savedMergedStages`,
+`internal/dispatch/shell.go`), with the matching command's
+stderr sent into its stdout (`runPipeGroup`, `internal/dispatch/shell_stages.go`;
+`DirectExecRunner.Exec`, `internal/runner/runner.go`). Each command then needs its own approval: an
+approval of `mise run check` covers it here too, and an approval saved for the whole line is not
+used. Each of these command prompts also shows the whole command (`authorizeStages`,
+`internal/dispatch/shell_stages.go`); a later connection or network prompt shows only its
+destination. A call with other redirections stays sandboxed or is refused, as described below, and so
+does either form when a command in it sets a variable (`X=1`) or needs the shell, such as
+`grep ^FAIL`, `cat *.log` or a bare name that is not a program (`savedMergedStages`). Otherwise the two forms differ from a shell as other separately run
+commands do: a builtin that also exists as a program, such as `echo`, or `cd` on some systems, runs
+as that program (`verifyStagePrograms`, `internal/dispatch/shell_env.go`), and an option wildcard
+matching no file is passed as typed (`StageNeedsShell`, `internal/permissions/shellpaths.go`).
+
+In Build, codemeld refuses, before any approval prompt, a call that names a matching command but would
+keep it in the sandbox, where it cannot pass; nothing runs, and the refusal names the entry and what to
+send instead (`refuseLiteralEntry` and `refusePipedEntry`, `internal/dispatch/shell.go`). It refuses
+two cases: a call it hands to the shell whole, other than the two forms above, in which it can still
+find the matching command, as in `mise run check 2>&1 | tail -6; echo "EXIT=${PIPESTATUS[0]}"`,
+`mise run check 2>/dev/null` or `sh -c 'mise run check'`; and a call in which a matching command
+receives piped input and not every command matches, as in `echo x | mise run check`. Run the command
+on its own, or as `mise run check 2>&1 | tail -60`: the call then fails with the command's exit status,
+so `PIPESTATUS` is not needed. A refused call might have passed in the sandbox, and a saved grant or an
+earlier approval of that call does not avoid the refusal. Codemeld does not look inside a redirection
+to a file, a command substitution, a wrapper such as `sh`, `bash` or `xargs` used as one of the
+commands, or a command that sets a variable inside a compound, so such a call stays sandboxed without
+a refusal, as in `mise run check > out.log 2>&1` or `mise run check | sh`.
+
+The list is read only from that file, only when project approval admitted the project's settings at
+launch, and is re-read when the file changes (`newWritableFoldersReader` and
+`writableFoldersReader.outsideSandboxEntries`, `internal/bootstrap/blockedpaths.go`). A list in the
+committed `.codemeld/settings.yaml` is ignored, so a repository cannot make its own commands skip the
+sandbox through that file; the global settings file refuses the key
+(`rejectGlobalOutsideSandboxCommands`, `internal/config/load.go`). It changes nothing in Plan or Auto
+edits, and it never approves a command: each still needs its ordinary approval. Headless runs honor it
+too. The command's stderr, and its `tool_exec_end` record, begin with `codemeld: ran outside the
+sandbox: matches outside_sandbox_commands entry "<entry>" in .codemeld/settings.local.yaml`
+(`outsideEntryNote`, `internal/bootstrap/tooldispatch_shell.go`). `/settings` lists the saved entries
+in `.codemeld/settings.local.yaml` at the end of its commands / tool grants tab, marking invalid ones,
+and `r` removes the selected entry from that file (`newSettingsDeps`, `internal/bootstrap/starttui.go`).
 
 <a id="sandboxed-network"></a>**Sandboxed network.** A sandboxed command reaches
 the network only through codemeld's session proxy, or in Build and Auto edits through a
@@ -505,8 +579,11 @@ UI and in a headless run with `--prompt-for-approval`:
 No choice saves a grant. A headless run without `--prompt-for-approval` and a command run by a child
 agent are not asked: the connection is refused. A connection that is neither TCP nor to a Unix
 socket path, such as UDP, and one whose destination codemeld cannot inspect or resolve, is refused
-without asking. For a shell command, each connection decision codemeld answered with this check on
-the command's own connections is written to the session, with repeats counted in one entry; see
+without asking. For a shell command or a version-control tool action, each connection decision
+codemeld answered with this check on the command's own connections is written to the active session
+(`recordConnectDecisions`, called by `confinedShellRunner.Exec` and `confinedRunner.Exec` in
+`internal/bootstrap/confinedrunner.go`), with repeats within one sandboxed run counted in one entry
+(`Broker.record` in `internal/enforce/broker_linux.go`); see
 [Sessions](sessions.md). Not written are every decision in Plan, where codemeld only lets
 connections reach the session proxy and keeps no decision records (`policy` sets
 `enforce.BrokerSlice` in `internal/bootstrap/confinedrunner.go`, and `attachBroker` in
@@ -517,9 +594,7 @@ the sandbox filter makes before codemeld sees the call, such as creating a UDP s
 (`seccompFilterFor` in `internal/enforce/seccomp_linux.go`), a decision whose reply could not reach
 the command, for example because the call was interrupted (`Broker.handle` in
 `internal/enforce/broker_linux.go`), bind and listen decisions, and every decision when no session
-is active (`recordConnectDecisions` in `internal/bootstrap/confinedrunner.go`). Connection decisions made during a version-control tool action, such as a
-hook that connects, are not recorded yet (`confinedRunner.Exec` in
-`internal/bootstrap/confinedrunner.go`).
+is active (`recordConnectDecisions` in `internal/bootstrap/confinedrunner.go`).
 
 Some Unix sockets are always denied: no prompt, and no grant opens them (`denyListPaths` in
 `internal/enforce/denylist_linux.go`). They are the systemd user manager
@@ -573,7 +648,9 @@ secret, in Git when a remote-tracking branch contains it, and whenever that chec
 
 `web_search` and `web_fetch` never run without your approval, in any mode: each call needs an answer
 at the prompt or an approval for that exact host and tool, for this session or saved in the
-project. A request on a non-default scheme or port asks every time, allow once or deny only.
+project. A nonstandard port, or a redirect that changes scheme or port, requires a fresh one-time
+answer. An initial HTTP URL on its standard port follows host/tool approval rules, with an HTTPS
+attempt first.
 Enabling the tools or adding an Exa key is not an approval. A search reaches only `mcp.exa.ai`
 and never opens the pages it lists; reading one is a separate `web_fetch` the model must ask for.
 `web_fetch` checks every redirect hop on its own host, and refuses loopback, private-network and
@@ -610,7 +687,8 @@ denial stays, and any failure or pause note is added to its reason
 ## What the model is told
 
 Every turn starts with one system message: codemeld's instructions for the active mode (plus notes
-for some models), a description of the environment, and every `AGENTS.md` codemeld found (the
-global one and those from the filesystem root down to the launch folder). A `/compact` summary is
+for some models), a description of the environment, and the `AGENTS.md` files successfully loaded under the
+launch's instruction-file selection and size/readability limits (the global one and those from the
+filesystem root down to the launch folder). A `/compact` summary is
 sent as a user message marked as reference material, never as part of the system message, so text
 copied into a summary gains no authority.

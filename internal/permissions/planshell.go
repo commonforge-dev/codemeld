@@ -902,11 +902,11 @@ func stageIsShellProgram(tokens []string) bool {
 }
 
 // stageNeedsOwnedArgv reports whether a stage may auto-allow only where dispatch can rewrite its
-// argv. jj's isolation lives in a command-line `--config` prefix, because no environment variable
-// disables its repository and workspace configuration; the literal route re-runs its text through
-// `sh -c` and cannot carry that prefix, so a jj-bearing literal stays mutating.
+// argv. jj's and git's isolation lives in command-line flags, because no environment variable
+// disables jj's repository configuration or git's external diff and textconv drivers; the literal
+// route re-runs its text through `sh -c` and cannot carry those flags, so such a literal stays mutating.
 func stageNeedsOwnedArgv(tokens []string) bool {
-	return len(tokens) > 0 && tokens[0] == "jj"
+	return len(tokens) > 0 && (tokens[0] == "jj" || tokens[0] == "git")
 }
 
 var probeFlagPrograms = map[string]struct{}{

@@ -16,7 +16,7 @@ var templates embed.FS
 var builtinOrder = []string{"git", "hg", "jj"}
 
 var earlierVersions = map[string][]string{
-	"git": {"c8d1660ef5b7407fc8eee3ee2b3932b9fd6e2484112751b74cc060b29635d9ac"},
+	"git": {"c8d1660ef5b7407fc8eee3ee2b3932b9fd6e2484112751b74cc060b29635d9ac", "aae3db16eef217f13369b346ec56e617b83fc9477a4f51cb7ef8c881de236135"},
 	"hg":  {"584ca889387964dca3d4cbe7acfec6b454be14b3ce2d7758d27b3ff7657444ed"},
 	"jj":  {},
 }

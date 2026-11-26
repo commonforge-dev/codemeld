@@ -3242,3 +3242,112 @@ func TestSettingsPicker_FoldersFooterNamesTheAddKey(t *testing.T) {
 		}
 	}
 }
+
+const wantOutsideHeader = "run outside the sandbox (Build): these commands skip the sandbox; each still needs its approval"
+
+var outsideGrep = PermissionRow{Entry: permissions.PermissionEntry{Kind: "tool", Subject: "grep", PathScope: "*", GrantKind: "global"}}
+
+func openOutsideCommands(a *App, grants []PermissionRow, rows *[]WritableFolderRow, unreadable string, removed *[]string) {
+	deps := SettingsDeps{
+		Rows:   func() []PermissionRow { return grants },
+		Revoke: func(PermissionRow) {},
+		Outside: OutsideCommandDeps{
+			List: func() ([]WritableFolderRow, string) { return *rows, unreadable },
+			Remove: func(entry string) string {
+				*removed = append(*removed, entry)
+				*rows = slices.DeleteFunc(*rows, func(r WritableFolderRow) bool { return r.Entry == entry })
+				return entry + " removed from outside_sandbox_commands"
+			},
+		},
+	}
+	a.openSettingsPicker(grants, deps, SessionSettings{})
+}
+
+func TestSettingsPicker_CommandsTabListsOutsideCommands(t *testing.T) {
+	rows := []WritableFolderRow{{Entry: "mise run check"}, {Entry: "bad\n\tentry", Invalid: "subject\nhas a newline"}}
+	cases := []struct {
+		name       string
+		grants     []PermissionRow
+		unreadable string
+		want       []string
+	}{
+		{name: "after the grants", grants: []PermissionRow{outsideGrep}, want: []string{
+			"allow the grep tool — globally", wantOutsideHeader, "  mise run check", "  bad entry — invalid: subject has a newline"}},
+		{name: "no grants", want: []string{settingsEmptyRow, wantOutsideHeader, "  mise run check", "  bad entry — invalid: subject has a newline"}},
+		{name: "unreadable", unreadable: "settings.local.yaml: bad yaml", want: []string{settingsEmptyRow, wantOutsideHeader, "  settings unreadable: settings.local.yaml: bad yaml"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var removed []string
+			listed := slices.Clone(rows)
+			a := New(nil)
+			openOutsideCommands(a, tc.grants, &listed, tc.unreadable, &removed)
+
+			if got := permissionsRowsOnTab(a); !slices.Equal(got, tc.want) {
+				t.Fatalf("commands tab rows = %q, want %q", got, tc.want)
+			}
+			a.stepSettingsTab(1)
+			if got := permissionsRowsOnTab(a); slices.Contains(got, wantOutsideHeader) {
+				t.Fatalf("folders tab rows = %q, want no outside-sandbox section", got)
+			}
+		})
+	}
+}
+
+func TestSettingsPicker_OutsideRemoveConfirmsThenRemovesTheSelectedEntry(t *testing.T) {
+	var removed []string
+	rows := []WritableFolderRow{{Entry: "mise run check"}, {Entry: "go test :*", Invalid: "unused"}}
+	a := New(nil)
+	openOutsideCommands(a, []PermissionRow{outsideGrep}, &rows, "", &removed)
+	a.settingsPicker.list.SetCurrentItem(3)
+
+	if ev := pressSettingsKey(a, 'r'); ev != nil {
+		t.Fatal("r reached the list, want the picker to consume it")
+	}
+	modal, ok := a.pages.GetPage(settingsDeletePage).(*tview.Modal)
+	if !ok {
+		t.Fatal("r on an outside-sandbox entry opened no confirmation")
+	}
+	if len(removed) != 0 {
+		t.Fatalf("Remove called before confirming: %q", removed)
+	}
+	keyModal(a, modal, tcell.KeyEnter)
+
+	if !slices.Equal(removed, []string{"go test :*"}) {
+		t.Fatalf("Remove received %q, want [go test :*]", removed)
+	}
+	if got := a.NoticeText(); got != "go test :* removed from outside_sandbox_commands" {
+		t.Errorf("notice = %q, want the result line", got)
+	}
+	want := []string{"allow the grep tool — globally", wantOutsideHeader, "  mise run check"}
+	if got := permissionsRowsOnTab(a); !slices.Equal(got, want) {
+		t.Fatalf("rows after remove = %q, want %q", got, want)
+	}
+}
+
+func TestSettingsPicker_OutsideRemoveIgnoresGrantHeaderAndUnreadableRows(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unreadable string
+		row        int
+	}{
+		{name: "grant row", row: 0},
+		{name: "header row", row: 1},
+		{name: "unreadable row", unreadable: "bad yaml", row: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var removed []string
+			rows := []WritableFolderRow{{Entry: "mise run check"}}
+			a := New(nil)
+			openOutsideCommands(a, []PermissionRow{outsideGrep}, &rows, tc.unreadable, &removed)
+			a.settingsPicker.list.SetCurrentItem(tc.row)
+			pressSettingsKey(a, 'r')
+			if modal, ok := a.pages.GetPage(settingsDeletePage).(*tview.Modal); ok {
+				keyModal(a, modal, tcell.KeyEnter)
+			}
+			if len(removed) != 0 {
+				t.Fatalf("Remove called with %q on the %s", removed, tc.name)
+			}
+		})
+	}
+}

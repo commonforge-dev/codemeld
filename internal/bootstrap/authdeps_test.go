@@ -6765,42 +6765,44 @@ func wantRuns(t *testing.T, inner *confineInner, unconfined, confined int) {
 	}
 }
 
+func wantNothingRemembered(t *testing.T, auth *productionAuthorizer, content string) {
+	t.Helper()
+	if len(auth.outside.subjects) != 0 || strings.Contains(content, staleOutsideRunText) {
+		t.Fatalf("remembered = %v, content = %q; want nothing remembered and no request to run it again", auth.outside.subjects, content)
+	}
+}
+
 func TestProductionAuthorizer_BuildOutsideRunSkipsAllowApprovalsOfTheRememberedSubject(t *testing.T) {
 	network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
 	for _, tc := range []struct {
-		command, subject string
-		first            tui.PromptOption
+		command string
+		first   tui.PromptOption
 	}{
-		{"touch a", "touch a", tui.OptionAllowOnce},
-		{"touch a > /dev/null", "touch a > /dev/null", tui.OptionAllowOnce},
-		{"touch a", "touch a", tui.OptionAllowSession},
-		{"touch a > /dev/null", "touch a > /dev/null", tui.OptionAllowSession},
+		{"touch a", tui.OptionAllowOnce},
+		{"touch a > /dev/null", tui.OptionAllowOnce},
+		{"touch a", tui.OptionAllowSession},
+		{"touch a > /dev/null", tui.OptionAllowSession},
 	} {
 		t.Run(fmt.Sprintf("%s/%d", tc.command, tc.first), func(t *testing.T) {
-			swapInvocationRefusals(t, network, network)
-			prompts := &scriptedPrompts{answers: []tui.PromptOption{tc.first}}
+			swapInvocationRefusals(t, network)
+			prompts := &scriptedPrompts{answers: []tui.PromptOption{tc.first, tui.OptionAllowOnce}}
 			d, auth, inner := outsideBuildDispatcher(t, prompts)
 
-			if got := dispatchOutside(t, d, tc.command); !strings.Contains(got.Content, wantOutsideRunLine) || !auth.outside.has(tc.subject) {
-				t.Fatalf("first run content = %q, remembered = %v; want the outside-run line and the subject remembered", got.Content, auth.outside.has(tc.subject))
+			got := dispatchOutside(t, d, tc.command)
+			if len(prompts.shown) != 2 {
+				t.Fatalf("prompts = %d, want the earlier approval skipped for the remembered subject in the same call", len(prompts.shown))
 			}
-			wantRuns(t, inner, 0, 1)
 			if prompts.shown[0].ExceptionalAuthority != "" {
 				t.Fatalf("first prompt authority = %q, want an ordinary prompt", prompts.shown[0].ExceptionalAuthority)
 			}
-
-			prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
-			dispatchOutside(t, d, tc.command)
-			if len(prompts.shown) != 2 {
-				t.Fatalf("prompts = %d, want the earlier approval skipped for the remembered subject", len(prompts.shown))
-			}
 			if p := prompts.shown[1]; p.ExceptionalAuthority != wantOutsideAuthority || p.Action != "Allow "+wantOutsideAuthority {
-				t.Fatalf("re-issued prompt authority/action = %q/%q, want the outside-run prompt", p.ExceptionalAuthority, p.Action)
+				t.Fatalf("second prompt authority/action = %q/%q, want the outside-run prompt", p.ExceptionalAuthority, p.Action)
 			}
 			wantRuns(t, inner, 1, 1)
-			if auth.outside.has(tc.subject) {
-				t.Fatal("subject still remembered after the outside run")
+			if !strings.HasPrefix(dispatchedStderr(t, got.Content), wantOutsideRetriedLine) {
+				t.Fatalf("content = %q, want the outside run's result led by the retried line", got.Content)
 			}
+			wantNothingRemembered(t, auth, got.Content)
 
 			dispatchOutside(t, d, tc.command)
 			if len(prompts.shown) != 2 {
@@ -6809,6 +6811,82 @@ func TestProductionAuthorizer_BuildOutsideRunSkipsAllowApprovalsOfTheRememberedS
 			wantRuns(t, inner, 1, 2)
 		})
 	}
+}
+
+func TestProductionAuthorizer_BuildOutsideFailurePromptsOnceInTheSameCall(t *testing.T) {
+	network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	swapInvocationRefusals(t, network)
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce}}
+	d, auth, inner := outsideBuildDispatcher(t, prompts)
+	auth.grants.AppendPermission(permissions.PermissionEntry{Kind: "direct", Subject: "touch :*", PathScope: d.processCWD, GrantKind: "folder"})
+
+	got := dispatchOutside(t, d, "touch a")
+	if len(prompts.shown) != 1 || prompts.shown[0].ExceptionalAuthority != wantOutsideAuthority {
+		t.Fatalf("prompts = %+v, want exactly one, the outside prompt", prompts.shown)
+	}
+	wantRuns(t, inner, 1, 1)
+	if want := wantOutsideRetriedLine + "boom"; dispatchedStderr(t, got.Content) != want {
+		t.Fatalf("stderr = %q, want %q", dispatchedStderr(t, got.Content), want)
+	}
+	wantNothingRemembered(t, auth, got.Content)
+}
+
+func TestProductionAuthorizer_BuildOutsideDenyKeepsTheSandboxedResultAndForgets(t *testing.T) {
+	network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	for _, granted := range []bool{true, false} {
+		t.Run(fmt.Sprintf("granted=%v", granted), func(t *testing.T) {
+			swapInvocationRefusals(t, network, nil, network)
+			prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce, tui.OptionDeny}}
+			d, auth, inner := outsideBuildDispatcher(t, prompts)
+			ordinary := 1
+			if granted {
+				auth.grants.AppendPermission(permissions.PermissionEntry{Kind: "direct", Subject: "touch :*", PathScope: d.processCWD, GrantKind: "folder"})
+				prompts.answers, ordinary = prompts.answers[1:], 0
+			}
+
+			got := dispatchOutside(t, d, "touch a")
+			if len(prompts.shown) != ordinary+1 || prompts.shown[ordinary].ExceptionalAuthority != wantOutsideAuthority {
+				t.Fatalf("prompts = %+v, want %d ordinary then the outside prompt", prompts.shown, ordinary)
+			}
+			wantRuns(t, inner, 0, 1)
+			want := "boom\n" + refusedLine("a.test:80", network[0].Reason) + "\n" + confinedFailureNote + "\n" + wantOutsideDeclinedLine
+			if got.Denied || dispatchedStderr(t, got.Content) != want {
+				t.Fatalf("denied = %v, stderr = %q; want the sandboxed result %q", got.Denied, dispatchedStderr(t, got.Content), want)
+			}
+			wantNothingRemembered(t, auth, got.Content)
+
+			got = dispatchOutside(t, d, "touch a")
+			if len(prompts.shown) != ordinary+1 || got.Denied {
+				t.Fatalf("prompts = %d, denied = %v; want the identical call run sandboxed with no prompt", len(prompts.shown), got.Denied)
+			}
+			wantRuns(t, inner, 0, 2)
+			wantNothingRemembered(t, auth, got.Content)
+
+			prompts.answers = []tui.PromptOption{tui.OptionDeny}
+			got = dispatchOutside(t, d, "touch a")
+			if len(prompts.shown) != ordinary+2 || prompts.shown[ordinary+1].ExceptionalAuthority != wantOutsideAuthority {
+				t.Fatalf("prompts = %+v, want the fresh refusal's own outside prompt", prompts.shown)
+			}
+			wantRuns(t, inner, 0, 3)
+			wantNothingRemembered(t, auth, got.Content)
+		})
+	}
+}
+
+func TestProductionAuthorizer_BuildOutsideReadOnlyFailureIsNotRunAgain(t *testing.T) {
+	network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
+	swapInvocationRefusals(t, network, network)
+	prompts := &scriptedPrompts{}
+	d, auth, inner := outsideBuildDispatcher(t, prompts)
+	got := dispatchOutside(t, d, "ls")
+	if len(prompts.shown) != 0 {
+		t.Fatalf("prompts = %+v, want none", prompts.shown)
+	}
+	wantRuns(t, inner, 0, 1)
+	if !strings.Contains(got.Content, "a.test:80") {
+		t.Fatalf("content = %q, want the refusal listed", got.Content)
+	}
+	wantNothingRemembered(t, auth, got.Content)
 }
 
 func TestProductionAuthorizer_BuildOutsideRunKeepsACachedDeny(t *testing.T) {
@@ -6824,59 +6902,35 @@ func TestProductionAuthorizer_BuildOutsideRunKeepsACachedDeny(t *testing.T) {
 	wantRuns(t, inner, 0, 0)
 }
 
-func TestProductionAuthorizer_BuildOutsidePromptOffersOnlyOnceOrDenyAndDenyForgets(t *testing.T) {
+func TestProductionAuthorizer_BuildOutsidePromptOffersOnlyOnceOrDeny(t *testing.T) {
 	network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
-	swapInvocationRefusals(t, network, network)
-	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce}}
+	swapInvocationRefusals(t, network)
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce, tui.OptionAllowSession}}
 	d, auth, inner := outsideBuildDispatcher(t, prompts)
-	dispatchOutside(t, d, "touch a")
-
-	auth.resetTurnCache()
-	prompts.answers = []tui.PromptOption{tui.OptionAllowSession}
 	if _, err := d.Dispatch(context.Background(), bashCall("c1", "touch a")); err == nil {
 		t.Fatal("Dispatch = nil error, want allow in this session refused on the outside-run prompt")
 	}
-	wantRuns(t, inner, 0, 1)
-
-	prompts.answers = []tui.PromptOption{tui.OptionDeny}
-	if got := dispatchOutside(t, d, "touch a"); !got.Denied {
-		t.Fatalf("content = %q, want the denial", got.Content)
-	}
-	if p := prompts.shown[2]; p.ExceptionalAuthority != wantOutsideAuthority || auth.outside.has("touch a") {
-		t.Fatalf("denied prompt authority = %q, remembered = %v; want the outside-run prompt and the subject forgotten", p.ExceptionalAuthority, auth.outside.has("touch a"))
+	if p := prompts.shown[1]; p.ExceptionalAuthority != wantOutsideAuthority {
+		t.Fatalf("second prompt authority = %q, want the outside-run prompt", p.ExceptionalAuthority)
 	}
 	wantRuns(t, inner, 0, 1)
-
-	auth.resetTurnCache()
-	prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
-	dispatchOutside(t, d, "touch a")
-	if prompts.shown[3].ExceptionalAuthority != "" {
-		t.Fatalf("prompt after the deny authority = %q, want an ordinary prompt", prompts.shown[3].ExceptionalAuthority)
-	}
-	wantRuns(t, inner, 0, 2)
+	wantNothingRemembered(t, auth, "")
 }
 
 func TestProductionAuthorizer_BuildOutsideBatchRunsOnlyTheRememberedStageUnconfined(t *testing.T) {
 	network := []refusal{{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"}}
 	swapInvocationRefusals(t, nil, network, nil)
-	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce}}
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce, tui.OptionAllowOnce}}
 	d, auth, inner := outsideBuildDispatcher(t, prompts)
-	dispatchOutside(t, d, "touch b | touch a")
-	if !auth.outside.has("touch a") || auth.outside.has("touch b") {
-		t.Fatal("want only the refused stage remembered")
-	}
-	wantRuns(t, inner, 0, 2)
-
-	auth.resetTurnCache()
-	prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
-	dispatchOutside(t, d, "touch b | touch a")
-	if p := prompts.shown[1]; p.ExceptionalAuthority != wantOutsideAuthority || len(p.BatchedStages) != 2 {
-		t.Fatalf("batched prompt authority = %q, stages = %q; want one outside-run prompt for both stages", p.ExceptionalAuthority, p.BatchedStages)
+	got := dispatchOutside(t, d, "touch b | touch a")
+	if p := prompts.shown[1]; p.ExceptionalAuthority != wantOutsideAuthority {
+		t.Fatalf("second prompt authority = %q, want the outside-run prompt", p.ExceptionalAuthority)
 	}
 	wantRuns(t, inner, 1, 3)
 	if !slices.Equal(inner.execs[0].Argv, []string{"touch", "a"}) {
 		t.Fatalf("unconfined argv = %q, want the remembered stage", inner.execs[0].Argv)
 	}
+	wantNothingRemembered(t, auth, got.Content)
 }
 
 func TestProductionAuthorizer_BuildOutsideBatchKeepsTheOtherStagesApprovals(t *testing.T) {
@@ -6885,14 +6939,10 @@ func TestProductionAuthorizer_BuildOutsideBatchKeepsTheOtherStagesApprovals(t *t
 		t.Run(fmt.Sprint(first), func(t *testing.T) {
 			swapInvocationRefusals(t, nil, network, nil)
 			prompts := &scriptedPrompts{answers: []tui.PromptOption{first, tui.OptionAllowOnce}}
-			d, auth, inner := outsideBuildDispatcher(t, prompts)
-			dispatchOutside(t, d, "touch b | touch a")
-			if first == tui.OptionAllowSession {
-				auth.resetTurnCache()
-			}
+			d, _, inner := outsideBuildDispatcher(t, prompts)
 			dispatchOutside(t, d, "touch b | touch a")
 			if p := prompts.shown[1]; p.ExceptionalAuthority != wantOutsideAuthority || len(p.BatchedStages) != 0 || p.Subject != "touch a" {
-				t.Fatalf("re-issued prompt authority = %q, subject = %q, stages = %q; want an outside-run prompt for the remembered stage only", p.ExceptionalAuthority, p.Subject, p.BatchedStages)
+				t.Fatalf("outside prompt authority = %q, subject = %q, stages = %q; want an outside-run prompt for the remembered stage only", p.ExceptionalAuthority, p.Subject, p.BatchedStages)
 			}
 			wantRuns(t, inner, 1, 3)
 		})
@@ -6905,16 +6955,12 @@ func TestProductionAuthorizer_BuildOutsidePromptCarriesTheLastRunsRefusals(t *te
 		{Host: "a.test", Port: "80", Reason: "not approved (no one to ask)"},
 	}
 	swapInvocationRefusals(t, refused)
-	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce}}
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAllowOnce, tui.OptionAllowOnce}}
 	d, auth, _ := outsideBuildDispatcher(t, prompts)
 	dispatchOutside(t, d, "touch a")
 	if got := prompts.shown[0].OutsideReasons; got != nil {
 		t.Fatalf("ordinary prompt outside reasons = %q, want none", got)
 	}
-
-	auth.resetTurnCache()
-	prompts.answers = []tui.PromptOption{tui.OptionAllowOnce}
-	dispatchOutside(t, d, "touch a")
 	want := []string{
 		"sandbox likely refused write: /home/u/sbtest/a.txt (touch; to allow, add the writable folder /home/u/sbtest in /settings, folders tab, key a)",
 		"network refused: a.test:80 (not approved (no one to ask))",
@@ -6975,4 +7021,185 @@ func TestProductionAuthorizer_BuildOutsideBatchKeepsASharedFolderGrantForTheOthe
 	if !slices.Equal(inner.execs[0].Argv, []string{"touch", "a"}) || inner.bounded[0].Argv[len(inner.bounded[0].Argv)-1] != "b" {
 		t.Fatalf("unconfined = %q, confined = %q; want touch a unconfined and touch b sandboxed", inner.execs[0].Argv, inner.bounded[0].Argv)
 	}
+}
+
+func alwaysOutsideShower(prompts *scriptedPrompts, subject string) promptShower {
+	return func(req tui.PromptRequest) (tui.PromptDecision, error) {
+		d, err := prompts.show(req)
+		if d.Option == tui.OptionAlwaysOutside {
+			d.StoredSubject = subject
+		}
+		return d, err
+	}
+}
+
+func savingOutsideAuthorizer(t *testing.T, prompts *scriptedPrompts) (*productionToolDispatcher, *productionAuthorizer, *confineInner, *[]string) {
+	t.Helper()
+	d, auth, inner := outsideBuildDispatcher(t, prompts)
+	auth.display.projectApproved = true
+	var saved []string
+	auth.saveOutside = func(subject string) (string, bool) {
+		saved = append(saved, subject)
+		return "saved " + subject, true
+	}
+	return d, auth, inner, &saved
+}
+
+func TestProductionAuthorizer_OutsidePromptOffersAlwaysOutsideOnlyWhenSavingIsPossible(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the write-permission check")
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, auth *productionAuthorizer)
+		want  bool
+	}{
+		{"approved writable project", func(*testing.T, *productionAuthorizer) {}, true},
+		{"no save function", func(_ *testing.T, auth *productionAuthorizer) { auth.saveOutside = nil }, false},
+		{"unapproved project", func(_ *testing.T, auth *productionAuthorizer) { auth.display.projectApproved = false }, false},
+		{"read-only settings file", func(t *testing.T, auth *productionAuthorizer) {
+			writeLocalProjectSettings(t, auth.display.projectRoot, "outside_sandbox_commands: []\n")
+			if err := os.Chmod(auth.display.localSettingsPath, 0o400); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"read-only settings folder without the file", func(t *testing.T, auth *productionAuthorizer) {
+			dir := filepath.Dir(auth.display.localSettingsPath)
+			if err := os.Mkdir(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		}, false},
+		{"writable settings file in a read-only folder", func(t *testing.T, auth *productionAuthorizer) {
+			writeLocalProjectSettings(t, auth.display.projectRoot, "outside_sandbox_commands: []\n")
+			dir := filepath.Dir(auth.display.localSettingsPath)
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		}, false},
+	} {
+		for _, site := range []string{"Authorize", "AuthorizeBatch"} {
+			t.Run(tc.name+"/"+site, func(t *testing.T) {
+				prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionDeny}}
+				d, auth, _, _ := savingOutsideAuthorizer(t, prompts)
+				tc.setup(t, auth)
+				auth.outside.add("touch a", nil)
+				if _, err := authorizerSites[site](auth, directShellAuthRequest("touch a", d.processCWD)); err != nil {
+					t.Fatal(err)
+				}
+				if p := prompts.shown[0]; p.ExceptionalAuthority != wantOutsideAuthority || p.OfferAlwaysOutside != tc.want {
+					t.Fatalf("prompt authority = %q, offer = %v; want the outside prompt with offer %v", p.ExceptionalAuthority, p.OfferAlwaysOutside, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestLocalSettingsWritable_AgreesWithTheOutsideSave(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the permission checks")
+	}
+	const folder, file, lock = ".codemeld", ".codemeld/settings.local.yaml", ".codemeld/settings.local.yaml.lock"
+	for _, tc := range []struct {
+		name   string
+		absent bool
+		target string
+		mode   os.FileMode
+		link   bool
+		want   bool
+	}{
+		{name: "no folder", absent: true, want: true},
+		{name: "no folder in a read-only root", absent: true, target: ".", mode: 0o500},
+		{name: "no folder in an unreadable root", absent: true, target: ".", mode: 0o300},
+		{name: "file and lock", want: true},
+		{name: "folder in a read-only root", target: ".", mode: 0o500, want: true},
+		{name: "folder in an unreadable root", target: ".", mode: 0o300},
+		{name: "read-only folder", target: folder, mode: 0o500},
+		{name: "unreadable folder", target: folder, mode: 0o300},
+		{name: "unsearchable folder", target: folder, mode: 0o600},
+		{name: "linked folder", target: folder, link: true},
+		{name: "unreadable file", target: file, mode: 0o200},
+		{name: "linked file", target: file, link: true},
+		{name: "read-only lock", target: lock, mode: 0o400, want: true},
+		{name: "unreadable lock", target: lock, mode: 0o200},
+		{name: "linked lock", target: lock, link: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if !tc.absent {
+				writeLocalProjectSettings(t, root, "outside_sandbox_commands: []\n")
+				if err := os.WriteFile(filepath.Join(root, lock), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := filepath.Join(root, tc.target)
+			if tc.link {
+				if err := os.Rename(target, target+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target+".real", target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.mode != 0 {
+				if err := os.Chmod(target, tc.mode); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
+			}
+			if got := localSettingsWritable(root, config.LocalSettingsPath(root)); got != tc.want {
+				t.Errorf("localSettingsWritable = %v, want %v", got, tc.want)
+			}
+			if notice, saved := addOutsideCommand(root, true, "touch a"); saved != tc.want {
+				t.Errorf("addOutsideCommand saved = %v (%s), want %v", saved, notice, tc.want)
+			}
+		})
+	}
+}
+
+func TestProductionAuthorizer_BatchedOutsidePromptNeverOffersAlwaysOutside(t *testing.T) {
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionDeny}}
+	d, auth, _, _ := savingOutsideAuthorizer(t, prompts)
+	auth.outside.add("touch a", nil)
+	auth.outside.add("touch b", nil)
+	if _, err := auth.AuthorizeBatch(context.Background(), []dispatch.BatchAuthRequest{
+		directShellAuthRequest("touch b", d.processCWD), directShellAuthRequest("touch a", d.processCWD),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p := prompts.shown[0]; p.ExceptionalAuthority != wantOutsideAuthority || p.OfferAlwaysOutside {
+		t.Fatalf("batched prompt authority = %q, offer = %v; want the outside prompt without the offer", p.ExceptionalAuthority, p.OfferAlwaysOutside)
+	}
+}
+
+func TestProductionAuthorizer_AlwaysOutsideSaveFailureKeepsTheAllowOnceRun(t *testing.T) {
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAlwaysOutside}}
+	d, auth, inner, _ := savingOutsideAuthorizer(t, prompts)
+	auth.prompts.show = alwaysOutsideShower(prompts, "touch a")
+	notices := &recordingNotices{}
+	auth.notices = notices
+	auth.saveOutside = func(string) (string, bool) { return "couldn't update the file: busy", false }
+	auth.outside.add("touch a", nil)
+
+	dispatchOutside(t, d, "touch a")
+	if !slices.Equal(notices.texts, []string{"couldn't update the file: busy"}) {
+		t.Fatalf("notices = %q, want the save failure", notices.texts)
+	}
+	wantRuns(t, inner, 1, 0)
+}
+
+func TestProductionAuthorizer_AlwaysOutsideScopeThatCannotMatchTheRequestSavesNothing(t *testing.T) {
+	prompts := &scriptedPrompts{answers: []tui.PromptOption{tui.OptionAlwaysOutside}}
+	d, auth, inner, saved := savingOutsideAuthorizer(t, prompts)
+	auth.prompts.show = alwaysOutsideShower(prompts, "touch b")
+	notices := &recordingNotices{}
+	auth.notices = notices
+	auth.outside.add("touch a", nil)
+
+	dispatchOutside(t, d, "touch a")
+	if len(*saved) != 0 || len(notices.texts) != 1 || !strings.Contains(notices.texts[0], "nothing written") {
+		t.Fatalf("saved = %q, notices = %q; want nothing saved and one notice", *saved, notices.texts)
+	}
+	wantRuns(t, inner, 1, 0)
 }

@@ -492,6 +492,49 @@ func TestRecognizeSimpleCompoundForGrant_EligibleNullRedirects(t *testing.T) {
 			stages:  [][]string{{"gofmt", "-w", "a.go"}, {"go", "build", "./..."}},
 			ops:     []string{"&&"},
 		},
+		{
+			name:   "stderr onto stdout on a piped stage",
+			input:  "mise run check 2>&1 | tail -60",
+			stages: [][]string{{"mise", "run", "check"}, {"tail", "-60"}},
+			ops:    []string{"|"},
+		},
+		{
+			name:   "stderr onto stdout with no space before the pipe",
+			input:  "a 2>&1| b",
+			stages: [][]string{{"a"}, {"b"}},
+			ops:    []string{"|"},
+		},
+		{
+			name:   "stderr onto stdout at the start of a stage",
+			input:  "a && 2>&1 b",
+			stages: [][]string{{"a"}, {"b"}},
+			ops:    []string{"&&"},
+		},
+		{
+			name:   "stderr onto stdout on the last stage",
+			input:  "a | b 2>&1",
+			stages: [][]string{{"a"}, {"b"}},
+			ops:    []string{"|"},
+		},
+		{
+			name:   "stderr onto stdout after a stdout null redirect on the last stage",
+			input:  "a | b >/dev/null 2>&1",
+			stages: [][]string{{"a"}, {"b"}},
+			ops:    []string{"|"},
+		},
+		{
+			name:   "stderr onto stdout before a stdout null redirect on the last stage",
+			input:  "a | b 2>&1 >/dev/null",
+			stages: [][]string{{"a"}, {"b"}},
+			ops:    []string{"|"},
+		},
+		{
+			name:    "accepted wrapper strips stderr onto stdout inside the quoted body",
+			input:   `sh -c 'a 2>&1 | b'`,
+			wrapped: true,
+			stages:  [][]string{{"a"}, {"b"}},
+			ops:     []string{"|"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -527,7 +570,6 @@ func TestRecognizeSimpleCompoundForGrant_ByteExactNegatives(t *testing.T) {
 	}{
 		{"stdout to null feeding a pipe", "a >/dev/null | b"},
 		{"explicit stdout descriptor feeding a pipe", "a 1>/dev/null | b"},
-		{"stderr onto stdout", "a 2>&1 | b"},
 		{"stdout onto stderr", "a 1>&2 | b"},
 		{"different target", "a > out.txt | b"},
 		{"append to null", "a >> /dev/null | b"},
@@ -549,6 +591,20 @@ func TestRecognizeSimpleCompoundForGrant_ByteExactNegatives(t *testing.T) {
 		{"wrapper with an extra positional argument", `sh -c 'a 2>/dev/null | b' extra`},
 		{"path-form sh wrapper", `/bin/sh -c 'a 2>/dev/null | b'`},
 		{"bash wrapper", `bash -c 'a 2>/dev/null | b'`},
+		{"stdout onto stderr on the last stage", "a | b 1>&2"},
+		{"descriptor-less duplication onto stderr", "a >&2 | b"},
+		{"stderr onto itself", "a 2>&2 | b"},
+		{"stderr closed", "a 2>&- | b"},
+		{"space inside the duplication", "a 2>& 1 | b"},
+		{"multi-digit duplication target", "a 2>&12 | b"},
+		{"combined descriptors", "a &>1 | b"},
+		{"descriptor-less duplication to a file", "a >& out.txt | b"},
+		{"duplication glued to a following word", "a 2>&1x | b"},
+		{"duplication glued to a preceding word", "a f2>&1 | b"},
+		{"stdout to null next to stderr onto stdout feeding a pipe", "a >/dev/null 2>&1 | b"},
+		{"stderr onto stdout followed by a file redirect", "a 2>&1 > out.txt | b"},
+		{"variable next to stderr onto stdout", "a $X 2>&1 | b"},
+		{"glob next to stderr onto stdout", "a *.go 2>&1 | b"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -596,7 +652,16 @@ func TestStripNullRedirectsForGrant(t *testing.T) {
 		{"stdout on the last stage", "a | b >/dev/null", "a | b", true, true},
 		{"stdout feeding a pipe is kept", "a >/dev/null | b", "a >/dev/null | b", false, true},
 		{"explicit stdout descriptor feeding a pipe is kept", "a 1>/dev/null | b", "a 1>/dev/null | b", false, true},
-		{"duplication is kept", "a 2>&1 | b", "a 2>&1 | b", false, true},
+		{"stderr onto stdout feeding a pipe", "a 2>&1 | b", "a | b", true, true},
+		{"stderr onto stdout on the last stage", "a | b 2>&1", "a | b", true, true},
+		{"stderr onto stdout after a stdout null redirect", "a >/dev/null 2>&1", "a", true, true},
+		{"stderr onto stdout before a stdout null redirect", "a 2>&1 >/dev/null", "a", true, true},
+		{"stdout to null next to stderr onto stdout feeding a pipe is kept", "a >/dev/null 2>&1 | b", "a >/dev/null | b", true, true},
+		{"accepted wrapper strips stderr onto stdout", `sh -c 'a 2>&1 | b'`, `sh -c 'a | b'`, true, true},
+		{"stdout onto stderr is kept", "a 1>&2 | b", "a 1>&2 | b", false, true},
+		{"single-quoted duplication is kept", "a '2>&1' | b", "a '2>&1' | b", false, true},
+		{"double-quoted duplication is kept", `a "2>&1" | b`, `a "2>&1" | b`, false, true},
+		{"escaped duplication is kept", `a 2\>&1 | b`, `a 2\>&1 | b`, false, true},
 		{"glued word suffix is kept", "a f2>/dev/null | b", "a f2>/dev/null | b", false, true},
 		{"other target is kept", "a > out.txt | b", "a > out.txt | b", false, true},
 		{"accepted wrapper is rebuilt around the stripped body", `sh -c 'a 2>/dev/null | b'`, `sh -c 'a | b'`, true, true},
@@ -806,6 +871,7 @@ func TestMatchesCompoundSubject_NullRedirectWidening(t *testing.T) {
 	positives := []string{
 		"./p.sh other.txt 2>/dev/null | sed -n 1,18p",
 		"./p.sh other.txt 2> /dev/null | sed -n 1,18p",
+		"./p.sh other.txt 2>&1 | sed -n 1,18p",
 	}
 	for _, cmd := range positives {
 		t.Run("match/"+cmd, func(t *testing.T) {
@@ -819,7 +885,6 @@ func TestMatchesCompoundSubject_NullRedirectWidening(t *testing.T) {
 		name string
 		cmd  string
 	}{
-		{"descriptor duplication", "./p.sh other.txt 2>&1 | sed -n 1,18p"},
 		{"different target", "./p.sh other.txt > log | sed -n 1,18p"},
 		{"stdout discarded into a pipe", "./p.sh other.txt >/dev/null | sed -n 1,18p"},
 		{"glued word suffix", "./p.sh other.txt f1>/dev/null | sed -n 1,18p"},
@@ -849,6 +914,59 @@ func TestMatchesCompoundSubject_NullRedirectWidening(t *testing.T) {
 	}
 	if matchesCompoundSubject(canon(t, "./p.sh other.txt 2>/dev/null | sed -n 1,18p"), exact) {
 		t.Fatalf("the all-exact grant must not cover a different argument; the strip does not widen a stage")
+	}
+}
+
+func TestRecognizeSimpleCompoundForGrant_StripKeepsNewlineBoundary(t *testing.T) {
+	wrappedGrant, err := EncodeCompoundSubject(true, []string{"echo :*", "cat :*"}, []string{"|"})
+	if err != nil {
+		t.Fatalf("EncodeCompoundSubject (wrapped) error: %v", err)
+	}
+	bareGrant, err := EncodeCompoundSubject(false, []string{"echo :*", "cat :*"}, []string{"|"})
+	if err != nil {
+		t.Fatalf("EncodeCompoundSubject (bare) error: %v", err)
+	}
+
+	positives := []struct{ cmd, grant string }{
+		{"sh -c 'echo 2>&1 touch marker | cat'", wrappedGrant},
+		{"sh -c 'echo 2>/dev/null touch marker | cat'", wrappedGrant},
+		{"echo 2>&1 touch marker | cat", bareGrant},
+		{"sh -c 'echo\t2>&1 touch marker | cat'", wrappedGrant},
+		{"sh -c 'echo 2>&1\t2>/dev/null touch marker | cat'", wrappedGrant},
+	}
+	for _, tt := range positives {
+		t.Run("match/"+tt.cmd, func(t *testing.T) {
+			if !literalCompoundMatches(t, tt.cmd, tt.grant) {
+				t.Fatalf("Match(%q) = false, want true", tt.cmd)
+			}
+		})
+	}
+
+	negatives := []struct{ name, cmd, grant string }{
+		{"stderr onto stdout after a newline", "sh -c 'echo\n2>&1 touch marker | cat'", wrappedGrant},
+		{"stderr to null after a newline", "sh -c 'echo\n2>/dev/null touch marker | cat'", wrappedGrant},
+		{"repeated duplication around a newline", "sh -c 'echo 2>&1\n2>&1 touch marker | cat'", wrappedGrant},
+		{"null redirect then duplication around a newline", "sh -c 'echo 2>/dev/null\n2>&1 touch marker | cat'", wrappedGrant},
+		{"duplication then null redirect around a newline", "sh -c 'echo 2>&1\n2>/dev/null touch marker | cat'", wrappedGrant},
+		{"bare stderr onto stdout after a newline", "echo\n2>&1 touch marker | cat", bareGrant},
+		{"stderr onto stdout after a carriage return", "sh -c 'echo\r2>&1 touch marker | cat'", wrappedGrant},
+		{"stderr to null after a carriage return", "sh -c 'echo\r2>/dev/null touch marker | cat'", wrappedGrant},
+		{"stderr to null split by a carriage return", "sh -c 'echo 2>\r/dev/null touch marker | cat'", wrappedGrant},
+		{"repeated duplication around a carriage return", "sh -c 'echo 2>&1\r2>&1 touch marker | cat'", wrappedGrant},
+		{"null redirect then duplication around a carriage return", "sh -c 'echo 2>/dev/null\r2>&1 touch marker | cat'", wrappedGrant},
+		{"duplication then null redirect around a carriage return", "sh -c 'echo 2>&1\r2>/dev/null touch marker | cat'", wrappedGrant},
+		{"carriage return then newline before duplication", "sh -c 'echo\r\n2>&1 touch marker | cat'", wrappedGrant},
+		{"bare stderr onto stdout after a carriage return", "echo\r2>&1 touch marker | cat", bareGrant},
+	}
+	for _, tt := range negatives {
+		t.Run("refuse/"+tt.name, func(t *testing.T) {
+			if _, ok := RecognizeSimpleCompoundForGrant(canon(t, tt.cmd)); ok {
+				t.Fatalf("RecognizeSimpleCompoundForGrant(%q) = ok, want refused", tt.cmd)
+			}
+			if literalCompoundMatches(t, tt.cmd, tt.grant) {
+				t.Fatalf("Match(%q) = true, want false", tt.cmd)
+			}
+		})
 	}
 }
 

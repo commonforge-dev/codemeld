@@ -63,7 +63,7 @@ func writeFullTemplateWithClasses(t *testing.T, path, binary string, withDetect 
 	for _, a := range []string{"diff", "log", "branch-current", "is-clean", "stash", "stash-pop", "merge-status", "rebase-status"} {
 		if a == "log" && classes["log"] != "" {
 			// A trusted read_only declaration is honored only over the product's own read-only argv.
-			fmt.Fprintf(&b, "log:\n  argv: [%s, log, --oneline, -n, \"20\"]\n", binary)
+			fmt.Fprintf(&b, "log:\n  argv: [%s, -c, core.fsmonitor=false, -c, core.pager=cat, --no-pager, log, --oneline, -n, \"20\"]\n", binary)
 		} else {
 			fmt.Fprintf(&b, "%s:\n  argv: [%s, %s]\n", a, binary, a)
 		}

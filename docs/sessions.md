@@ -59,21 +59,21 @@ you would treat the session.
 
 ## Source of truth
 
-`internal/events/payloads.go` is authoritative and always current:
-
-- The block of `Kind…` constants (`KindLaunchBegan`, `KindToolExecEnd`, …) is the complete set
-  of event kind strings written to the `kind` field.
-- Each payload struct beneath it carries the JSON field tags and a validator, so the struct for
-  a kind *is* that event's field list and rules. `EventPayload` is the closed interface every
-  payload implements. `ValidatePayload` is the load-time entry point; the `unmarshalPayload` switch
-  it calls maps a kind string to its payload struct — read that switch to see which struct owns a
-  given kind.
+`internal/events/payloads.go` is authoritative and always current. Start with `payloads.go`'s kind
+constants (`KindLaunchBegan`, `KindToolExecEnd`, …) and `unmarshalPayload` dispatch, then follow
+each payload type to its definition; some live in separate events files. A payload struct carries
+the JSON field tags and a validator, so the struct for a kind *is* that event's field list and
+rules. `EventPayload` is the closed interface every payload implements, and `ValidatePayload` is
+the load-time entry point.
 
 One combination is easy to misread, so it is worth naming here: a `permission_decision` with
 `outcome: "granted"` and **no** grant fields — no `grant_kind`, and no `grant_path_scope` (or
 `grant_host_scope` on a host prompt) — is an **allow this once** approval: the user approved that
-one call and nothing was stored. A granted decision that carries both grant fields records a stored
-grant: session, folder, or global for a path subject, and session or project for a host subject. A
+one call. No durable or session grant was stored; a cacheable allow-once decision may still cover
+identical requests for the rest of the turn. A granted decision that carries both grant fields
+records the requested grant: session, folder, or global for a path subject, and session or project
+for a host subject. Grant fields record the requested grant. Check later `permission_persist_failed`
+records before treating folder/global/project persistence as successful. A
 partial pair (one field without the other) is invalid and never written. Every answered prompt
 therefore has exactly one `permission_decision`, so `permission_prompt_shown` and `permission_decision` counts match for a
 session in which the user answered every prompt.
@@ -83,7 +83,7 @@ grant table, which can be **wider** than the request's own `subject` — approvi
 may store `git`, and approving the `edit` tool may store the `write` capability. `subject` always
 stays the requested one, so a prompt and its decision still pair up; `grant_subject` is what tells
 you which stored grant a later `permission_matched` is resolving against. It is absent on an
-allow-once or denied decision (nothing was stored), and also absent on every stored grant written
+allow-once or denied decision (no grant was requested), and also absent on every grant written
 before the field existed — an absent `grant_subject` on a granted decision that carries grant fields
 means an older session, not a subject equal to `subject`.
 
@@ -239,9 +239,9 @@ position. Because the discriminator is new, older predeployment builds **reject*
 
 Two files, in a fixed order.
 
-The **child** is summary-only. Its whole record stream is the compaction record at `Records[0]`
-plus its own `launch_began` (`source: fork`) — none of the parent's messages are copied, which is
-what distinguishes it from `/fork`'s full-continuation child. Its title is the parent's stored
+The **child** is summary-only. The child contains the compaction record, its launch event
+(`launch_began`, `source: fork`) and an execution-capability record; no parent messages are
+copied, which is what distinguishes it from `/fork`'s full-continuation child. Its title is the parent's stored
 title with ` (compacted)` appended, or `Compacted session` when the parent has no title. Its
 `forked_from.record_id` is the id of the parent's **last record** — whatever its type, message or
 event — at the moment the child is created, after the summary came back — not the compact success
@@ -508,6 +508,10 @@ how a run ended:
 codemeld sessions show <session-id|path> --kind tool_exec_end --last 5
 ```
 
+When command or VCS output, or a command's piped input, was cut at the output limit, the tool
+message the model got ends with a notice saying so, while `tool_exec_end` keeps `truncated` and
+`original_bytes`.
+
 When a tool run inside the sandbox did not get an environment variable it expected, read the
 `execution_capability` record written when that codemeld process started
 (`--kind execution_capability`): when the launch self-test passed, it lists the names codemeld
@@ -537,8 +541,8 @@ codemeld sessions show <session-id|path> --kind model_response --last 1 --json
 ```
 
 `codemeld sessions doctor <id|path>` reports anomalies and incomplete turns (above),
-`codemeld sessions permissions <id|path>` lists the permission prompts a human was actually
-shown — in record order, each with its decision or `pending` — followed by a count of the
+`codemeld sessions permissions <id|path>` lists requests that reached the approval step,
+including requests cancelled before a prompt was displayed — in record order, each with its decision or `pending` — followed by a count of the
 authorizations that never prompted (`permission_matched`) grouped by `outcome_source`, then a
 separate block of [System One checks](system-one.md) (`permission_system_one_check`), and then the
 explicit revocation requests (`permission_revoke_requested`), and
@@ -551,10 +555,12 @@ every line of the file is ordinary JSON if you would rather read it with a JSON 
 `sessions permissions` reads the distinctions above off the records for you, and `--json` emits the
 same facts as one machine-readable document:
 
-- **What the approval stored.** A granted row says `grant=allow_once` when the decision carried no
-  grant fields, and otherwise names the stored grant kind (`session` / `folder` / `global` for a
-  path subject, `session` / `project` for a host subject), the folder or host it was stored at, and
-  the stored subject — which may be wider than the requested one. A global grant is named by its
+- **What the approval requested.** A granted row says `grant=allow_once` when the decision carried
+  no grant fields, and otherwise names the requested grant kind (`session` / `folder` / `global` for
+  a path subject, `session` / `project` for a host subject), the folder or host, and the grant
+  subject — which may be wider than the requested one. Grant fields record the requested grant;
+  check later `permission_persist_failed` records before treating folder/global/project persistence
+  as successful. A global grant is named by its
   kind alone: its recorded scope is the all-paths sentinel, not a folder, and is never printed as a
   path.
 - **Whether the prompt broadened an earlier approval.** A prompt is flagged as a scope escalation
@@ -824,7 +830,7 @@ Compare `sha256` with the content you expect rather than with whatever the path 
 ## Connection decisions: what a `connect_decision` record shows
 
 When codemeld checks a sandboxed command's own connections ([direct connections](approvals.md#connect-grants),
-Auto edits only), it writes the outcomes when the command finishes: one `connect_decision` record
+Auto edits and Build), it writes the outcomes when the command finishes: one `connect_decision` record
 per distinct outcome, with how many times it happened (`recordConnectDecisions` in
 `internal/bootstrap/confinedrunner.go`). Plan commands, and runs where that check is off, write
 none. `codemeld sessions show --kind connect_decision <id|path>` prints each record as a line

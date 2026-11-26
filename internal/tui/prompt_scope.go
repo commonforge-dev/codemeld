@@ -32,14 +32,21 @@ const scopeProgramWarning = "⚠ Program scope authorizes ANY invocation of this
 // program, so for a destructive program it also authorizes the ones that delete data
 // or rewrite history. It is advisory only: it never blocks the grant or changes the
 // stored subject — it only sharpens the caution.
-const scopeDestructiveProgramWarning = "⚠ DESTRUCTIVE program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history."
+const scopeDestructiveProgramWarning = "WARNING - Edit capable program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history."
 
-const scopePrefixNotice = "A prefix choice stores every token shown before :* verbatim; only the tokens after it may vary. Changing a fixed token re-prompts."
+const outsideProgramWarning = "⚠ Program scope matches ANY invocation of this program with ANY arguments in this project."
+
+const outsideDestructiveProgramWarning = "WARNING - Edit capable program: this matches EVERY subcommand, including ones that permanently delete data or rewrite history."
+
+const scopePrefixNotice = "A choice ending in :* matches any command that starts with the words before :*.\nExample: go test :* matches go test -v, but not go build."
 
 const scopePathNotice = "The path choice stores a directory boundary. Use ← and → to widen or narrow it; / and your home directory are never offered. When the command runs, its path argument is resolved and checked against that boundary at the moment permission is decided — the boundary is not an execution-time sandbox and does not confine what the program opens afterwards."
 
-func scopeChooserHelp(opts []scopeOption) string {
+func scopeChooserHelp(opts []scopeOption, outside bool) string {
 	help := "Choose the subject scope this grant stores:"
+	if outside {
+		help = "Choose which commands always run outside the sandbox:"
+	}
 	for _, so := range opts {
 		if so.Kind == ScopePrefix {
 			help += "\n\n" + scopePrefixNotice
@@ -52,6 +59,9 @@ func scopeChooserHelp(opts []scopeOption) string {
 			break
 		}
 	}
+	if outside {
+		return help + "\n\n" + outsideProgramWarning
+	}
 	return help + "\n\n" + scopeProgramWarning
 }
 
@@ -59,11 +69,15 @@ func scopeChooserHelp(opts []scopeOption) string {
 // It is always the standard breadth warning; for a destructive program the stronger
 // destructive advisory is prepended. The destructive line never replaces the breadth
 // warning — both are shown — so a destructive confirm carries strictly more caution.
-func programConfirmWarning(destructive bool) string {
-	if destructive {
-		return scopeDestructiveProgramWarning + "\n\n" + scopeProgramWarning
+func programConfirmWarning(destructive, outside bool) string {
+	breadth, edit := scopeProgramWarning, scopeDestructiveProgramWarning
+	if outside {
+		breadth, edit = outsideProgramWarning, outsideDestructiveProgramWarning
 	}
-	return scopeProgramWarning
+	if destructive {
+		return edit + "\n\n" + breadth
+	}
+	return breadth
 }
 
 // scopeOption is one selectable subject-scope row in the chooser: its

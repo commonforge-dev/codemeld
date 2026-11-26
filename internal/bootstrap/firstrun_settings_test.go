@@ -142,6 +142,11 @@ sessions:
   # the session record stream and when fed back to the model. Applies to each
   # stream independently. Default is 64 KiB; minimum is 256 bytes.
   max_tool_output_bytes: 65536
+  # cap (in bytes) on what one sandboxed command in a pipe hands to the next.
+  # It costs codemeld memory, not model tokens: max_tool_output_bytes is what
+  # limits the text the model reads. The larger of the two applies to a pipe.
+  # Read at launch. Default is 16 MiB; minimum is 256 bytes; no maximum.
+  max_pipe_bytes: 16777216
 
 agent_instructions:
   # instruction files (AGENTS.md and any configured additions) larger than

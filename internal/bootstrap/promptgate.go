@@ -17,6 +17,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
+	"codemeld.dev/codemeld/internal/fserrors"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/netproxy"
 	"codemeld.dev/codemeld/internal/permissions"
@@ -119,6 +120,7 @@ type PromptDisplay struct {
 	DirectHTTPFallback   bool
 	ExceptionalAuthority string
 	OutsideReasons       []string
+	OfferAlwaysOutside   bool
 }
 
 func exceptionalAuthority(req permissions.MatchRequest, mc permissions.ModeContext) string {
@@ -182,6 +184,15 @@ func (c outsideCache) Lookup(req permissions.MatchRequest) (string, bool) {
 	return outcome, hit
 }
 
+// Record keeps a declined outside run out of the turn cache: it refused running outside the
+// sandbox, not the command the user already approved to run inside it.
+func (c outsideCache) Record(req permissions.MatchRequest, outcome string) {
+	if outcome == "deny" && slices.ContainsFunc(c.reqs, func(r permissions.MatchRequest) bool { return inflightKeyOf(r) == inflightKeyOf(req) }) {
+		return
+	}
+	c.ApprovalCache.Record(req, outcome)
+}
+
 func settleOutside(ctx context.Context, choice permissions.PromptChoice, outside *outsideSubjects, subject string) {
 	switch choice {
 	case permissions.PromptAllowOnce:
@@ -191,9 +202,33 @@ func settleOutside(ctx context.Context, choice permissions.PromptChoice, outside
 	}
 }
 
+func addOutsideCommand(projectRoot string, approved bool, subject string) (string, bool) {
+	if !approved || projectRoot == "" {
+		return blockedProjectUnavailable, false
+	}
+	path := fserrors.CollapseControls(config.LocalSettingsPath(projectRoot))
+	current, err := outsideCommands{projectRoot: projectRoot}.entries()
+	if err != nil {
+		return fserrors.CollapseControls(err.Error()) + "; nothing written", false
+	}
+	if slices.Contains(current, subject) {
+		return fmt.Sprintf("%s is already in outside_sandbox_commands in %s; nothing written", fserrors.CollapseControls(subject), path), false
+	}
+	if _, reason, _, err := config.PersistLocal(projectRoot, config.KeyOutsideSandboxCommands, config.WritableFolderAdd(subject)); err != nil {
+		return fmt.Sprintf("couldn't update %s: %s", path, reason), false
+	}
+	return fmt.Sprintf("%s added to outside_sandbox_commands in %s", fserrors.CollapseControls(subject), path), true
+}
+
 func exceptionalAction(authority string) string { return "Allow " + authority }
 
 func checkExceptionalChoice(pr tui.PromptRequest, d tui.PromptDecision) error {
+	if d.Option == tui.OptionAlwaysOutside {
+		if pr.ExceptionalAuthority == outsideSandboxAuthority && pr.OfferAlwaysOutside {
+			return nil
+		}
+		return errors.New("bootstrap: the prompt did not offer always running outside the sandbox")
+	}
 	if pr.ExceptionalAuthority != "" && d.Option != tui.OptionAllowOnce && d.Option != tui.OptionDeny {
 		return fmt.Errorf("bootstrap: a prompt adding %s accepts only allow once or deny, not option %d", pr.ExceptionalAuthority, d.Option)
 	}
@@ -521,6 +556,7 @@ func buildPromptRequest(req permissions.MatchRequest, display PromptDisplay, esc
 		Summary:                 promptSummaryFor(req, display, nil),
 		ExceptionalAuthority:    display.ExceptionalAuthority,
 		OutsideReasons:          display.OutsideReasons,
+		OfferAlwaysOutside:      display.OfferAlwaysOutside && display.ExceptionalAuthority == outsideSandboxAuthority && req.Kind == matchKindDirect,
 	}
 	// CanonicalProgram/CanonicalArgs drive the direct-command scope
 	// sub-choice; only a direct command carries SubjectTokens, and the prompt leaves
@@ -592,7 +628,7 @@ func mapOutcome(d tui.PromptDecision) (permissions.PromptOutcome, error) {
 	switch d.Option {
 	case tui.OptionDeny:
 		out.DenyEnvelope = d.DenyEnvelope
-	case tui.OptionAllowSession, tui.OptionAllowFolder, tui.OptionAllowGlobal:
+	case tui.OptionAllowSession, tui.OptionAllowFolder, tui.OptionAllowGlobal, tui.OptionAlwaysOutside:
 		out.StoredSubject = d.StoredSubject
 	}
 	return out, nil
@@ -617,7 +653,7 @@ func mapOutcomeFor(d tui.PromptDecision, display PromptDisplay) (permissions.Pro
 // reporting false for an unrecognized option.
 func optionToChoice(o tui.PromptOption) (permissions.PromptChoice, bool) {
 	switch o {
-	case tui.OptionAllowOnce:
+	case tui.OptionAllowOnce, tui.OptionAlwaysOutside:
 		return permissions.PromptAllowOnce, true
 	case tui.OptionDeny:
 		return permissions.PromptDeny, true

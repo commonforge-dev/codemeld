@@ -165,9 +165,6 @@ func (d *productionToolDispatcher) dispatchWebFetch(ctx context.Context, args ma
 	if auth.err != nil {
 		return turn.ToolResult{}, auth.err
 	}
-	// A refusal wins over any result the transport still produced: a denied https redirect is
-	// followed by the plain-http attempt for a direct http target, and that fallback content must
-	// not stand in for the refused hop.
 	if auth.envelope != "" {
 		return turn.ToolResult{Content: auth.envelope, Denied: true, WrapUp: auth.wrapUp}, nil
 	}

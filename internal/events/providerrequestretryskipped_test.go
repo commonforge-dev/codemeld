@@ -9,7 +9,6 @@ package events
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -51,30 +50,10 @@ func TestEmitProviderRequestRetrySkipped_InvalidPayloadSkipsFlush(t *testing.T) 
 }
 
 func TestEmitProviderRequestRetrySkipped_FlushFailureInvokesHandler(t *testing.T) {
-	wantErr := errors.New("flush boom")
-	restoreFlush := flushStore
-	flushStore = func(ctx context.Context, s *sessions.Store) (fserrors.Category, sessions.WriteReason, error) {
-		return fserrors.NoSpace, sessions.ReasonWriteError, wantErr
-	}
-	t.Cleanup(func() { flushStore = restoreFlush })
-
-	var (
-		calls     int
-		gotReason sessions.WriteReason
-	)
-	handler := func(cat fserrors.Category, reason sessions.WriteReason, err error) {
-		calls++
-		gotReason = reason
-	}
-	store := sessions.New(filepath.Join(t.TempDir(), "session.json"), newSession())
-	err := EmitProviderRequestRetrySkipped(context.Background(), store, "openai", "gpt-4o",
-		"http", "http_error", "budget_exhausted", 2, 0, handler)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("returned error = %v, want %v", err, wantErr)
-	}
-	if calls != 1 || gotReason != sessions.ReasonWriteError {
-		t.Fatalf("handler calls=%d reason=%q, want 1 write_error", calls, gotReason)
-	}
+	assertFlushFailureInvokesHandler(t, func(store *sessions.Store, handler WriteFailureHandler) error {
+		return EmitProviderRequestRetrySkipped(context.Background(), store, "openai", "gpt-4o",
+			"http", "http_error", "budget_exhausted", 2, 0, handler)
+	})
 }
 
 // The validator rejects an unknown skip reason, a (phase, reason) tuple outside the

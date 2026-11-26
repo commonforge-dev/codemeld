@@ -75,7 +75,7 @@ run = "go test -race ./..."
 
 [tasks.test-fast]
 description = "Tests without the race detector (faster; reuses the normal build cache)"
-run = "go test ./..."
+run = 'n=$(( $(nproc) - 2 )); [ "$n" -ge 1 ] || n=1; go test -p "$n" ./...'
 
 [tasks.test-pkg]
 description = "Tests only the packages given (no race detector), e.g. mise run test-pkg ./internal/ids -run TestNewV7"

@@ -31,6 +31,12 @@ func TestValidate_Accepts(t *testing.T) {
 `,
 		},
 		{
+			"sessions.max_pipe_bytes minimum boundary",
+			`sessions:
+  max_pipe_bytes: 256
+`,
+		},
+		{
 			"connection-only provider with default auth_header omitted",
 			`provider:
   openai:
@@ -418,6 +424,13 @@ func TestValidate_Rejects(t *testing.T) {
   max_tool_output_bytes: 255
 `,
 			"sessions.max_tool_output_bytes",
+		},
+		{
+			"sessions.max_pipe_bytes below minimum",
+			`sessions:
+  max_pipe_bytes: 255
+`,
+			"sessions.max_pipe_bytes",
 		},
 		{
 			"unknown subkey under auth_header",

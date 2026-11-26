@@ -85,9 +85,9 @@ func RecognizeSimpleCompound(canonical string) (SimpleCompound, bool) {
 	return SimpleCompound{Wrapped: wrapped, Stages: stages, Operators: operators}, true
 }
 
-// RecognizeSimpleCompoundForGrant decides grant identity only: it ignores bare `/dev/null` redirects,
-// so a caller deciding which executor runs the command must keep using SimpleCompoundStages, which
-// still refuses every redirect.
+// RecognizeSimpleCompoundForGrant decides grant identity only: it ignores bare `/dev/null` redirects
+// and bare `2>&1`, so a caller deciding which executor runs the command must keep using
+// SimpleCompoundStages, which still refuses every redirect.
 func RecognizeSimpleCompoundForGrant(canonical string) (SimpleCompound, bool) {
 	stripped, removed, ok := stripNullRedirectsForGrant(canonical)
 	if !ok {
@@ -221,13 +221,18 @@ func stripStageNullRedirects(stage string, mask []bool, feedsPipe bool) (string,
 			continue
 		}
 		start, end, spanOK := nullRedirectSpan(stage, mask, i)
-		// nullRedirectSpan also accepts the duplications `2>&1` and `1>&2`; they change the bytes a
-		// downstream stage receives, so grant identity keeps them.
-		if !spanOK || start < kept || !strings.HasSuffix(stage[start:end], devNullTarget) {
+		// Shell parsing treats LF as a command separator and CR as a word byte, so neither may be removed.
+		if !spanOK || start < kept || strings.ContainsAny(stage[start:end], "\r\n") {
+			continue
+		}
+		// A stage grant never constrains its stdin, so adding stderr to a pipe widens nothing; `1>&2`
+		// stays because it moves stdout away from the stream a later stage was granted.
+		stderrDup := strings.HasSuffix(stage[start:end], "2>&1")
+		if !stderrDup && !strings.HasSuffix(stage[start:end], devNullTarget) {
 			continue
 		}
 		// Discarding stdout changes what a piped stage reads, so only stderr is neutral there.
-		if feedsPipe && nullRedirectDescriptor(stage, mask, i) != "2" {
+		if !stderrDup && feedsPipe && nullRedirectDescriptor(stage, mask, i) != "2" {
 			continue
 		}
 		b.WriteString(stage[kept:start])

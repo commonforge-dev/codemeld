@@ -6528,27 +6528,31 @@ func runHeadlessOutside(t *testing.T, approvals io.Reader, calls int) (*confineI
 }
 
 func TestRunHeadless_BuildOutsideRunWithAnApproverRunsOnlyTheApprovedInvocationUnconfined(t *testing.T) {
-	inner, tool, stderr := runHeadlessOutside(t, strings.NewReader("1\n"), 3)
-	if len(tool) != 3 || !strings.Contains(tool[0], "run it again; you will be asked first") {
-		t.Fatalf("tool messages = %q, want three, the first offering the outside run", tool)
+	inner, tool, stderr := runHeadlessOutside(t, strings.NewReader("1\n"), 2)
+	if len(tool) != 2 || !strings.Contains(tool[0], strings.TrimSuffix(wantOutsideRetriedLine, "\n")) ||
+		strings.Contains(tool[0]+tool[1], staleOutsideRunText) {
+		t.Fatalf("tool messages = %q, want two, the first the outside run's result in the same call", tool)
 	}
 	if len(inner.execs) != 1 || len(inner.bounded) != 2 || !slices.Equal(inner.execs[0].Argv, []string{"touch", "a"}) {
-		t.Fatalf("unconfined %+v, confined %d; want only the approved second call unconfined", inner.execs, len(inner.bounded))
+		t.Fatalf("unconfined %+v, confined %d; want only the first call's approved rerun unconfined", inner.execs, len(inner.bounded))
 	}
 	if n := strings.Count(stderr, "approval required"); n != 1 {
 		t.Fatalf("prompts = %d, want one despite the folder grant:\n%s", n, stderr)
 	}
 	for _, want := range []string{
-		"Allow running outside the sandbox: touch a",
+		"Command failed in the sandbox; run it again outside the sandbox: touch a",
 		"⚠ This command runs outside the sandbox: nothing limits what it can read, write or reach except your user account. Allowed once.",
+		"[1] allow this once     — run the command again, once, outside the sandbox; nothing is saved",
 		"codemeld: choose 1-2: ",
 	} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr)
 		}
 	}
-	if strings.Contains(stderr, "still runs inside the sandbox") {
-		t.Fatalf("stderr claims the command runs inside the sandbox:\n%s", stderr)
+	for _, unwanted := range []string{"still runs inside the sandbox", "Allow running outside the sandbox", "a repeat asks again"} {
+		if strings.Contains(stderr, unwanted) {
+			t.Fatalf("stderr contains %q:\n%s", unwanted, stderr)
+		}
 	}
 }
 
@@ -6565,13 +6569,18 @@ func TestRunHeadless_BuildOutsidePromptShowsWhatTheSandboxRefusedInsteadOfTheSum
 	}
 }
 
-func TestRunHeadless_BuildOutsideRunWithoutAnApproverIsRefused(t *testing.T) {
-	inner, tool, _ := runHeadlessOutside(t, nil, 2)
+func TestRunHeadless_BuildOutsideFailureWithoutAnApproverIsNotRunAgain(t *testing.T) {
+	inner, tool, _ := runHeadlessOutside(t, nil, 1)
 	if len(inner.execs) != 0 || len(inner.bounded) != 1 {
 		t.Fatalf("unconfined/confined runs = %d/%d, want 0/1", len(inner.execs), len(inner.bounded))
 	}
-	if len(tool) != 2 || !strings.Contains(tool[1], "no approval available in non-interactive run mode for an exceptional action that adds running outside the sandbox") {
-		t.Fatalf("tool messages = %q, want the re-issue refused as an exceptional action", tool)
+	if len(tool) != 1 || !strings.Contains(tool[0], "/srv/data/out.txt") {
+		t.Fatalf("tool messages = %q, want one listing the refusal", tool)
+	}
+	for _, unwanted := range []string{"no approval available", staleOutsideRunText, wantOutsideDeclinedLine} {
+		if strings.Contains(tool[0], unwanted) {
+			t.Fatalf("tool message contains %q: %q", unwanted, tool[0])
+		}
 	}
 }
 

@@ -64,6 +64,27 @@ func withBashTimeoutNote(stderr []byte, cap int, note string) []byte {
 	return append(slices.Clip(kept), note...)
 }
 
+type outsideEntriesKey struct{}
+
+func withOutsideEntries(ctx context.Context, entries ...string) context.Context {
+	if !slices.ContainsFunc(entries, func(e string) bool { return e != "" }) {
+		return ctx
+	}
+	return context.WithValue(ctx, outsideEntriesKey{}, entries)
+}
+
+func outsideEntry(ctx context.Context, i int) string {
+	entries, _ := ctx.Value(outsideEntriesKey{}).([]string)
+	if i >= len(entries) {
+		return ""
+	}
+	return entries[i]
+}
+
+func outsideEntryNote(entry string) string {
+	return fmt.Sprintf("codemeld: ran outside the sandbox: matches outside_sandbox_commands entry %q in .codemeld/settings.local.yaml\n", entry)
+}
+
 type shellEventRunner struct {
 	inner             dispatch.Runner
 	active            func() *sessions.Store
@@ -176,6 +197,13 @@ func (r *shellEventRunner) pipelinePrepared(ctx context.Context, subjects, specs
 	if pipelineErr != nil && r.timedOut(ctx) && onlyCanceled(results, len(specs)) && errors.Is(pipelineErr, context.DeadlineExceeded) {
 		pipelineErr = nil
 	}
+	for i := range results {
+		if entry := outsideEntry(ctx, i); entry != "" {
+			note := outsideEntryNote(entry)
+			results[i].StderrTotal = max(results[i].StderrTotal, int64(len(results[i].Stderr))) + int64(len(note))
+			results[i].Stderr = append([]byte(note), results[i].Stderr...)
+		}
+	}
 	if pending.store == nil {
 		return results, pipelineErr
 	}
@@ -231,6 +259,7 @@ func onlyCanceled(results []runner.PipelineResult, stages int) bool {
 }
 
 func (r *shellEventRunner) Exec(ctx context.Context, spec runner.RunSpec) (runner.RunResult, error) {
+	entry := outsideEntry(ctx, 0)
 	ctx = r.ExecutionContext(ctx)
 	kind, subject := shellExecSubject(spec.Argv)
 	if r.active != nil {
@@ -241,6 +270,9 @@ func (r *shellEventRunner) Exec(ctx context.Context, spec runner.RunSpec) (runne
 	res, err := r.inner.Exec(ctx, spec)
 	if err != nil {
 		return runner.RunResult{}, err
+	}
+	if entry != "" {
+		res.Stderr = append([]byte(outsideEntryNote(entry)), res.Stderr...)
 	}
 	if r.active != nil {
 		if err := events.EmitToolExecEnd(r.active(), spec.InvocationID, kind, subject, res.ExitCode, res.Duration.Milliseconds(), res.Stdout, res.Stderr, r.cap, r.childInvocationID); err != nil {

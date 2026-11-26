@@ -4278,3 +4278,146 @@ func TestRewriteKey_DomainGrants_RefusalsLeaveTheFileUnchanged(t *testing.T) {
 		})
 	}
 }
+
+func TestRewriteKey_OutsideSandboxCommands_AddKeepsKeysCommentsAndAnchors(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "settings.local.yaml")
+	writeAt(t, target, "# local settings\nblocked_paths:\n  - /secret\n# saved commands\noutside_sandbox_commands:\n  - &vet go vet ./...\n  - mise run check\n")
+
+	if step, cat, err := RewriteKey(target, "outside_sandbox_commands", WritableFolderAdd("make lint")); step != "" || cat != "" || err != nil {
+		t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# local settings\nblocked_paths:\n  - /secret\n# saved commands\noutside_sandbox_commands:\n- &vet go vet ./...\n- mise run check\n- make lint\n"
+	if string(got) != want {
+		t.Fatalf("file =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestRewriteKey_OutsideSandboxCommands_RemoveKeepsKeysAndComments(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "settings.local.yaml")
+	writeAt(t, target, "# local settings\noutside_sandbox_commands: [mise run check, go vet ./...]\n# after\nblocked_paths: [/secret]\n")
+
+	if step, cat, err := RewriteKey(target, "outside_sandbox_commands", WritableFolderRemove("mise run check")); step != "" || cat != "" || err != nil {
+		t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# local settings\noutside_sandbox_commands:\n- go vet ./...\n# after\nblocked_paths: [/secret]\n"
+	if string(got) != want {
+		t.Fatalf("file =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestRewriteKey_OutsideSandboxCommands_AddCreatesAbsentFile(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "settings.local.yaml")
+
+	if step, cat, err := RewriteKey(target, "outside_sandbox_commands", WritableFolderAdd("mise run check")); step != "" || cat != "" || err != nil {
+		t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "outside_sandbox_commands:\n- mise run check\n"; string(got) != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteKey_OutsideSandboxCommands_KeepsListAnchor(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		value       any
+		want        string
+	}{
+		{"add", "outside_sandbox_commands: &saved\n  - go vet ./...\n", WritableFolderAdd("make lint"), "outside_sandbox_commands: &saved\n- go vet ./...\n- make lint\n"},
+		{"remove", "outside_sandbox_commands: &saved [mise run check, go vet ./...]\n", WritableFolderRemove("mise run check"), "outside_sandbox_commands: &saved\n- go vet ./...\n"},
+		{"remove last", "outside_sandbox_commands: &saved [go vet ./...]\n", WritableFolderRemove("go vet ./..."), "outside_sandbox_commands: &saved []\n"},
+		{"add with alias", "outside_sandbox_commands: &saved [go vet ./...]\ndeclared_commands: *saved\n", WritableFolderAdd("make lint"), "outside_sandbox_commands: &saved\n- go vet ./...\n- make lint\ndeclared_commands: *saved\n"},
+		{"remove with alias", "outside_sandbox_commands: &saved [mise run check, go vet ./...]\ndeclared_commands: *saved\n", WritableFolderRemove("mise run check"), "outside_sandbox_commands: &saved\n- go vet ./...\ndeclared_commands: *saved\n"},
+		{"flow root add", "{outside_sandbox_commands: &saved [go vet ./...], declared_commands: *saved}\n", WritableFolderAdd("make lint"), "{outside_sandbox_commands: &saved [go vet ./..., make lint], declared_commands: *saved}\n"},
+		{"flow root remove", "{outside_sandbox_commands: &saved [mise run check, go vet ./...], declared_commands: *saved}\n", WritableFolderRemove("mise run check"), "{outside_sandbox_commands: &saved [go vet ./...], declared_commands: *saved}\n"},
+		{"flow root remove last", "{outside_sandbox_commands: &saved [go vet ./...]}\n", WritableFolderRemove("go vet ./..."), "{outside_sandbox_commands: &saved []}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.local.yaml")
+			writeAt(t, target, tc.input)
+			if step, cat, err := RewriteKey(target, KeyOutsideSandboxCommands, tc.value); step != "" || cat != "" || err != nil {
+				t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+			}
+			got := readAt(t, target)
+			if got != tc.want {
+				t.Fatalf("file =\n%q\nwant\n%q", got, tc.want)
+			}
+			if err := Validate([]byte(got), target); err != nil {
+				t.Fatalf("rewritten file fails validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_WritableFolders_DropsListPropertiesAndComments(t *testing.T) {
+	const block = "writable_folders: &folders # dirs\n  # note\n  - /a # first\n  - /b\n"
+	for _, tc := range []struct {
+		name, input string
+		value       any
+		want        string
+	}{
+		{"flow anchor add", "writable_folders: &folders [/a]\n", WritableFolderAdd("/b"), "writable_folders:\n- /a\n- /b\n"},
+		{"block add", block, WritableFolderAdd("/c"), "writable_folders:\n- /a\n- /b\n- /c\n"},
+		{"block remove", block, WritableFolderRemove("/b"), "writable_folders:\n- /a\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.yaml")
+			writeAt(t, target, tc.input)
+			if step, cat, err := RewriteKey(target, KeyWritableFolders, tc.value); step != "" || cat != "" || err != nil {
+				t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+			}
+			if got := readAt(t, target); got != tc.want {
+				t.Fatalf("file =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRewriteKey_OutsideSandboxCommands_KeepsListComments(t *testing.T) {
+	const block = "outside_sandbox_commands: # saved commands\n  # keep this explanation\n  - go vet ./... # required before publishing\n  - mise run check\n"
+	const flow = "outside_sandbox_commands: [ # saved commands\n  # keep this explanation\n  go vet ./..., # required before publishing\n  mise run check\n]\n"
+	const flowRoot = "{outside_sandbox_commands: [ # saved commands\n  # keep this explanation\n  go vet ./..., # required before publishing\n  mise run check\n]}\n"
+	const kept = "outside_sandbox_commands: # saved commands\n# keep this explanation\n- go vet ./... # required before publishing\n"
+	for _, tc := range []struct {
+		name, input string
+		value       any
+		want        string
+	}{
+		{"block add", block, WritableFolderAdd("make lint"), kept + "- mise run check\n- make lint\n"},
+		{"block remove", block, WritableFolderRemove("mise run check"), kept},
+		{"block remove commented entry", block, WritableFolderRemove("go vet ./..."), "outside_sandbox_commands: # saved commands\n- mise run check\n"},
+		{"flow add", flow, WritableFolderAdd("make lint"), kept + "- mise run check\n- make lint\n"},
+		{"flow remove", flow, WritableFolderRemove("mise run check"), kept},
+		{"flow root add", flowRoot, WritableFolderAdd("make lint"), "{outside_sandbox_commands: [ # saved commands\n  # keep this explanation\n  go vet ./..., # required before publishing\n  mise run check,\n  make lint\n]}\n"},
+		{"flow root remove", flowRoot, WritableFolderRemove("mise run check"), "{outside_sandbox_commands: [ # saved commands\n  # keep this explanation\n  go vet ./... # required before publishing\n]}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "settings.local.yaml")
+			writeAt(t, target, tc.input)
+			if step, cat, err := RewriteKey(target, KeyOutsideSandboxCommands, tc.value); step != "" || cat != "" || err != nil {
+				t.Fatalf("RewriteKey = (%q, %q, %v), want success", step, cat, err)
+			}
+			got := readAt(t, target)
+			if got != tc.want {
+				t.Fatalf("file =\n%q\nwant\n%q", got, tc.want)
+			}
+			if err := Validate([]byte(got), target); err != nil {
+				t.Fatalf("rewritten file fails validation: %v", err)
+			}
+		})
+	}
+}

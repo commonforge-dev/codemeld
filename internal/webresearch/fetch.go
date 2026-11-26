@@ -72,8 +72,13 @@ func fetch(ctx context.Context, client *http.Client, rawURL string, authorize Au
 	if plaintext {
 		// Authorization for a direct HTTP target covers its initial HTTPS attempt.
 		secure, secureTarget := overHTTPS(first, target)
-		if resp, err := follow(ctx, noFollow, secure, secureTarget, authorize, false); err == nil {
+		resp, err := follow(ctx, noFollow, secure, secureTarget, authorize, false)
+		if err == nil {
 			return resp, nil
+		}
+		var failure *transportFailure
+		if !errors.As(err, &failure) || ctx.Err() != nil {
+			return nil, err
 		}
 	}
 	return follow(ctx, noFollow, first, target, authorize, plaintext)

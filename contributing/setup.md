@@ -1,6 +1,6 @@
 # Development setup
 
-_Last updated: 2026-11-10_
+_Last updated: 2026-11-24_
 
 This page is the whole "get building" story: the toolchain, the commands, and how to run the
 binary. The dependency list itself is [`go.mod`](../go.mod).
@@ -135,14 +135,16 @@ differently and neither overrides the other):
 - **`openai` (Platform API key):** in the app, type `/connect`, pick the OpenAI Platform and paste
   the key; this saves the `provider.openai` entry (`base_url` and `api_key`) in
   `~/.codemeld/global/settings.yaml` and the models it found in `~/.codemeld/global/models.yaml`.
-  A headless run (`./codemeld run`, for CI or servers) never loads a model list, so it needs both
-  from the app: run `/connect` once on that host, or copy there the `provider.openai` entry into
-  its `settings.yaml` and a `models.yaml` the app wrote.
-  Then pick a listed model with `./codemeld run --model openai/<id>`; a model missing from
-  `models.yaml` is rejected. In a headless run a set `OPENAI_API_KEY` takes precedence over the
-  entry's `api_key`, which may then be empty; it does not create the entry or the model list.
+  A headless run (`./codemeld run`, for CI or servers) with `--model` fetches a never-discovered
+  API-key provider's model list once; configure the provider entry first. An existing provider
+  cache entry is not refreshed automatically.
+  Then pick a model with `./codemeld run --model openai/<id>`. A missing model is rejected after
+  any eligible first-use catalog fetch; the environment key does not create a provider entry, but
+  can authenticate that fetch. In a headless run a set `OPENAI_API_KEY` takes precedence over the
+  entry's `api_key`, which may then be empty.
 
-Run `./codemeld auth status` to see which providers are authenticated (it prints no secrets), then
+Run `./codemeld auth status` to see local OpenAI Platform and ChatGPT credential state without
+secrets; it does not test upstream authentication or report other providers. Then
 run `./codemeld` inside any project folder. See the top-level [`README.md`](../README.md) "First
 run" for the full first-run flow,
 [`docs/architecture.md`](../docs/architecture.md#openai-authentication-two-separate-providers) →
@@ -197,8 +199,8 @@ plain runtime tools, and each is strictly optional.
 
 ## Platform note
 
-Linux is the tested platform: `mise run check` builds codemeld and runs the test suite there, and
-there is no hosted CI. macOS and FreeBSD build but are untested. Windows is not supported: codemeld
+Linux is the tested platform: `mise run check` compiles code during checks and runs the test suite, `mise run build`
+produces the executable, and there is no hosted CI. macOS and FreeBSD build but are untested. Windows is not supported: codemeld
 does not compile for it. Confined shell execution works only on Linux amd64 and arm64; every other
 platform runs shell commands unconfined with ordinary prompts. There is **no CGO**, so the
 binary is a single static file with no runtime dependencies. See the Per-OS Gates table in

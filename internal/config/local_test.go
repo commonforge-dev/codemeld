@@ -229,6 +229,7 @@ func TestValidateLocalSettingsBytes_RejectsKeysOutsideTheAllowList(t *testing.T)
 		{"discovery.boundary", "discovery:\n  boundary: project-root\n", "discovery.boundary"},
 		{"sessions.retention_days", "sessions:\n  retention_days: 30\n", "sessions.retention_days"},
 		{"sessions.max_tool_output_bytes", "sessions:\n  max_tool_output_bytes: 4096\n", "sessions.max_tool_output_bytes"},
+		{"sessions.max_pipe_bytes", "sessions:\n  max_pipe_bytes: 1048576\n", "sessions.max_pipe_bytes"},
 		{"provider", "provider:\n  openai:\n    base_url: https://example.test\n    api_key: k\n", "provider.openai.api_key"},
 		{"auth", "auth:\n  openai-chatgpt:\n    access_token: t\n", "auth.openai-chatgpt"},
 		{"model.favorites", "model:\n  favorites:\n    - provider: openai\n      id: gpt-x\n", "model.favorites"},
@@ -429,6 +430,17 @@ func TestValidateLocalSettingsBytes_AcceptsConnectGrants(t *testing.T) {
 	}
 	if !reflect.DeepEqual(raw["connect_grants"], []any{"127.0.0.1:5436"}) {
 		t.Fatalf("raw = %v, want connect_grants preserved", raw)
+	}
+}
+
+func TestValidateLocalSettingsBytes_AcceptsOutsideSandboxCommands(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.local.yaml")
+	raw, cat, err := ValidateLocalSettingsBytes([]byte("outside_sandbox_commands: [\"mise run check\"]\n"), path)
+	if cat != LoadOK || err != nil {
+		t.Fatalf("cat = %q, err = %v; want LoadOK and nil", cat, err)
+	}
+	if !reflect.DeepEqual(raw["outside_sandbox_commands"], []any{"mise run check"}) {
+		t.Fatalf("raw = %v, want outside_sandbox_commands preserved", raw)
 	}
 }
 

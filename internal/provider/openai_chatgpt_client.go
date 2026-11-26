@@ -39,7 +39,7 @@ const (
 	// chatGPTAccountHeader carries the stored account id alongside the bearer token.
 	// Its value is a credential-derived secret for redaction.
 	chatGPTAccountHeader      = "ChatGPT-Account-ID"
-	chatGPTCodexClientVersion = "0.169.0"
+	chatGPTCodexClientVersion = "0.172.0"
 	// chatGPTCodexOriginator is the Codex client originator/User-Agent identity the
 	// discovery endpoint expects alongside the ChatGPT credentials.
 	chatGPTCodexOriginator     = "codex_cli_rs"

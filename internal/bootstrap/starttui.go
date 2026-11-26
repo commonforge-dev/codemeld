@@ -59,13 +59,22 @@ func (l permissionsCacheLister) List() []permissions.PermissionEntry {
 // codemeldVersion is the build version the /status overlay and the launch banner
 // report (item 1). It is hard-coded and bumped by hand on each
 // release; a single source so the banner and /status never drift.
-var codemeldVersion = "Beta 0.4.14"
+var codemeldVersion = "Beta 0.4.15"
 
 // discoveryLaunchDirOnly is the discovery.boundary value under which the
 // per-project model.active write lands in the launch directory, so the cross-mode
 // marker disclosure applies. config has no exported constant for it; this mirrors
 // the literal the config and vcs packages compare against.
 const discoveryLaunchDirOnly = "launch-dir-only"
+
+func newLaunchCache(result *BootstrapResult, composed map[string]any) (*config.Cache, error) {
+	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths, result.Home)
+	if err != nil {
+		return nil, err
+	}
+	cache.SetLocalAdmitted(vcsTemplatesApproved(result.TrustDecision))
+	return cache, nil
+}
 
 // StartTUI is the step-8 launch. It narrows the bootstrap result's active
 // session + composed config + run-scoped model state, assembles the production
@@ -105,7 +114,7 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	if composed == nil {
 		composed = map[string]any{}
 	}
-	cache, err := config.NewCache(composed, result.ProjectRoot, result.ConfigLayerPaths, result.Home)
+	cache, err := newLaunchCache(result, composed)
 	if err != nil {
 		return fmt.Errorf("bootstrap: StartTUI build config cache: %w", err)
 	}
@@ -213,6 +222,9 @@ func StartTUI(ctx context.Context, result *BootstrapResult, stdout io.Writer) (r
 	conf.connectAsker = authorizer.prompts.AskConnect
 	conf.outside = &outsideSubjects{}
 	authorizer.outside = conf.outside
+	authorizer.saveOutside = func(subject string) (string, bool) {
+		return addOutsideCommand(authorizer.display.projectRoot, authorizer.display.projectApproved, subject)
+	}
 	for _, row := range launchRows {
 		authorizer.grants.addRow(row)
 	}
@@ -645,6 +657,7 @@ func newSystemOneDeps(cache *config.Cache, status func() string) tui.SystemOneDe
 }
 
 var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.ActiveState, authorizer *productionAuthorizer, writable writableFolders) tui.SettingsDeps {
+	outside := writable.outsideCommands()
 	return tui.SettingsDeps{
 		Lister: permissionsCacheLister{grants: authorizer.grants},
 		Picker: tui.NewSettingsPicker(app, tui.OpenRouterSettings{
@@ -714,6 +727,7 @@ var newSettingsDeps = func(app *tui.App, cache *config.Cache, active *model.Acti
 		Revoke:   func(row tui.PermissionRow) { authorizer.RevokeRow(row, app) },
 		Share:    authorizer.ShareGrant,
 		Writable: writable.deps(cache, authorizer),
+		Outside:  tui.OutsideCommandDeps{List: outside.list, Remove: outside.remove},
 		Approved: authorizer.display.projectApproved,
 		Boundary: cache.Discovery(),
 	}
@@ -1569,5 +1583,6 @@ func launchConfinement(resolution enforce.Resolution, tmpDir string, modeActive 
 		grants:        cache.DomainGrants(),
 		connectGrants: cache.ConnectGrants(),
 		writes:        &writeRefusalReports{seen: map[string]bool{}},
+		pipeBytes:     cache.MaxPipeBytes(),
 	}
 }

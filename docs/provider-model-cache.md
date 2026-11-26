@@ -28,8 +28,8 @@ Per provider (`config.DiscoveredProvider` in `internal/config/discovered_models.
   sends the highest of this value, the npm registry's current Codex version, and the compiled
   `chatGPTCodexClientVersion`.
 
-The store's write path (`sanitizeProvider`) redacts any secret-shaped key or value as a backstop, so
-auth material cannot reach disk even if a producer places it in the free-form metadata.
+The store's write path (`sanitizeProvider`) removes known secret-shaped strings and keys; producers
+must still supply only safe selection metadata.
 
 ## Reads are offline; writes are discovery-driven
 
@@ -75,10 +75,8 @@ that order until one yields options. A root that is absent is an optional non-ma
 that sends only one of these shapes discovers normally. Every option is length- and charset-capped,
 so a hostile `/models` body cannot smuggle a blob through as an option; a malformed container or a
 list with no valid entry yields no options, while a mixed list keeps its valid entries and skips the
-rest. Discovery (`internal/provider/apikey_model_discovery.go`) decodes each record as a map of raw
-top-level messages and then traverses only `id`, `architecture`, and the table's roots, reaching only
-the declared segments and leaves inside them, so unrelated roots and nested siblings never enter a
-decoded value or the store.
+rest. Discovery (`internal/provider/apikey_model_discovery.go`) projects IDs, input modalities, tool
+capabilities and the declared reasoning-effort shapes, dropping unrelated response data.
 
 `configuredEffortFromCapabilities` (`internal/provider/catalog.go`) keeps a model's options only when
 the cached entry set `supportsReasoningEffort`, de-duplicates them, and preserves the provider's own
@@ -139,9 +137,9 @@ and all receive the same result; requests for **different** providers proceed in
 
 ## Failure retention and secrets
 
-Any failure — a refused redirect, malformed body, authentication error, an empty discovered-model list, a
-persistence error, a timed-out session renewal, or a rebuild before completion — leaves the **prior
-on-disk entry and live catalog unchanged**. The result handed back to the picker is a static
+API-key discovery rejects an empty usable list. ChatGPT discovery may replace its entry with an
+empty list. After publication the live catalog reloads; a failed reread does not roll back
+publication. The result handed back to the picker is a static
 classification carrying no API key, auth header, provider body, or raw upstream error:
 
 - `refused` — not a configured API-key provider, an `openai-chatgpt` request that is unforced or has

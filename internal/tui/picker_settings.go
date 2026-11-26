@@ -59,6 +59,7 @@ const (
 const (
 	writableHeaderRow = "writable folders: sandboxed commands may write here; the grants above cover file tools only"
 	writableAddLine   = "+ add writable folder (a)"
+	outsideHeaderRow  = "run outside the sandbox (Build): these commands skip the sandbox; each still needs its approval"
 )
 
 const discoveryLaunchDirOnly = "launch-dir-only"
@@ -107,6 +108,7 @@ type settingsPickerSession struct {
 	session   SessionSettings
 	retention *tview.InputField
 	writable  WritableFoldersView
+	outside   WritableFoldersView
 }
 
 type maxPriceEditor struct {
@@ -903,6 +905,9 @@ func (a *App) renderSettingsTab() {
 		pp.addWritableRows()
 		addHeight = 1
 	}
+	if pp.outsideSection() {
+		pp.addOutsideRows()
+	}
 	pp.body.ResizeItem(pp.addLine, addHeight, 0)
 	a.updateRowHelp(pp.list.GetCurrentItem())
 }
@@ -1031,6 +1036,10 @@ func (a *App) showSettingsDelete() {
 		a.showWritableRemove(entry)
 		return
 	}
+	if entry, ok := pp.outsideEntryAt(pp.list.GetCurrentItem()); ok {
+		a.showOutsideRemove(entry)
+		return
+	}
 	if pp.deps.Revoke == nil {
 		return
 	}
@@ -1126,9 +1135,55 @@ func (a *App) showWritableRemove(entry string) {
 	}
 	text := "Remove this writable folder?\n\n" + shareConfirmFact(entry) +
 		"\n\nIt is removed from the project's .codemeld/settings.yaml for everyone who pulls the repository."
+	a.confirmSettingsRemove(text, func() string { return pp.deps.Writable.Remove(entry) })
+}
+
+func (pp *settingsPickerSession) outsideSection() bool {
+	return pp.activeTab == 0 && pp.deps.Outside.List != nil
+}
+
+func (pp *settingsPickerSession) outsideEntryAt(i int) (string, bool) {
+	if !pp.outsideSection() || pp.outside.Unreadable != "" {
+		return "", false
+	}
+	j := i - (max(len(pp.global), 1) + 1)
+	if j < 0 || j >= len(pp.outside.Rows) {
+		return "", false
+	}
+	return pp.outside.Rows[j].Entry, true
+}
+
+func (pp *settingsPickerSession) addOutsideRows() {
+	pp.outside.Rows, pp.outside.Unreadable = pp.deps.Outside.List()
+	pp.list.AddItem(outsideHeaderRow, "", 0, nil)
+	if pp.outside.Unreadable != "" {
+		pp.list.AddItem("  settings unreadable: "+fserrors.CollapseControls(pp.outside.Unreadable), "", 0, nil)
+		return
+	}
+	for _, row := range pp.outside.Rows {
+		text := "  " + fserrors.CollapseControls(row.Entry)
+		if row.Invalid != "" {
+			text += " — invalid: " + fserrors.CollapseControls(row.Invalid)
+		}
+		pp.list.AddItem(text, "", 0, nil)
+	}
+}
+
+func (a *App) showOutsideRemove(entry string) {
+	pp := a.settingsPicker
+	if pp.deps.Outside.Remove == nil {
+		return
+	}
+	text := "Remove this command from outside_sandbox_commands?\n\n" + shareConfirmFact(entry) +
+		"\n\nIt is removed from your .codemeld/settings.local.yaml, so its next run in Build is sandboxed."
+	a.confirmSettingsRemove(text, func() string { return pp.deps.Outside.Remove(entry) })
+}
+
+func (a *App) confirmSettingsRemove(text string, remove func() string) {
+	pp := a.settingsPicker
 	a.showSettingsConfirm(text, "Remove", func() {
 		prev := pp.list.GetCurrentItem()
-		a.Notice(pp.deps.Writable.Remove(entry))
+		a.Notice(remove())
 		a.renderSettingsTab()
 		pp.list.SetCurrentItem(min(prev, pp.list.GetItemCount()-1))
 		a.refocusSettingsList()

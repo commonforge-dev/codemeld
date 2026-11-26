@@ -93,6 +93,9 @@ func ValidateGlobalSettingsBytes(b []byte, path string) (raw map[string]any, cat
 	if writeErr := rejectGlobalWritableFolders(path, raw); writeErr != nil {
 		return nil, SchemaValidationError, writeErr
 	}
+	if outsideErr := rejectGlobalOutsideSandboxCommands(path, raw); outsideErr != nil {
+		return nil, SchemaValidationError, outsideErr
+	}
 	return raw, LoadOK, nil
 }
 
@@ -201,6 +204,15 @@ func rejectGlobalWritableFolders(path string, raw map[string]any) error {
 		return nil
 	}
 	return fmt.Errorf("%s: schema validation failed at writable_folders: %s", path, globalWritableFoldersDetail)
+}
+
+const globalOutsideSandboxCommandsDetail = "outside_sandbox_commands is project-only and must be moved to the project's .codemeld/settings.local.yaml"
+
+func rejectGlobalOutsideSandboxCommands(path string, raw map[string]any) error {
+	if _, ok := raw["outside_sandbox_commands"]; !ok {
+		return nil
+	}
+	return fmt.Errorf("%s: schema validation failed at outside_sandbox_commands: %s", path, globalOutsideSandboxCommandsDetail)
 }
 
 // LoadConsequence states what the failure did to the run in progress. The formatter cannot

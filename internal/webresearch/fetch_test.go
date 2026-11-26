@@ -706,17 +706,64 @@ func TestFetch_DirectHTTPTriesHTTPSBeforeItsLiteralFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("an http redirect cannot replace the literal fallback", func(t *testing.T) {
+	t.Run("an http redirect stops the fetch", func(t *testing.T) {
 		tr := &trace{}
 		respond := redirectOnce(secure, "http://cdn.other.example/guide")
 		resp, err := fetch(context.Background(), tr.client(respond), direct, tr.authorizer(nil))
-		if err != nil {
-			t.Fatalf("fetch = %v, want the HTTP fallback", err)
+		if err == nil {
+			resp.Body.Close()
+			t.Fatal("fetch = success, want the refused http redirect reported")
 		}
-		resp.Body.Close()
-		want := []string{"auth http://docs.example.com:80", "req " + secure, "req " + direct}
+		if !strings.Contains(err.Error(), "refused an http redirect") {
+			t.Fatalf("fetch = %v, want the refused http redirect", err)
+		}
+		want := []string{"auth http://docs.example.com:80", "req " + secure}
 		if !slices.Equal(tr.events, want) {
-			t.Fatalf("fetch recorded %v, want only the literal original HTTP URL after HTTPS: %v", tr.events, want)
+			t.Fatalf("fetch recorded %v, want no request after the refused redirect: %v", tr.events, want)
+		}
+	})
+
+	t.Run("a denied https redirect stops the fetch", func(t *testing.T) {
+		tr := &trace{}
+		deny := func(target Target) error {
+			if target.Host == "cdn.other.example" {
+				return errDenied
+			}
+			return nil
+		}
+		respond := redirectOnce(secure, "https://cdn.other.example/guide")
+		resp, err := fetch(context.Background(), tr.client(respond), direct, tr.authorizer(deny))
+		if err == nil {
+			resp.Body.Close()
+			t.Fatal("fetch = success, want the denial reported")
+		}
+		if !errors.Is(err, errDenied) {
+			t.Fatalf("fetch = %v, want the denial wrapped", err)
+		}
+		want := []string{"auth http://docs.example.com:80", "req " + secure, "auth https://cdn.other.example:443"}
+		if !slices.Equal(tr.events, want) {
+			t.Fatalf("fetch recorded %v, want no request after the denial: %v", tr.events, want)
+		}
+	})
+
+	t.Run("cancellation during https stops the fetch", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		tr := &trace{}
+		respond := func(r *http.Request) (*http.Response, error) {
+			if r.URL.String() == secure {
+				cancel()
+				return nil, context.Canceled
+			}
+			return response(http.StatusOK, ""), nil
+		}
+		resp, err := fetch(ctx, tr.client(respond), direct, tr.authorizer(nil))
+		if err == nil {
+			resp.Body.Close()
+			t.Fatal("fetch = success, want the cancellation reported")
+		}
+		if got, want := tr.requests(), []string{secure}; !slices.Equal(got, want) {
+			t.Fatalf("fetch attempted %v, want only %v", got, want)
 		}
 	})
 

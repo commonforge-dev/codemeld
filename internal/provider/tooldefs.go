@@ -171,7 +171,6 @@ func AskUserToolDefinition() ToolDefinition {
 								"description": "The selectable answers for this question. Every option's label must differ from every other option's label in the question, even when their descriptions differ.",
 								"minItems":    1,
 								"maxItems":    MaxAskUserOptions,
-								"uniqueItems": true,
 								"items": map[string]any{
 									"type": "object",
 									"properties": map[string]any{

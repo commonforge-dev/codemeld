@@ -179,7 +179,7 @@ func (p *proxyServer) serve(conn net.Conn) {
 			return
 		}
 		go func() {
-			_, _ = io.Copy(up, br)
+			_, _ = io.Copy(struct{ io.Writer }{up}, br)
 			_ = up.(*net.TCPConn).CloseWrite()
 		}()
 	} else {
@@ -190,7 +190,9 @@ func (p *proxyServer) serve(conn net.Conn) {
 			return
 		}
 	}
-	_, _ = io.Copy(conn, up)
+	// A TCP-to-TCP io.Copy splices through pipes Go pools until a later GC closes them, which shifts
+	// the descriptor counts later tests compare, so both copies hide ReadFrom and WriteTo.
+	_, _ = io.Copy(struct{ io.Writer }{conn}, struct{ io.Reader }{up})
 }
 
 func (p *proxyServer) count() int {

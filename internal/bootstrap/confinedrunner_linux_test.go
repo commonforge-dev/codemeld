@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +33,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"codemeld.dev/codemeld/internal/config"
+	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/enforce"
 	"codemeld.dev/codemeld/internal/events"
 	"codemeld.dev/codemeld/internal/ids"
@@ -3325,6 +3328,98 @@ func TestConfinedRunner_ConnectModeThroughTheRealHelper(t *testing.T) {
 	})
 }
 
+func TestConfinedVCS_ConnectDecisionsThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	if !resolveExecutionCapability(enforce.ResolveInput{Home: home}).ConnectSelfTestPassed {
+		t.Skip("unverified: the connect self-test did not pass on this host")
+	}
+	sockets, err := os.MkdirTemp("", "cm-vcs-connect-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockets) })
+	if sockets, err = filepath.EvalSymlinks(sockets); err != nil {
+		t.Fatal(err)
+	}
+	granted, ungranted := filepath.Join(sockets, "granted"), filepath.Join(sockets, "ungranted")
+	for _, path := range []string{granted, ungranted} {
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+	}
+	tmpDir := filepath.Join(filepath.Dir(project), "tmp")
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	conf := liveRealHelperConfinement(t, home, project, tmpDir, writableFoldersYAML())
+	conf.connectGrants = []string{granted}
+
+	lookup, target := t.TempDir(), filepath.Join(t.TempDir(), "target")
+	script := "#!/bin/sh\nread -r dest < " + target + "\nexec " + os.Args[0] + " '-test.run=^TestConfinedConnectChild$' -- unix-connect \"$dest\"\n"
+	if err := os.WriteFile(filepath.Join(lookup, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf.lookupPath = lookup + ":" + conf.lookupPath
+	prevVCS := newVCSActionRunner
+	newVCSActionRunner = func() runner.Runner { return &helperForwardingRunner{bin: bin} }
+	t.Cleanup(func() { newVCSActionRunner = prevVCS })
+
+	store := mkStore(t)
+	active := func() *sessions.Store { return store }
+	factory := &toolRegistryFactory{active: &ActiveVCS{Template: productVettedGitTemplate(t), RepoRoot: project}}
+	reg, err := realizeToolRegistry(factory, emptyCache(t, project), active, home, project, securitystate.Policy{}, generalAgentBinding{notices: &recordingNotices{}, confinement: conf})
+	if err != nil {
+		t.Fatalf("realizeToolRegistry: %v", err)
+	}
+	status, ok := reg.Lookup("vcs_status")
+	if !ok {
+		t.Fatal("vcs_status not registered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, tc := range []struct{ dest, want string }{{granted, "connected"}, {ungranted, fmt.Sprintf("connect %d", syscall.EPERM)}} {
+		if err := os.WriteFile(target, []byte(tc.dest+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if res, err := status.Invoke(ctx, map[string]any{}); err != nil || firstLine(string(res.Stdout)) != tc.want {
+			t.Fatalf("vcs_status connecting to %s: %v, stdout %q, stderr %q; want %q", tc.dest, err, res.Stdout, res.Stderr, tc.want)
+		}
+	}
+	want := []events.ConnectDecision{
+		{Destination: granted, Decision: "allowed", Step: "grant", Count: 1},
+		{Destination: ungranted, Decision: "denied", Reason: "Unix socket connect not granted", Count: 1},
+	}
+	requireRecorded := func(after string) {
+		t.Helper()
+		if got := decodeStoreEvents[events.ConnectDecision](t, reloadStore(t, store), "connect_decision"); !slices.Equal(got, want) {
+			t.Errorf("connect decisions in the session file after %s:\n got %+v\nwant %+v", after, got, want)
+		}
+	}
+	requireRecorded("the version-control actions")
+
+	spec := runner.RunSpec{Argv: []string{os.Args[0], "-test.run=^TestConfinedConnectChild$", "--", "unix-connect", granted}, Cwd: project}
+	spec.InvocationID = ids.NewV7()
+	failing := &confinedRunner{inner: failAfterRun{&helperForwardingRunner{bin: bin}}, conf: conf, cap: 4096, active: active}
+	if _, err := failing.Exec(ctx, spec); !errors.Is(err, errCaptureFailed) {
+		t.Errorf("connect followed by an execution error returned %v, want %v", err, errCaptureFailed)
+	}
+	want = append(want, events.ConnectDecision{Destination: granted, Decision: "allowed", Step: "grant", Count: 1})
+	requireRecorded("the failed execution")
+
+	for name, none := range map[string]func() *sessions.Store{"no store func": nil, "no active store": func() *sessions.Store { return nil }} {
+		t.Run(name, func(t *testing.T) {
+			spec.InvocationID = ids.NewV7()
+			res, err := (&confinedRunner{inner: &helperForwardingRunner{bin: bin}, conf: conf, cap: 4096, active: none}).Exec(ctx, spec)
+			if err != nil || firstLine(string(res.Stdout)) != "connected" {
+				t.Errorf("connect without a session: %v, stdout %q, stderr %q; want connected and no error", err, res.Stdout, res.Stderr)
+			}
+		})
+	}
+	requireRecorded("the runs without a session")
+}
+
 var errCaptureFailed = errors.New("capture failed")
 
 type failAfterRun struct{ *helperForwardingRunner }
@@ -3544,5 +3639,369 @@ func TestConfinedFailure_FileRefusalLinesAreEscapedAndFitTheRoom(t *testing.T) {
 	}
 	if got := f.additions(len(lines[3]) + len(lines[4]) + 1); got != "" {
 		t.Errorf("additions without room for the closing lines = %q, want none", got)
+	}
+}
+
+func TestConfinedRunner_BuildSavedOutsideCommandFollowsTheLiveSettingsThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	base, err := filepath.EvalSymlinks(filepath.Dir(project))
+	if err != nil {
+		t.Fatal(err)
+	}
+	project = filepath.Join(base, "project")
+	outside, tmpDir := filepath.Join(base, "outside"), filepath.Join(base, "tmp")
+	for _, dir := range []string{outside, tmpDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLocalProjectSettings(t, project, "outside_sandbox_commands: [\"touch :*\"]\n")
+	cache, err := config.NewCache(map[string]any{}, project, []string{SettingsPath(home)}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.SetLocalAdmitted(true)
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	conf := withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.Build, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
+	store := mkStore(t)
+	run := func(t *testing.T, target string) (tools.Result, events.ToolExecEnd) {
+		t.Helper()
+		shell := &confinedShellRunner{events: &shellEventRunner{inner: &helperForwardingRunner{bin: bin}, active: func() *sessions.Store { return store }, cap: 4096}, conf: conf}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := dispatch.DispatchShell(ctx, "touch "+target, "", project, &recordingAuthorizer{decision: allow()}, shell)
+		if err != nil || ctx.Err() != nil {
+			t.Fatalf("touch %s: %v, %v; result %+v", target, err, ctx.Err(), res)
+		}
+		ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+		return res, ends[len(ends)-1]
+	}
+
+	first := filepath.Join(outside, "first")
+	res, end := run(t, first)
+	note := "codemeld: ran outside the sandbox: matches outside_sandbox_commands entry \"touch :*\" in .codemeld/settings.local.yaml\n"
+	if res.ExitCode != 0 || !strings.HasPrefix(end.Stderr, note) {
+		t.Fatalf("saved command: exit %d stderr %q, tool_exec_end.stderr %q; want success and the note line", res.ExitCode, res.Stderr, end.Stderr)
+	}
+	if _, err := os.Lstat(first); err != nil {
+		t.Fatalf("stat %s: %v, want the file written outside the sandbox", first, err)
+	}
+
+	rewriteSettings(t, config.LocalSettingsPath(project), "outside_sandbox_commands: []\n")
+	second := filepath.Join(outside, "second")
+	res, end = run(t, second)
+	if res.ExitCode == 0 || strings.Contains(end.Stderr, note) {
+		t.Fatalf("entry removed: exit %d, tool_exec_end.stderr %q; want a sandboxed refusal with no note", res.ExitCode, end.Stderr)
+	}
+	if _, err := os.Lstat(second); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat %s = %v, want it absent", second, err)
+	}
+}
+
+func TestConfinedShell_SavedHeadPipesAllItsOutputToASandboxedStageThroughTheRealHelper(t *testing.T) {
+	home, project, bin := realConfinementHost(t)
+	project, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(filepath.Dir(project), "tmp")
+	if err := os.Mkdir(tmpDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalProjectSettings(t, project, "outside_sandbox_commands: [\"seq 1 20000\"]\n")
+	cache, err := config.NewCache(map[string]any{}, project, []string{SettingsPath(home)}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.SetLocalAdmitted(true)
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	conf := withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.Build, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
+	store := mkStore(t)
+	inner := &helperForwardingRunner{bin: bin}
+	const maxToolOutputBytes = 4096
+	d := newProductionToolDispatcher(tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()}, home, project,
+		func() *sessions.Store { return store }, maxToolOutputBytes, securitystate.Policy{})
+	d.confinement = conf
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := d.Dispatch(ctx, bashCall("c1", "seq 1 20000 | tail -n 1"))
+	if err != nil || ctx.Err() != nil {
+		t.Fatalf("dispatch: %v, %v; result %+v", err, ctx.Err(), res)
+	}
+	if len(inner.specs) != 2 || inner.specs[0].Argv[0] == "/proc/self/exe" || inner.specs[1].Argv[0] != "/proc/self/exe" {
+		t.Fatalf("specs = %+v, want the head outside and tail through the helper", inner.specs)
+	}
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+	const note = "codemeld: ran outside the sandbox: matches outside_sandbox_commands entry \"seq 1 20000\" in .codemeld/settings.local.yaml\n"
+	if len(ends) != 2 || !strings.HasPrefix(ends[0].Stderr, note) || strings.Contains(ends[1].Stderr, note) {
+		t.Fatalf("tool_exec_end = %+v, want the note on the head only", ends)
+	}
+	if got := ends[0].OriginalBytes; !ends[0].Truncated || got == nil || got.Stdout <= 64<<10 {
+		t.Fatalf("head tool_exec_end = %+v, want a truncated record of more than 64 KiB", ends[0])
+	}
+	if ends[1].ExitCode != 0 || ends[1].Stdout != "20000\n" {
+		t.Fatalf("tail exit %d, stdout %q, stderr %q; want the head's last line", ends[1].ExitCode, ends[1].Stdout, ends[1].Stderr)
+	}
+}
+
+func realHelperPipeDispatcher(t *testing.T, maxToolOutputBytes int, settings map[string]any) (*productionToolDispatcher, *helperForwardingRunner, *sessions.Store, string) {
+	t.Helper()
+	home, project, bin := realConfinementHost(t)
+	project, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(filepath.Dir(project), "tmp")
+	if err := os.Mkdir(tmpDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := config.NewCache(settings, project, []string{SettingsPath(home)}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+	conf := withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.Build, mode.SourceDefault), cache, home,
+		securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
+	store := mkStore(t)
+	inner := &helperForwardingRunner{bin: bin}
+	d := newProductionToolDispatcher(tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()}, home, project,
+		func() *sessions.Store { return store }, maxToolOutputBytes, securitystate.Policy{})
+	d.confinement = conf
+	return d, inner, store, project
+}
+
+func TestConfinedShell_CutPipedInputGetsANoticeThroughTheRealHelper(t *testing.T) {
+	const maxToolOutputBytes = 4096
+	total := 0
+	for i := 1; i <= 200000; i++ {
+		total += len(strconv.Itoa(i)) + 1
+	}
+	cut := func(received int) string {
+		return fmt.Sprintf("%d\ncodemeld: piped input cut: command 2 received %d of %d bytes from command 1; its result may be wrong.", received, received, total)
+	}
+	for _, tc := range []struct {
+		name      string
+		pipeBytes int
+		capture   int
+		want      string
+	}{
+		{"launch default", 0, 16777216, strconv.Itoa(total)},
+		{"small limit above the output limit", 8192, 8192, cut(8192)},
+		{"limit below the output limit", 1024, 1024, cut(maxToolOutputBytes)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, inner, store, _ := realHelperPipeDispatcher(t, maxToolOutputBytes, map[string]any{})
+			if tc.pipeBytes != 0 {
+				d.confinement.pipeBytes = tc.pipeBytes
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := d.Dispatch(ctx, bashCall("c1", "seq 1 200000 | wc -c"))
+			if err != nil || ctx.Err() != nil {
+				t.Fatalf("dispatch: %v, %v; result %+v", err, ctx.Err(), res)
+			}
+			if len(inner.specs) != 2 || inner.specs[0].Argv[0] != "/proc/self/exe" || inner.specs[1].Argv[0] != "/proc/self/exe" ||
+				inner.specs[0].StdoutCapture != tc.capture || inner.specs[1].StdoutCapture != 0 {
+				t.Fatalf("specs = %+v, want both stages through the helper and only the first capturing %d stdout bytes", inner.specs, tc.capture)
+			}
+			if res.Content != tc.want {
+				t.Fatalf("content = %q, want %q", res.Content, tc.want)
+			}
+			ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+			if len(ends) != 2 {
+				t.Fatalf("tool_exec_end events = %d, want one per stage", len(ends))
+			}
+			for i, end := range ends {
+				if len(end.Stdout) > maxToolOutputBytes || len(end.Stderr) > maxToolOutputBytes {
+					t.Fatalf("stage %d stored %d stdout and %d stderr bytes, want at most %d each", i+1, len(end.Stdout), len(end.Stderr), maxToolOutputBytes)
+				}
+			}
+			if got := ends[0].OriginalBytes; !ends[0].Truncated || got == nil || got.Stdout != int64(total) {
+				t.Fatalf("first stage tool_exec_end = %+v, want truncated with the full %d bytes", ends[0], total)
+			}
+		})
+	}
+}
+
+func TestConfinedShell_MaxPipeBytesSettingSetsTheHandOffThroughTheRealHelper(t *testing.T) {
+	const maxToolOutputBytes = 4096
+	total := 0
+	for i := 1; i <= 200000; i++ {
+		total += len(strconv.Itoa(i)) + 1
+	}
+	for _, tc := range []struct {
+		name         string
+		maxPipeBytes int
+		received     int
+	}{
+		{"custom value", 8192, 8192},
+		{"value below the output limit", 1024, maxToolOutputBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, inner, _, _ := realHelperPipeDispatcher(t, maxToolOutputBytes,
+				map[string]any{"sessions": map[string]any{"max_pipe_bytes": tc.maxPipeBytes}})
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := d.Dispatch(ctx, bashCall("c1", "seq 1 200000 | wc -c"))
+			if err != nil || ctx.Err() != nil {
+				t.Fatalf("dispatch: %v, %v; result %+v", err, ctx.Err(), res)
+			}
+			if len(inner.specs) != 2 || inner.specs[0].StdoutCapture != tc.maxPipeBytes {
+				t.Fatalf("specs = %+v, want the first stage capturing %d stdout bytes", inner.specs, tc.maxPipeBytes)
+			}
+			want := fmt.Sprintf("%d\ncodemeld: piped input cut: command 2 received %d of %d bytes from command 1; its result may be wrong.", tc.received, tc.received, total)
+			if res.Content != want {
+				t.Fatalf("content = %q, want %q", res.Content, want)
+			}
+		})
+	}
+}
+
+func TestRunHeadless_ConfinedPipePersistsWithinTheOutputLimitThroughTheRealHelper(t *testing.T) {
+	const maxToolOutputBytes = 4096
+	home, project, bin := realConfinementHost(t)
+	total := 0
+	for i := 1; i <= 200000; i++ {
+		total += len(strconv.Itoa(i)) + 1
+	}
+	run := &helperForwardingRunner{bin: bin}
+	result := headlessResult(t, project, mode.NewActiveState(mode.Plan, mode.SourceDefault))
+	result.Home, result.ConfigLayerPaths = home, []string{SettingsPath(home)}
+	result.Config["confinement"] = map[string]any{"program_lookup": "strict"}
+	result.Config["sessions"] = map[string]any{"max_tool_output_bytes": maxToolOutputBytes}
+	runHeadlessShell(t, result, run, "seq 1 200000 | wc -c; seq 1 200000 | cat")
+
+	if len(run.specs) != 4 || run.specs[0].StdoutCapture != 16777216 || run.specs[2].StdoutCapture != 16777216 {
+		t.Fatalf("inner runs = %+v, want four stages with both producers holding 16 MiB of stdout", run.specs)
+	}
+	reloaded := reloadStore(t, result.Session)
+	ends := decodeStoreEvents[events.ToolExecEnd](t, reloaded, events.KindToolExecEnd)
+	if len(ends) != 4 {
+		t.Fatalf("tool_exec_end events = %d, want one per stage", len(ends))
+	}
+	for i, end := range ends {
+		if len(end.Stdout) > maxToolOutputBytes || len(end.Stderr) > maxToolOutputBytes {
+			t.Fatalf("stage %d stored %d stdout and %d stderr bytes, want at most %d each", i+1, len(end.Stdout), len(end.Stderr), maxToolOutputBytes)
+		}
+	}
+	for _, i := range []int{0, 2, 3} {
+		if got := ends[i].OriginalBytes; !ends[i].Truncated || got == nil || got.Stdout != int64(total) {
+			t.Fatalf("stage %d tool_exec_end = %+v, want truncated with the full %d bytes", i+1, ends[i], total)
+		}
+	}
+	if ends[1].Stdout != strconv.Itoa(total)+"\n" {
+		t.Fatalf("wc stdout = %q, want the full %d bytes counted", ends[1].Stdout, total)
+	}
+	toolMsgs := messagesByRole(reloaded, "tool")
+	if len(toolMsgs) != 1 {
+		t.Fatalf("tool messages = %d, want one", len(toolMsgs))
+	}
+	count := strconv.Itoa(total) + "\n"
+	content := toolMsgs[0].Content.Text()
+	stdout, ok := strings.CutSuffix(content, "\n"+outputCutNotice("stdout", maxToolOutputBytes, len(count)+total))
+	if !ok || len(stdout) > maxToolOutputBytes || !strings.HasPrefix(stdout, count+"1\n2\n") {
+		t.Fatalf("tool message = %q, want at most %d stdout bytes starting with the wc count, then the cut notice", content, maxToolOutputBytes)
+	}
+}
+
+func TestConfinedShell_PipedStdinReachesTheCommandThroughTheRealHelper(t *testing.T) {
+	var piped bytes.Buffer
+	for i := 1; i <= 200000; i++ {
+		fmt.Fprintf(&piped, "%d\n", i)
+	}
+	sum := sha256.Sum256(piped.Bytes())
+	for _, tc := range []struct {
+		name, consumer, want string
+		within               time.Duration
+	}{
+		{"read in full", "sha256sum", hex.EncodeToString(sum[:]) + "  -", time.Second},
+		{"exits without reading", "true", "(no output)", time.Second},
+		{"leaves a background reader holding it", "holder", "(no output)", 3500 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, _, project := realHelperPipeDispatcher(t, 4096, map[string]any{})
+			consumer := tc.consumer
+			if consumer == "holder" {
+				consumer = filepath.Join(project, "holder")
+				if err := os.WriteFile(consumer, []byte("#!/bin/sh\nexec 3<&0\nsleep 5 <&3 >/dev/null 2>&1 &\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			began := time.Now()
+			res, err := d.Dispatch(ctx, bashCall("c1", "seq 1 200000 | "+consumer))
+			elapsed := time.Since(began)
+			if err != nil || ctx.Err() != nil {
+				t.Fatalf("dispatch: %v, %v; result %+v", err, ctx.Err(), res)
+			}
+			if res.Content != tc.want || elapsed > tc.within {
+				t.Fatalf("content = %q after %v, want %q within %v", res.Content, elapsed, tc.want, tc.within)
+			}
+		})
+	}
+}
+
+func TestConfinedShell_SavedCommandPipesItsMergedStderrThroughTheRealHelper(t *testing.T) {
+	for _, removed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("entry removed after routing %v", removed), func(t *testing.T) {
+			home, project, bin := realConfinementHost(t)
+			project, err := filepath.EvalSymlinks(project)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpDir := filepath.Join(filepath.Dir(project), "tmp")
+			if err := os.Mkdir(tmpDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			saved := filepath.Join(project, "check")
+			if err := os.WriteFile(saved, []byte("#!/bin/sh\necho first\necho last >&2\nexit 3\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeLocalProjectSettings(t, project, "outside_sandbox_commands: ["+strconv.Quote(saved)+"]\n")
+			cache, err := config.NewCache(map[string]any{}, project, []string{SettingsPath(home)}, home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cache.SetLocalAdmitted(true)
+			resolution := resolveExecutionCapability(enforce.ResolveInput{Home: home})
+			conf := withSessionProxy(t, launchConfinement(resolution, tmpDir, mode.NewActiveState(mode.Build, mode.SourceDefault), cache, home,
+				securitystate.Policy{Blocked: permissions.NewBlockedPaths(home, nil)}, nil))
+			store := mkStore(t)
+			inner := &helperForwardingRunner{bin: bin}
+			auth := &capturingAuthorizer{decision: allow()}
+			if removed {
+				auth.onAuthorize = func() { writeLocalProjectSettings(t, project, "outside_sandbox_commands: []\n") }
+			}
+			d := newProductionToolDispatcher(tools.NewRegistry(), inner, auth, home, project,
+				func() *sessions.Store { return store }, 4096, securitystate.Policy{})
+			d.confinement = conf
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res, err := d.Dispatch(ctx, bashCall("c1", saved+" 2>&1 | tail -n 1"))
+			if err != nil || ctx.Err() != nil {
+				t.Fatalf("dispatch: %v, %v; result %+v", err, ctx.Err(), res)
+			}
+			if len(inner.specs) != 2 || (inner.specs[0].Argv[0] == "/proc/self/exe") != removed || inner.specs[1].Argv[0] != "/proc/self/exe" {
+				t.Fatalf("specs = %+v, want head confined = %v and tail through the helper", inner.specs, removed)
+			}
+			ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+			if len(ends) != 2 || ends[0].ExitCode != 3 || ends[0].Stdout != "first\nlast\n" || ends[1].ExitCode != 0 || ends[1].Stdout != "last\n" {
+				t.Fatalf("tool_exec_end = %+v, want the merged head failing and tail printing its last line", ends)
+			}
+			note := "codemeld: ran outside the sandbox: matches outside_sandbox_commands entry " + strconv.Quote(saved) + " in .codemeld/settings.local.yaml\n"
+			failed := strings.Contains(res.Content, "exit status 3")
+			if removed {
+				if failed || strings.Contains(ends[0].Stderr, note) || !strings.Contains(ends[0].Stderr, "ran inside the confinement boundary") {
+					t.Fatalf("content %q, head stderr %q; want tail's status and only the sandbox note", res.Content, ends[0].Stderr)
+				}
+				return
+			}
+			if !failed || ends[0].Stderr != note || strings.Contains(ends[1].Stderr, note) || !strings.Contains(res.Content, note[:len(note)-1]) {
+				t.Fatalf("content %q, tool_exec_end %+v; want the head's status and its outside note", res.Content, ends)
+			}
+		})
 	}
 }

@@ -234,8 +234,8 @@ func TestAskUserToolDefinition_NameAndSchema(t *testing.T) {
 	if options["maxItems"] != MaxAskUserOptions {
 		t.Fatalf("options.maxItems = %v, want %d", options["maxItems"], MaxAskUserOptions)
 	}
-	if options["uniqueItems"] != true {
-		t.Fatalf("options.uniqueItems = %v, want true (it refuses identical option objects only; distinct labels are the decoder's check)", options["uniqueItems"])
+	if _, ok := options["uniqueItems"]; ok {
+		t.Fatalf("options.uniqueItems is set, want it absent (the ChatGPT strict-schema compiler rejects the keyword; distinct labels are the decoder's check)")
 	}
 	if got := options["description"].(string); !strings.Contains(got, "must differ from every other option's label") {
 		t.Errorf("options description = %q, want it to state that labels must be distinct", got)

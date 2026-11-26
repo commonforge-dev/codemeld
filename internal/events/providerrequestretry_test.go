@@ -80,6 +80,14 @@ func TestEmitProviderRequestRetry_AttemptBelowOneRejected(t *testing.T) {
 }
 
 func TestEmitProviderRequestRetry_FlushFailureInvokesHandler(t *testing.T) {
+	assertFlushFailureInvokesHandler(t, func(store *sessions.Store, handler WriteFailureHandler) error {
+		return EmitProviderRequestRetry(context.Background(), store, "openai", "gpt-4o",
+			"http", "http_error", 2, 1000, 0, handler)
+	})
+}
+
+func assertFlushFailureInvokesHandler(t *testing.T, emit func(store *sessions.Store, handler WriteFailureHandler) error) {
+	t.Helper()
 	wantErr := errors.New("flush boom")
 	restoreFlush := flushStore
 	flushStore = func(ctx context.Context, s *sessions.Store) (fserrors.Category, sessions.WriteReason, error) {
@@ -96,8 +104,7 @@ func TestEmitProviderRequestRetry_FlushFailureInvokesHandler(t *testing.T) {
 		gotReason = reason
 	}
 	store := sessions.New(filepath.Join(t.TempDir(), "session.json"), newSession())
-	err := EmitProviderRequestRetry(context.Background(), store, "openai", "gpt-4o",
-		"http", "http_error", 2, 1000, 0, handler)
+	err := emit(store, handler)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("returned error = %v, want %v", err, wantErr)
 	}

@@ -522,25 +522,11 @@ func TestGrepTool_ArgumentValidation(t *testing.T) {
 // outside, ../ traversal) and a directory-symlink `path` argument are all rejected fail-closed before any
 // traversal, with no out-of-root content leaked.
 func TestGrepTool_ContainmentRejections(t *testing.T) {
-	root := t.TempDir()
-	outsideDir := t.TempDir()
-	writeFile(t, filepath.Join(outsideDir, "secret.go"), "needle\n")
-	if err := os.Symlink(outsideDir, filepath.Join(root, "escape")); err != nil {
-		t.Fatalf("Symlink: %v", err)
-	}
-	mkdirAll(t, filepath.Join(root, "realdir"))
-	if err := os.Symlink(filepath.Join(root, "realdir"), filepath.Join(root, "indirlink")); err != nil {
-		t.Fatalf("Symlink: %v", err)
-	}
-	tool := newGrepToolIn(t, root)
-
-	assertContainmentRejections(t, func(p string) (tools.Result, error) {
-		return invokeGrep(t, tool, map[string]any{"pattern": "needle", "path": p})
-	}, "needle", []pathCase{
-		{"symlink escape dir", "escape"},
-		{"absolute outside", outsideDir},
-		{"dotdot traversal", "../" + filepath.Base(outsideDir)},
-		{"in-root directory symlink", "indirlink"},
+	assertToolContainment(t, "needle\n", "needle", func(t *testing.T, root string) func(path string) (tools.Result, error) {
+		tool := newGrepToolIn(t, root)
+		return func(p string) (tools.Result, error) {
+			return invokeGrep(t, tool, map[string]any{"pattern": "needle", "path": p})
+		}
 	})
 }
 

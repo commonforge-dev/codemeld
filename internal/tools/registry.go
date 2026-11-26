@@ -28,6 +28,17 @@ type Result struct {
 	// this result, so the model context and the reported result cannot describe two different
 	// reads of the same path. Empty for every tool that produces no image.
 	ModelContextImage string
+
+	// A zero total means not reported.
+	StdoutTotal int64
+	StderrTotal int64
+	PipeCuts    []PipeCut
+}
+
+type PipeCut struct {
+	Command  int
+	Received int64
+	Total    int64
 }
 
 // Metadata is the advertising metadata and read-only classification a Tool exposes.

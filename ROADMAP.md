@@ -12,15 +12,26 @@
 ## Ongoing
 
 ## Completed
+- **0.4.15 Beta November 2026:**
+  - Build can run matching commands listed in admitted project settings.local.yaml outside the sandbox, subject to ordinary authorization and supported command forms
+  - Fewer repeat prompts: saved approvals for piped or chained commands still apply when error output is merged
+  - Fix for the v0.4.14 known issue with unrecorded version-control connections
+  - Fix: the ChatGPT model gpt-6.2-astra no longer fails every turn in the editor with an HTTP 400 error before the model runs
+  - Sandboxed pipes pass up to sessions.max_pipe_bytes (16 MiB by default) to the next command, separately from the model's output limit
+  - Security fix for the v0.4.14 known issue with directory tools
+  - Security fix: a settings file or folder that cannot be read now makes codemeld ask again instead of approving automatically
+  - Security fix: a web fetch stops after you deny a redirect instead of retrying over plain HTTP
+  - Security fix: read-only Git dispatch suppresses repository-configured fsmonitor, pager, external diff and textconv programs; other configured programs are not isolated
+  - The model is told when a command's output, or what was piped into it, was cut at the output limit
 - **0.4.14 Beta — November 2026:**
-  - When a sandboxed command fails because it wrote outside the allowed folders, codemeld tells you which folder and how to allow it
-  - Folders that sandboxed commands may write to can be added and removed in settings
-  - OpenRouter model settings show how many providers fit your price caps, and their speed range
-  - How long codemeld waits for a model that sends nothing is configurable
   - ChatGPT models keep working when OpenAI updates its client version
+  - Folders that sandboxed commands may write to can be added and removed in settings
   - Headless runs can use a model from a provider whose models codemeld hasn't loaded yet
-  - Security fix: directory tools that walk the project folder itself or a folder outside the project can no longer be led into a blocked folder by a link swapped in after the blocked check
+  - How long codemeld waits for a model that sends nothing is configurable
   - Model prompts and documentation corrected for sandboxed network access and inherited variables
+  - OpenRouter model settings show how many providers fit your price caps, and their speed range
+  - Security fix: directory tools that walk the project folder itself or a folder outside the project can no longer be led into a blocked folder by a link swapped in after the blocked check
+  - When a sandboxed command fails because it wrote outside the allowed folders, codemeld tells you which folder and how to allow it
 - **0.4.13 Beta — November 2026:**
   - Sandboxed Auto edits can amend the last commit without asking, until it has been pushed
   - Build mode runs the commands you approve inside the sandbox; when one fails, codemeld says which folder was refused and can run it once outside the sandbox after asking

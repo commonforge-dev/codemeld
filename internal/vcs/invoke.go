@@ -243,6 +243,8 @@ func invokeResolvedCWD(ctx context.Context, actionName string, action *ActionSpe
 	if err := emit(endPayload(actionName, res, stdoutTotal, stderrTotal, invocationID, cap, ChildInvocationID(ctx))); err != nil {
 		return tools.Result{}, err
 	}
+	res.StdoutTotal = max(stdoutTotal, int64(len(res.Stdout)))
+	res.StderrTotal = max(stderrTotal, int64(len(res.Stderr)))
 	return res, nil
 }
 
@@ -259,6 +261,8 @@ func emitPaired(ctx context.Context, emit EventAppender, actionName, pathScope, 
 	if err := emit(endPayload(actionName, res, 0, 0, invocationID, cap, childID)); err != nil {
 		return tools.Result{}, err
 	}
+	res.StdoutTotal = int64(len(res.Stdout))
+	res.StderrTotal = int64(len(res.Stderr))
 	return res, nil
 }
 

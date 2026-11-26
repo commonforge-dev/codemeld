@@ -21,11 +21,12 @@ const localKeyDetail = "key belongs in the project's .codemeld/settings.yaml"
 const localGlobalGrantDetail = "grant_kind global is a machine-wide grant and must be written to ~/.codemeld/global/settings.yaml"
 
 var localAllowedKeys = map[string]bool{
-	"model":          true,
-	"permissions":    true,
-	blockedPathsKey:  true,
-	domainGrantsKey:  true,
-	connectGrantsKey: true,
+	"model":                    true,
+	"permissions":              true,
+	blockedPathsKey:            true,
+	domainGrantsKey:            true,
+	connectGrantsKey:           true,
+	"outside_sandbox_commands": true,
 }
 
 var localAllowedModelSubkeys = map[string]bool{"active": true}

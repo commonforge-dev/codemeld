@@ -248,10 +248,10 @@ detect:
   marker: .git
 
 status:
-  argv: [git, status, --short]
+  argv: [git, -c, core.fsmonitor=false, -c, core.pager=cat, --no-pager, status, --short]
 
 diff:
-  argv: [git, diff]
+  argv: [git, -c, core.fsmonitor=false, -c, core.pager=cat, --no-pager, diff, --no-ext-diff, --no-textconv]
 
 add:
   argv: [git, add, "{path}"]
@@ -263,7 +263,7 @@ amend:
   argv: [git, commit, --amend, -m, "{message}"]
 
 log:
-  argv: [git, log, --oneline, -n, "20"]
+  argv: [git, -c, core.fsmonitor=false, -c, core.pager=cat, --no-pager, log, --oneline, -n, "20"]
 
 branch-current:
   argv: [git, branch, --show-current]
@@ -278,7 +278,7 @@ restore-file:
   argv: [git, restore, "{path}"]
 
 is-clean:
-  argv: [git, status, --porcelain]
+  argv: [git, -c, core.fsmonitor=false, -c, core.pager=cat, --no-pager, status, --porcelain]
 
 stash:
   argv: [git, stash, push]

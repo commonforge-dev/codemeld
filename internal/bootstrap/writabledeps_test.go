@@ -217,3 +217,132 @@ func TestWritableFolders_ListReportsAFIFOSettingsFileUnreadable(t *testing.T) {
 		t.Fatalf("lstat lock file: %v, want none created", err)
 	}
 }
+
+func writeLocalSettings(t *testing.T, project, content string) string {
+	t.Helper()
+	path := filepath.Join(project, ".codemeld", "settings.local.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func requireFileBytes(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("%s =\n%q\nwant\n%q", path, got, want)
+	}
+}
+
+func TestOutsideCommands_ListReadsOnlyTheLocalFile(t *testing.T) {
+	project := declaredScopeDir(t)
+	writeProjectSettings(t, project, "outside_sandbox_commands: [committed command]\n")
+	writeLocalSettings(t, project, "outside_sandbox_commands: [mise run check]\n")
+
+	rows, unreadable := newWritableFolders(declaredScopeDir(t), project, true).outsideCommands().list()
+
+	if unreadable != "" || len(rows) != 1 || rows[0].Entry != "mise run check" || rows[0].Invalid != "" {
+		t.Fatalf("list = %+v, %q; want only the valid local entry", rows, unreadable)
+	}
+}
+
+func TestOutsideCommands_ListWithoutLocalFileIsEmpty(t *testing.T) {
+	project := declaredScopeDir(t)
+	writeProjectSettings(t, project, "outside_sandbox_commands: [committed command]\n")
+
+	rows, unreadable := newWritableFolders(declaredScopeDir(t), project, true).outsideCommands().list()
+
+	if unreadable != "" || len(rows) != 0 {
+		t.Fatalf("list = %+v, %q; want an empty list", rows, unreadable)
+	}
+}
+
+func TestOutsideCommands_ListMarksEntriesParseEntryRejects(t *testing.T) {
+	project := declaredScopeDir(t)
+	writeLocalSettings(t, project, "outside_sandbox_commands: [web_fetch, go vet ./...]\n")
+
+	rows, unreadable := newWritableFolders(declaredScopeDir(t), project, true).outsideCommands().list()
+
+	if unreadable != "" || len(rows) != 2 {
+		t.Fatalf("list = %+v, %q; want two rows", rows, unreadable)
+	}
+	if !strings.Contains(rows[0].Invalid, "web_fetch") {
+		t.Fatalf("rows[0].Invalid = %q, want the parse error for web_fetch", rows[0].Invalid)
+	}
+	if rows[1].Invalid != "" {
+		t.Fatalf("rows[1].Invalid = %q, want a valid entry", rows[1].Invalid)
+	}
+}
+
+func TestOutsideCommands_RemoveRewritesOnlyTheLocalFile(t *testing.T) {
+	project := declaredScopeDir(t)
+	const committed = "# shared\noutside_sandbox_commands: [mise run check]\n"
+	writeProjectSettings(t, project, committed)
+	local := writeLocalSettings(t, project, "# mine\noutside_sandbox_commands:\n- mise run check\n- go vet ./...\n")
+
+	msg := newWritableFolders(declaredScopeDir(t), project, true).outsideCommands().remove("mise run check")
+
+	if want := "mise run check removed from outside_sandbox_commands in " + local; msg != want {
+		t.Fatalf("remove = %q, want %q", msg, want)
+	}
+	requireFileBytes(t, local, "# mine\noutside_sandbox_commands:\n- go vet ./...\n")
+	requireFileBytes(t, filepath.Join(project, ".codemeld", "settings.yaml"), committed)
+}
+
+func TestOutsideCommands_RemoveAbsentEntryWritesNothing(t *testing.T) {
+	t.Run("entry not in the local list", func(t *testing.T) {
+		project := declaredScopeDir(t)
+		const content = "outside_sandbox_commands: [go vet ./...]\n"
+		local := writeLocalSettings(t, project, content)
+
+		msg := newWritableFolders(declaredScopeDir(t), project, true).outsideCommands().remove("mise run check")
+
+		if want := "mise run check is not in outside_sandbox_commands in " + local + "; nothing written"; msg != want {
+			t.Fatalf("remove = %q, want %q", msg, want)
+		}
+		requireFileBytes(t, local, content)
+	})
+	t.Run("no local file", func(t *testing.T) {
+		project := declaredScopeDir(t)
+
+		msg := newWritableFolders(declaredScopeDir(t), project, true).outsideCommands().remove("mise run check")
+
+		if !strings.HasSuffix(msg, "; nothing written") {
+			t.Fatalf("remove = %q, want a nothing-written refusal", msg)
+		}
+		if _, err := os.Stat(filepath.Join(project, ".codemeld")); !os.IsNotExist(err) {
+			t.Fatalf("stat .codemeld: %v, want nothing written", err)
+		}
+	})
+}
+
+func TestOutsideCommands_RemoveRefusesWithoutApprovedProject(t *testing.T) {
+	const refusal = "refused: project settings are not available for this launch (no approved project root); nothing written"
+	const content = "outside_sandbox_commands: [mise run check]\n"
+	cases := map[string]func(project string) outsideCommands{
+		"untrusted project": func(project string) outsideCommands {
+			return newWritableFolders(declaredScopeDir(t), project, false).outsideCommands()
+		},
+		"no project root": func(string) outsideCommands {
+			return newWritableFolders(declaredScopeDir(t), "", true).outsideCommands()
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			project := declaredScopeDir(t)
+			local := writeLocalSettings(t, project, content)
+
+			if got := build(project).remove("mise run check"); got != refusal {
+				t.Fatalf("remove = %q, want %q", got, refusal)
+			}
+			requireFileBytes(t, local, content)
+		})
+	}
+}

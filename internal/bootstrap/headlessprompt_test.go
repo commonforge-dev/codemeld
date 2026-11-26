@@ -1056,8 +1056,12 @@ func TestTerminalPrompter_DirectProgramScopeNeedsDistinctConfirmation(t *testing
 	if !strings.Contains(confirm, "confirm program-wide grant") {
 		t.Fatalf("confirm is not a distinct acknowledgement choice:\n%s", confirm)
 	}
-	if strings.Contains(got, scopeDestructiveProgramWarning) {
+	if strings.Contains(got, "Edit capable program") {
 		t.Fatalf("non-destructive program carried the destructive advisory:\n%s", got)
+	}
+	const note = "\n  A choice ending in :* matches any command that starts with the words before :*.\n  Example: go test :* matches go test -v, but not go build.\n"
+	if !strings.Contains(got, note) {
+		t.Fatalf("scope choices do not show the indented prefix note %q:\n%s", note, got)
 	}
 	if strings.Contains(confirm, "saved to:") {
 		t.Fatalf("session Program confirmation claimed a persistence target:\n%s", confirm)
@@ -1067,6 +1071,10 @@ func TestTerminalPrompter_DirectProgramScopeNeedsDistinctConfirmation(t *testing
 	loud, outcome := promptDirect(t, "4\n3\n1\n", destructive, d)
 	if outcome.Choice != permissions.PromptAllowFolder || outcome.StoredSubject != "rm :*" {
 		t.Fatalf("outcome = %+v, want a folder grant storing %q", outcome, "rm :*")
+	}
+	const editWarning = "\n  WARNING - Edit capable program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history.\n"
+	if !strings.Contains(loud, editWarning) || strings.Contains(loud, "this matches EVERY") {
+		t.Fatalf("destructive confirm does not carry exactly the approval warning %q:\n%s", editWarning, loud)
 	}
 	tail := loud[strings.LastIndex(loud, scopeDestructiveProgramWarning):]
 	if !strings.Contains(tail, scopeProgramWarning) {

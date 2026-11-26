@@ -1243,8 +1243,8 @@ func TestRedactCredentials_SkipsEmptySecrets(t *testing.T) {
 }
 
 func TestChatGPTCodexClientVersionPinned(t *testing.T) {
-	if chatGPTCodexClientVersion != "0.169.0" {
-		t.Fatalf("chatGPTCodexClientVersion = %q, want 0.169.0", chatGPTCodexClientVersion)
+	if chatGPTCodexClientVersion != "0.172.0" {
+		t.Fatalf("chatGPTCodexClientVersion = %q, want 0.172.0", chatGPTCodexClientVersion)
 	}
 }
 
@@ -1274,7 +1274,7 @@ func chatGPTToServer(t *testing.T, discovery *httptest.Server) *http.Client {
 }
 
 func TestRefreshChatGPTModelCache_SendsHighestClientVersion(t *testing.T) {
-	const pinned = "0.169.0"
+	const pinned = "0.172.0"
 	jsonVersion := func(v string) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")

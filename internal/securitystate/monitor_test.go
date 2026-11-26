@@ -258,11 +258,7 @@ func TestMonitor_DeclaredCommandDrift(t *testing.T) {
   - prep-open-tasks.sh --only
   - sed -n
 `
-	tests := []struct {
-		name   string
-		after  string
-		labels []Label
-	}{
+	assertSectionDrift(t, before, SectionDeclaredCommands, []driftCase{
 		{
 			name:   "entry added",
 			after:  before + "  - ./dira\n",
@@ -278,15 +274,25 @@ func TestMonitor_DeclaredCommandDrift(t *testing.T) {
 			after:  strings.Replace(before, "prep-open-tasks.sh --only", "prep-open-tasks.sh", 1),
 			labels: []Label{LabelAdded, LabelRemoved},
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := checkpointAfter(t, LayerProject, before, tt.after)
-			if !slices.Equal(result.Sections, []Section{SectionDeclaredCommands}) {
-				t.Fatalf("sections = %v, want only %q", result.Sections, SectionDeclaredCommands)
+	})
+}
+
+type driftCase struct {
+	name   string
+	after  string
+	labels []Label
+}
+
+func assertSectionDrift(t *testing.T, before string, section Section, cases []driftCase) {
+	t.Helper()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := checkpointAfter(t, LayerProject, before, tc.after)
+			if !slices.Equal(result.Sections, []Section{section}) {
+				t.Fatalf("sections = %v, want only %q", result.Sections, section)
 			}
-			if !slices.Equal(result.Labels, tt.labels) {
-				t.Fatalf("labels = %v, want %v", result.Labels, tt.labels)
+			if !slices.Equal(result.Labels, tc.labels) {
+				t.Fatalf("labels = %v, want %v", result.Labels, tc.labels)
 			}
 		})
 	}
@@ -378,11 +384,7 @@ func TestMonitor_WritableFolderDrift(t *testing.T) {
   - /data/build
   - "~/scratch"
 `
-	tests := []struct {
-		name   string
-		after  string
-		labels []Label
-	}{
+	assertSectionDrift(t, before, SectionWritableFolders, []driftCase{
 		{
 			name:   "entry added",
 			after:  before + "  - /data/cache\n",
@@ -398,18 +400,7 @@ func TestMonitor_WritableFolderDrift(t *testing.T) {
 			after:  strings.Replace(before, "/data/build", "/data", 1),
 			labels: []Label{LabelAdded, LabelRemoved},
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := checkpointAfter(t, LayerProject, before, tt.after)
-			if !slices.Equal(result.Sections, []Section{SectionWritableFolders}) {
-				t.Fatalf("sections = %v, want only %q", result.Sections, SectionWritableFolders)
-			}
-			if !slices.Equal(result.Labels, tt.labels) {
-				t.Fatalf("labels = %v, want %v", result.Labels, tt.labels)
-			}
-		})
-	}
+	})
 }
 
 func TestMonitor_WritableFolderReorderIsNotDrift(t *testing.T) {

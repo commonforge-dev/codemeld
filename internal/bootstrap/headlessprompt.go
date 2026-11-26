@@ -344,7 +344,7 @@ const hostFreshConfirmationNotice = "⚠ Non-default scheme or port: this needs 
 
 const scopeProgramWarning = "⚠ Program scope authorizes ANY invocation of this program with ANY arguments within the chosen path scope."
 
-const scopeDestructiveProgramWarning = "⚠ DESTRUCTIVE program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history."
+const scopeDestructiveProgramWarning = "WARNING - Edit capable program: this grant authorizes EVERY subcommand, including ones that permanently delete data or rewrite history."
 
 // promptSummaryRows routes through the same permissions owner the interactive prompt uses, so
 // both surfaces report identical shape counts for a request.
@@ -384,7 +384,7 @@ func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.Pr
 		return
 	}
 	if disp.Action != "" {
-		_, _ = fmt.Fprintf(p.out, "  %s: %s\n", disp.Action, visible(disp.Subject))
+		_, _ = fmt.Fprintf(p.out, "  %s: %s\n", tui.PromptAction(disp.Action, disp.ExceptionalAuthority), visible(disp.Subject))
 	} else if disp.Subject != "" {
 		_, _ = fmt.Fprintf(p.out, "  %s\n", visible(disp.Subject))
 	}
@@ -414,8 +414,12 @@ func (p *terminalPrompter) render(req permissions.MatchRequest, disp dispatch.Pr
 	if line := capabilityCoverageLine(req, disp); line != "" {
 		_, _ = fmt.Fprintf(p.out, "  %s\n", line)
 	}
-	if disp.ExceptionalAuthority != "" {
+	if disp.ExceptionalAuthority == outsideSandboxAuthority {
+		_, _ = fmt.Fprintln(p.out, "  [1] allow this once     — run the command again, once, outside the sandbox; nothing is saved")
+	} else if disp.ExceptionalAuthority != "" {
 		_, _ = fmt.Fprintln(p.out, "  [1] allow this once     — run this call only; nothing is remembered and a repeat asks again")
+	}
+	if disp.ExceptionalAuthority != "" {
 		_, _ = fmt.Fprintln(p.out, "  [2] deny                — refuse this call")
 		_, _ = fmt.Fprint(p.out, "codemeld: choose 1-2: ")
 		return
@@ -572,7 +576,7 @@ func (p *terminalPrompter) readDirectScope(ctx context.Context, req permissions.
 	return outcome, nil
 }
 
-const scopePrefixNotice = "A prefix choice stores every token shown before :* verbatim; only the tokens after it may vary. Changing a fixed token re-prompts."
+const scopePrefixNotice = "A choice ending in :* matches any command that starts with the words before :*.\nExample: go test :* matches go test -v, but not go build."
 
 // headlessScopeChoices fixes the path choice at its widest selectable ancestor: this surface
 // reads one number and cannot walk the boundary, and the immediate parent of a path that
@@ -614,7 +618,9 @@ func (p *terminalPrompter) renderScopeChoices(req permissions.MatchRequest, mode
 	for i, c := range choices {
 		_, _ = fmt.Fprintf(p.out, "  [%d] %s%s\n", i+1, permissions.SingleLineControlEscape(p.scopeLabel(model, c)), recommendedMark(i == model.Recommended))
 	}
-	_, _ = fmt.Fprintf(p.out, "  %s\n", scopePrefixNotice)
+	for line := range strings.SplitSeq(scopePrefixNotice, "\n") {
+		_, _ = fmt.Fprintf(p.out, "  %s\n", line)
+	}
 	if row := model.PathRow(); row >= 0 {
 		_, _ = fmt.Fprintf(p.out, "  %s\n", scopePathNotice(choices[row].Boundaries[choices[row].Boundary]))
 	}

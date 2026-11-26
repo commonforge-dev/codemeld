@@ -1042,27 +1042,30 @@ func (d *productionToolDispatcher) Dispatch(ctx context.Context, call turn.Assem
 				return turn.ToolResult{Content: hint}, nil
 			}
 		}
-		shellRun := &shellEventRunner{inner: d.runner, active: d.active, cap: d.outputCap, childInvocationID: d.childInvocationID, timeout: timeout}
-		defer shellRun.releaseExecution()
-		run := &confinedShellRunner{events: shellRun, conf: d.confinement}
-		res, derr := dispatch.DispatchShell(ctx, command, d.home, d.processCWD, d.authorizer, run, d.guard)
-		var refusal *securitystate.Refusal
-		if errors.As(derr, &refusal) {
-			return d.denyProtectedState(refusal)
+		auto := readOnlyRecorder{Authorizer: d.authorizer, auto: map[string]bool{}}
+		var first dispatch.Authorizer = auto
+		if batch, ok := d.authorizer.(dispatch.BatchAuthorizer); ok {
+			first = batchReadOnlyRecorder{auto, batch}
 		}
-		timedOut := derr == nil && shellRun.timedOut(ctx)
-		noteRoom := 0
-		if timedOut {
-			noteRoom = len("\n" + bashTimeoutNote(timeout))
+		res, failure, derr := d.runShell(ctx, command, timeout, first, len("\n"+outsideDeclinedLine))
+		defer failure.forget()
+		if derr != nil || failure == nil || !failure.outside || !slices.ContainsFunc(failure.subjects, func(s string) bool { return !auto.auto[s] }) {
+			return d.shellResult(res, derr)
 		}
-		if run.failure != nil {
-			res.Stderr, _ = withConfinedFailure(res.Stderr, d.outputCap-noteRoom, run.failure)
+		again, againFailure, aerr := d.runShell(ctx, command, timeout, d.authorizer, 0)
+		defer againFailure.forget()
+		if denied := (*dispatch.DeniedError)(nil); errors.As(aerr, &denied) {
+			total := max(res.StderrTotal, int64(len(res.Stderr)))
+			kept := len(rawPrefixWithin(res.Stderr, d.outputCap-len("\n"+outsideDeclinedLine)))
+			res.Stderr = withBashTimeoutNote(res.Stderr, d.outputCap, outsideDeclinedLine)
+			res.StderrTotal = total + int64(len(res.Stderr)-kept)
+			return d.shellResult(res, nil)
 		}
-		if timedOut {
-			res.Stderr = withBashTimeoutNote(res.Stderr, d.outputCap, bashTimeoutNote(timeout))
-			res.ExitCode = -1
+		if aerr == nil {
+			again.StderrTotal = max(again.StderrTotal, int64(len(again.Stderr))) + int64(len(outsideRetriedLine))
+			again.Stderr = append([]byte(outsideRetriedLine), again.Stderr...)
 		}
-		return d.adapt(res, derr, false)
+		return d.shellResult(again, aerr)
 	}
 	if call.Name == provider.AskUserToolName && d.askUser != nil {
 		return d.dispatchAskUser(ctx, call.Arguments)
@@ -1092,6 +1095,73 @@ func (d *productionToolDispatcher) Dispatch(ctx context.Context, call turn.Assem
 	}
 	res, derr := dispatch.DispatchTool(ctx, call.Name, args, d.home, d.processCWD, d.registry, d.authorizer, d.guard)
 	return d.adaptTool(call.Name, res, derr)
+}
+
+const (
+	outsideRetriedLine  = "codemeld: this command failed in the sandbox; the user had it run again outside the sandbox.\n"
+	outsideDeclinedLine = "codemeld: the user chose not to run this command outside the sandbox."
+)
+
+type readOnlyRecorder struct {
+	dispatch.Authorizer
+	auto map[string]bool
+}
+
+func (r readOnlyRecorder) Authorize(ctx context.Context, req permissions.MatchRequest, disp dispatch.PromptDisplay, modeCtx permissions.ModeContext) (permissions.Decision, error) {
+	dec, err := r.Authorizer.Authorize(ctx, req, disp, modeCtx)
+	r.auto[req.Subject] = r.auto[req.Subject] || dec.ReadOnlyAuto
+	return dec, err
+}
+
+type batchReadOnlyRecorder struct {
+	readOnlyRecorder
+	batch dispatch.BatchAuthorizer
+}
+
+func (r batchReadOnlyRecorder) AuthorizeBatch(ctx context.Context, reqs []dispatch.BatchAuthRequest) ([]permissions.Decision, error) {
+	decs, err := r.batch.AuthorizeBatch(ctx, reqs)
+	for i, dec := range decs {
+		r.auto[reqs[i].Req.Subject] = r.auto[reqs[i].Req.Subject] || dec.ReadOnlyAuto
+	}
+	return decs, err
+}
+
+func (d *productionToolDispatcher) runShell(ctx context.Context, command string, timeout time.Duration, authorizer dispatch.Authorizer, room int) (tools.Result, *confinedFailure, error) {
+	shellRun := &shellEventRunner{inner: d.runner, active: d.active, cap: d.outputCap, childInvocationID: d.childInvocationID, timeout: timeout}
+	defer shellRun.releaseExecution()
+	run := &confinedShellRunner{events: shellRun, conf: d.confinement}
+	res, derr := dispatch.DispatchShell(ctx, command, d.home, d.processCWD, authorizer, run, d.guard)
+	if run.failure == nil || !run.failure.outside {
+		room = 0
+	}
+	timedOut := derr == nil && shellRun.timedOut(ctx)
+	noteRoom := 0
+	if timedOut {
+		noteRoom = len("\n" + bashTimeoutNote(timeout))
+	}
+	stderrTotal := max(res.StderrTotal, int64(len(res.Stderr)))
+	if run.failure != nil {
+		var kept int
+		res.Stderr, kept = withConfinedFailure(res.Stderr, d.outputCap-noteRoom-room, run.failure)
+		stderrTotal += int64(len(res.Stderr) - kept)
+		res.StderrTotal = stderrTotal
+	}
+	if timedOut {
+		kept := len(rawPrefixWithin(res.Stderr, d.outputCap-noteRoom-room))
+		res.Stderr = withBashTimeoutNote(res.Stderr, d.outputCap-room, bashTimeoutNote(timeout))
+		stderrTotal += int64(len(res.Stderr) - kept)
+		res.StderrTotal = stderrTotal
+		res.ExitCode = -1
+	}
+	return res, run.failure, derr
+}
+
+func (d *productionToolDispatcher) shellResult(res tools.Result, err error) (turn.ToolResult, error) {
+	var refusal *securitystate.Refusal
+	if errors.As(err, &refusal) {
+		return d.denyProtectedState(refusal)
+	}
+	return d.adapt(res, err, false)
 }
 
 // dispatchGeneralAgent runs the two halves of DispatchTool separately so a general_agent call whose
@@ -1297,8 +1367,29 @@ func formatToolResult(res tools.Result, cap int, preserveStdoutNewlines bool) st
 	if res.ExitCode != 0 {
 		parts = append(parts, fmt.Sprintf("exit status %d", res.ExitCode))
 	}
+	content := strings.Join(parts, "\n")
 	if len(parts) == 0 {
-		return "(no output)"
+		content = "(no output)"
 	}
-	return strings.Join(parts, "\n")
+	var notices []string
+	for _, c := range res.PipeCuts {
+		notices = append(notices, fmt.Sprintf("codemeld: piped input cut: command %d received %d of %d bytes from command %d; its result may be wrong.", c.Command, c.Received, c.Total, c.Command-1))
+	}
+	notices = appendOutputCut(notices, "stdout", res.Stdout, res.StdoutTotal, cap)
+	notices = appendOutputCut(notices, "stderr", res.Stderr, res.StderrTotal, cap)
+	if len(notices) == 0 {
+		return content
+	}
+	return content + "\n" + strings.Join(notices, "\n")
+}
+
+func appendOutputCut(notices []string, stream string, held []byte, total int64, cap int) []string {
+	if total == 0 {
+		return notices
+	}
+	kept, _, truncated, _ := events.TruncateToolOutput(held, nil, cap)
+	if !truncated && total <= int64(len(held)) {
+		return notices
+	}
+	return append(notices, fmt.Sprintf("codemeld: output cut: %s shows %d of %d bytes; the rest is missing. Narrow the command to see it.", stream, len(kept), total))
 }

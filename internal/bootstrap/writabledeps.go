@@ -131,3 +131,80 @@ func persistWritableFolder(path string, payload any) string {
 	}
 	return ""
 }
+
+type outsideCommands struct {
+	projectRoot string
+	allowed     bool
+}
+
+func (w writableFolders) outsideCommands() outsideCommands {
+	return outsideCommands{projectRoot: w.projectRoot, allowed: w.allowed}
+}
+
+func (o outsideCommands) entries() ([]string, error) {
+	if o.projectRoot == "" {
+		return nil, nil
+	}
+	path := config.LocalSettingsPath(o.projectRoot)
+	data, found, ok := fsutil.ReadSettingsBytes(path)
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", path, errSettingsUnreadable)
+	}
+	if !found {
+		return nil, nil
+	}
+	raw, _, err := config.ValidateLocalSettingsBytes(data, path)
+	if err != nil {
+		return nil, err
+	}
+	value := raw[config.KeyOutsideSandboxCommands]
+	if value == nil {
+		return nil, nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s: outside_sandbox_commands must be a list, got %T", path, value)
+	}
+	entries := make([]string, len(items))
+	for i, item := range items {
+		if entries[i], ok = item.(string); !ok {
+			return nil, fmt.Errorf("%s: outside_sandbox_commands entry %d must be a string, got %T", path, i, item)
+		}
+	}
+	return entries, nil
+}
+
+func (o outsideCommands) list() ([]tui.WritableFolderRow, string) {
+	entries, err := o.entries()
+	if err != nil {
+		return nil, fserrors.CollapseControls(err.Error())
+	}
+	path := config.LocalSettingsPath(o.projectRoot)
+	rows := make([]tui.WritableFolderRow, len(entries))
+	for i, entry := range entries {
+		rows[i].Entry = entry
+		raw := map[string]any{"kind": "direct", "subject": entry, "path_scope": "*", "grant_kind": "global"}
+		if _, err := permissions.ParseEntry(raw, path, i); err != nil {
+			rows[i].Invalid = fserrors.CollapseControls(err.Error())
+		}
+	}
+	return rows, ""
+}
+
+func (o outsideCommands) remove(entry string) string {
+	if !o.allowed || o.projectRoot == "" {
+		return blockedProjectUnavailable
+	}
+	path := config.LocalSettingsPath(o.projectRoot)
+	current, err := o.entries()
+	if err != nil {
+		return fserrors.CollapseControls(err.Error()) + "; nothing written"
+	}
+	if !slices.Contains(current, entry) {
+		return fmt.Sprintf("%s is not in outside_sandbox_commands in %s; nothing written", fserrors.CollapseControls(entry), fserrors.CollapseControls(path))
+	}
+	if _, reason, _, err := config.PersistLocal(o.projectRoot, config.KeyOutsideSandboxCommands, config.WritableFolderRemove(entry)); err != nil {
+		return fmt.Sprintf("couldn't update %s: %s", fserrors.CollapseControls(path), reason)
+	}
+	return fmt.Sprintf("%s removed from outside_sandbox_commands in %s", fserrors.CollapseControls(entry), fserrors.CollapseControls(path))
+}

@@ -2175,3 +2175,63 @@ func TestActionTool_AmendHgRepository(t *testing.T) {
 		t.Fatalf("last commit description = %q after a refusal, want amended", got)
 	}
 }
+
+func newGitCanaryRepo(t *testing.T, configKey string) (root, marker string) {
+	t.Helper()
+	requireBinary(t, "git")
+	root = t.TempDir()
+	scripts := t.TempDir()
+	marker = filepath.Join(scripts, "ran")
+	script := filepath.Join(scripts, "canary")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"f.txt": "one\n", ".gitattributes": "f.txt diff=canary\n"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runIn(t, root, "git", "init", "-q")
+	runIn(t, root, "git", "add", ".")
+	runIn(t, root, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "init")
+	runIn(t, root, "git", "config", configKey, script)
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root, marker
+}
+
+func TestBuiltinGitReadOnlyActions_RunNoRepositoryConfiguredProgram(t *testing.T) {
+	wantOutput := map[string]string{"vcs_status": "f.txt", "vcs_diff": "+two", "vcs_log": "init", "vcs_is_clean": "f.txt"}
+	wantReadOnly := []string{"vcs_branch_current", "vcs_diff", "vcs_is_clean", "vcs_log", "vcs_merge_status", "vcs_rebase_status", "vcs_status"}
+	for _, key := range []string{"core.fsmonitor", "diff.external", "diff.canary.textconv", "core.pager"} {
+		t.Run(key, func(t *testing.T) {
+			root, marker := newGitCanaryRepo(t, key)
+			reg := tools.NewRegistry()
+			if err := RegisterActions(reg, mustLoadBuiltin(t, "git"), root, cmdrunner.DirectExecRunner{}, newCapture().appendEvent, 1<<16); err != nil {
+				t.Fatalf("RegisterActions: %v", err)
+			}
+			var ran []string
+			for _, tool := range reg.List() {
+				if !tool.Advertise().ReadOnly {
+					continue
+				}
+				ran = append(ran, tool.Name())
+				res, err := tool.Invoke(context.Background(), map[string]any{})
+				if err != nil {
+					t.Fatalf("%s: %v", tool.Name(), err)
+				}
+				if _, err := os.Stat(marker); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("%s ran the program configured in %s (marker stat err=%v)", tool.Name(), key, err)
+				}
+				if want, ok := wantOutput[tool.Name()]; ok && (res.ExitCode != 0 || !strings.Contains(string(res.Stdout), want)) {
+					t.Errorf("%s = exit %d stdout %q stderr %q, want exit 0 and %q", tool.Name(), res.ExitCode, res.Stdout, res.Stderr, want)
+				}
+			}
+			slices.Sort(ran)
+			if !slices.Equal(ran, wantReadOnly) {
+				t.Fatalf("read-only tools = %v, want %v", ran, wantReadOnly)
+			}
+		})
+	}
+}

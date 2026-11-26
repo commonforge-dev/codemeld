@@ -265,6 +265,81 @@ func TestMaterializeBuiltinTemplates_EarlierVersionReplacedAndLoadsAsReference(t
 	}
 }
 
+const unisolatedGitTemplate = `# codemeld built-in VCS template: git.
+#
+# Materialized to ~/.codemeld/global/vcs/git.yaml on first run as a complete,
+# copy-and-modify reference. Each top-level key is one VCS action. 'detect' uses
+# a single 'marker' key; every other action uses 'argv' (run directly, with no
+# shell) and an optional 'cwd'. The placeholders {path}, {message}, and {branch}
+# are substituted before the command runs.
+
+detect:
+  marker: .git
+
+status:
+  argv: [git, status, --short]
+
+diff:
+  argv: [git, diff]
+
+add:
+  argv: [git, add, "{path}"]
+
+commit:
+  argv: [git, commit, -m, "{message}"]
+
+amend:
+  argv: [git, commit, --amend, -m, "{message}"]
+
+log:
+  argv: [git, log, --oneline, -n, "20"]
+
+branch-current:
+  argv: [git, branch, --show-current]
+
+branch-create:
+  argv: [git, branch, "{branch}"]
+
+branch-switch:
+  argv: [git, switch, "{branch}"]
+
+restore-file:
+  argv: [git, restore, "{path}"]
+
+is-clean:
+  argv: [git, status, --porcelain]
+
+stash:
+  argv: [git, stash, push]
+
+stash-pop:
+  argv: [git, stash, pop]
+
+# Probe-only: report whether a merge is in progress; never start/continue/abort.
+merge-status:
+  argv: [git, rev-parse, --verify, --quiet, MERGE_HEAD]
+
+# Probe-only: report whether a rebase is in progress; never start/continue/abort.
+rebase-status:
+  argv: [git, rev-parse, --verify, --quiet, REBASE_HEAD]
+`
+
+func TestMaterializeBuiltinTemplates_UnisolatedGitTemplateReplaced(t *testing.T) {
+	home := t.TempDir()
+	seedFirstRunDirs(t, home)
+	gitPath := VCSTemplatePath(home, "git")
+	seedFile(t, gitPath, unisolatedGitTemplate)
+
+	if path, cat, err := MaterializeBuiltinTemplates(home); err != nil {
+		t.Fatalf("MaterializeBuiltinTemplates: %v (path=%q cat=%q)", err, path, cat)
+	}
+
+	want, _ := builtin.BuiltinTemplate("git")
+	if got := readString(t, gitPath); got != string(want) {
+		t.Fatalf("git.yaml = %q, want the current embedded bytes", got)
+	}
+}
+
 func TestMaterializeBuiltinTemplates_EditedCopyOfEarlierVersionUntouched(t *testing.T) {
 	home := t.TempDir()
 	seedFirstRunDirs(t, home)

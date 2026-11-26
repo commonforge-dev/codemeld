@@ -1185,3 +1185,49 @@ func TestWalkOpenDirUnder_FilesystemRootIsReadable(t *testing.T) {
 		t.Fatalf("ReadDir(/) error = %v", err)
 	}
 }
+
+func walkBoundarySwapFixture(t *testing.T) (proj string, blocked *permissions.BlockedPaths) {
+	t.Helper()
+	proj = eval(t, t.TempDir())
+	outside := eval(t, t.TempDir())
+	mkdir(t, filepath.Join(proj, "sub"))
+	writeFile(t, filepath.Join(proj, "sub", "f.txt"), "x")
+	secret := filepath.Join(outside, "sub")
+	mkdir(t, secret)
+	writeFile(t, filepath.Join(secret, "SENTINEL"), "x")
+	blocked = permissions.NewBlockedPaths(eval(t, t.TempDir()), []permissions.BlockedEntry{{Path: secret, Source: "test"}})
+	walkSwapAt(t, &walkBeforeBoundaryOpen, func() {
+		replaceWithSymlink(t, proj, outside)
+		t.Cleanup(func() {
+			if err := os.Remove(proj); err != nil {
+				t.Errorf("Remove: %v", err)
+			}
+			if err := os.Rename(proj+"-orig", proj); err != nil {
+				t.Errorf("Rename: %v", err)
+			}
+		})
+	})
+	return proj, blocked
+}
+
+func TestWalk_BoundarySwappedBeforeSubtreeOpenRefused(t *testing.T) {
+	t.Run("list tool", func(t *testing.T) {
+		proj, blocked := walkBoundarySwapFixture(t)
+		tool := newListToolIn(t, proj)
+		tool.SetBlockedPaths(blocked)
+
+		res, err := invokeList(t, tool, map[string]any{"path": "sub"})
+		if err != nil {
+			t.Fatalf("Invoke error = %v", err)
+		}
+		if out := string(res.Stdout) + string(res.Stderr); strings.Contains(out, "SENTINEL") {
+			t.Fatalf("list output %q names an entry of the swapped-in folder", out)
+		}
+	})
+	t.Run("walker", func(t *testing.T) {
+		proj, blocked := walkBoundarySwapFixture(t)
+
+		got, err := walkEmitted(WalkOptions{Root: filepath.Join(proj, "sub"), ProjectRoot: proj, Blocked: blocked})
+		walkAssertRefused(t, got, err)
+	})
+}

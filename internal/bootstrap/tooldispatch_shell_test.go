@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/events"
+	"codemeld.dev/codemeld/internal/fserrors"
 	"codemeld.dev/codemeld/internal/ids"
 	"codemeld.dev/codemeld/internal/mode"
 	"codemeld.dev/codemeld/internal/model"
@@ -328,6 +330,37 @@ func TestShellEventRunner_PostLaunchErrorStillPairsEveryEmittedStart(t *testing.
 	}
 }
 
+type stagedResultsRunner struct {
+	fakeDispatchRunner
+	results []cmdrunner.RunResult
+}
+
+func (f *stagedResultsRunner) Exec(context.Context, cmdrunner.RunSpec) (cmdrunner.RunResult, error) {
+	i := atomic.AddInt32(&f.calls, 1) - 1
+	return f.results[i], nil
+}
+
+func TestProductionDispatcher_SequentialPipeIntoUnlaunchedStageGetsNoPipedInputNotice(t *testing.T) {
+	prependFixturePrograms(t, "alpha", "beta")
+	run := &stagedResultsRunner{results: []cmdrunner.RunResult{
+		{Stdout: bytes.Repeat([]byte("a"), 4096), StdoutTotal: 108894},
+		{ExitCode: -1, LaunchErrCategory: fserrors.NotFound},
+	}}
+	store := mkStore(t)
+	d := newProductionToolDispatcher(tools.NewRegistry(), run, &recordingAuthorizer{decision: allow()}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, 65536, securitystate.Policy{})
+
+	res, err := d.Dispatch(context.Background(), bashCall("c1", "alpha | beta"))
+	if err != nil {
+		t.Fatalf("Dispatch error = %v, want nil", err)
+	}
+	if run.callCount() != 2 {
+		t.Fatalf("Exec calls = %d, want both stages attempted", run.callCount())
+	}
+	if strings.Contains(res.Content, "piped input cut") {
+		t.Fatalf("content = %q, want no piped input notice for a stage that never started", res.Content)
+	}
+}
+
 func TestShellEventRunner_PipelineWithoutPreflightRunsNothing(t *testing.T) {
 	store := mkStore(t)
 	inner := &fakePipelineDispatchRunner{}
@@ -398,7 +431,7 @@ func TestProductionDispatcher_BashPipelinePersistsExactlyTheModelInputBytes(t *t
 	if !ends[1].Truncated || ends[1].OriginalBytes == nil || ends[1].OriginalBytes.Stdout != 40 {
 		t.Fatalf("final end = %+v, want truncated with the true 40-byte total", ends[1])
 	}
-	wantContent := strings.TrimRight(string(wantStdout), "\n") + "\nstderr:\ne1e2"
+	wantContent := strings.TrimRight(string(wantStdout), "\n") + "\nstderr:\ne1e2\n" + outputCutNotice("stdout", len(wantStdout), 40)
 	if res.Content != wantContent {
 		t.Fatalf("model content = %q, want %q — the persisted final stdout after the formatter's cosmetic newline trim, then every stage's stderr in order", res.Content, wantContent)
 	}
@@ -433,8 +466,8 @@ func TestProductionDispatcher_BashPipelineStreamsAndBoundsThroughTheRealRunner(t
 		if got.err != nil {
 			t.Fatalf("Dispatch error = %v, want nil", got.err)
 		}
-		if got.res.Content != "y\ny" {
-			t.Fatalf("content = %q, want the capped final stdout after the formatter's newline trim", got.res.Content)
+		if want := "y\ny\n" + outputCutNotice("stdout", 4, 5000); got.res.Content != want {
+			t.Fatalf("content = %q, want %q", got.res.Content, want)
 		}
 	case <-time.After(30 * time.Second):
 		cancel()
@@ -1095,7 +1128,7 @@ func TestProductionDispatcher_ConfinedTimeoutKeepsBothNotesWithinTheCap(t *testi
 			if err != nil {
 				t.Fatalf("Dispatch: %v", err)
 			}
-			stderr, ok := strings.CutSuffix(res.Content, "\nexit status -1")
+			stderr, _, ok := strings.Cut(res.Content, "\nexit status -1\ncodemeld: output cut: stderr")
 			if !ok || len(stderr) > cap {
 				t.Fatalf("content = %q (%d stderr bytes), want stderr within the %d-byte cap then exit status -1", res.Content, len(stderr), cap)
 			}
@@ -1104,6 +1137,162 @@ func TestProductionDispatcher_ConfinedTimeoutKeepsBothNotesWithinTheCap(t *testi
 				t.Fatalf("stderr = %q, want the confinement note once, then the timeout note once", stderr)
 			}
 		})
+	}
+}
+
+func TestProductionDispatcher_ConfinedPipeStageHoldingMoreStaysWithinTheOutputLimit(t *testing.T) {
+	const cap, pipeBytes, size = 512, 64 * 512, 16 * 512
+	limit := 100 * time.Millisecond
+	for _, tc := range []struct {
+		name      string
+		exit      int
+		timedOut  bool
+		failNoted bool
+	}{
+		{"both stages run", 0, false, false},
+		{"both stages fail confined", 1, false, true},
+		{"time limit ends the first stage", 0, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stage := cmdrunner.RunResult{ExitCode: tc.exit, Stdout: bytes.Repeat([]byte("o"), size), Stderr: bytes.Repeat([]byte("e"), size)}
+			inner := &confineInner{results: []cmdrunner.RunResult{stage, stage}}
+			if tc.timedOut {
+				inner.onBounded = func(cmdrunner.RunSpec) { time.Sleep(limit + 100*time.Millisecond) }
+			}
+			store := mkStore(t)
+			d := newProductionToolDispatcher(tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()}, t.TempDir(), t.TempDir(), func() *sessions.Store { return store }, cap, securitystate.Policy{})
+			conf := withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: programDir(t, "ls"), blocked: testBlocked(t)})
+			conf.pipeBytes = pipeBytes
+			d.confinement = conf
+			call := bashCall("c1", "ls | ls")
+			if tc.timedOut {
+				call = bashCallWithTimeout("c1", "ls | ls", int(limit.Milliseconds()))
+			}
+
+			res, err := d.Dispatch(context.Background(), call)
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			wantRuns := 2
+			if tc.timedOut {
+				wantRuns = 1
+			}
+			if len(inner.bounded) != wantRuns || inner.bounded[0].StdoutCapture != pipeBytes || inner.boundedCap != cap ||
+				(wantRuns == 2 && inner.bounded[1].StdoutCapture != 0) {
+				t.Fatalf("bounded runs %d, last limit %d; want %d runs at limit %d with only the first holding %d stdout bytes", len(inner.bounded), inner.boundedCap, wantRuns, cap, pipeBytes)
+			}
+			stdout, rest, ok := strings.Cut(res.Content, "\nstderr:\n")
+			stderr, _, _ := strings.Cut(rest, "\nexit status")
+			stderr, _, _ = strings.Cut(stderr, "\ncodemeld: output cut")
+			if !ok || len(stdout) > cap || len(stderr) > cap || strings.Contains(stderr, confinedFailureNote) != tc.failNoted {
+				t.Fatalf("content = %q, want stdout and stderr within %d bytes each, confined failure note %v", res.Content, cap, tc.failNoted)
+			}
+			ends := decodeStoreEvents[events.ToolExecEnd](t, reloadStore(t, store), events.KindToolExecEnd)
+			if len(ends) != wantRuns {
+				t.Fatalf("tool_exec_end events = %d, want %d", len(ends), wantRuns)
+			}
+			for i, end := range ends {
+				if len(end.Stdout) > cap || len(end.Stderr) > cap || !end.Truncated || end.OriginalBytes == nil || end.OriginalBytes.Stdout != size {
+					t.Fatalf("stage %d tool_exec_end = %d stdout, %d stderr bytes, %+v; want each within %d and the full %d stdout bytes reported", i+1, len(end.Stdout), len(end.Stderr), end.OriginalBytes, cap, size)
+				}
+			}
+		})
+	}
+}
+
+func outputCutNotice(stream string, shown, total int) string {
+	return fmt.Sprintf("codemeld: output cut: %s shows %d of %d bytes; the rest is missing. Narrow the command to see it.", stream, shown, total)
+}
+
+func TestProductionDispatcher_OutputCutNotices(t *testing.T) {
+	const cap = 8
+	plain := func(stdout, stderr string, exit int) dispatch.Runner {
+		return &fakeDispatchRunner{result: cmdrunner.RunResult{Stdout: []byte(stdout), Stderr: []byte(stderr), ExitCode: exit}}
+	}
+	for _, tc := range []struct {
+		name      string
+		command   string
+		run       dispatch.Runner
+		sandboxed bool
+		want      string
+	}{
+		{"sandboxed stdout over the limit", "ls", &confineInner{stdout: []byte("aaaaaaaa"), stdoutSize: 100}, true,
+			"aaaaaaaa\n" + outputCutNotice("stdout", 8, 100)},
+		{"unsandboxed stdout over the limit", "ls", plain("aaaaaaaaaaaa", "", 0), false,
+			"aaaaaaaa\n" + outputCutNotice("stdout", 8, 12)},
+		{"literal command stdout over the limit", "ls 2>&1", plain("aaaaaaaaaaaa", "", 0), false,
+			"aaaaaaaa\n" + outputCutNotice("stdout", 8, 12)},
+		{"stdout exactly at the limit", "ls", plain("aaaaaaaa", "", 0), false, "aaaaaaaa"},
+		{"both streams over the limit with a failed exit", "ls", plain("oooooooooooo", "eeeeeeeeee", 3), false,
+			"oooooooo\nstderr:\neeeeeeee\nexit status 3\n" + outputCutNotice("stdout", 8, 12) + "\n" + outputCutNotice("stderr", 8, 10)},
+		{"staged groups over the limit together", "alpha; beta", plain("abcde", "", 0), false,
+			"abcdeabc\n" + outputCutNotice("stdout", 8, 10)},
+		{"streaming pipe with a cut earlier stage", "alpha | beta", &fakePipelineDispatchRunner{results: []cmdrunner.PipelineResult{
+			{Stdout: []byte("aaaaaaaa"), StdoutTotal: 1000},
+			{Stdout: []byte("3\n"), StdoutTotal: 2},
+		}}, false, "3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prependFixturePrograms(t, "alpha", "beta")
+			d := dispatcherFor(t, tools.NewRegistry(), tc.run, &recordingAuthorizer{decision: allow()})
+			d.outputCap = cap
+			if tc.sandboxed {
+				d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: programDir(t, "ls"), blocked: testBlocked(t)})
+			}
+			res, err := d.Dispatch(context.Background(), bashCall("c1", tc.command))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if res.Content != tc.want {
+				t.Fatalf("content = %q, want %q", res.Content, tc.want)
+			}
+			if inner, ok := tc.run.(*confineInner); ok && len(inner.bounded) != 1 {
+				t.Fatalf("bounded runs = %d, want the command run through the sandbox", len(inner.bounded))
+			}
+		})
+	}
+}
+
+func TestProductionDispatcher_NoteStepsReportTheStderrTheyCut(t *testing.T) {
+	const cap = 512
+	limit := 100 * time.Millisecond
+	for _, tc := range []struct {
+		name             string
+		failure, timeout bool
+	}{{"failure note", true, false}, {"timeout note", false, true}, {"both notes", true, true}} {
+		for _, size := range []int{4, cap} {
+			t.Run(tc.name+"/"+strconv.Itoa(size), func(t *testing.T) {
+				inner := &confineInner{exitCode: 1, stderr: bytes.Repeat([]byte("e"), size)}
+				d := dispatcherFor(t, tools.NewRegistry(), inner, &recordingAuthorizer{decision: allow()})
+				d.outputCap = cap
+				call, status := bashCall("c1", "ls"), "\nexit status 1"
+				if tc.failure {
+					d.confinement = withSessionTemp(t, &confinement{constrained: true, mode: fixedMode(string(mode.Plan)), lookupPath: programDir(t, "ls"), blocked: testBlocked(t)})
+				}
+				if tc.timeout {
+					sleep := func(cmdrunner.RunSpec) { time.Sleep(limit + 100*time.Millisecond) }
+					inner.onBounded, inner.onExec = sleep, sleep
+					call, status = bashCallWithTimeout("c1", "ls", int(limit.Milliseconds())), "\nexit status -1"
+				}
+
+				res, err := d.Dispatch(context.Background(), call)
+				if err != nil {
+					t.Fatalf("Dispatch: %v", err)
+				}
+				stderr, notice, ok := strings.Cut(res.Content, status)
+				if !ok || strings.Contains(stderr, confinedFailureNote) != tc.failure || strings.Contains(stderr, "timed out after") != tc.timeout {
+					t.Fatalf("content = %q, want stderr with the expected notes then %q", res.Content, status)
+				}
+				want := ""
+				if size == cap {
+					kept := len(stderr) - len(strings.TrimLeft(stderr, "e"))
+					want = "\n" + outputCutNotice("stderr", len(stderr), size+len(stderr)-kept)
+				}
+				if notice != want {
+					t.Fatalf("notice = %q, want %q (content %q)", notice, want, res.Content)
+				}
+			})
+		}
 	}
 }
 
@@ -1271,4 +1460,356 @@ func TestProductionDispatcher_BashTimeoutStartsAfterAuthorizationAndIsShared(t *
 		}
 		wantOneTimeoutNote(t, res.Content, 450*time.Millisecond)
 	})
+}
+
+func TestProductionDispatcher_SavedOutsideCommandStillAsksItsOrdinaryApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		option  tui.PromptOption
+		outside int
+	}{
+		{"allow once", tui.OptionAllowOnce, 1},
+		{"deny", tui.OptionDeny, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var inner *confineInner
+			ranBeforePrompt := false
+			h := newPinShellHarness(t, mode.NewActiveState(mode.Build, mode.SourceDefault), func(tui.PromptRequest) tui.PromptDecision {
+				ranBeforePrompt = len(inner.execs)+len(inner.bounded)+len(inner.pipelines) > 0
+				return tui.PromptDecision{Option: tc.option}
+			}, "mise")
+			inner = h.inner
+			h.d.confinement.writable = savedOutsideReader(t, h.d.processCWD, "mise run check")
+			t.Setenv("PATH", h.d.confinement.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			res, err := h.d.Dispatch(context.Background(), bashCall("c1", "mise run check"))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if len(*h.shown) != 1 || ranBeforePrompt {
+				t.Fatalf("prompts = %d, ran before the prompt = %v; want one ordinary approval prompt before any run", len(*h.shown), ranBeforePrompt)
+			}
+			if prompt := (*h.shown)[0]; prompt.ExceptionalAuthority != "" {
+				t.Fatalf("prompt = %+v, want the ordinary command approval, not the outside-run prompt", prompt)
+			}
+			if len(inner.execs) != tc.outside || len(inner.bounded) != 0 {
+				t.Fatalf("unconfined/confined = %d/%d, want %d/0", len(inner.execs), len(inner.bounded), tc.outside)
+			}
+			if noted := strings.Contains(res.Content, strings.TrimSuffix(outsideEntryNote("mise run check"), "\n")); noted != (tc.outside == 1) {
+				t.Fatalf("content = %q, want the saved-entry note only when the command ran", res.Content)
+			}
+		})
+	}
+}
+
+func TestProductionDispatcher_SavedOutsideHeadOfAMixedPipeNeedsOnlyItsOrdinaryApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		granted                     bool
+		option                      tui.PromptOption
+		prompts, outside, sandboxed int
+	}{
+		{"granted", true, tui.OptionDeny, 0, 1, 1},
+		{"allow once", false, tui.OptionAllowOnce, 1, 1, 1},
+		{"deny", false, tui.OptionDeny, 1, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var inner *confineInner
+			ranBeforePrompt := false
+			h := newPinShellHarness(t, mode.NewActiveState(mode.Build, mode.SourceDefault), func(tui.PromptRequest) tui.PromptDecision {
+				ranBeforePrompt = inner.calls() > 0
+				return tui.PromptDecision{Option: tc.option}
+			}, "mise", "tail")
+			inner = h.inner
+			inner.results = []cmdrunner.RunResult{{ExitCode: 3}, {Stdout: []byte("last")}}
+			h.d.confinement.writable = savedOutsideReader(t, h.d.processCWD, "mise run check")
+			h.d.confinement.outside = &outsideSubjects{}
+			if tc.granted {
+				h.spy.grants.AppendPermission(permissions.PermissionEntry{Kind: "direct", Subject: "mise run check", PathScope: "*", GrantKind: "global"})
+			}
+			t.Setenv("PATH", h.d.confinement.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			res, err := h.d.Dispatch(context.Background(), bashCall("c1", "mise run check | tail -60"))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if len(*h.shown) != tc.prompts || ranBeforePrompt {
+				t.Fatalf("prompts = %+v, ran before the prompt = %v; want %d before any run", *h.shown, ranBeforePrompt, tc.prompts)
+			}
+			for _, prompt := range *h.shown {
+				if prompt.ExceptionalAuthority != "" {
+					t.Fatalf("prompt = %+v, want the ordinary command approval", prompt)
+				}
+			}
+			if len(inner.execs) != tc.outside || len(inner.bounded) != tc.sandboxed || len(inner.pipelines) != 0 {
+				t.Fatalf("unconfined/confined/pipelines = %d/%d/%d, want %d/%d/0", len(inner.execs), len(inner.bounded), len(inner.pipelines), tc.outside, tc.sandboxed)
+			}
+			if tc.outside == 0 {
+				return
+			}
+			if got := strings.Join(inner.execs[0].Argv, " "); got != "mise run check" {
+				t.Fatalf("outside = %q, want the saved check", got)
+			}
+			const note = `codemeld: ran outside the sandbox: matches outside_sandbox_commands entry "mise run check" in .codemeld/settings.local.yaml`
+			if strings.Count(res.Content, note) != 1 || !strings.Contains(res.Content, "exit status 3") {
+				t.Fatalf("content = %q, want the head's note and its exit status", res.Content)
+			}
+		})
+	}
+}
+
+func newMergedStderrHarness(t *testing.T, decide func(tui.PromptRequest) tui.PromptDecision) pinShellHarness {
+	t.Helper()
+	h := newPinShellHarness(t, mode.NewActiveState(mode.Build, mode.SourceDefault), decide, "mise", "tail", "touch")
+	h.d.confinement.writable = savedOutsideReader(t, h.d.processCWD, "mise run check")
+	h.d.confinement.outside = &outsideSubjects{}
+	h.spy.outside = h.d.confinement.outside
+	t.Setenv("PATH", h.d.confinement.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return h
+}
+
+func globalDirectGrant(subject string) permissions.PermissionEntry {
+	return permissions.PermissionEntry{Kind: "direct", Subject: subject, PathScope: "*", GrantKind: "global"}
+}
+
+func TestProductionDispatcher_SavedCommandWithMergedStderrNeedsOnlyItsOrdinaryApproval(t *testing.T) {
+	for _, form := range []string{"mise run check 2>&1 | tail -60", "mise run check 2>&1", "cd {cwd} && mise run check 2>&1 | tail -60"} {
+		for _, tc := range []struct {
+			name    string
+			granted bool
+			option  tui.PromptOption
+			prompts int
+			runs    bool
+		}{
+			{"granted", true, tui.OptionDeny, 0, true},
+			{"allow once", false, tui.OptionAllowOnce, 1, true},
+			{"deny", false, tui.OptionDeny, 1, false},
+		} {
+			t.Run(tc.name+"/"+form, func(t *testing.T) {
+				var inner *confineInner
+				ranBeforePrompt := false
+				h := newMergedStderrHarness(t, func(tui.PromptRequest) tui.PromptDecision {
+					ranBeforePrompt = inner.calls() > 0
+					return tui.PromptDecision{Option: tc.option}
+				})
+				inner = h.inner
+				inner.results = []cmdrunner.RunResult{{ExitCode: 3, Stdout: []byte("merged")}, {Stdout: []byte("last")}}
+				if tc.granted {
+					h.spy.grants.AppendPermission(globalDirectGrant("mise run check"))
+				}
+				command := strings.ReplaceAll(form, "{cwd}", h.d.processCWD)
+
+				res, err := h.d.Dispatch(context.Background(), bashCall("c1", command))
+				if err != nil {
+					t.Fatalf("Dispatch: %v", err)
+				}
+				if len(*h.shown) != tc.prompts || ranBeforePrompt {
+					t.Fatalf("prompts = %+v, ran before the prompt = %v; want %d before any run", *h.shown, ranBeforePrompt, tc.prompts)
+				}
+				for _, p := range *h.shown {
+					if p.Kind != tui.SubjectDirectCommand || p.Subject != "mise run check" || p.ExceptionalAuthority != "" || p.Body != "Whole command: "+command {
+						t.Fatalf("prompt = %+v, want the ordinary approval of the direct command, showing the whole one", p)
+					}
+				}
+				if !tc.runs {
+					if inner.calls() != 0 || !res.Denied {
+						t.Fatalf("calls = %d, result %+v; want a denial that runs nothing", inner.calls(), res)
+					}
+					return
+				}
+				sandboxed := 0
+				if strings.Contains(command, "|") {
+					sandboxed = 1
+				}
+				if len(inner.execs) != 1 || !inner.execs[0].MergeStderr || len(inner.bounded) != sandboxed || len(inner.pipelines) != 0 || !strings.Contains(res.Content, "exit status 3") {
+					t.Fatalf("runs %d/%d/%d, content %q; want the merged check outside, the rest sandboxed, and its status",
+						len(inner.execs), len(inner.bounded), len(inner.pipelines), res.Content)
+				}
+			})
+		}
+	}
+}
+
+func TestProductionAuthorizers_EveryPromptOfTheMergedStderrFormsShowsTheWholeCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name, command string
+		granted       []string
+		remembered    string
+		subject       string
+		batched       int
+		unapproved    int
+	}{
+		{name: "single", command: "mise run check 2>&1", subject: "mise run check", unapproved: 1},
+		{name: "single before a read-only stage", command: "  mise run check 2>&1 | tail -60 ", subject: "mise run check", unapproved: 1},
+		{name: "only the rest", command: "mise run check 2>&1 | touch x", granted: []string{"mise run check"}, subject: "touch x", unapproved: 1},
+		{name: "batched", command: "mise run check 2>&1 | touch x", batched: 2, unapproved: 2},
+		{name: "batched with a later group", command: "mise run check 2>&1 | tail -5 && touch x", batched: 2, unapproved: 2},
+		{name: "outside", command: "mise run check 2>&1 | tail -60", granted: []string{"mise run check"}, remembered: "mise run check", subject: "mise run check", unapproved: 1},
+		{name: "outside rest", command: "mise run check 2>&1 | touch x", granted: []string{"mise run check"}, remembered: "touch x", subject: "touch x", unapproved: 1},
+		{name: "outside batched", command: "mise run check 2>&1 | touch x", remembered: "mise run check", batched: 2, unapproved: 2},
+	} {
+		body := "Whole command: " + strings.TrimSpace(tc.command)
+		t.Run("tui/"+tc.name, func(t *testing.T) {
+			h := newMergedStderrHarness(t, nil)
+			for _, subject := range tc.granted {
+				h.spy.grants.AppendPermission(globalDirectGrant(subject))
+			}
+			authority := ""
+			if tc.remembered != "" {
+				h.d.confinement.outside.add(tc.remembered, nil)
+				authority = wantOutsideAuthority
+			}
+			if _, err := h.d.Dispatch(context.Background(), bashCall("c1", tc.command)); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if len(*h.shown) != 1 {
+				t.Fatalf("prompts = %+v, want one", *h.shown)
+			}
+			if p := (*h.shown)[0]; p.Body != body || p.Pipeline != "" || p.Subject != tc.subject || len(p.BatchedStages) != tc.batched || p.ExceptionalAuthority != authority {
+				t.Fatalf("prompt = %+v, want body %q, subject %q, %d batched stages, authority %q", p, body, tc.subject, tc.batched, authority)
+			}
+		})
+		t.Run("terminal/"+tc.name, func(t *testing.T) {
+			h := newMergedStderrHarness(t, nil)
+			var out bytes.Buffer
+			store := mkStore(t)
+			auth := newHeadlessAuthorizer(emptyCache(t, h.d.processCWD), func() *sessions.Store { return store }, mode.NewActiveState(mode.Build, mode.SourceDefault),
+				newTerminalPrompter(strings.NewReader("1\n1\n"), &out), stderrNoticeRenderer{w: &bytes.Buffer{}})
+			auth.executionConstrained = true
+			auth.outside = h.d.confinement.outside
+			h.d.authorizer = auth
+			for _, subject := range tc.granted {
+				auth.grants.AppendPermission(globalDirectGrant(subject))
+			}
+			notices := 0
+			if tc.remembered != "" {
+				h.d.confinement.outside.add(tc.remembered, nil)
+				notices = 1
+			}
+			if _, err := h.d.Dispatch(context.Background(), bashCall("c1", tc.command)); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			text := out.String()
+			if strings.Count(text, "approval required for a tool call") != tc.unapproved || strings.Count(text, "\n"+body+"\n") != tc.unapproved ||
+				strings.Count(text, "This command runs outside the sandbox") != notices {
+				t.Fatalf("terminal = %q, want %d prompts each showing %q, %d of them to run outside", text, tc.unapproved, body, notices)
+			}
+		})
+	}
+}
+
+func TestProductionAuthorizer_TheWholeCommandLineChangesOnlyTheDisplay(t *testing.T) {
+	for _, tc := range []struct{ merged, plain string }{
+		{"mise run check 2>&1", "mise run check"},
+		{"mise run check 2>&1 | tail -5 && touch x", "mise run check; touch x"},
+	} {
+		t.Run(tc.merged, func(t *testing.T) {
+			options := []tui.PromptOption{tui.OptionAllowOnce, tui.OptionAllowSession}
+			var h pinShellHarness
+			h = newMergedStderrHarness(t, func(tui.PromptRequest) tui.PromptDecision {
+				return tui.PromptDecision{Option: options[min(len(*h.shown), len(options))-1]}
+			})
+			for _, command := range []string{tc.plain, tc.merged, tc.plain} {
+				if _, err := h.d.Dispatch(context.Background(), bashCall("c1", command)); err != nil {
+					t.Fatalf("Dispatch(%q): %v", command, err)
+				}
+				h.spy.resetTurnCache()
+			}
+			if len(*h.shown) != 2 {
+				t.Fatalf("prompts = %+v, want the grant from the second to cover the plain command", *h.shown)
+			}
+			plain, merged := (*h.shown)[0], (*h.shown)[1]
+			if plain.Body != "" || merged.Body != "Whole command: "+tc.merged {
+				t.Fatalf("bodies = %q, %q; want only the merged form to carry one", plain.Body, merged.Body)
+			}
+			merged.Body = ""
+			if !reflect.DeepEqual(merged, plain) {
+				t.Fatalf("prompt = %+v, want %+v but for the body", merged, plain)
+			}
+		})
+	}
+}
+
+const sandboxedSavedCommand = `codemeld: not run: "mise run check" is in outside_sandbox_commands (.codemeld/settings.local.yaml), but this call would keep it in the sandbox`
+
+func TestProductionDispatcher_ACallThatWouldKeepASavedCommandSandboxedIsRefusedInBand(t *testing.T) {
+	for _, command := range []string{`mise run check 2>&1 | tail -6; echo "EXIT=${PIPESTATUS[0]}"`, "echo x | mise run check"} {
+		for _, approver := range []string{"tui", "terminal", "none"} {
+			t.Run(approver+"/"+command, func(t *testing.T) {
+				h := newMergedStderrHarness(t, nil)
+				var out bytes.Buffer
+				if approver != "tui" {
+					var terminal *terminalPrompter
+					if approver == "terminal" {
+						terminal = newTerminalPrompter(strings.NewReader("1\n1\n"), &out)
+					}
+					store := mkStore(t)
+					auth := newHeadlessAuthorizer(emptyCache(t, h.d.processCWD), func() *sessions.Store { return store }, mode.NewActiveState(mode.Build, mode.SourceDefault),
+						terminal, stderrNoticeRenderer{w: &bytes.Buffer{}})
+					auth.executionConstrained = true
+					auth.outside = h.d.confinement.outside
+					h.d.authorizer = auth
+				}
+				res, err := h.d.Dispatch(context.Background(), bashCall("c1", command))
+				if err != nil {
+					t.Fatalf("Dispatch: %v, want the refusal as the tool result", err)
+				}
+				if !strings.Contains(res.Content, sandboxedSavedCommand) || len(*h.shown) != 0 || out.Len() != 0 || h.inner.calls() != 0 {
+					t.Fatalf("content %q, prompts %d, terminal %q, runs %d; want only the refusal", res.Content, len(*h.shown), out.String(), h.inner.calls())
+				}
+			})
+		}
+	}
+}
+
+func TestProductionDispatcher_OnlyBuildInTheSandboxWithAMatchingEntryRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mode  mode.Mode
+		setup func(t *testing.T, h pinShellHarness)
+	}{
+		{"plan", mode.Plan, nil},
+		{"auto edits", mode.AutoEdits, nil},
+		{"no sandbox", mode.Build, func(_ *testing.T, h pinShellHarness) { h.d.confinement.constrained = false }},
+		{"no matching entry", mode.Build, func(t *testing.T, h pinShellHarness) {
+			h.d.confinement.writable = savedOutsideReader(t, h.d.processCWD, "mise run check-dev")
+		}},
+	} {
+		for _, command := range []string{"mise run check 2>/dev/null", "echo x | mise run check"} {
+			t.Run(tc.name+"/"+command, func(t *testing.T) {
+				h := newPinShellHarness(t, mode.NewActiveState(tc.mode, mode.SourceDefault), nil, "mise", "tail")
+				h.d.confinement.writable = savedOutsideReader(t, h.d.processCWD, "mise run check")
+				h.d.confinement.outside = &outsideSubjects{}
+				t.Setenv("PATH", h.d.confinement.lookupPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+				if tc.setup != nil {
+					tc.setup(t, h)
+				}
+				res, err := h.d.Dispatch(context.Background(), bashCall("c1", command))
+				if err != nil || strings.Contains(res.Content, "codemeld: not run:") {
+					t.Fatalf("err %v, content %q; want no refusal for the saved command", err, res.Content)
+				}
+			})
+		}
+	}
+}
+
+func TestProductionDispatcher_UndecomposedOrUnmatchedSpellingsAreNeitherRefusedNorRunOutside(t *testing.T) {
+	for _, command := range []string{
+		"notmise run check 2>&1",
+		"mise run check-dev 2>&1",
+		"echo 'mise run check' 2>&1",
+		"X=1 mise run check 2>&1",
+		"env -i mise run check 2>&1",
+		"mise run check > out.log 2>&1",
+		"mise run check | sh",
+		"mise run check $(echo x)",
+	} {
+		t.Run(command, func(t *testing.T) {
+			h := newMergedStderrHarness(t, nil)
+			res, err := h.d.Dispatch(context.Background(), bashCall("c1", command))
+			if err != nil || strings.Contains(res.Content, "codemeld: not run:") || len(h.inner.execs) != 0 {
+				t.Fatalf("err %v, content %q, outside runs %+v; want no refusal and nothing outside", err, res.Content, h.inner.execs)
+			}
+		})
+	}
 }

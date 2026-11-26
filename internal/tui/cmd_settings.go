@@ -60,6 +60,11 @@ type WritableFolderDeps struct {
 	Remove func(entry string) string
 }
 
+type OutsideCommandDeps struct {
+	List   func() ([]WritableFolderRow, string)
+	Remove func(entry string) string
+}
+
 // SettingsDeps is the /settings handler's dependency surface. A nil Revoke leaves the
 // overlay read-only and a nil Share leaves it without a share action. Approved is the run's
 // explicit root approval, never inferred from the loaded rows, and Boundary is
@@ -71,6 +76,7 @@ type SettingsDeps struct {
 	Revoke   func(PermissionRow)
 	Share    func(PermissionRow) ShareResult
 	Writable WritableFolderDeps
+	Outside  OutsideCommandDeps
 	Approved bool
 	Boundary string
 	tab      int

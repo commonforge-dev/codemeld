@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"codemeld.dev/codemeld/internal/model"
 	"codemeld.dev/codemeld/internal/permissions"
 	"codemeld.dev/codemeld/internal/provider"
+	cmdrunner "codemeld.dev/codemeld/internal/runner"
 	"codemeld.dev/codemeld/internal/sessions"
 	"codemeld.dev/codemeld/internal/subagent"
 	"codemeld.dev/codemeld/internal/tools"
@@ -790,10 +792,14 @@ func vcsTools(t *testing.T, tmpl *vcs.Template, trustExplicitClasses bool) []too
 	return reg.List()
 }
 
-var builtinGitActions = map[string]vcs.ActionSpec{
-	"status": {Argv: []string{"git", "status", "--short"}},
-	"diff":   {Argv: []string{"git", "diff"}},
-	"commit": {Argv: []string{"git", "commit", "-m", "{message}"}},
+func builtinGitActions(t *testing.T) map[string]vcs.ActionSpec {
+	t.Helper()
+	tmpls, err := vcs.LoadBuiltinTemplates()
+	if err != nil {
+		t.Fatalf("LoadBuiltinTemplates: %v", err)
+	}
+	actions := tmpls["git"].Actions
+	return map[string]vcs.ActionSpec{"status": actions["status"], "diff": actions["diff"], "commit": actions["commit"]}
 }
 
 func declaredReadOnly(spec vcs.ActionSpec) vcs.ActionSpec {
@@ -814,6 +820,7 @@ func vcsChildCases(t *testing.T) []struct {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), ".codemeld", "vcs", "git.yaml")
 	global := filepath.Join(t.TempDir(), "global", "vcs", "git.yaml")
+	gitActions := builtinGitActions(t)
 	return []struct {
 		name       string
 		registered []tools.Tool
@@ -822,20 +829,20 @@ func vcsChildCases(t *testing.T) []struct {
 		{"no active VCS", nil, nil},
 		{
 			"byte-identical project reference copy",
-			vcsTools(t, gitTemplate(project, true, builtinGitActions), false),
+			vcsTools(t, gitTemplate(project, true, gitActions), false),
 			[]string{"vcs_diff", "vcs_status"},
 		},
 		{
 			"trusted global read-only declaration over the product argv",
 			vcsTools(t, gitTemplate(global, false, map[string]vcs.ActionSpec{
-				"status": declaredReadOnly(builtinGitActions["status"]),
-				"commit": builtinGitActions["commit"],
+				"status": declaredReadOnly(gitActions["status"]),
+				"commit": gitActions["commit"],
 			}), true),
 			[]string{"vcs_status"},
 		},
 		{
 			"untrusted project template",
-			vcsTools(t, gitTemplate(project, false, builtinGitActions), false),
+			vcsTools(t, gitTemplate(project, false, gitActions), false),
 			nil,
 		},
 		{
@@ -3343,6 +3350,84 @@ func TestGeneralAgent_PathFreeLookAlikesAreNeverAReadOnlyChild(t *testing.T) {
 			}
 			if offered := advertisedToChild(h.client.requests[0]); !slices.Contains(offered, filetools.EditToolName) {
 				t.Fatalf("child offered %v, want the path-declaring tool set", offered)
+			}
+		})
+	}
+}
+
+func gitCanaryRepo(t *testing.T, configKey string) (root, marker string) {
+	t.Helper()
+	root = t.TempDir()
+	scripts := t.TempDir()
+	marker = filepath.Join(scripts, "ran")
+	script := filepath.Join(scripts, "canary")
+	writeWithMode(t, script, "#!/bin/sh\ntouch '"+marker+"'\n", 0o755)
+	writeWithMode(t, filepath.Join(root, "f.txt"), "one\n", 0o644)
+	writeWithMode(t, filepath.Join(root, ".gitattributes"), "f.txt diff=canary\n", 0o644)
+	for _, argv := range [][]string{
+		{"git", "init", "-q"},
+		{"git", "add", "."},
+		{"git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "init"},
+		{"git", "config", configKey, script},
+	} {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", argv, err, out)
+		}
+	}
+	writeWithMode(t, filepath.Join(root, "f.txt"), "two\n", 0o644)
+	return root, marker
+}
+
+func TestGeneralAgent_ReadOnlyChildRunsBuiltinGitReadsWithoutRepositoryConfiguredPrograms(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	tmpls, err := vcs.LoadBuiltinTemplates()
+	if err != nil {
+		t.Fatalf("LoadBuiltinTemplates: %v", err)
+	}
+	calls := [][2]string{{"vcs_status", "{}"}, {"vcs_diff", "{}"}, {"vcs_log", "{}"}, {"vcs_is_clean", "{}"}}
+	wantOutput := map[string]string{"vcs_status": "f.txt", "vcs_diff": "+two", "vcs_log": "init", "vcs_is_clean": "f.txt"}
+	for _, key := range []string{"core.fsmonitor", "diff.external", "diff.canary.textconv", "core.pager"} {
+		t.Run(key, func(t *testing.T) {
+			root, marker := gitCanaryRepo(t, key)
+			reg := tools.NewRegistry()
+			if err := vcs.RegisterActions(reg, tmpls["git"], root, cmdrunner.DirectExecRunner{}, func(events.EventPayload) error { return nil }, 1<<16); err != nil {
+				t.Fatalf("RegisterActions: %v", err)
+			}
+			h := newHarness(t,
+				streamRound(toolCallsChunk(calls...)),
+				streamRound(contentChunk("done"), finishChunk()),
+			)
+			h.registered = reg.List()
+			real := &fileToolDispatcher{results: map[string]tools.Result{}, tools: map[string]tools.Tool{}}
+			for _, tool := range h.registered {
+				real.tools[tool.Name()] = tool
+			}
+			h.override = func(permissions.ModeContext) turn.ToolDispatcher { return real }
+
+			res, err := h.tool().Invoke(t.Context(), map[string]any{instructionsArg: "look around"})
+			if err != nil || res.ExitCode != 0 {
+				t.Fatalf("Invoke = %+v, %v, want a completed child", res, err)
+			}
+			offered := advertisedToChild(h.client.requests[0])
+			for _, call := range calls {
+				name := call[0]
+				if tool, _ := reg.Lookup(name); !tool.Advertise().ReadOnly {
+					t.Errorf("%s Advertise().ReadOnly = false, want true", name)
+				}
+				if !slices.Contains(offered, name) {
+					t.Errorf("read-only child was not offered %s; offered=%v", name, offered)
+				}
+				r, ok := real.results[name]
+				if !ok || r.ExitCode != 0 || !strings.Contains(string(r.Stdout), wantOutput[name]) {
+					t.Errorf("%s result = %+v (ran=%v), want exit 0 and %q in stdout", name, r, ok, wantOutput[name])
+				}
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("a child-run git read ran the program configured in %s (marker stat err=%v)", key, err)
 			}
 		})
 	}

@@ -29,6 +29,11 @@ func TestEnforceGlobalOnly_Rejects(t *testing.T) {
 			"sessions.max_tool_output_bytes",
 		},
 		{
+			"sessions.max_pipe_bytes",
+			map[string]any{"sessions": map[string]any{"max_pipe_bytes": 1048576}},
+			"sessions.max_pipe_bytes",
+		},
+		{
 			"empty provider map",
 			map[string]any{"provider": map[string]any{}},
 			"provider",

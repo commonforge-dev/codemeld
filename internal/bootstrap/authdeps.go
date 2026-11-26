@@ -23,6 +23,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"codemeld.dev/codemeld/internal/config"
 	"codemeld.dev/codemeld/internal/dispatch"
 	"codemeld.dev/codemeld/internal/events"
@@ -68,7 +70,39 @@ type productionAuthorizer struct {
 	blocked              *permissions.BlockedPaths
 	systemOne            *systemOneCheck
 	outside              *outsideSubjects
+	saveOutside          func(subject string) (string, bool)
 	localNotice          sync.Once
+}
+
+func localSettingsWritable(projectRoot, path string) bool {
+	if unix.Access(projectRoot, unix.R_OK|unix.X_OK) != nil {
+		return false
+	}
+	dir := filepath.Dir(path)
+	info, err := os.Lstat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return unix.Access(projectRoot, unix.W_OK) == nil
+	}
+	if err != nil || !info.IsDir() || unix.Access(dir, unix.R_OK|unix.W_OK|unix.X_OK) != nil {
+		return false
+	}
+	return absentOrAccessibleFile(path, unix.R_OK|unix.W_OK) && absentOrAccessibleFile(config.LocalSettingsLockPath(projectRoot), unix.R_OK)
+}
+
+func absentOrAccessibleFile(path string, access uint32) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	return info.Mode().IsRegular() && unix.Access(path, access) == nil
+}
+
+func (a *productionAuthorizer) saveOutsideScope(req permissions.MatchRequest, scope string) (string, bool) {
+	subject := permissions.DirectSubjectForRequest(req, scope)
+	if !permissions.Match(req, []permissions.PermissionEntry{{Kind: matchKindDirect, Subject: subject, PathScope: "*", GrantKind: globalGrantKind}}).Matched {
+		return fserrors.CollapseControls(scope) + " cannot be saved to outside_sandbox_commands because the entry would not match this command; nothing written", false
+	}
+	return a.saveOutside(subject)
 }
 
 func liveWritableFolders(constrained, broken bool, live *writableFoldersReader) []string {
@@ -170,6 +204,7 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 	display := a.buildPromptDisplay(markOutside(markExceptional(disp, req, modeCtx), req, modeCtx, a.outside), req.PathScope)
 	if display.ExceptionalAuthority == outsideSandboxAuthority {
 		display.OutsideReasons = a.outside.reasons(req.Subject)
+		display.OfferAlwaysOutside = a.saveOutside != nil && a.display.projectApproved && localSettingsWritable(a.display.projectRoot, a.display.localSettingsPath)
 	}
 	texts := systemOneLiteralTexts{}
 	texts.add(req, disp.Subject)
@@ -181,10 +216,18 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 		ask := prompt
 		prompt = func(ctx context.Context, esc permissions.ScopeEscalation) (permissions.PromptOutcome, error) {
 			out, err := ask(ctx, esc)
-			if err == nil {
-				settleOutside(ctx, out.Choice, a.outside, req.Subject)
+			if err != nil {
+				return out, err
 			}
-			return out, err
+			if display.OfferAlwaysOutside && out.Choice == permissions.PromptAllowOnce && out.StoredSubject != "" {
+				msg, saved := a.saveOutsideScope(req, out.StoredSubject)
+				a.notices.Notice(msg)
+				if saved {
+					a.outside.remove(req.Subject)
+				}
+			}
+			settleOutside(ctx, out.Choice, a.outside, req.Subject)
+			return out, nil
 		}
 	}
 	deps := permissions.AuthorizeDeps{
@@ -227,6 +270,13 @@ func (a *productionAuthorizer) Authorize(ctx context.Context, req permissions.Ma
 func (a *productionAuthorizer) AuthorizeBatch(ctx context.Context, reqs []dispatch.BatchAuthRequest) ([]permissions.Decision, error) {
 	if len(reqs) == 0 {
 		return nil, nil
+	}
+	if len(reqs) == 1 {
+		d, err := a.Authorize(ctx, reqs[0].Req, reqs[0].Display, reqs[0].ModeCtx)
+		if err != nil {
+			return nil, err
+		}
+		return []permissions.Decision{d}, nil
 	}
 	release, err := a.acquireBatchInflight(ctx, reqs)
 	if err != nil {
